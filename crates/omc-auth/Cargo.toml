@@ -1,0 +1,16 @@
+[package]
+name = "omc-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dirs = "7.0.0"
+oauth2 = "5.0.0"
+open = "5.4.5"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tiny_http = "0.12.0"
+tokio = { version = "1.54.1", features = ["rt", "macros"] }
+url = "2.5.8"

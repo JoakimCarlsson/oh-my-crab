@@ -1,0 +1,13 @@
+[package]
+name = "omc-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+crossterm = "0.29.0"
+omc-auth.workspace = true
+omc-providers.workspace = true
+ratatui = "0.30.2"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync"] }
