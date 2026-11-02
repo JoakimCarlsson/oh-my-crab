@@ -5,6 +5,7 @@ use omc_auth::Credentials;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::prompt::PROMPT;
 use crate::{ProviderError, sse};
 
 /// Messages endpoint.
@@ -16,8 +17,8 @@ const MODELS_URL: &str = "https://api.anthropic.com/v1/models";
 /// Model used when the user has not picked one.
 pub const DEFAULT_MODEL: &str = "claude-haiku-5-5";
 
-/// System prompt that Claude subscription tokens require.
-const SYSTEM: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+/// First system block, which Claude subscription tokens require.
+const IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /// One server-sent event payload from the Messages stream.
 #[derive(Deserialize)]
@@ -110,7 +111,10 @@ pub async fn send(
         "model": model,
         "max_tokens": 1024,
         "stream": true,
-        "system": [{ "type": "text", "text": SYSTEM }],
+        "system": [
+            { "type": "text", "text": IDENTITY },
+            { "type": "text", "text": PROMPT },
+        ],
         "messages": [{ "role": "user", "content": prompt }],
     });
     let response = authorized(reqwest::Client::new().post(URL), credentials)

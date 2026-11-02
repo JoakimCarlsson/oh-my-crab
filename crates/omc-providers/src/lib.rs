@@ -3,6 +3,7 @@
 mod claude;
 mod codex;
 mod error;
+mod prompt;
 mod sse;
 
 pub use error::ProviderError;

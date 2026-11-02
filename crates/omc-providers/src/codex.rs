@@ -5,6 +5,7 @@ use omc_auth::Credentials;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::prompt::PROMPT;
 use crate::{ProviderError, sse};
 
 /// Responses endpoint of the Codex backend.
@@ -15,9 +16,6 @@ const MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
 
 /// Client version the model list is filtered for.
 const CLIENT_VERSION: &str = "0.159.0";
-
-/// Instructions sent with every request.
-const INSTRUCTIONS: &str = "You are a friendly assistant. Keep replies short.";
 
 /// One server-sent event payload from the Responses stream.
 #[derive(Deserialize)]
@@ -126,7 +124,7 @@ pub async fn send(
 ) -> Result<(), ProviderError> {
     let body = json!({
         "model": model,
-        "instructions": INSTRUCTIONS,
+        "instructions": PROMPT,
         "input": [{
             "type": "message",
             "role": "user",
