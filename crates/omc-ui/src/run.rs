@@ -62,7 +62,10 @@ fn update(app: &mut App, tx: &UnboundedSender<Msg>, msg: Msg) {
         Msg::LoginUrl(url) => app.say(format!(
             "Opening browser to log in. If it does not open, visit: {url}"
         )),
-        Msg::LoggedIn(provider) => app.say(format!("Logged in with {}. Say hi.", provider.label())),
+        Msg::LoggedIn(provider) => {
+            app.active = Some(provider);
+            app.say(format!("Logged in with {}. Say hi.", provider.label()));
+        }
         Msg::LoginFailed(error) => app.say(format!("Login failed: {error}")),
         Msg::Delta(delta) => app.append_reply(&delta),
         Msg::Done => app.busy = false,
@@ -70,7 +73,56 @@ fn update(app: &mut App, tx: &UnboundedSender<Msg>, msg: Msg) {
             app.busy = false;
             app.say(format!("Error: {error}"));
         }
+        Msg::ModelChosen(provider, model) => {
+            app.say(format!("Using {model}. Change it with /model <id>."));
+            app.models.entry(provider).or_insert(model);
+        }
+        Msg::ModelList(provider, list) => show_models(app, provider, &list),
+        Msg::ModelListFailed(error) => app.say(format!("Could not list models: {error}")),
     }
+}
+
+/// Prints the models `provider` offers, marking the one in use.
+fn show_models(app: &mut App, provider: Provider, list: &[String]) {
+    let current = app.models.get(&provider);
+    let lines: Vec<String> = list
+        .iter()
+        .map(|id| {
+            let mark = if Some(id) == current { "*" } else { " " };
+            format!("  {mark} {id}")
+        })
+        .collect();
+    app.say(format!(
+        "Models for {} (use /model <id>):\n{}",
+        provider.label(),
+        lines.join("\n")
+    ));
+}
+
+/// Handles `/model` with no argument: shows the current model and lists the rest.
+fn model_overview(app: &mut App, tx: &UnboundedSender<Msg>) {
+    let Some(provider) = app.active else {
+        app.say("Log in first with /login.");
+        return;
+    };
+    let current = app
+        .models
+        .get(&provider)
+        .map_or("provider default".to_string(), Clone::clone);
+    app.say(format!(
+        "Current model: {current}. Fetching available models..."
+    ));
+    tasks::start_model_list(tx.clone());
+}
+
+/// Handles `/model <id>`: uses `id` for the active provider from now on.
+fn set_model(app: &mut App, id: &str) {
+    let Some(provider) = app.active else {
+        app.say("Log in first with /login.");
+        return;
+    };
+    app.models.insert(provider, id.to_string());
+    app.say(format!("Model set to {id}."));
 }
 
 /// Routes a key press according to the current mode.
@@ -119,12 +171,16 @@ fn submit(app: &mut App, tx: &UnboundedSender<Msg>) {
         "" => {}
         "/quit" => app.quit = true,
         "/login" => app.mode = Mode::Picker(0),
+        "/model" => model_overview(app, tx),
+        command if command.starts_with("/model ") => {
+            set_model(app, command["/model ".len()..].trim())
+        }
         command if command.starts_with('/') => app.say(format!("Unknown command: {command}")),
         _ if app.busy => app.say("Still waiting for the previous reply."),
         _ => {
             app.push(Role::User, line.clone());
             app.busy = true;
-            tasks::start_chat(tx.clone(), line);
+            tasks::start_chat(tx.clone(), line, app.models.clone());
         }
     }
 }

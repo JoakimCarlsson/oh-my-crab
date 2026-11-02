@@ -19,4 +19,10 @@ pub enum Msg {
     Done,
     /// Sending the message failed with the given description.
     Failed(String),
+    /// A default model was resolved for a provider on its first message.
+    ModelChosen(Provider, String),
+    /// The models a provider offers the account, best first.
+    ModelList(Provider, Vec<String>),
+    /// Fetching the model list failed with the given description.
+    ModelListFailed(String),
 }

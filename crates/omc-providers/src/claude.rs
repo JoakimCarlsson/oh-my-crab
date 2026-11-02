@@ -10,8 +10,11 @@ use crate::{ProviderError, sse};
 /// Messages endpoint.
 const URL: &str = "https://api.anthropic.com/v1/messages";
 
-/// Model used for replies.
-const MODEL: &str = "claude-haiku-5-5";
+/// Model list endpoint.
+const MODELS_URL: &str = "https://api.anthropic.com/v1/models";
+
+/// Model used when the user has not picked one.
+pub const DEFAULT_MODEL: &str = "claude-haiku-5-5";
 
 /// System prompt that Claude subscription tokens require.
 const SYSTEM: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
@@ -42,7 +45,56 @@ struct ErrorBody {
     message: String,
 }
 
-/// Sends `prompt` to Claude and calls `on_delta` with each text chunk.
+/// The body of a model list response.
+#[derive(Deserialize)]
+struct ModelList {
+    /// The listed models.
+    data: Vec<ModelEntry>,
+}
+
+/// One entry of a model list response.
+#[derive(Deserialize)]
+struct ModelEntry {
+    /// The model id to pass when sending.
+    id: String,
+}
+
+/// Adds the OAuth headers Claude subscription tokens require to `request`.
+fn authorized(
+    request: reqwest::RequestBuilder,
+    credentials: &Credentials,
+) -> reqwest::RequestBuilder {
+    request
+        .bearer_auth(&credentials.access)
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
+        .header("anthropic-dangerous-direct-browser-access", "true")
+        .header("x-app", "cli")
+        .header("user-agent", "claude-cli/2.1.0 (external, cli)")
+}
+
+/// Lists the model ids the account can use, newest first.
+///
+/// # Errors
+///
+/// Returns [`ProviderError`] on network failure or a non-success status.
+pub async fn list_models(credentials: &Credentials) -> Result<Vec<String>, ProviderError> {
+    let response = authorized(reqwest::Client::new().get(MODELS_URL), credentials)
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(ProviderError::Status {
+            status: status.to_string(),
+            body,
+        });
+    }
+    let list: ModelList = response.json().await?;
+    Ok(list.data.into_iter().map(|entry| entry.id).collect())
+}
+
+/// Sends `prompt` to Claude using `model` and calls `on_delta` with each text chunk.
 ///
 /// # Errors
 ///
@@ -50,24 +102,18 @@ struct ErrorBody {
 /// error event inside the stream.
 pub async fn send(
     credentials: &Credentials,
+    model: &str,
     prompt: &str,
     mut on_delta: impl FnMut(&str),
 ) -> Result<(), ProviderError> {
     let body = json!({
-        "model": MODEL,
+        "model": model,
         "max_tokens": 1024,
         "stream": true,
         "system": [{ "type": "text", "text": SYSTEM }],
         "messages": [{ "role": "user", "content": prompt }],
     });
-    let response = reqwest::Client::new()
-        .post(URL)
-        .bearer_auth(&credentials.access)
-        .header("anthropic-version", "2023-06-01")
-        .header("anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
-        .header("anthropic-dangerous-direct-browser-access", "true")
-        .header("x-app", "cli")
-        .header("user-agent", "claude-cli/2.1.0 (external, cli)")
+    let response = authorized(reqwest::Client::new().post(URL), credentials)
         .json(&body)
         .send()
         .await?;

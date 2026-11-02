@@ -19,4 +19,7 @@ pub enum ProviderError {
     /// The event stream was malformed or the provider reported an error in it.
     #[error("stream error: {0}")]
     Stream(String),
+    /// The provider reported no models for this account.
+    #[error("no models available for this account; pick one with /model <id>")]
+    NoModels,
 }

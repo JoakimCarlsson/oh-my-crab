@@ -1,5 +1,7 @@
 //! Application state shared by the event loop and the renderer.
 
+use std::collections::HashMap;
+
 use omc_auth::Provider;
 
 /// Who wrote a chat entry.
@@ -41,6 +43,10 @@ pub struct App {
     pub busy: bool,
     /// Set when the user asked to exit.
     pub quit: bool,
+    /// The provider messages are sent to, once logged in.
+    pub active: Option<Provider>,
+    /// The model chosen per provider; absent means the provider default.
+    pub models: HashMap<Provider, String>,
 }
 
 impl App {
@@ -56,6 +62,8 @@ impl App {
             mode: Mode::Chat,
             busy: false,
             quit: false,
+            active,
+            models: HashMap::new(),
         };
         app.say(greeting);
         app
