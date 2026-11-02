@@ -6,6 +6,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
+use unicode_width::UnicodeWidthChar;
 
 use crate::state::{App, ApprovalPrompt, CHOICES, Mode, ModelPicker, Role};
 
@@ -23,16 +24,26 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-/// Splits `text` into lines no wider than `width` characters.
+/// Splits `text` into lines no wider than `width` terminal columns.
+///
+/// Width is measured in display columns, so wide characters count double and
+/// zero-width ones count nothing.
 fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut lines = Vec::new();
     for raw in text.split('\n') {
-        let chars: Vec<char> = raw.chars().collect();
-        if chars.is_empty() {
-            lines.push(String::new());
+        let mut line = String::new();
+        let mut columns = 0;
+        for c in raw.chars() {
+            let w = c.width().unwrap_or(0);
+            if columns + w > width && !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+                columns = 0;
+            }
+            line.push(c);
+            columns += w;
         }
-        lines.extend(chars.chunks(width).map(|chunk| chunk.iter().collect()));
+        lines.push(line);
     }
     lines
 }
@@ -200,5 +211,11 @@ mod tests {
     #[test]
     fn wrap_splits_long_lines_and_keeps_blank_ones() {
         assert_eq!(wrap("abcde\n\nf", 2), vec!["ab", "cd", "e", "", "f"]);
+    }
+
+    /// Wide characters count as two columns.
+    #[test]
+    fn wrap_measures_display_width() {
+        assert_eq!(wrap("日本語", 4), vec!["日本", "語"]);
     }
 }

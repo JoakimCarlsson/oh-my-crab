@@ -1569,6 +1569,7 @@ dependencies = [
  "omc-tools",
  "ratatui",
  "tokio",
+ "unicode-width",
 ]
 
 [[package]]

@@ -68,10 +68,23 @@ pub fn sanitize(text: &str) -> String {
         .map(|c| match c {
             '\n' => "\n".to_string(),
             '\t' => "    ".to_string(),
-            c if c.is_control() => c.escape_unicode().to_string(),
+            c if c.is_control() || is_invisible(c) => c.escape_unicode().to_string(),
             c => c.to_string(),
         })
         .collect()
+}
+
+/// Returns whether `c` is a format, separator or tag character that renders as
+/// nothing or reorders text, such as bidi controls and zero-width characters.
+fn is_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{ad}' | '\u{61c}' | '\u{180e}'
+        | '\u{200b}'..='\u{200f}'
+        | '\u{2028}'..='\u{202e}'
+        | '\u{2060}'..='\u{206f}'
+        | '\u{feff}'
+        | '\u{fff9}'..='\u{fffb}'
+        | '\u{e0000}'..='\u{e007f}')
 }
 
 /// Formats `text` as diff lines, each starting with `marker`, so every line of
@@ -91,6 +104,12 @@ mod tests {
     #[test]
     fn sanitize_escapes_control_characters() {
         assert_eq!(sanitize("a\u{1b}[31mb\nc"), "a\\u{1b}[31mb\nc");
+    }
+
+    /// Bidi and zero-width characters are escaped.
+    #[test]
+    fn sanitize_escapes_invisible_characters() {
+        assert_eq!(sanitize("a\u{202e}b\u{200b}c"), "a\\u{202e}b\\u{200b}c");
     }
 
     /// Every line gets the marker.
