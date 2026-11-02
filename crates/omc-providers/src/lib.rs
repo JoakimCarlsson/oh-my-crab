@@ -1,11 +1,13 @@
 //! Streaming chat requests and model discovery for the logged-in provider.
 
+mod chat;
 mod claude;
 mod codex;
 mod error;
 mod prompt;
 mod sse;
 
+pub use chat::{ChatModel, DeltaSink, Message, RemoteModel, Reply, ToolCall, ToolResult, ToolSpec};
 pub use error::ProviderError;
 
 use omc_auth::{Credentials, Provider};
@@ -46,25 +48,5 @@ pub async fn default_model(
             .into_iter()
             .next()
             .ok_or(ProviderError::NoModels),
-    }
-}
-
-/// Sends `prompt` to `provider` using `model` and calls `on_delta` with each
-/// streamed text chunk.
-///
-/// # Errors
-///
-/// Returns [`ProviderError`] when the request fails, the provider answers with a
-/// non-success status, or the stream breaks.
-pub async fn send(
-    provider: Provider,
-    credentials: &Credentials,
-    model: &str,
-    prompt: &str,
-    on_delta: impl FnMut(&str),
-) -> Result<(), ProviderError> {
-    match provider {
-        Provider::Claude => claude::send(credentials, model, prompt, on_delta).await,
-        Provider::Codex => codex::send(credentials, model, prompt, on_delta).await,
     }
 }

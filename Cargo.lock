@@ -1352,6 +1352,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "omc-agent"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "omc-providers",
+ "omc-tools",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
 name = "omc-auth"
 version = "0.1.0"
 dependencies = [
@@ -1371,6 +1384,7 @@ dependencies = [
 name = "omc-providers"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "eventsource-stream",
  "futures-util",
  "omc-auth",
@@ -1397,8 +1411,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
+ "omc-agent",
  "omc-auth",
  "omc-providers",
+ "omc-tools",
  "ratatui",
  "tokio",
 ]

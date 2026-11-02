@@ -8,6 +8,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
+omc-agent = { path = "crates/omc-agent" }
 omc-auth = { path = "crates/omc-auth" }
 omc-providers = { path = "crates/omc-providers" }
 omc-tools = { path = "crates/omc-tools" }

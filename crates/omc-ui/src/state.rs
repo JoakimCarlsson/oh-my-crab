@@ -1,8 +1,11 @@
 //! Application state shared by the event loop and the renderer.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use omc_auth::Provider;
+use omc_providers::Message;
+use omc_tools::Registry;
 
 /// Who wrote a chat entry.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -13,6 +16,12 @@ pub enum Role {
     Assistant,
     /// Status and error messages from crab itself.
     System,
+    /// A tool call the model requested.
+    Tool,
+    /// The collapsed result of a successful tool call.
+    ToolOutput,
+    /// The collapsed description of a failed tool call.
+    ToolError,
 }
 
 /// One entry in the chat view.
@@ -57,11 +66,15 @@ pub struct App {
     pub active: Option<Provider>,
     /// The model chosen per provider; absent means the provider default.
     pub models: HashMap<Provider, String>,
+    /// The conversation so far, replayed to the model on every request.
+    pub history: Vec<Message>,
+    /// The tools the model may call.
+    pub registry: Arc<Registry>,
 }
 
 impl App {
     /// Creates the initial state with a greeting based on the active provider.
-    pub fn new(active: Option<Provider>) -> Self {
+    pub fn new(active: Option<Provider>, registry: Arc<Registry>) -> Self {
         let greeting = match active {
             Some(provider) => format!("Logged in with {}. Say hi.", provider.label()),
             None => "Not logged in. Type /login to pick Claude or Codex.".to_string(),
@@ -74,6 +87,8 @@ impl App {
             quit: false,
             active,
             models: HashMap::new(),
+            history: Vec::new(),
+            registry,
         };
         app.say(greeting);
         app
@@ -95,5 +110,60 @@ impl App {
             Some(entry) if entry.role == Role::Assistant => entry.text.push_str(delta),
             _ => self.push(Role::Assistant, delta.to_string()),
         }
+    }
+
+    /// Appends a tool result entry, collapsed to a few lines.
+    pub fn push_tool_result(&mut self, text: &str, is_error: bool) {
+        let role = if is_error {
+            Role::ToolError
+        } else {
+            Role::ToolOutput
+        };
+        self.push(role, collapse(text));
+    }
+}
+
+/// Most lines of a tool result shown in the chat view.
+const COLLAPSED_LINES: usize = 4;
+
+/// Longest line of a collapsed tool result, in characters.
+const COLLAPSED_WIDTH: usize = 160;
+
+/// Shortens `text` to [`COLLAPSED_LINES`] lines of [`COLLAPSED_WIDTH`]
+/// characters, noting how many lines were hidden.
+fn collapse(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut shown: Vec<String> = lines
+        .iter()
+        .take(COLLAPSED_LINES)
+        .map(|line| match line.char_indices().nth(COLLAPSED_WIDTH) {
+            Some((end, _)) => format!("{}…", &line[..end]),
+            None => (*line).to_string(),
+        })
+        .collect();
+    if lines.len() > COLLAPSED_LINES {
+        shown.push(format!("… ({} more lines)", lines.len() - COLLAPSED_LINES));
+    }
+    if shown.is_empty() {
+        shown.push("(no output)".to_string());
+    }
+    shown.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Long results keep four lines and report the rest.
+    #[test]
+    fn collapse_hides_extra_lines() {
+        let text = "1\n2\n3\n4\n5\n6";
+        assert_eq!(collapse(text), "1\n2\n3\n4\n… (2 more lines)");
+    }
+
+    /// Empty output is labelled rather than shown blank.
+    #[test]
+    fn collapse_labels_empty_output() {
+        assert_eq!(collapse(""), "(no output)");
     }
 }

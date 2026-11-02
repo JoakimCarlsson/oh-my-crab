@@ -1,7 +1,9 @@
 //! Messages delivered to the UI event loop.
 
 use crossterm::event::Event;
+use omc_agent::AgentEvent;
 use omc_auth::Provider;
+use omc_providers::Message;
 
 /// Everything the event loop reacts to.
 pub enum Msg {
@@ -13,10 +15,10 @@ pub enum Msg {
     LoggedIn(Provider),
     /// A login failed with the given description.
     LoginFailed(String),
-    /// A streamed chunk of the assistant reply.
-    Delta(String),
-    /// The assistant reply is complete.
-    Done,
+    /// Streamed text or tool activity from the running turn.
+    Agent(AgentEvent),
+    /// The turn is complete; carries the conversation including its messages.
+    Done(Vec<Message>),
     /// Sending the message failed with the given description.
     Failed(String),
     /// A default model was resolved for a provider on its first message.

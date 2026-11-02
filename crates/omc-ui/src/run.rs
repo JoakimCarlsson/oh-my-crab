@@ -1,7 +1,11 @@
 //! The terminal setup and event loop.
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use std::sync::Arc;
+
+use omc_agent::AgentEvent;
 use omc_auth::Provider;
+use omc_tools::Registry;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::message::Msg;
@@ -15,7 +19,8 @@ use crate::{tasks, view};
 /// Returns terminal I/O errors from drawing or reading input.
 pub async fn run() -> anyhow::Result<()> {
     let active = omc_auth::active_provider().unwrap_or(None);
-    let mut app = App::new(active);
+    let registry = Registry::builtin(std::env::current_dir()?)?;
+    let mut app = App::new(active, Arc::new(registry));
     let (tx, mut rx) = mpsc::unbounded_channel();
     spawn_input_reader(tx.clone());
     let mut terminal = ratatui::init();
@@ -67,8 +72,11 @@ fn update(app: &mut App, tx: &UnboundedSender<Msg>, msg: Msg) {
             app.say(format!("Logged in with {}. Say hi.", provider.label()));
         }
         Msg::LoginFailed(error) => app.say(format!("Login failed: {error}")),
-        Msg::Delta(delta) => app.append_reply(&delta),
-        Msg::Done => app.busy = false,
+        Msg::Agent(event) => on_agent_event(app, event),
+        Msg::Done(history) => {
+            app.history = history;
+            app.busy = false;
+        }
         Msg::Failed(error) => {
             app.busy = false;
             app.say(format!("Error: {error}"));
@@ -84,6 +92,17 @@ fn update(app: &mut App, tx: &UnboundedSender<Msg>, msg: Msg) {
             }
             app.say(format!("Could not list models: {error}"));
         }
+    }
+}
+
+/// Shows one event of the running turn in the chat view.
+fn on_agent_event(app: &mut App, event: AgentEvent) {
+    match event {
+        AgentEvent::Delta(delta) => app.append_reply(&delta),
+        AgentEvent::ToolStart { name, summary, .. } => {
+            app.push(Role::Tool, format!("{name} {summary}"));
+        }
+        AgentEvent::ToolDone { text, is_error, .. } => app.push_tool_result(&text, is_error),
     }
 }
 
@@ -201,7 +220,13 @@ fn submit(app: &mut App, tx: &UnboundedSender<Msg>) {
         _ => {
             app.push(Role::User, line.clone());
             app.busy = true;
-            tasks::start_chat(tx.clone(), line, app.models.clone());
+            tasks::start_chat(
+                tx.clone(),
+                line,
+                app.models.clone(),
+                app.history.clone(),
+                app.registry.clone(),
+            );
         }
     }
 }

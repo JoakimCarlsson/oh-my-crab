@@ -42,6 +42,9 @@ fn role_style(role: Role) -> Style {
         Role::User => Style::new().fg(Color::Cyan),
         Role::Assistant => Style::new().fg(Color::Green),
         Role::System => Style::new().fg(Color::DarkGray),
+        Role::Tool => Style::new().fg(Color::Yellow),
+        Role::ToolOutput => Style::new().fg(Color::DarkGray),
+        Role::ToolError => Style::new().fg(Color::Red),
     }
 }
 
@@ -51,6 +54,9 @@ fn role_prefix(role: Role) -> &'static str {
         Role::User => "you: ",
         Role::Assistant => "crab: ",
         Role::System => "* ",
+        Role::Tool => "> ",
+        Role::ToolOutput => "  ",
+        Role::ToolError => "  ! ",
     }
 }
 

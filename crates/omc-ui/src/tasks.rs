@@ -1,8 +1,12 @@
 //! Background tasks that report back to the event loop.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use omc_agent::AgentEvent;
 use omc_auth::Provider;
+use omc_providers::{Message, RemoteModel};
+use omc_tools::Registry;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::message::Msg;
@@ -24,15 +28,22 @@ pub fn start_login(tx: UnboundedSender<Msg>, provider: Provider) {
     });
 }
 
-/// Sends `prompt` to the logged-in provider and streams the reply back.
+/// Runs one turn of the agent loop for `prompt` and streams its events back.
 ///
 /// `models` holds the user's model choices; a provider without one gets its
-/// default, which is reported back with [`Msg::ModelChosen`].
-pub fn start_chat(tx: UnboundedSender<Msg>, prompt: String, models: HashMap<Provider, String>) {
+/// default, which is reported back with [`Msg::ModelChosen`]. `history` is the
+/// conversation so far; the extended conversation comes back in [`Msg::Done`].
+pub fn start_chat(
+    tx: UnboundedSender<Msg>,
+    prompt: String,
+    models: HashMap<Provider, String>,
+    history: Vec<Message>,
+    registry: Arc<Registry>,
+) {
     tokio::spawn(async move {
-        let result = stream_reply(&tx, &prompt, &models).await;
+        let result = run_agent(&tx, prompt, &models, history, &registry).await;
         let msg = match result {
-            Ok(()) => Msg::Done,
+            Ok(history) => Msg::Done(history),
             Err(e) => Msg::Failed(format!("{e:#}")),
         };
         let _ = tx.send(msg);
@@ -61,16 +72,19 @@ async fn fetch_models() -> anyhow::Result<(Provider, Vec<String>)> {
     Ok((provider, list))
 }
 
-/// Refreshes credentials if needed, then forwards each reply chunk to `tx`.
+/// Refreshes credentials if needed, then runs the agent loop, forwarding its
+/// events to `tx`.
 ///
 /// # Errors
 ///
-/// Returns the auth or provider error that stopped the reply.
-async fn stream_reply(
+/// Returns the auth or provider error that stopped the turn.
+async fn run_agent(
     tx: &UnboundedSender<Msg>,
-    prompt: &str,
+    prompt: String,
     models: &HashMap<Provider, String>,
-) -> anyhow::Result<()> {
+    mut history: Vec<Message>,
+    registry: &Registry,
+) -> anyhow::Result<Vec<Message>> {
     let (provider, credentials) = omc_auth::active_credentials().await?;
     let model = match models.get(&provider) {
         Some(model) => model.clone(),
@@ -80,9 +94,14 @@ async fn stream_reply(
             model
         }
     };
-    omc_providers::send(provider, &credentials, &model, prompt, |delta| {
-        let _ = tx.send(Msg::Delta(delta.to_string()));
-    })
-    .await?;
-    Ok(())
+    let model = RemoteModel {
+        provider,
+        credentials,
+        model,
+    };
+    let events = |event: AgentEvent| {
+        let _ = tx.send(Msg::Agent(event));
+    };
+    omc_agent::run_turn(&model, registry, &mut history, prompt, &events).await?;
+    Ok(history)
 }
