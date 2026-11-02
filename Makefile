@@ -1,7 +1,9 @@
+PREFIX ?= $(HOME)/.local
+
 .PHONY: install fmt lint
 
 install:
-	cargo install --path crates/omc --locked
+	cargo install --path crates/omc --locked --force --root $(PREFIX)
 
 fmt:
 	cargo fmt --all
