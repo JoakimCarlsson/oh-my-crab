@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::atomic::write_atomic;
-use crate::tool::parse_args;
+use crate::tool::{marked_lines, parse_args};
 use crate::{Sandbox, Tool, ToolError, ToolOutput};
 
 /// Creates a file or replaces its whole content.
@@ -61,11 +61,16 @@ impl Tool for Write {
         true
     }
 
-    /// Shows the file and the number of bytes to write.
+    /// Shows the file, the size of the content and all of it.
     fn describe(&self, args: &Value) -> String {
-        let path = args["path"].as_str().unwrap_or("?");
-        let bytes = args["content"].as_str().map_or(0, str::len);
-        format!("{path} ({bytes} bytes)")
+        let path = self.sandbox.describe(args["path"].as_str().unwrap_or("?"));
+        let content = args["content"].as_str().unwrap_or_default();
+        format!(
+            "{path} ({} lines, {} bytes)\n{}",
+            content.lines().count(),
+            content.len(),
+            marked_lines('+', content)
+        )
     }
 
     /// Writes the file on a blocking thread.

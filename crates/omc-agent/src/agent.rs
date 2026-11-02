@@ -2,7 +2,7 @@
 
 use futures_util::future::join_all;
 use omc_providers::{ChatModel, Message, ProviderError, ToolCall, ToolResult, ToolSpec};
-use omc_tools::Registry;
+use omc_tools::{Registry, sanitize};
 use thiserror::Error;
 
 use crate::{ApprovalRequest, Approvals};
@@ -133,10 +133,10 @@ async fn run_calls(
     let mut sequential = Vec::new();
     for (index, call) in calls.iter().enumerate() {
         let tool = registry.get(&call.name);
-        let summary = tool.map_or_else(
+        let summary = sanitize(&tool.map_or_else(
             || call.arguments.to_string(),
             |t| t.describe(&call.arguments),
-        );
+        ));
         events(AgentEvent::ToolStart {
             id: call.id.clone(),
             name: call.name.clone(),

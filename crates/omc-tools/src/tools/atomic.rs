@@ -1,6 +1,7 @@
 //! Atomic file replacement shared by the mutating tools.
 
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -36,16 +37,19 @@ pub fn write_atomic(path: &Path, content: &[u8]) -> Result<(), ToolError> {
     result
 }
 
-/// Writes `content` to `temp`, copies the permissions of `target` and renames
+/// Writes `content` to `temp`, created owner-only when `target` exists and with
+/// the default mode otherwise, copies the permissions of `target` and renames
 /// `temp` over `target`.
 ///
 /// # Errors
 ///
 /// Returns [`ToolError::Io`] on any filesystem failure.
 fn write_and_rename(temp: &Path, target: &Path, content: &[u8]) -> Result<(), ToolError> {
+    let mode = if target.exists() { 0o600 } else { 0o666 };
     let mut file = std::fs::File::options()
         .write(true)
         .create_new(true)
+        .mode(mode)
         .open(temp)?;
     file.write_all(content)?;
     file.sync_all()?;

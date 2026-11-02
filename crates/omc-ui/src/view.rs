@@ -143,17 +143,25 @@ fn draw_model_picker(frame: &mut Frame, app: &App, picker: &ModelPicker) {
 }
 
 /// Most lines of the call description shown in the approval prompt.
-const APPROVAL_LINES: usize = 8;
+const APPROVAL_LINES: usize = 20;
 
 /// Draws the approval prompt centered over the chat: the call and the choices.
 fn draw_approval(frame: &mut Frame, prompt: &ApprovalPrompt) {
     let width = frame.area().width.clamp(20, 80);
     let inner = width.saturating_sub(2) as usize;
-    let mut lines: Vec<Line> = wrap(&prompt.request.summary, inner)
+    let wrapped = wrap(&prompt.request.summary, inner);
+    let hidden = wrapped.len().saturating_sub(APPROVAL_LINES);
+    let mut lines: Vec<Line> = wrapped
         .into_iter()
         .take(APPROVAL_LINES)
         .map(Line::from)
         .collect();
+    if hidden > 0 {
+        lines.push(Line::styled(
+            format!("… {hidden} more lines not shown; deny if unsure"),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
     lines.push(Line::from(""));
     for (index, (label, _)) in CHOICES.iter().enumerate() {
         let style = if index == prompt.selected {

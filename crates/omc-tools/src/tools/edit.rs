@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::atomic::write_atomic;
-use crate::tool::parse_args;
+use crate::tool::{marked_lines, parse_args};
 use crate::{Sandbox, Tool, ToolError, ToolOutput};
 
 /// Replaces one exact occurrence of a string in a file.
@@ -65,12 +65,16 @@ impl Tool for Edit {
         true
     }
 
-    /// Shows the file being edited and the size of the change.
+    /// Shows the file and every line of the change.
     fn describe(&self, args: &Value) -> String {
-        let path = args["path"].as_str().unwrap_or("?");
+        let path = self.sandbox.describe(args["path"].as_str().unwrap_or("?"));
         let old = args["old_string"].as_str().unwrap_or_default();
         let new = args["new_string"].as_str().unwrap_or_default();
-        format!("{path}\n- {}\n+ {}", preview(old), preview(new))
+        format!(
+            "{path}\n{}\n{}",
+            marked_lines('-', old),
+            marked_lines('+', new)
+        )
     }
 
     /// Performs the replacement on a blocking thread.
@@ -81,16 +85,6 @@ impl Tool for Edit {
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))??;
         Ok(ToolOutput::new(text))
-    }
-}
-
-/// Returns the first line of `text`, shortened, for display.
-fn preview(text: &str) -> String {
-    let first = text.lines().next().unwrap_or_default();
-    let more = if text.lines().count() > 1 { " …" } else { "" };
-    match first.char_indices().nth(80) {
-        Some((end, _)) => format!("{}…{more}", &first[..end]),
-        None => format!("{first}{more}"),
     }
 }
 

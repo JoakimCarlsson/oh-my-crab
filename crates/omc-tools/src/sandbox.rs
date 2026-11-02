@@ -61,6 +61,17 @@ impl Sandbox {
         }
     }
 
+    /// Describes where `path` really points, for the approval prompt.
+    ///
+    /// Shows the resolved path relative to the root, or flags a path that
+    /// would be rejected.
+    pub fn describe(&self, path: &str) -> String {
+        match self.resolve(path) {
+            Ok(resolved) => self.display(&resolved),
+            Err(_) => format!("{path} (OUTSIDE the working directory; will be rejected)"),
+        }
+    }
+
     /// Returns `path` relative to the root for display, or unchanged when it is
     /// not under the root.
     pub fn display(&self, path: &Path) -> String {

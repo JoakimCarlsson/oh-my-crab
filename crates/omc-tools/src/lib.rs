@@ -12,5 +12,5 @@ mod testutil;
 pub use error::ToolError;
 pub use registry::Registry;
 pub use sandbox::Sandbox;
-pub use tool::{Tool, ToolOutput, parse_args};
+pub use tool::{Tool, ToolOutput, marked_lines, parse_args, sanitize};
 pub use tools::{Bash, Edit, Glob, Grep, Read, Write};
