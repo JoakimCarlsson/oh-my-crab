@@ -3,25 +3,37 @@
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::sync::Arc;
 
-use omc_agent::AgentEvent;
+use omc_agent::{AgentEvent, Approvals, Decision};
 use omc_auth::Provider;
 use omc_tools::Registry;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::message::Msg;
-use crate::state::{App, Mode, ModelPicker, Role};
+use crate::state::{App, ApprovalPrompt, CHOICES, Mode, ModelPicker, Role};
+use crate::tasks::UiPrompter;
 use crate::{tasks, view};
+
+/// Settings chosen on the command line.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Options {
+    /// Run `bash`, `edit` and `write` without asking.
+    pub yolo: bool,
+}
 
 /// Runs the TUI until the user quits.
 ///
 /// # Errors
 ///
 /// Returns terminal I/O errors from drawing or reading input.
-pub async fn run() -> anyhow::Result<()> {
+pub async fn run(options: Options) -> anyhow::Result<()> {
     let active = omc_auth::active_provider().unwrap_or(None);
     let registry = Registry::builtin(std::env::current_dir()?)?;
-    let mut app = App::new(active, Arc::new(registry));
     let (tx, mut rx) = mpsc::unbounded_channel();
+    let approvals = Approvals::new(Arc::new(UiPrompter::new(tx.clone())), options.yolo);
+    let mut app = App::new(active, Arc::new(registry), Arc::new(approvals));
+    if options.yolo {
+        app.say("--yolo: bash, edit and write run without asking.");
+    }
     spawn_input_reader(tx.clone());
     let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal, &mut app, &tx, &mut rx).await;
@@ -73,6 +85,13 @@ fn update(app: &mut App, tx: &UnboundedSender<Msg>, msg: Msg) {
         }
         Msg::LoginFailed(error) => app.say(format!("Login failed: {error}")),
         Msg::Agent(event) => on_agent_event(app, event),
+        Msg::Approval { request, reply } => {
+            app.mode = Mode::Approve(ApprovalPrompt {
+                request,
+                reply: Some(reply),
+                selected: 0,
+            });
+        }
         Msg::Done(history) => {
             app.history = history;
             app.busy = false;
@@ -148,8 +167,39 @@ fn on_key(app: &mut App, tx: &UnboundedSender<Msg>, key: KeyEvent) {
     match app.mode {
         Mode::Picker(selected) => on_picker_key(app, tx, key.code, selected),
         Mode::Models(_) => on_models_key(app, key.code),
+        Mode::Approve(_) => on_approve_key(app, key.code),
         Mode::Chat => on_chat_key(app, tx, key.code),
     }
+}
+
+/// Handles a key press while a tool call awaits approval.
+///
+/// `y`, `a` and `n` answer directly, the arrows and Enter pick a highlighted
+/// choice, and Esc denies.
+fn on_approve_key(app: &mut App, code: KeyCode) {
+    let Mode::Approve(prompt) = &mut app.mode else {
+        return;
+    };
+    let decision = match code {
+        KeyCode::Char('y') => Some(Decision::AllowOnce),
+        KeyCode::Char('a') => Some(Decision::AllowAlways),
+        KeyCode::Char('n') | KeyCode::Esc => Some(Decision::Deny),
+        KeyCode::Up => {
+            prompt.selected = prompt.selected.saturating_sub(1);
+            None
+        }
+        KeyCode::Down => {
+            prompt.selected = (prompt.selected + 1).min(CHOICES.len() - 1);
+            None
+        }
+        KeyCode::Enter => Some(CHOICES[prompt.selected].1),
+        _ => None,
+    };
+    let Some(decision) = decision else { return };
+    if let Some(reply) = prompt.reply.take() {
+        let _ = reply.send(decision);
+    }
+    app.mode = Mode::Chat;
 }
 
 /// Handles a key press while the model picker is open.
@@ -226,6 +276,7 @@ fn submit(app: &mut App, tx: &UnboundedSender<Msg>) {
                 app.models.clone(),
                 app.history.clone(),
                 app.registry.clone(),
+                app.approvals.clone(),
             );
         }
     }

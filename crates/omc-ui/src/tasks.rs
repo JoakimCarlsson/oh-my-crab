@@ -3,13 +3,44 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use omc_agent::AgentEvent;
+use async_trait::async_trait;
+use omc_agent::{AgentEvent, ApprovalRequest, Approvals, Decision, Prompter};
 use omc_auth::Provider;
 use omc_providers::{Message, RemoteModel};
 use omc_tools::Registry;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
 
 use crate::message::Msg;
+
+/// A [`Prompter`] that shows the question in the TUI and waits for the answer.
+pub struct UiPrompter {
+    /// Channel to the event loop.
+    tx: UnboundedSender<Msg>,
+}
+
+impl UiPrompter {
+    /// Creates a prompter that asks through `tx`.
+    pub fn new(tx: UnboundedSender<Msg>) -> Self {
+        Self { tx }
+    }
+}
+
+#[async_trait]
+impl Prompter for UiPrompter {
+    /// Sends the request to the event loop and waits; denies when the UI is gone.
+    async fn ask(&self, request: &ApprovalRequest) -> Decision {
+        let (reply, answer) = oneshot::channel();
+        let msg = Msg::Approval {
+            request: request.clone(),
+            reply,
+        };
+        if self.tx.send(msg).is_err() {
+            return Decision::Deny;
+        }
+        answer.await.unwrap_or(Decision::Deny)
+    }
+}
 
 /// Starts the browser login for `provider` in the background.
 pub fn start_login(tx: UnboundedSender<Msg>, provider: Provider) {
@@ -39,9 +70,10 @@ pub fn start_chat(
     models: HashMap<Provider, String>,
     history: Vec<Message>,
     registry: Arc<Registry>,
+    approvals: Arc<Approvals>,
 ) {
     tokio::spawn(async move {
-        let result = run_agent(&tx, prompt, &models, history, &registry).await;
+        let result = run_agent(&tx, prompt, &models, history, &registry, &approvals).await;
         let msg = match result {
             Ok(history) => Msg::Done(history),
             Err(e) => Msg::Failed(format!("{e:#}")),
@@ -84,6 +116,7 @@ async fn run_agent(
     models: &HashMap<Provider, String>,
     mut history: Vec<Message>,
     registry: &Registry,
+    approvals: &Approvals,
 ) -> anyhow::Result<Vec<Message>> {
     let (provider, credentials) = omc_auth::active_credentials().await?;
     let model = match models.get(&provider) {
@@ -102,6 +135,6 @@ async fn run_agent(
     let events = |event: AgentEvent| {
         let _ = tx.send(Msg::Agent(event));
     };
-    omc_agent::run_turn(&model, registry, &mut history, prompt, &events).await?;
+    omc_agent::run_turn(&model, registry, approvals, &mut history, prompt, &events).await?;
     Ok(history)
 }

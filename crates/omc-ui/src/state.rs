@@ -3,9 +3,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use omc_agent::{ApprovalRequest, Approvals, Decision};
 use omc_auth::Provider;
 use omc_providers::Message;
 use omc_tools::Registry;
+use tokio::sync::oneshot;
 
 /// Who wrote a chat entry.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -40,6 +42,25 @@ pub enum Mode {
     Picker(usize),
     /// Choosing a model in the model picker.
     Models(ModelPicker),
+    /// Deciding whether a tool call may run.
+    Approve(ApprovalPrompt),
+}
+
+/// The Allow once, Allow always and Deny choices, in display order.
+pub const CHOICES: [(&str, Decision); 3] = [
+    ("Allow once (y)", Decision::AllowOnce),
+    ("Allow always this session (a)", Decision::AllowAlways),
+    ("Deny (n)", Decision::Deny),
+];
+
+/// A tool call waiting for the user's decision.
+pub struct ApprovalPrompt {
+    /// What is being asked about.
+    pub request: ApprovalRequest,
+    /// Where the decision goes; consumed when answered.
+    pub reply: Option<oneshot::Sender<Decision>>,
+    /// Index into [`CHOICES`] of the highlighted choice.
+    pub selected: usize,
 }
 
 /// The model picker: the offered models once fetched, and the highlighted row.
@@ -70,11 +91,17 @@ pub struct App {
     pub history: Vec<Message>,
     /// The tools the model may call.
     pub registry: Arc<Registry>,
+    /// The policy deciding which tool calls need the user's say-so.
+    pub approvals: Arc<Approvals>,
 }
 
 impl App {
     /// Creates the initial state with a greeting based on the active provider.
-    pub fn new(active: Option<Provider>, registry: Arc<Registry>) -> Self {
+    pub fn new(
+        active: Option<Provider>,
+        registry: Arc<Registry>,
+        approvals: Arc<Approvals>,
+    ) -> Self {
         let greeting = match active {
             Some(provider) => format!("Logged in with {}. Say hi.", provider.label()),
             None => "Not logged in. Type /login to pick Claude or Codex.".to_string(),
@@ -89,6 +116,7 @@ impl App {
             models: HashMap::new(),
             history: Vec::new(),
             registry,
+            approvals,
         };
         app.say(greeting);
         app

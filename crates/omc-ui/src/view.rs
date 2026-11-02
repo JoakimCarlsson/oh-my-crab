@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 
-use crate::state::{App, Mode, ModelPicker, Role};
+use crate::state::{App, ApprovalPrompt, CHOICES, Mode, ModelPicker, Role};
 
 /// Draws the whole interface into `frame`.
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -18,6 +18,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match &app.mode {
         Mode::Picker(selected) => draw_picker(frame, *selected),
         Mode::Models(picker) => draw_model_picker(frame, app, picker),
+        Mode::Approve(prompt) => draw_approval(frame, prompt),
         Mode::Chat => {}
     }
 }
@@ -139,6 +140,36 @@ fn draw_model_picker(frame: &mut Frame, app: &App, picker: &ModelPicker) {
     let mut state = ListState::default().with_selected(Some(picker.selected));
     frame.render_widget(Clear, area);
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Most lines of the call description shown in the approval prompt.
+const APPROVAL_LINES: usize = 8;
+
+/// Draws the approval prompt centered over the chat: the call and the choices.
+fn draw_approval(frame: &mut Frame, prompt: &ApprovalPrompt) {
+    let width = frame.area().width.clamp(20, 80);
+    let inner = width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = wrap(&prompt.request.summary, inner)
+        .into_iter()
+        .take(APPROVAL_LINES)
+        .map(Line::from)
+        .collect();
+    lines.push(Line::from(""));
+    for (index, (label, _)) in CHOICES.iter().enumerate() {
+        let style = if index == prompt.selected {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::new()
+        };
+        lines.push(Line::styled(format!(" {label}"), style));
+    }
+    let title = format!(" Allow {}? ", prompt.request.tool);
+    let area = centered(frame.area(), width, lines.len() as u16 + 2);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(title)),
+        area,
+    );
 }
 
 /// Returns a `width` by `height` rectangle centered in `area`, clamped to fit.

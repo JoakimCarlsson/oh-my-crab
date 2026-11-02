@@ -6,4 +6,4 @@ mod state;
 mod tasks;
 mod view;
 
-pub use run::run;
+pub use run::{Options, run};

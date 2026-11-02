@@ -5,6 +5,8 @@ use omc_providers::{ChatModel, Message, ProviderError, ToolCall, ToolResult, Too
 use omc_tools::Registry;
 use thiserror::Error;
 
+use crate::{ApprovalRequest, Approvals};
+
 /// Most model requests one user turn may make before the loop gives up.
 pub const MAX_ITERATIONS: usize = 25;
 
@@ -49,7 +51,8 @@ pub enum AgentError {
 /// Runs one user turn: sends `prompt`, executes tool calls and loops until the
 /// model answers without calling a tool.
 ///
-/// New messages are appended to `history`. When the turn fails, `history` is
+/// Tools that need approval run only when `approvals` allows the call; a denied
+/// call is answered to the model with an error result. New messages are appended to `history`. When the turn fails, `history` is
 /// restored to what it was before the call, so it never holds a tool call
 /// without its result. Tool failures are not errors here: they are sent to the
 /// model as results. `events` observes streamed text and tool activity.
@@ -61,13 +64,14 @@ pub enum AgentError {
 pub async fn run_turn(
     model: &dyn ChatModel,
     registry: &Registry,
+    approvals: &Approvals,
     history: &mut Vec<Message>,
     prompt: String,
     events: &(dyn Fn(AgentEvent) + Send + Sync),
 ) -> Result<(), AgentError> {
     let start = history.len();
     history.push(Message::User(prompt));
-    let result = drive(model, registry, history, events).await;
+    let result = drive(model, registry, approvals, history, events).await;
     if result.is_err() {
         history.truncate(start);
     }
@@ -82,6 +86,7 @@ pub async fn run_turn(
 async fn drive(
     model: &dyn ChatModel,
     registry: &Registry,
+    approvals: &Approvals,
     history: &mut Vec<Message>,
     events: &(dyn Fn(AgentEvent) + Send + Sync),
 ) -> Result<(), AgentError> {
@@ -94,7 +99,7 @@ async fn drive(
         if calls.is_empty() {
             return Ok(());
         }
-        let results = join_all(calls.iter().map(|call| execute(registry, call, events))).await;
+        let results = run_calls(registry, approvals, &calls, events).await;
         history.push(Message::ToolResults(results));
     }
     Err(AgentError::IterationLimit(MAX_ITERATIONS))
@@ -112,27 +117,88 @@ fn tool_specs(registry: &Registry) -> Vec<ToolSpec> {
         .collect()
 }
 
-/// Runs one tool call and reports it through `events`.
+/// Runs the calls of one model reply and returns their results in call order.
 ///
-/// A failing or unknown tool yields a result with `is_error` set.
-async fn execute(
+/// Every call is announced first. Calls that need approval are asked about one
+/// at a time, in order. Approved calls then run one after another so edits
+/// cannot race, while calls that need no approval run concurrently.
+async fn run_calls(
+    registry: &Registry,
+    approvals: &Approvals,
+    calls: &[ToolCall],
+    events: &(dyn Fn(AgentEvent) + Send + Sync),
+) -> Vec<ToolResult> {
+    let mut slots: Vec<Option<ToolResult>> = vec![None; calls.len()];
+    let mut concurrent = Vec::new();
+    let mut sequential = Vec::new();
+    for (index, call) in calls.iter().enumerate() {
+        let tool = registry.get(&call.name);
+        let summary = tool.map_or_else(
+            || call.arguments.to_string(),
+            |t| t.describe(&call.arguments),
+        );
+        events(AgentEvent::ToolStart {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            summary: summary.clone(),
+        });
+        match tool {
+            None => {
+                let message = format!("unknown tool: {}", call.name);
+                slots[index] = Some(finish(call, message, true, events));
+            }
+            Some(tool) if tool.needs_approval() => {
+                let request = ApprovalRequest {
+                    tool: call.name.clone(),
+                    summary,
+                };
+                if approvals.allows(&request).await {
+                    sequential.push(index);
+                } else {
+                    let message = "the user denied this tool call".to_string();
+                    slots[index] = Some(finish(call, message, true, events));
+                }
+            }
+            Some(_) => concurrent.push(index),
+        }
+    }
+    let done = join_all(
+        concurrent
+            .iter()
+            .map(|&index| run_call(registry, &calls[index], events)),
+    )
+    .await;
+    for (index, result) in concurrent.into_iter().zip(done) {
+        slots[index] = Some(result);
+    }
+    for index in sequential {
+        slots[index] = Some(run_call(registry, &calls[index], events).await);
+    }
+    slots.into_iter().flatten().collect()
+}
+
+/// Runs one approved tool call and reports its outcome.
+///
+/// A failing tool yields a result with `is_error` set.
+async fn run_call(
     registry: &Registry,
     call: &ToolCall,
     events: &(dyn Fn(AgentEvent) + Send + Sync),
 ) -> ToolResult {
-    let summary = registry.get(&call.name).map_or_else(
-        || call.arguments.to_string(),
-        |t| t.describe(&call.arguments),
-    );
-    events(AgentEvent::ToolStart {
-        id: call.id.clone(),
-        name: call.name.clone(),
-        summary,
-    });
     let (text, is_error) = match registry.call(&call.name, call.arguments.clone()).await {
         Ok(output) => (output.text, false),
         Err(error) => (error.to_string(), true),
     };
+    finish(call, text, is_error, events)
+}
+
+/// Reports the outcome of `call` through `events` and builds its result.
+fn finish(
+    call: &ToolCall,
+    text: String,
+    is_error: bool,
+    events: &(dyn Fn(AgentEvent) + Send + Sync),
+) -> ToolResult {
     events(AgentEvent::ToolDone {
         id: call.id.clone(),
         name: call.name.clone(),
@@ -150,13 +216,14 @@ async fn execute(
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use omc_providers::{DeltaSink, Reply};
     use serde_json::json;
 
     use super::*;
+    use crate::{Decision, Prompter};
 
     /// A model that plays back a fixed list of replies.
     struct Scripted {
@@ -211,6 +278,22 @@ mod tests {
         }
     }
 
+    /// A prompter that denies every request.
+    struct DenyAll;
+
+    #[async_trait]
+    impl Prompter for DenyAll {
+        /// Always answers [`Decision::Deny`].
+        async fn ask(&self, _request: &ApprovalRequest) -> Decision {
+            Decision::Deny
+        }
+    }
+
+    /// Builds a policy that denies every tool needing approval.
+    fn deny_all() -> Approvals {
+        Approvals::new(Arc::new(DenyAll), false)
+    }
+
     /// Creates an empty scratch directory under the workspace's `build/`.
     fn scratch(name: &str) -> PathBuf {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -237,9 +320,16 @@ mod tests {
         let log = Mutex::new(Vec::new());
         let events = |event: AgentEvent| log.lock().unwrap().push(event);
         let mut history = Vec::new();
-        run_turn(&model, &registry, &mut history, "read it".into(), &events)
-            .await
-            .unwrap();
+        run_turn(
+            &model,
+            &registry,
+            &deny_all(),
+            &mut history,
+            "read it".into(),
+            &events,
+        )
+        .await
+        .unwrap();
         assert_eq!(history.len(), 4);
         let Message::ToolResults(results) = &history[2] else {
             panic!("expected tool results, got {:?}", history[2]);
@@ -287,9 +377,16 @@ mod tests {
         };
         let model = Scripted::new(vec![first, Reply::default()]);
         let mut history = Vec::new();
-        run_turn(&model, &registry, &mut history, "go".into(), &|_| {})
-            .await
-            .unwrap();
+        run_turn(
+            &model,
+            &registry,
+            &deny_all(),
+            &mut history,
+            "go".into(),
+            &|_| {},
+        )
+        .await
+        .unwrap();
         let Message::ToolResults(results) = &history[2] else {
             panic!("expected tool results");
         };
@@ -306,9 +403,73 @@ mod tests {
         let registry = Registry::builtin(&dir).unwrap();
         let model = Scripted::new(vec![call_reply("t", "read", json!({ "path": "a.txt" }))]);
         let mut history = vec![Message::User("earlier".into())];
-        let result = run_turn(&model, &registry, &mut history, "loop".into(), &|_| {}).await;
+        let result = run_turn(
+            &model,
+            &registry,
+            &deny_all(),
+            &mut history,
+            "loop".into(),
+            &|_| {},
+        )
+        .await;
         assert!(matches!(result, Err(AgentError::IterationLimit(_))));
         assert_eq!(model.seen.lock().unwrap().len(), MAX_ITERATIONS);
         assert_eq!(history, vec![Message::User("earlier".into())]);
+    }
+
+    /// A denied edit does not touch the file and the model is told why.
+    #[tokio::test]
+    async fn denied_tools_do_not_run() {
+        let dir = scratch("loop-denied");
+        std::fs::write(dir.join("f.txt"), "before\n").unwrap();
+        let registry = Registry::builtin(&dir).unwrap();
+        let edit = json!({ "path": "f.txt", "old_string": "before", "new_string": "after" });
+        let model = Scripted::new(vec![call_reply("e", "edit", edit), Reply::default()]);
+        let mut history = Vec::new();
+        run_turn(
+            &model,
+            &registry,
+            &deny_all(),
+            &mut history,
+            "edit".into(),
+            &|_| {},
+        )
+        .await
+        .unwrap();
+        let Message::ToolResults(results) = &history[2] else {
+            panic!("expected tool results");
+        };
+        assert!(results[0].is_error);
+        assert!(results[0].text.contains("denied"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+            "before\n"
+        );
+    }
+
+    /// In yolo mode the same edit runs without asking.
+    #[tokio::test]
+    async fn yolo_runs_tools_without_asking() {
+        let dir = scratch("loop-yolo");
+        std::fs::write(dir.join("f.txt"), "before\n").unwrap();
+        let registry = Registry::builtin(&dir).unwrap();
+        let edit = json!({ "path": "f.txt", "old_string": "before", "new_string": "after" });
+        let model = Scripted::new(vec![call_reply("e", "edit", edit), Reply::default()]);
+        let approvals = Approvals::new(Arc::new(DenyAll), true);
+        let mut history = Vec::new();
+        run_turn(
+            &model,
+            &registry,
+            &approvals,
+            &mut history,
+            "edit".into(),
+            &|_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+            "after\n"
+        );
     }
 }

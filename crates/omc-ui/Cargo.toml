@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow = "1.0.104"
+async-trait = "0.1.92"
 crossterm = "0.29.0"
 omc-agent.workspace = true
 omc-auth.workspace = true
