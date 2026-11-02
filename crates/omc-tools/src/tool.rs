@@ -3,6 +3,8 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
+use unicode_width::UnicodeWidthChar;
+
 use crate::ToolError;
 
 /// What a successful tool call returns to the model.
@@ -74,17 +76,27 @@ pub fn sanitize(text: &str) -> String {
         .collect()
 }
 
-/// Returns whether `c` is a format, separator or tag character that renders as
-/// nothing or reorders text, such as bidi controls and zero-width characters.
+/// Returns whether `c` could render as nothing, reorder text or masquerade as
+/// a space.
+///
+/// Every non-ASCII character that measures zero columns wide is covered, which
+/// takes in format characters, bidi controls, variation selectors and combining
+/// marks. Non-space whitespace, the bidi and tag ranges and the Hangul fillers,
+/// which some terminals draw as blanks, are listed explicitly.
 fn is_invisible(c: char) -> bool {
-    matches!(c,
-        '\u{ad}' | '\u{61c}' | '\u{180e}'
-        | '\u{200b}'..='\u{200f}'
-        | '\u{2028}'..='\u{202e}'
-        | '\u{2060}'..='\u{206f}'
-        | '\u{feff}'
-        | '\u{fff9}'..='\u{fffb}'
-        | '\u{e0000}'..='\u{e007f}')
+    if c.is_ascii() {
+        return false;
+    }
+    c.width() == Some(0)
+        || (c.is_whitespace() && c != ' ')
+        || matches!(c,
+            '\u{ad}' | '\u{61c}' | '\u{115f}' | '\u{1160}' | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}'
+            | '\u{3164}' | '\u{feff}' | '\u{ffa0}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{e0000}'..='\u{e0fff}')
 }
 
 /// Formats `text` as diff lines, each starting with `marker`, so every line of
@@ -110,6 +122,15 @@ mod tests {
     #[test]
     fn sanitize_escapes_invisible_characters() {
         assert_eq!(sanitize("a\u{202e}b\u{200b}c"), "a\\u{202e}b\\u{200b}c");
+    }
+
+    /// Variation selectors, combining marks and Hangul fillers are escaped.
+    #[test]
+    fn sanitize_escapes_zero_width_and_filler_characters() {
+        assert_eq!(sanitize("a\u{fe0f}"), "a\\u{fe0f}");
+        assert_eq!(sanitize("e\u{301}"), "e\\u{301}");
+        assert_eq!(sanitize("\u{3164}"), "\\u{3164}");
+        assert_eq!(sanitize("plain é 日本"), "plain é 日本");
     }
 
     /// Every line gets the marker.
