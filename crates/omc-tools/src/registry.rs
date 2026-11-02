@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::{Tool, ToolError, ToolOutput};
+use crate::tools::Read;
+use crate::{Sandbox, Tool, ToolError, ToolOutput};
 
 /// A set of tools addressable by name.
 #[derive(Clone, Default)]
@@ -18,6 +19,18 @@ impl Registry {
     /// Creates an empty registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a registry holding every built-in tool, confined to `root`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Io`] when `root` cannot be canonicalized.
+    pub fn builtin(root: impl AsRef<std::path::Path>) -> Result<Self, ToolError> {
+        let sandbox = Sandbox::new(root)?;
+        let mut registry = Self::new();
+        registry.register(Read::new(sandbox));
+        Ok(registry)
     }
 
     /// Adds `tool`, replacing any tool with the same name.
