@@ -10,6 +10,7 @@ globset = "0.4.21"
 grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
 ignore = "0.4.34"
+libc = "0.2.191"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
