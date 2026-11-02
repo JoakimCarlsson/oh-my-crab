@@ -2,6 +2,7 @@
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::sync::Arc;
+use std::time::Instant;
 
 use omc_agent::{AgentEvent, Approvals, Decision};
 use omc_auth::Provider;
@@ -9,7 +10,9 @@ use omc_tools::Registry;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::message::Msg;
-use crate::state::{App, ApprovalPrompt, CHOICES, Mode, ModelPicker, Role};
+use crate::state::{
+    APPROVAL_GRACE, App, ApprovalPrompt, CHOICES, DENY_INDEX, Mode, ModelPicker, Role,
+};
 use crate::tasks::UiPrompter;
 use crate::{tasks, view};
 
@@ -89,7 +92,8 @@ fn update(app: &mut App, tx: &UnboundedSender<Msg>, msg: Msg) {
             app.mode = Mode::Approve(ApprovalPrompt {
                 request,
                 reply: Some(reply),
-                selected: 0,
+                selected: DENY_INDEX,
+                opened: Instant::now(),
             });
         }
         Msg::Done(history) => {
@@ -175,7 +179,8 @@ fn on_key(app: &mut App, tx: &UnboundedSender<Msg>, key: KeyEvent) {
 /// Handles a key press while a tool call awaits approval.
 ///
 /// `y`, `a` and `n` answer directly, the arrows and Enter pick a highlighted
-/// choice, and Esc denies.
+/// choice, and Esc denies. Keys that would allow the call are ignored for
+/// [`APPROVAL_GRACE`] after the prompt opens.
 fn on_approve_key(app: &mut App, code: KeyCode) {
     let Mode::Approve(prompt) = &mut app.mode else {
         return;
@@ -196,6 +201,9 @@ fn on_approve_key(app: &mut App, code: KeyCode) {
         _ => None,
     };
     let Some(decision) = decision else { return };
+    if decision != Decision::Deny && prompt.opened.elapsed() < APPROVAL_GRACE {
+        return;
+    }
     if let Some(reply) = prompt.reply.take() {
         let _ = reply.send(decision);
     }

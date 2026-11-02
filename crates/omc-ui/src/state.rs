@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use omc_agent::{ApprovalRequest, Approvals, Decision};
 use omc_auth::Provider;
@@ -61,7 +62,16 @@ pub struct ApprovalPrompt {
     pub reply: Option<oneshot::Sender<Decision>>,
     /// Index into [`CHOICES`] of the highlighted choice.
     pub selected: usize,
+    /// When the prompt opened, so keys typed ahead can be ignored.
+    pub opened: Instant,
 }
+
+/// How long after opening an approval prompt refuses to allow anything, so
+/// keys typed before it appeared cannot approve a call.
+pub const APPROVAL_GRACE: Duration = Duration::from_millis(500);
+
+/// Index into [`CHOICES`] of the Deny choice, which starts highlighted.
+pub const DENY_INDEX: usize = 2;
 
 /// The model picker: the offered models once fetched, and the highlighted row.
 pub struct ModelPicker {
