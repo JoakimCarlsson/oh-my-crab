@@ -53,7 +53,7 @@ impl Sandbox {
                 other => folded.push(other),
             }
         }
-        let resolved = canonicalize_existing(&folded);
+        let resolved = canonicalize_existing(&folded).ok_or_else(outside)?;
         if resolved.starts_with(&self.root) {
             Ok(resolved)
         } else {
@@ -72,19 +72,26 @@ impl Sandbox {
 }
 
 /// Canonicalizes the longest existing prefix of `path` and re-appends the rest.
-fn canonicalize_existing(path: &Path) -> PathBuf {
+///
+/// Returns `None` when a component exists on disk but cannot be canonicalized,
+/// which is what a dangling symlink looks like: its target is unknown, so it
+/// could point anywhere and a write through it would escape.
+fn canonicalize_existing(path: &Path) -> Option<PathBuf> {
     let mut existing = path.to_path_buf();
     let mut tail = Vec::new();
     loop {
         if let Ok(real) = existing.canonicalize() {
-            return tail.iter().rev().fold(real, |acc, name| acc.join(name));
+            return Some(tail.iter().rev().fold(real, |acc, name| acc.join(name)));
+        }
+        if existing.symlink_metadata().is_ok() {
+            return None;
         }
         match (existing.file_name(), existing.parent()) {
             (Some(name), Some(parent)) => {
                 tail.push(name.to_os_string());
                 existing = parent.to_path_buf();
             }
-            _ => return path.to_path_buf(),
+            _ => return Some(path.to_path_buf()),
         }
     }
 }
@@ -132,6 +139,19 @@ mod tests {
         let sandbox = Sandbox::new(&dir).unwrap();
         assert!(matches!(
             sandbox.resolve("link/file.txt"),
+            Err(ToolError::OutsidePath(_))
+        ));
+    }
+
+    /// A dangling symlink is rejected even though its target does not exist.
+    #[test]
+    fn rejects_dangling_symlinks() {
+        let dir = scratch("sandbox-dangling");
+        let outside = scratch("sandbox-dangling-target");
+        std::os::unix::fs::symlink(outside.join("missing.txt"), dir.join("link")).unwrap();
+        let sandbox = Sandbox::new(&dir).unwrap();
+        assert!(matches!(
+            sandbox.resolve("link"),
             Err(ToolError::OutsidePath(_))
         ));
     }
