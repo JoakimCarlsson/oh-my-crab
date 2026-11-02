@@ -4,8 +4,9 @@ use std::time::Duration;
 
 use oauth2::basic::{BasicClient, BasicTokenResponse};
 use oauth2::{
-    AuthUrl, AuthorizationCode, ClientId, CsrfToken, EndpointNotSet, EndpointSet,
-    PkceCodeChallenge, RedirectUrl, RefreshToken, Scope, TokenResponse, TokenUrl,
+    AuthUrl, AuthorizationCode, ClientId, CsrfToken, EndpointNotSet, EndpointSet, ErrorResponse,
+    PkceCodeChallenge, RedirectUrl, RefreshToken, RequestTokenError, Scope, TokenResponse,
+    TokenUrl,
 };
 
 use crate::AuthError;
@@ -14,6 +15,12 @@ use crate::credentials::{Credentials, now_ms};
 use crate::http::ProviderHttp;
 use crate::jwt;
 use crate::provider::Spec;
+
+/// Random bytes behind the authorization `state`, which encodes to 43 characters.
+const STATE_BYTES: u32 = 32;
+
+/// Random bytes behind the PKCE verifier, which encodes to 128 characters.
+const PKCE_VERIFIER_BYTES: u32 = 96;
 
 /// Margin subtracted from token lifetimes so refresh happens early.
 const EXPIRY_SKEW: Duration = Duration::from_secs(300);
@@ -32,6 +39,39 @@ fn client(spec: &Spec) -> Result<ConfiguredClient, AuthError> {
         .set_auth_uri(AuthUrl::new(spec.authorize_url.to_string()).map_err(bad)?)
         .set_token_uri(TokenUrl::new(spec.token_url.to_string()).map_err(bad)?)
         .set_redirect_uri(RedirectUrl::new(spec.redirect_uri.to_string()).map_err(bad)?))
+}
+
+/// Builds a readable [`AuthError::Token`] from a failed token request.
+///
+/// The oauth2 crate's own messages for unreadable responses and transport
+/// failures hide the cause, so the raw body or the error chain is added.
+fn describe<RE, T>(error: RequestTokenError<RE, T>) -> AuthError
+where
+    RE: std::error::Error + 'static,
+    T: ErrorResponse + 'static,
+{
+    let detail = match error {
+        RequestTokenError::ServerResponse(response) => response.to_string(),
+        RequestTokenError::Parse(cause, body) => format!(
+            "unreadable token response ({cause}): {}",
+            String::from_utf8_lossy(&body)
+        ),
+        RequestTokenError::Request(cause) => error_chain(&cause),
+        RequestTokenError::Other(message) => message,
+    };
+    AuthError::Token(detail)
+}
+
+/// Joins `error` and its sources into one line separated by `: `.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(next) = source {
+        text.push_str(": ");
+        text.push_str(&next.to_string());
+        source = next.source();
+    }
+    text
 }
 
 /// Builds the HTTP adapter for `spec` with the given extra headers.
@@ -79,9 +119,9 @@ fn credentials_from(
 /// token exchange is rejected.
 pub async fn login(spec: &'static Spec, notify: impl Fn(String)) -> Result<Credentials, AuthError> {
     let client = client(spec)?;
-    let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
+    let (challenge, verifier) = PkceCodeChallenge::new_random_sha256_len(PKCE_VERIFIER_BYTES);
     let mut request = client
-        .authorize_url(CsrfToken::new_random)
+        .authorize_url(|| CsrfToken::new_random_len(STATE_BYTES))
         .set_pkce_challenge(challenge);
     for scope in spec.scopes {
         request = request.add_scope(Scope::new((*scope).to_string()));
@@ -109,7 +149,7 @@ pub async fn login(spec: &'static Spec, notify: impl Fn(String)) -> Result<Crede
     let token = exchange
         .request_async(&http_for(spec, &[])?)
         .await
-        .map_err(|e| AuthError::Token(e.to_string()))?;
+        .map_err(describe)?;
     credentials_from(spec, &token, None)
 }
 
@@ -123,6 +163,6 @@ pub async fn refresh(spec: &'static Spec, stored: &Credentials) -> Result<Creden
         .exchange_refresh_token(&RefreshToken::new(stored.refresh.clone()))
         .request_async(&http_for(spec, spec.refresh_headers)?)
         .await
-        .map_err(|e| AuthError::Token(e.to_string()))?;
+        .map_err(describe)?;
     credentials_from(spec, &token, Some(stored))
 }
