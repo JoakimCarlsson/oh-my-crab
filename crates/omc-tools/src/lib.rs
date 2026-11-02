@@ -13,4 +13,4 @@ pub use error::ToolError;
 pub use registry::Registry;
 pub use sandbox::Sandbox;
 pub use tool::{Tool, ToolOutput, parse_args};
-pub use tools::{Bash, Glob, Grep, Read};
+pub use tools::{Bash, Edit, Glob, Grep, Read, Write};
