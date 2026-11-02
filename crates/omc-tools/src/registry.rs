@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::tools::{Grep, Read};
+use crate::tools::{Glob, Grep, Read};
 use crate::{Sandbox, Tool, ToolError, ToolOutput};
 
 /// A set of tools addressable by name.
@@ -30,7 +30,8 @@ impl Registry {
         let sandbox = Sandbox::new(root)?;
         let mut registry = Self::new();
         registry.register(Read::new(sandbox.clone()));
-        registry.register(Grep::new(sandbox));
+        registry.register(Grep::new(sandbox.clone()));
+        registry.register(Glob::new(sandbox));
         Ok(registry)
     }
 
