@@ -68,3 +68,36 @@ impl<'c> AsyncHttpClient<'c> for ProviderHttp {
         self.inner.call(self.rewrite(request))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Form bodies become JSON and extra headers are attached when configured.
+    #[test]
+    fn rewrite_converts_form_to_json_and_adds_headers() {
+        let http = ProviderHttp::new(true, &[("anthropic-beta", "oauth-2025-04-20")]).unwrap();
+        let request = oauth2::http::Request::builder()
+            .method("POST")
+            .uri("https://example.com/token")
+            .body(b"grant_type=refresh_token&refresh_token=abc%20d".to_vec())
+            .unwrap();
+        let rewritten = http.rewrite(request);
+        let body: serde_json::Value = serde_json::from_slice(rewritten.body()).unwrap();
+        assert_eq!(body["grant_type"], "refresh_token");
+        assert_eq!(body["refresh_token"], "abc d");
+        assert_eq!(rewritten.headers()[CONTENT_TYPE], "application/json");
+        assert_eq!(rewritten.headers()["anthropic-beta"], "oauth-2025-04-20");
+    }
+
+    /// Form bodies are left untouched when JSON is not requested.
+    #[test]
+    fn rewrite_keeps_form_body_by_default() {
+        let http = ProviderHttp::new(false, &[]).unwrap();
+        let request = oauth2::http::Request::builder()
+            .uri("https://example.com/token")
+            .body(b"a=b".to_vec())
+            .unwrap();
+        assert_eq!(http.rewrite(request).body(), b"a=b");
+    }
+}
