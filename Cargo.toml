@@ -10,4 +10,5 @@ license = "MIT"
 [workspace.dependencies]
 omc-auth = { path = "crates/omc-auth" }
 omc-providers = { path = "crates/omc-providers" }
+omc-tools = { path = "crates/omc-tools" }
 omc-ui = { path = "crates/omc-ui" }
