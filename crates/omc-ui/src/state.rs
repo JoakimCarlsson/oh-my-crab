@@ -48,7 +48,7 @@ impl App {
     pub fn new(active: Option<Provider>) -> Self {
         let greeting = match active {
             Some(provider) => format!("Logged in with {}. Say hi.", provider.label()),
-            None => "Not logged in. Type /login to pick Claude.".to_string(),
+            None => "Not logged in. Type /login to pick Claude or Codex.".to_string(),
         };
         let mut app = Self {
             entries: Vec::new(),

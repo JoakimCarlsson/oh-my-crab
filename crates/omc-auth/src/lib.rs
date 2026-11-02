@@ -5,6 +5,7 @@ mod credentials;
 mod error;
 mod flow;
 mod http;
+mod jwt;
 mod provider;
 mod session;
 mod store;

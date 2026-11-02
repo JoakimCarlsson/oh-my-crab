@@ -12,6 +12,7 @@ use crate::AuthError;
 use crate::callback;
 use crate::credentials::{Credentials, now_ms};
 use crate::http::ProviderHttp;
+use crate::jwt;
 use crate::provider::Spec;
 
 /// Margin subtracted from token lifetimes so refresh happens early.
@@ -44,6 +45,7 @@ fn http_for(
 /// Converts a token response into credentials, keeping `previous` values the
 /// response omits.
 fn credentials_from(
+    spec: &Spec,
     token: &BasicTokenResponse,
     previous: Option<&Credentials>,
 ) -> Result<Credentials, AuthError> {
@@ -54,11 +56,16 @@ fn credentials_from(
         .ok_or_else(|| AuthError::Token("response carried no refresh token".into()))?;
     let lifetime = token.expires_in().unwrap_or(DEFAULT_LIFETIME);
     let usable = lifetime.saturating_sub(EXPIRY_SKEW);
+    let access = token.access_token().secret().clone();
+    let from_jwt = spec
+        .account_from_jwt
+        .then(|| jwt::chatgpt_account_id(&access))
+        .flatten();
     Ok(Credentials {
-        access: token.access_token().secret().clone(),
+        account_id: from_jwt.or_else(|| previous.and_then(|p| p.account_id.clone())),
+        access,
         refresh,
         expires_at_ms: now_ms() + usable.as_millis() as u64,
-        account_id: previous.and_then(|p| p.account_id.clone()),
     })
 }
 
@@ -103,7 +110,7 @@ pub async fn login(spec: &'static Spec, notify: impl Fn(String)) -> Result<Crede
         .request_async(&http_for(spec, &[])?)
         .await
         .map_err(|e| AuthError::Token(e.to_string()))?;
-    credentials_from(&token, None)
+    credentials_from(spec, &token, None)
 }
 
 /// Exchanges the refresh token in `stored` for fresh credentials.
@@ -117,5 +124,5 @@ pub async fn refresh(spec: &'static Spec, stored: &Credentials) -> Result<Creden
         .request_async(&http_for(spec, spec.refresh_headers)?)
         .await
         .map_err(|e| AuthError::Token(e.to_string()))?;
-    credentials_from(&token, Some(stored))
+    credentials_from(spec, &token, Some(stored))
 }

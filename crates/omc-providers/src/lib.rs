@@ -1,6 +1,7 @@
 //! Streaming chat requests to the logged-in provider.
 
 mod claude;
+mod codex;
 mod error;
 mod sse;
 
@@ -22,5 +23,6 @@ pub async fn send(
 ) -> Result<(), ProviderError> {
     match provider {
         Provider::Claude => claude::send(credentials, prompt, on_delta).await,
+        Provider::Codex => codex::send(credentials, prompt, on_delta).await,
     }
 }
