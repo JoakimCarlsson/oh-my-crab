@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 
-use crate::state::{App, Mode, Role};
+use crate::state::{App, Mode, ModelPicker, Role};
 
 /// Draws the whole interface into `frame`.
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -15,8 +15,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
     draw_chat(frame, app, chat);
     draw_input(frame, app, input);
-    if let Mode::Picker(selected) = app.mode {
-        draw_picker(frame, selected);
+    match &app.mode {
+        Mode::Picker(selected) => draw_picker(frame, *selected),
+        Mode::Models(picker) => draw_model_picker(frame, app, picker),
+        Mode::Chat => {}
     }
 }
 
@@ -95,6 +97,40 @@ fn draw_picker(frame: &mut Frame, selected: usize) {
         .block(Block::bordered().title(" Login (Enter select, Esc cancel) "))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default().with_selected(Some(selected));
+    frame.render_widget(Clear, area);
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Draws the model picker centered over the chat, or a loading note until the
+/// models have been fetched.
+fn draw_model_picker(frame: &mut Frame, app: &App, picker: &ModelPicker) {
+    let provider = app.active.map_or("provider", Provider::label);
+    let title = format!(" Models for {provider} (Enter select, Esc cancel) ");
+    let block = Block::bordered().title(title);
+    let Some(items) = &picker.items else {
+        let area = centered(frame.area(), 44, 3);
+        frame.render_widget(Clear, area);
+        frame.render_widget(Paragraph::new("Loading models...").block(block), area);
+        return;
+    };
+    let current = app.active.and_then(|provider| app.models.get(&provider));
+    let rows: Vec<ListItem> = items
+        .iter()
+        .map(|id| {
+            let mark = if Some(id) == current { "*" } else { " " };
+            ListItem::new(format!("{mark} {id}"))
+        })
+        .collect();
+    let widest = items.iter().map(|id| id.chars().count()).max().unwrap_or(0);
+    let area = centered(
+        frame.area(),
+        (widest as u16 + 6).max(44),
+        items.len() as u16 + 2,
+    );
+    let list = List::new(rows)
+        .block(block)
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    let mut state = ListState::default().with_selected(Some(picker.selected));
     frame.render_widget(Clear, area);
     frame.render_stateful_widget(list, area, &mut state);
 }

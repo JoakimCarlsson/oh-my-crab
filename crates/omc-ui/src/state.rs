@@ -29,6 +29,16 @@ pub enum Mode {
     Chat,
     /// Choosing a provider in the login picker, with the highlighted index.
     Picker(usize),
+    /// Choosing a model in the model picker.
+    Models(ModelPicker),
+}
+
+/// The model picker: the offered models once fetched, and the highlighted row.
+pub struct ModelPicker {
+    /// The models the provider offers, or `None` while they are being fetched.
+    pub items: Option<Vec<String>>,
+    /// Index of the highlighted model.
+    pub selected: usize,
 }
 
 /// The whole UI state.

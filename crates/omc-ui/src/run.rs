@@ -5,7 +5,7 @@ use omc_auth::Provider;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::message::Msg;
-use crate::state::{App, Mode, Role};
+use crate::state::{App, Mode, ModelPicker, Role};
 use crate::{tasks, view};
 
 /// Runs the TUI until the user quits.
@@ -77,42 +77,37 @@ fn update(app: &mut App, tx: &UnboundedSender<Msg>, msg: Msg) {
             app.say(format!("Using {model}. Change it with /model <id>."));
             app.models.entry(provider).or_insert(model);
         }
-        Msg::ModelList(provider, list) => show_models(app, provider, &list),
-        Msg::ModelListFailed(error) => app.say(format!("Could not list models: {error}")),
+        Msg::ModelList(provider, list) => fill_model_picker(app, provider, list),
+        Msg::ModelListFailed(error) => {
+            if matches!(app.mode, Mode::Models(_)) {
+                app.mode = Mode::Chat;
+            }
+            app.say(format!("Could not list models: {error}"));
+        }
     }
 }
 
-/// Prints the models `provider` offers, marking the one in use.
-fn show_models(app: &mut App, provider: Provider, list: &[String]) {
-    let current = app.models.get(&provider);
-    let lines: Vec<String> = list
-        .iter()
-        .map(|id| {
-            let mark = if Some(id) == current { "*" } else { " " };
-            format!("  {mark} {id}")
-        })
-        .collect();
-    app.say(format!(
-        "Models for {} (use /model <id>):\n{}",
-        provider.label(),
-        lines.join("\n")
-    ));
-}
-
-/// Handles `/model` with no argument: shows the current model and lists the rest.
-fn model_overview(app: &mut App, tx: &UnboundedSender<Msg>) {
-    let Some(provider) = app.active else {
+/// Opens the model picker and starts fetching the models to fill it.
+fn open_model_picker(app: &mut App, tx: &UnboundedSender<Msg>) {
+    if app.active.is_none() {
         app.say("Log in first with /login.");
         return;
-    };
-    let current = app
-        .models
-        .get(&provider)
-        .map_or("provider default".to_string(), Clone::clone);
-    app.say(format!(
-        "Current model: {current}. Fetching available models..."
-    ));
+    }
+    app.mode = Mode::Models(ModelPicker {
+        items: None,
+        selected: 0,
+    });
     tasks::start_model_list(tx.clone());
+}
+
+/// Fills the open model picker with `list`, highlighting the model in use.
+fn fill_model_picker(app: &mut App, provider: Provider, list: Vec<String>) {
+    let current = app.models.get(&provider);
+    let selected = list.iter().position(|id| Some(id) == current).unwrap_or(0);
+    if let Mode::Models(picker) = &mut app.mode {
+        picker.items = Some(list);
+        picker.selected = selected;
+    }
 }
 
 /// Handles `/model <id>`: uses `id` for the active provider from now on.
@@ -133,7 +128,33 @@ fn on_key(app: &mut App, tx: &UnboundedSender<Msg>, key: KeyEvent) {
     }
     match app.mode {
         Mode::Picker(selected) => on_picker_key(app, tx, key.code, selected),
+        Mode::Models(_) => on_models_key(app, key.code),
         Mode::Chat => on_chat_key(app, tx, key.code),
+    }
+}
+
+/// Handles a key press while the model picker is open.
+fn on_models_key(app: &mut App, code: KeyCode) {
+    let Mode::Models(picker) = &mut app.mode else {
+        return;
+    };
+    let count = picker.items.as_ref().map_or(0, Vec::len);
+    match code {
+        KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+        KeyCode::Down => picker.selected = (picker.selected + 1).min(count.saturating_sub(1)),
+        KeyCode::Esc => app.mode = Mode::Chat,
+        KeyCode::Enter => {
+            let chosen = picker
+                .items
+                .as_ref()
+                .and_then(|items| items.get(picker.selected))
+                .cloned();
+            app.mode = Mode::Chat;
+            if let Some(id) = chosen {
+                set_model(app, &id);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -171,7 +192,7 @@ fn submit(app: &mut App, tx: &UnboundedSender<Msg>) {
         "" => {}
         "/quit" => app.quit = true,
         "/login" => app.mode = Mode::Picker(0),
-        "/model" => model_overview(app, tx),
+        "/model" => open_model_picker(app, tx),
         command if command.starts_with("/model ") => {
             set_model(app, command["/model ".len()..].trim())
         }
