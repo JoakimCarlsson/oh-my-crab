@@ -1,0 +1,31 @@
+//! What the agent is told about its surroundings: the system prompt, the project's
+//! instruction files, and the skills and agent definitions found on disk.
+
+mod agents;
+mod discovery;
+mod environment;
+mod frontmatter;
+mod instructions;
+mod invoke;
+mod place;
+mod scope;
+mod skills;
+mod system;
+mod template;
+mod toml;
+
+#[cfg(test)]
+mod testutil;
+
+pub use agents::{AgentDefinition, READ_ONLY_TOOLS, builtin_agents};
+pub use discovery::{Discovered, discover};
+pub use environment::Environment;
+pub use frontmatter::{Parsed, parse as parse_frontmatter};
+pub use instructions::Instruction;
+pub use invoke::{
+    expand_skill, plan_approved, plan_rejected, skill_invocation, subagent_assignment,
+};
+pub use scope::Locations;
+pub use skills::Skill;
+pub use system::{PromptInput, build_prompt, build_subagent_prompt};
+pub use template::render;
