@@ -6,6 +6,7 @@
 //! so another program can hold the conversation.
 
 mod bridge;
+mod listing;
 mod prompt;
 mod serve;
 mod session;
@@ -15,5 +16,6 @@ mod toolset;
 mod translate;
 mod turn;
 
+pub use listing::tools;
 pub use serve::serve;
 pub use session::run;
