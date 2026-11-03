@@ -19,7 +19,7 @@ use crate::callback;
 use crate::credentials::{Credentials, now_ms};
 use crate::http::ProviderHttp;
 use crate::jwt;
-use crate::provider::Spec;
+use crate::method::Spec;
 
 /// Random bytes behind the authorization `state`, which encodes to 43 characters.
 const STATE_BYTES: u32 = 32;
@@ -166,6 +166,7 @@ fn credentials_from(
             || organization.and_then(|o| o.name.clone()),
             |p| p.org_name.clone(),
         ),
+        base_url: None,
         access,
         refresh,
         expires_at_ms: now_ms() + usable.as_millis() as u64,
@@ -233,7 +234,22 @@ pub async fn refresh(spec: &'static Spec, stored: &Credentials) -> Result<Creden
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::Provider;
+
+    /// A spec shaped like a provider that returns identity fields in its token response.
+    static TEST_SPEC: Spec = Spec {
+        client_id: "client",
+        authorize_url: "https://example.com/authorize",
+        token_url: "https://example.com/token",
+        scopes: &[],
+        authorize_params: &[],
+        port: 1,
+        path: "/callback",
+        redirect_uri: "http://localhost:1/callback",
+        json_body: true,
+        state_in_exchange: true,
+        refresh_headers: &[],
+        account_from_jwt: false,
+    };
 
     /// Claude's token response yields account and organization identity.
     #[test]
@@ -242,7 +258,7 @@ mod tests {
             "account":{"uuid":"acc","email_address":"me@example.com"},
             "organization":{"uuid":"org","name":"Team"}}"#;
         let token: Token = serde_json::from_str(body).unwrap();
-        let credentials = credentials_from(Provider::Claude.spec(), &token, None).unwrap();
+        let credentials = credentials_from(&TEST_SPEC, &token, None).unwrap();
         assert_eq!(credentials.account_id.as_deref(), Some("acc"));
         assert_eq!(credentials.email.as_deref(), Some("me@example.com"));
         assert_eq!(credentials.org_id.as_deref(), Some("org"));
@@ -263,22 +279,11 @@ mod tests {
             email: None,
             org_id: Some("org".into()),
             org_name: Some("Team".into()),
+            base_url: None,
         };
-        let credentials =
-            credentials_from(Provider::Claude.spec(), &token, Some(&previous)).unwrap();
+        let credentials = credentials_from(&TEST_SPEC, &token, Some(&previous)).unwrap();
         assert_eq!(credentials.org_id.as_deref(), Some("org"));
         assert_eq!(credentials.account_id.as_deref(), Some("acc"));
         assert_eq!(credentials.refresh, "r");
-    }
-
-    /// The Claude login asks for the scopes, callback and state oh-my-pi uses.
-    #[test]
-    fn claude_spec_matches_the_reference() {
-        let spec = Provider::Claude.spec();
-        assert!(spec.scopes.contains(&"user:sessions:claude_code"));
-        assert_eq!(spec.port, 54545);
-        assert_eq!(spec.path, "/callback");
-        assert!(spec.state_in_exchange && spec.json_body);
-        assert!(spec.refresh_headers.iter().any(|(k, _)| *k == "user-agent"));
     }
 }

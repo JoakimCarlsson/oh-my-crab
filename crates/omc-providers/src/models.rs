@@ -1,6 +1,6 @@
 //! What each known model can do: context window, output limit and thinking efforts.
 
-use omc_auth::Provider;
+use crate::{Provider, Wire};
 
 use crate::Effort;
 
@@ -192,19 +192,24 @@ pub(crate) fn codex_context_window(id: &str) -> u64 {
     }
 }
 
+/// The context window assumed for a model a server does not describe.
+const UNKNOWN_CONTEXT_WINDOW: u64 = 128_000;
+
 /// How many tokens of context `model` of `provider` takes in.
 pub fn context_window(provider: Provider, model: &str) -> u64 {
-    match provider {
-        Provider::Claude => claude_context_window(model),
-        Provider::Codex => codex_context_window(model),
+    match provider.wire() {
+        Wire::AnthropicMessages => claude_context_window(model),
+        Wire::OpenAiResponses => codex_context_window(model),
+        Wire::ChatCompletions => UNKNOWN_CONTEXT_WINDOW,
     }
 }
 
 /// The effort levels `model` of `provider` accepts, lightest first; none when it does not think.
 pub fn efforts(provider: Provider, model: &str) -> Vec<Effort> {
-    match provider {
-        Provider::Claude => claude_efforts(model),
-        Provider::Codex => codex_efforts(model),
+    match provider.wire() {
+        Wire::AnthropicMessages => claude_efforts(model),
+        Wire::OpenAiResponses => codex_efforts(model),
+        Wire::ChatCompletions => Vec::new(),
     }
 }
 

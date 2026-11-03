@@ -1,0 +1,74 @@
+//! How a provider is signed in to: the descriptions the login flows run from.
+
+/// Static description of a provider's OAuth endpoints and parameters.
+pub struct Spec {
+    /// Public OAuth client id.
+    pub client_id: &'static str,
+    /// Browser authorization endpoint.
+    pub authorize_url: &'static str,
+    /// Token endpoint used for exchange and refresh.
+    pub token_url: &'static str,
+    /// Requested scopes.
+    pub scopes: &'static [&'static str],
+    /// Extra query parameters on the authorization URL.
+    pub authorize_params: &'static [(&'static str, &'static str)],
+    /// Local callback port.
+    pub port: u16,
+    /// Local callback path.
+    pub path: &'static str,
+    /// Redirect URI registered with the provider.
+    pub redirect_uri: &'static str,
+    /// Whether the token endpoint expects a JSON body instead of a form.
+    pub json_body: bool,
+    /// Whether the authorization `state` is echoed in the code exchange.
+    pub state_in_exchange: bool,
+    /// Extra headers sent on refresh requests.
+    pub refresh_headers: &'static [(&'static str, &'static str)],
+    /// Whether the account id is read from the access token's JWT claims.
+    pub account_from_jwt: bool,
+}
+
+/// Static description of a provider's device-code login.
+pub struct Device {
+    /// Public OAuth client id.
+    pub client_id: &'static str,
+    /// Requested scope.
+    pub scope: &'static str,
+    /// Endpoint that starts the flow and returns the code to show.
+    pub code_url: &'static str,
+    /// Endpoint polled until the user has approved.
+    pub token_url: &'static str,
+    /// Headers sent on every request of the flow.
+    pub headers: &'static [(&'static str, &'static str)],
+    /// Endpoint that tells which API address serves the account, when that varies.
+    pub endpoint_url: Option<&'static str>,
+}
+
+/// What a login asks the user to do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoginPrompt {
+    /// Open this address in a browser.
+    Url(String),
+    /// Open this address and enter this code there.
+    Code {
+        /// Where to enter the code.
+        url: String,
+        /// The code to enter.
+        code: String,
+    },
+}
+
+/// How a provider is signed in to.
+pub enum Auth {
+    /// The browser authorization-code flow with PKCE.
+    OAuth(&'static Spec),
+    /// The device-code flow: the user enters a short code on a web page.
+    DeviceCode(&'static Device),
+    /// A static key read from the first of these environment variables that is set.
+    ApiKey {
+        /// Environment variables checked in order.
+        env: &'static [&'static str],
+    },
+    /// No credentials at all, as for a local server.
+    None,
+}

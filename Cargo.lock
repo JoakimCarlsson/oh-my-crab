@@ -1030,6 +1030,7 @@ dependencies = [
  "dirs",
  "oauth2",
  "open",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -1079,6 +1080,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
@@ -1418,6 +1420,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",

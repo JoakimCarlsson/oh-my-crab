@@ -22,9 +22,6 @@ const URL: &str = "https://api.anthropic.com/v1/messages";
 /// Model list endpoint.
 const MODELS_URL: &str = "https://api.anthropic.com/v1/models";
 
-/// Model used when the user has not picked one.
-pub const DEFAULT_MODEL: &str = "claude-haiku-5-5";
-
 /// Output tokens kept free for the visible answer when a thinking budget is set.
 const ANSWER_RESERVE: u64 = 4_000;
 

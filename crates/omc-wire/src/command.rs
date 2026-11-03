@@ -12,7 +12,7 @@ pub struct Opening {
     pub directory: PathBuf,
     /// The folder the logins are kept in, or the harness's own when there is none.
     pub home: Option<PathBuf>,
-    /// The provider that serves the conversation, `claude` or `codex`.
+    /// The provider that serves the conversation, the id of one of the providers in `docs/providers/supported.md`, such as `claude`.
     pub provider: String,
     /// The model to start with, or the provider's default when there is none.
     pub model: Option<String>,
@@ -74,9 +74,9 @@ pub enum Command {
         /// The value.
         value: String,
     },
-    /// Signs in to `provider`, reporting the address to open as a [`crate::Event::LoginUrl`].
+    /// Signs in to `provider`, reporting what to open as a [`crate::Event::LoginUrl`], or the page and code as a [`crate::Event::LoginCode`].
     Login {
-        /// The provider, `claude` or `codex`.
+        /// The id of the provider.
         provider: String,
     },
     /// Ends the conversation and the harness.

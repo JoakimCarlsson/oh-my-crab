@@ -2,16 +2,17 @@
 
 mod callback;
 mod credentials;
+mod device;
 mod error;
 mod flow;
 mod http;
 mod jwt;
-mod provider;
+mod method;
 mod session;
 mod store;
 
 pub use credentials::Credentials;
 pub use error::AuthError;
-pub use provider::Provider;
-pub use session::{active_credentials, active_provider, credentials_for, login};
+pub use method::{Auth, Device, LoginPrompt, Spec};
+pub use session::{active_id, credentials_for, login};
 pub use store::set_home;

@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use omc_agent::Journal;
-use omc_auth::{AuthError, Provider};
+use omc_auth::{AuthError, LoginPrompt};
 use omc_context::{Discovered, Locations, discover, expand_skill};
 use omc_providers::Message;
+use omc_providers::Provider;
 use omc_tools::{Registry, Skill};
 use omc_wire::{Command, Event, Opening, Slash};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -116,7 +117,7 @@ impl Session {
         if let Some(home) = home {
             omc_auth::set_home(home);
         }
-        let Some(provider) = parse_provider(provider) else {
+        let Some(provider) = Provider::from_id(provider) else {
             return self.say(Event::Failed(format!("unknown provider: {provider}")));
         };
         self.journal = None;
@@ -143,7 +144,7 @@ impl Session {
         if !discovered.skills.is_empty() {
             registry.register(Skill::new(discovered.skills.clone()));
         }
-        let credentials = match omc_auth::credentials_for(provider).await {
+        let credentials = match omc_providers::credentials_for(provider).await {
             Ok(credentials) => credentials,
             Err(AuthError::NotLoggedIn) => {
                 return self.say(Event::SignedOut {
@@ -307,14 +308,17 @@ impl Session {
 
     /// Signs in to `provider` in the background, reporting the address to open and how it ended.
     fn login(&self, provider: &str) {
-        let Some(provider) = parse_provider(provider) else {
+        let Some(provider) = Provider::from_id(provider) else {
             return self.say(Event::Failed(format!("unknown provider: {provider}")));
         };
         let out = self.shared.out.clone();
         tokio::spawn(async move {
             let address = out.clone();
-            let outcome = omc_auth::login(provider, move |url| {
-                let _ = address.send(Event::LoginUrl(url));
+            let outcome = omc_providers::login(provider, move |prompt| {
+                let _ = address.send(match prompt {
+                    LoginPrompt::Url(url) => Event::LoginUrl(url),
+                    LoginPrompt::Code { url, code } => Event::LoginCode { url, code },
+                });
             })
             .await;
             let _ = out.send(match outcome {
@@ -382,15 +386,6 @@ fn commands_of(discovered: &Discovered) -> Vec<Slash> {
             description: skill.description.clone(),
         })
         .collect()
-}
-
-/// The provider `name` names, when it names one.
-fn parse_provider(name: &str) -> Option<Provider> {
-    match name {
-        "claude" => Some(Provider::Claude),
-        "codex" => Some(Provider::Codex),
-        _ => None,
-    }
 }
 
 /// Tests for the conversation's re-reading of what is on disk.

@@ -1,10 +1,11 @@
 //! Provider-neutral conversation types and the [`ChatModel`] trait.
 
 use async_trait::async_trait;
-use omc_auth::{Credentials, Provider};
+use omc_auth::Credentials;
 use serde_json::Value;
 
-use crate::{ProviderError, claude, codex};
+use crate::wires::{anthropic_messages, chat_completions, openai_responses};
+use crate::{Provider, ProviderError, Wire};
 
 /// A tool the model may call, in provider-neutral form.
 #[derive(Debug, Clone)]
@@ -189,11 +190,22 @@ impl ChatModel for RemoteModel {
         request: Request<'_>,
         sink: &mut dyn Sink,
     ) -> Result<Reply, ProviderError> {
-        match self.provider {
-            Provider::Claude => {
-                claude::complete(&self.credentials, &self.model, request, sink).await
+        match self.provider.wire() {
+            Wire::AnthropicMessages => {
+                anthropic_messages::complete(&self.credentials, &self.model, request, sink).await
             }
-            Provider::Codex => codex::complete(&self.credentials, &self.model, request, sink).await,
+            Wire::OpenAiResponses => {
+                openai_responses::complete(&self.credentials, &self.model, request, sink).await
+            }
+            Wire::ChatCompletions => {
+                let base_url = chat_completions::base_url(self.provider, &self.credentials);
+                let target = chat_completions::Target {
+                    credentials: &self.credentials,
+                    base_url: &base_url,
+                    headers: self.provider.def().headers,
+                };
+                chat_completions::complete(target, &self.model, request, sink).await
+            }
         }
     }
 }

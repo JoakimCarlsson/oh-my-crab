@@ -24,9 +24,26 @@ pub struct Credentials {
     /// Display name of that organization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub org_name: Option<String>,
+    /// API address the account is served from, when the provider assigns one per account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
 }
 
 impl Credentials {
+    /// Credentials that never expire and carry `key` as the bearer token; empty for a server that needs none.
+    pub fn static_key(key: String) -> Self {
+        Self {
+            access: key,
+            refresh: String::new(),
+            expires_at_ms: u64::MAX,
+            account_id: None,
+            email: None,
+            org_id: None,
+            org_name: None,
+            base_url: None,
+        }
+    }
+
     /// Returns whether the access token has expired or is about to.
     pub fn is_expired(&self) -> bool {
         self.expires_at_ms <= now_ms()

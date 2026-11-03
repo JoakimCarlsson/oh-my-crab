@@ -14,6 +14,9 @@ pub enum AuthError {
     /// Reading or writing `auth.json` failed.
     #[error("credential storage failed: {0}")]
     Storage(String),
+    /// The provider needs an API key and none of its environment variables is set.
+    #[error("no API key found; set {0}")]
+    MissingKey(String),
     /// No provider has been logged in yet.
     #[error("not logged in; use /login")]
     NotLoggedIn,

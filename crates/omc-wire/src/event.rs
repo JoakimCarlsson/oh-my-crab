@@ -45,6 +45,13 @@ pub enum Event {
     SignedIn,
     /// The address the reader opens in a browser to sign in.
     LoginUrl(String),
+    /// The page the reader opens to sign in, and the code to enter there.
+    LoginCode {
+        /// The page to open.
+        url: String,
+        /// The code to enter on it.
+        code: String,
+    },
     /// The harness could not start or went on, for this reason.
     Failed(String),
     /// The agent named the conversation, or named it again.

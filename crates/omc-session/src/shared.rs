@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use omc_agent::Approvals;
-use omc_auth::Provider;
 use omc_providers::Effort;
+use omc_providers::Provider;
 use omc_tools::Host;
 use omc_wire::{Event, PlanStep, Question, Reply};
 use tokio::sync::mpsc::UnboundedSender;

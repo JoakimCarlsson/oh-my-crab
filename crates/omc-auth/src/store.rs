@@ -8,15 +8,15 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AuthError, Credentials, Provider};
+use crate::{AuthError, Credentials};
 
 /// On-disk shape of `auth.json`.
 #[derive(Default, Serialize, Deserialize)]
 pub struct AuthFile {
-    /// The provider messages are sent to.
-    pub active: Option<Provider>,
-    /// Stored credentials by provider.
-    pub credentials: BTreeMap<Provider, Credentials>,
+    /// The id of the provider messages are sent to.
+    pub active: Option<String>,
+    /// Stored credentials by provider id.
+    pub credentials: BTreeMap<String, Credentials>,
 }
 
 /// The folder `auth.json` lives in, when the host chose one.
@@ -82,4 +82,22 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let mut file = options.open(path)?;
     file.write_all(bytes)?;
     file.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file written before providers were looked up by id still loads and saves unchanged.
+    #[test]
+    fn an_existing_file_round_trips() {
+        let saved = r#"{"active":"claude","credentials":{"claude":{"access":"a","refresh":"r","expires_at_ms":1,"account_id":null}}}"#;
+        let file: AuthFile = serde_json::from_str(saved).unwrap();
+        assert_eq!(file.active.as_deref(), Some("claude"));
+        assert_eq!(file.credentials["claude"].access, "a");
+        let again: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&file).unwrap()).unwrap();
+        assert_eq!(again["active"], "claude");
+        assert!(again["credentials"]["claude"].is_object());
+    }
 }
