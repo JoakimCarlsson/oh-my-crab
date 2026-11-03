@@ -18,7 +18,7 @@ pub struct ToolSpec {
 }
 
 /// A tool invocation requested by the model.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     /// Provider-assigned id that the result must echo.
     pub id: String,
@@ -29,7 +29,7 @@ pub struct ToolCall {
 }
 
 /// The outcome of one tool call, sent back to the model.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolResult {
     /// Id of the call this answers.
     pub call_id: String,
@@ -38,6 +38,7 @@ pub struct ToolResult {
     /// Result text or error description.
     pub text: String,
     /// Whether the call failed.
+    #[serde(default)]
     pub is_error: bool,
 }
 
@@ -85,7 +86,8 @@ impl Effort {
 }
 
 /// What a request cost in tokens, as the provider counted it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Tokens {
     /// Input that was not read from a cache.
     pub input: u64,
@@ -105,7 +107,8 @@ impl Tokens {
 }
 
 /// What the model produced in one request.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Reply {
     /// The text part of the answer.
     pub text: String,
@@ -133,7 +136,7 @@ pub struct Request<'a> {
 }
 
 /// One entry of the conversation history.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Message {
     /// Text typed by the user.
     User(String),

@@ -3,7 +3,6 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -74,14 +73,13 @@ pub fn save(file: &AuthFile) -> Result<(), AuthError> {
     fs::rename(&staging, &path).map_err(|e| AuthError::Storage(e.to_string()))
 }
 
-/// Creates `path` with mode `0600` and writes `bytes` to it.
+/// Creates `path` and writes `bytes` to it; on systems with file modes the file is readable by its owner only (`0600`).
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path)?;
     file.write_all(bytes)?;
     file.sync_all()
 }

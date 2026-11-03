@@ -65,7 +65,7 @@ impl Tool for Bash {
 
     /// Describes the tool to the model.
     fn description(&self) -> &'static str {
-        "Run a shell command with bash in the working directory. Returns the exit code, stdout \
+        "Run a shell command in the working directory, with bash (cmd on Windows). Returns the exit code, stdout \
          and stderr. The command is killed after the timeout, and long output is truncated. \
          The user is asked to approve each command."
     }
@@ -110,15 +110,12 @@ impl Tool for Bash {
 /// Returns [`ToolError::Io`] when the shell cannot start and
 /// [`ToolError::Failed`], carrying the partial output, on timeout.
 async fn run(dir: &std::path::Path, command: &str, seconds: u64) -> Result<ToolOutput, ToolError> {
-    let mut child = Command::new("bash")
-        .arg("-c")
-        .arg(command)
+    let mut child = shell(command)
         .current_dir(dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .process_group(0)
         .spawn()?;
     let pid = child.id();
     let stdout = Arc::new(Mutex::new(Capture::default()));
@@ -165,12 +162,37 @@ async fn capture<R: AsyncRead + Unpin>(source: Option<R>, into: Arc<Mutex<Captur
     }
 }
 
+/// Builds the command that runs `command` in a shell: `bash -c` in a process group of its own, so the whole group can be killed.
+#[cfg(unix)]
+fn shell(command: &str) -> Command {
+    let mut shell = Command::new("bash");
+    shell.arg("-c").arg(command).process_group(0);
+    shell
+}
+
+/// Builds the command that runs `command` in a shell: `cmd /C`.
+#[cfg(windows)]
+fn shell(command: &str) -> Command {
+    let mut shell = Command::new("cmd");
+    shell.arg("/C").arg(command);
+    shell
+}
+
 /// Sends SIGKILL to the process group led by `pid`.
+#[cfg(unix)]
 fn kill_group(pid: u32) {
     let Ok(pgid) = i32::try_from(pid) else { return };
     unsafe {
         libc::kill(-pgid, libc::SIGKILL);
     }
+}
+
+/// Kills the process `pid` and every process it started, with `taskkill`.
+#[cfg(windows)]
+fn kill_group(pid: u32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status();
 }
 
 /// Formats the exit status and the captured streams for the model.
@@ -206,7 +228,7 @@ fn format_output(
     text
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::time::Instant;
 

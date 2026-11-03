@@ -203,6 +203,7 @@ mod tests {
     }
 
     /// File permissions survive an edit.
+    #[cfg(unix)]
     #[tokio::test]
     async fn keeps_file_permissions() {
         use std::os::unix::fs::PermissionsExt;
