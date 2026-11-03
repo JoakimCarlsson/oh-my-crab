@@ -48,6 +48,8 @@ struct Session {
     running: Option<(u64, AbortHandle)>,
     /// The number the next turn gets.
     turns: u64,
+    /// How many fresh context windows had been started when the running turn began.
+    resets_at_start: u64,
     /// Where finished turns report.
     ended: UnboundedSender<(u64, Ended)>,
 }
@@ -62,6 +64,7 @@ pub async fn run(mut commands: UnboundedReceiver<Command>, out: UnboundedSender<
         open: None,
         running: None,
         turns: 0,
+        resets_at_start: 0,
         ended,
     };
     loop {
@@ -166,6 +169,9 @@ impl Session {
         };
         let commands = commands_of(&discovered);
         let (journal, messages) = saved.unzip();
+        self.shared
+            .notebook
+            .load(journal.as_ref().map_or("", |journal| journal.notes()));
         self.history = messages.unwrap_or_default();
         self.journal = journal;
         self.open = Some(Open {
@@ -196,6 +202,7 @@ impl Session {
         };
         self.turns += 1;
         let number = self.turns;
+        self.resets_at_start = self.shared.notebook.resets();
         let prompt = expand_skill(&prompt, &open.discovered.skills);
         let turn = Turn {
             provider: open.provider,
@@ -254,7 +261,10 @@ impl Session {
                 reason,
                 account: None,
             }),
-            Ended::Failed(reason) => self.say(Event::Finished(Some(reason))),
+            Ended::Failed(reason) => {
+                self.keep_fresh_window();
+                self.say(Event::Finished(Some(reason)));
+            }
         }
     }
 
@@ -281,9 +291,27 @@ impl Session {
     }
 
     /// Records in the saved history that the turn that was stopped never happened.
-    fn forget_turn(&self) {
+    fn forget_turn(&mut self) {
+        self.keep_fresh_window();
         if let Some(Err(error)) = self.journal.as_ref().map(|j| j.cut(self.history.len())) {
             eprintln!("history not saved: {error}");
+        }
+        if let Some(Err(error)) = self
+            .journal
+            .as_ref()
+            .map(|j| j.save_notes(&self.shared.notebook.read()))
+        {
+            eprintln!("notes not saved: {error}");
+        }
+    }
+
+    /// When the turn that ended without an answer had started a fresh context window, the old history is gone for good, so the conversation goes on from the notes message that window began with.
+    fn keep_fresh_window(&mut self) {
+        if self.shared.notebook.resets() == self.resets_at_start {
+            return;
+        }
+        if let Some(opening) = self.shared.notebook.opening() {
+            self.history = vec![Message::User(opening)];
         }
     }
 
@@ -435,6 +463,7 @@ mod tests {
             }),
             running: None,
             turns: 0,
+            resets_at_start: 0,
             ended,
         };
         session.rescan();

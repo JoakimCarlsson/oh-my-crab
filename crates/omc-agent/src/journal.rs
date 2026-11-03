@@ -39,6 +39,8 @@ enum Written<'a> {
     Message(&'a Message),
     /// The history is cut back to this many messages.
     Cut(usize),
+    /// The notebook now holds this text.
+    Notes(&'a str),
 }
 
 /// One line of a history file, as it is read.
@@ -49,12 +51,16 @@ enum Record {
     Message(Message),
     /// The history is cut back to this many messages.
     Cut(usize),
+    /// The notebook now holds this text.
+    Notes(String),
 }
 
 /// The file a conversation's history is appended to.
 pub struct Journal {
     /// The file the history is in.
     path: PathBuf,
+    /// The notebook as the file held it when it was opened.
+    notes: String,
     /// The open file and the number of cut-backs written so far.
     state: Mutex<State>,
 }
@@ -133,7 +139,7 @@ impl Journal {
             .iter()
             .rposition(|&byte| byte == b'\n')
             .map_or(0, |end| end + 1);
-        let mut history = replay(path, &bytes[..complete])?;
+        let (mut history, notes) = replay(path, &bytes[..complete])?;
         let saved = history.len();
         if complete < bytes.len() {
             file.set_len(complete as u64).map_err(io_error)?;
@@ -153,6 +159,7 @@ impl Journal {
         }
         let journal = Arc::new(Self {
             path: path.to_path_buf(),
+            notes,
             state: Mutex::new(State {
                 file,
                 epoch: 0,
@@ -160,6 +167,23 @@ impl Journal {
             }),
         });
         Ok((journal, history))
+    }
+
+    /// The notebook the history was opened with, empty when none was saved.
+    pub fn notes(&self) -> &str {
+        &self.notes
+    }
+
+    /// Records that the notebook now holds `text` and syncs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the write or the sync, or of a cut-back that was waiting to be written.
+    pub fn save_notes(&self, text: &str) -> io::Result<()> {
+        let mut state = self.lock();
+        state.settle()?;
+        write_record(&mut state.file, &Written::Notes(text))?;
+        state.file.sync_data()
     }
 
     /// The file the history is kept in.
@@ -213,6 +237,42 @@ impl Scribe {
         }
         state.settle()?;
         write_record(&mut state.file, &Written::Message(message))
+    }
+
+    /// Records that the notebook now holds `text` and syncs; nothing is written when the history was cut back since this scribe was made.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the write or the sync, or of a cut-back that was waiting to be written.
+    pub fn notes(&self, text: &str) -> io::Result<()> {
+        let Some(journal) = self.journal.upgrade() else {
+            return Ok(());
+        };
+        let mut state = journal.lock();
+        if state.epoch != self.epoch {
+            return Ok(());
+        }
+        state.settle()?;
+        write_record(&mut state.file, &Written::Notes(text))?;
+        state.file.sync_data()
+    }
+
+    /// Starts the history over with `first` as its only message: the old messages are cut off and `first` is appended, in one step that keeps this scribe writing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the write, or of a cut-back that was waiting to be written.
+    pub fn restart(&self, first: &Message) -> io::Result<()> {
+        let Some(journal) = self.journal.upgrade() else {
+            return Ok(());
+        };
+        let mut state = journal.lock();
+        if state.epoch != self.epoch {
+            return Ok(());
+        }
+        state.settle()?;
+        write_record(&mut state.file, &Written::Cut(0))?;
+        write_record(&mut state.file, &Written::Message(first))
     }
 
     /// Syncs the file to disk, which is done when a turn ends.
@@ -280,13 +340,14 @@ fn write_record(file: &mut File, record: &Written<'_>) -> io::Result<()> {
     file.write_all(&line)
 }
 
-/// Builds the history the complete lines in `bytes` add up to.
+/// Builds the history and the notebook the complete lines in `bytes` add up to.
 ///
 /// # Errors
 ///
 /// Returns [`JournalError::Corrupt`] for a line that is not a record, or a cut-back past the start or past the end.
-fn replay(path: &Path, bytes: &[u8]) -> Result<Vec<Message>, JournalError> {
+fn replay(path: &Path, bytes: &[u8]) -> Result<(Vec<Message>, String), JournalError> {
     let mut history = Vec::new();
+    let mut notes = String::new();
     for (index, line) in bytes.split_inclusive(|&byte| byte == b'\n').enumerate() {
         let corrupt = |reason: String| JournalError::Corrupt {
             path: path.to_path_buf(),
@@ -295,6 +356,7 @@ fn replay(path: &Path, bytes: &[u8]) -> Result<Vec<Message>, JournalError> {
         };
         match serde_json::from_slice(line).map_err(|error| corrupt(error.to_string()))? {
             Record::Message(message) => history.push(message),
+            Record::Notes(text) => notes = text,
             Record::Cut(length) if length <= history.len() => history.truncate(length),
             Record::Cut(length) => {
                 return Err(corrupt(format!(
@@ -304,7 +366,7 @@ fn replay(path: &Path, bytes: &[u8]) -> Result<Vec<Message>, JournalError> {
             }
         }
     }
-    Ok(history)
+    Ok((history, notes))
 }
 
 /// The length of the first `turns` turns of `history`.
@@ -541,5 +603,28 @@ mod tests {
         .unwrap();
         let (_, loaded) = Journal::open(&path, None).unwrap();
         assert_eq!(loaded, [Message::User("q".into()), said("a")]);
+    }
+
+    /// The last notebook written comes back when the file is opened again, and cuts do not touch it.
+    #[test]
+    fn notes_survive_a_reopen() {
+        let path = scratch("notes.jsonl");
+        let (journal, _) = Journal::open(&path, None).unwrap();
+        assert_eq!(journal.notes(), "");
+        let scribe = journal.scribe();
+        scribe.append(&Message::User("hi".into())).unwrap();
+        scribe.append(&said("hello")).unwrap();
+        scribe.notes("first").unwrap();
+        scribe.notes("second").unwrap();
+        journal.cut(0).unwrap();
+        drop(scribe);
+        drop(journal);
+        let (journal, history) = Journal::open(&path, None).unwrap();
+        assert!(history.is_empty());
+        assert_eq!(journal.notes(), "second");
+        journal.save_notes("third").unwrap();
+        drop(journal);
+        let (journal, _) = Journal::open(&path, None).unwrap();
+        assert_eq!(journal.notes(), "third");
     }
 }

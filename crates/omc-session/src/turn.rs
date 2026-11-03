@@ -85,6 +85,7 @@ impl Turn {
             effort,
             discovered: self.discovered.clone(),
             environment: Arc::new(Environment::detect(&self.locations, &self.model)),
+            notebook: self.shared.notebook.clone(),
         });
         let shared = self.shared.clone();
         let refresh = move || toolset.live(shared.mode() == Mode::Plan);
@@ -96,6 +97,8 @@ impl Turn {
             system: &initial.system,
             effort,
             refresh: Some(&refresh),
+            notebook: Some(&self.shared.notebook),
+            window: Some(window),
         };
         let result = run_turn_recorded(
             &context,

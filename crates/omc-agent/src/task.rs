@@ -12,7 +12,14 @@ use serde_json::{Value, json};
 use crate::{AgentEvent, Approvals, Context, run_turn};
 
 /// The tools a subagent never gets: starting subagents of its own, and the ones that talk to the reader about the main agent's work.
-const WITHHELD: &[&str] = &["task", "exit_plan_mode", "ask", "todo"];
+const WITHHELD: &[&str] = &[
+    "task",
+    "exit_plan_mode",
+    "ask",
+    "todo",
+    "context_notes",
+    "new_context",
+];
 
 /// The kind of subagent used when the call names none.
 const DEFAULT_AGENT: &str = "task";
@@ -201,6 +208,8 @@ impl Tool for Task {
             system: &system,
             effort: self.settings.effort,
             refresh: None,
+            notebook: None,
+            window: None,
         };
         run_turn(
             &context,
@@ -277,6 +286,8 @@ mod tests {
                 system: "MAIN",
                 effort: None,
                 refresh: None,
+                notebook: None,
+                window: None,
             },
             &mut history,
             prompt.into(),
@@ -524,6 +535,8 @@ mod tests {
                         system: "MAIN",
                         effort: None,
                         refresh: None,
+                        notebook: None,
+                        window: None,
                     },
                     &mut mine,
                     "go".into(),

@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use omc_agent::Approvals;
 use omc_providers::Effort;
 use omc_providers::Provider;
-use omc_tools::Host;
+use omc_tools::{Host, Notebook};
 use omc_wire::{Event, PlanStep, Question, Reply};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -39,6 +39,8 @@ pub(crate) struct Shared {
     pub(crate) questions: Arc<Questions>,
     /// What is allowed without asking.
     pub(crate) approvals: Arc<Approvals>,
+    /// The notes the agent keeps, and its request for a fresh context window.
+    pub(crate) notebook: Arc<Notebook>,
     /// What can be set, and how it stands.
     state: Mutex<State>,
 }
@@ -51,6 +53,7 @@ impl Shared {
             out,
             approvals: Arc::new(Approvals::new(questions.clone(), false)),
             questions,
+            notebook: Arc::new(Notebook::new()),
             state: Mutex::new(State {
                 opened: false,
                 provider: None,

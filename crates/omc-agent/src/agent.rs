@@ -7,7 +7,7 @@ use omc_providers::{
     ChatModel, Effort, Message, ProviderError, Request, Sink, Tokens, ToolCall, ToolResult,
     ToolSpec,
 };
-use omc_tools::{Registry, sanitize};
+use omc_tools::{Notebook, Registry, sanitize};
 use thiserror::Error;
 
 use crate::{ApprovalRequest, Approvals, Scribe};
@@ -89,6 +89,10 @@ pub struct Context<'a> {
     pub effort: Option<Effort>,
     /// Gives the tools and system prompt to use for the next request when they can change during the turn, instead of `registry` and `system`.
     pub refresh: Option<&'a (dyn Fn() -> Live + Send + Sync)>,
+    /// The notebook whose reset requests are carried out when a batch of tool calls has finished, by dropping the history for a message holding the notes.
+    pub notebook: Option<&'a Notebook>,
+    /// The size of the model's context window in tokens, when it is known; the agent is reminded to save its notes when a request fills most of it.
+    pub window: Option<u64>,
 }
 
 /// Passes the chunks of a reply on as events.
@@ -108,6 +112,16 @@ impl Sink for Chunks<'_> {
         (self.events)(AgentEvent::Thought(chunk.to_owned()));
     }
 }
+
+/// The share of the context window, in percent, at which the agent is reminded to save its notes.
+const REMINDER_PERCENT: u64 = 80;
+
+/// Added to a batch of tool results when the context window is nearly full.
+const CONTEXT_REMINDER: &str = "
+
+<context-window-reminder>
+The current context window is nearing its rollover threshold. Before important details fall out of the live tail, use context_notes to save a concise durable notebook: current task state, decisions, changed files, evidence, blockers, and exact next steps. Keep the notebook a compact index with one line per item, no copied logs or file bodies, and replace stale entries instead of appending so it stays well under the 16 KiB cap. Do not call new_context until the notebook is current.
+</context-window-reminder>";
 
 /// Runs one user turn: sends `prompt`, executes tool calls and loops until the
 /// model answers without calling a tool.
@@ -134,7 +148,7 @@ pub async fn run_turn(
 
 /// Runs a turn like [`run_turn`], and appends what is added to `history` to `scribe`'s journal as it happens: the prompt, each model reply and each batch of tool results.
 ///
-/// When the turn fails, the journal is cut back to the history before the turn. The journal is synced when the turn ends. A journal that cannot be written to is reported on standard error and does not stop the turn.
+/// When the turn fails, the journal is cut back to the history before the turn, or to the notes message when the turn started a fresh context window. The journal is synced when the turn ends. A journal that cannot be written to is reported on standard error and does not stop the turn.
 ///
 /// # Errors
 ///
@@ -147,12 +161,18 @@ pub async fn run_turn_recorded(
     scribe: Option<&Scribe>,
 ) -> Result<(), AgentError> {
     let start = history.len();
+    let resets = context.notebook.map_or(0, Notebook::resets);
     history.push(Message::User(prompt));
     record(scribe, &history[start]);
     let result = drive(context, history, events, scribe).await;
     if result.is_err() {
-        history.truncate(start);
-        if let Some(Err(error)) = scribe.map(|scribe| scribe.cut(start)) {
+        let keep = if context.notebook.map_or(0, Notebook::resets) == resets {
+            start
+        } else {
+            1
+        };
+        history.truncate(keep);
+        if let Some(Err(error)) = scribe.map(|scribe| scribe.cut(keep)) {
             eprintln!("history not saved: {error}");
         }
     }
@@ -180,6 +200,8 @@ async fn drive(
     events: &(dyn Fn(AgentEvent) + Send + Sync),
     scribe: Option<&Scribe>,
 ) -> Result<(), AgentError> {
+    let mut saved = context.notebook.map_or(0, Notebook::revision);
+    let mut reminded = false;
     loop {
         let live = context.refresh.map(|refresh| refresh());
         let registry = live
@@ -195,6 +217,10 @@ async fn drive(
             effort: context.effort,
         };
         let reply = context.model.complete(request, &mut chunks).await?;
+        let nearly_full = reply
+            .tokens
+            .zip(context.window)
+            .is_some_and(|(tokens, window)| tokens.context() >= window / 100 * REMINDER_PERCENT);
         if let Some(tokens) = reply.tokens {
             events(AgentEvent::Used(tokens));
         }
@@ -204,9 +230,32 @@ async fn drive(
         if calls.is_empty() {
             return Ok(());
         }
-        let results = run_calls(registry, context.approvals, &calls, events).await;
+        let mut results = run_calls(registry, context.approvals, &calls, events).await;
+        if nearly_full && !reminded && context.notebook.is_some() {
+            reminded = true;
+            if let Some(last) = results.last_mut() {
+                last.text.push_str(CONTEXT_REMINDER);
+            }
+        }
         history.push(Message::ToolResults(results));
         record(scribe, &history[history.len() - 1]);
+        if let Some(notebook) = context.notebook
+            && notebook.revision() != saved
+        {
+            saved = notebook.revision();
+            if let Some(Err(error)) = scribe.map(|scribe| scribe.notes(&notebook.read())) {
+                eprintln!("notes not saved: {error}");
+            }
+        }
+        if let Some(opening) = context.notebook.and_then(Notebook::take_reset) {
+            reminded = false;
+            let opening = Message::User(opening);
+            if let Some(Err(error)) = scribe.map(|scribe| scribe.restart(&opening)) {
+                eprintln!("history not saved: {error}");
+            }
+            history.clear();
+            history.push(opening);
+        }
     }
 }
 
@@ -435,6 +484,8 @@ mod tests {
                 system: "",
                 effort: None,
                 refresh: None,
+                notebook: None,
+                window: None,
             },
             &mut history,
             "read it".into(),
@@ -497,6 +548,8 @@ mod tests {
                 system: "",
                 effort: None,
                 refresh: None,
+                notebook: None,
+                window: None,
             },
             &mut history,
             "go".into(),
@@ -535,6 +588,8 @@ mod tests {
                 system: "",
                 effort: None,
                 refresh: None,
+                notebook: None,
+                window: None,
             },
             &mut history,
             "go".into(),
@@ -562,6 +617,8 @@ mod tests {
                 system: "",
                 effort: None,
                 refresh: None,
+                notebook: None,
+                window: None,
             },
             &mut history,
             "edit".into(),
@@ -598,6 +655,8 @@ mod tests {
                 system: "",
                 effort: None,
                 refresh: None,
+                notebook: None,
+                window: None,
             },
             &mut history,
             "edit".into(),
@@ -638,6 +697,8 @@ mod tests {
                 system: "",
                 effort: None,
                 refresh: None,
+                notebook: None,
+                window: None,
             },
             history,
             prompt.into(),

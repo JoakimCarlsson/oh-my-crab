@@ -63,6 +63,7 @@ pub fn tools() -> Result<Vec<ToolInfo>, String> {
         effort: None,
         discovered: Arc::new(Discovered::default()),
         environment: Arc::new(Environment::detect(&locations, "")),
+        notebook: shared.notebook.clone(),
     });
     let mut listed: Vec<ToolInfo> = Vec::new();
     for plan in [false, true] {
@@ -94,10 +95,12 @@ mod tests {
             [
                 "ask",
                 "bash",
+                "context_notes",
                 "edit",
                 "exit_plan_mode",
                 "glob",
                 "grep",
+                "new_context",
                 "read",
                 "skill",
                 "task",

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use omc_agent::{Approvals, EventSink, Live, Task, TaskSettings};
 use omc_context::{Discovered, Environment, PromptInput, build_prompt, build_subagent_prompt};
 use omc_providers::{ChatModel, Effort};
-use omc_tools::{Ask, ExitPlanMode, Host, Registry, Todo};
+use omc_tools::{Ask, ContextNotes, ExitPlanMode, Host, NewContext, Notebook, Registry, Todo};
 
 /// What the tools and prompts of a turn are built from.
 pub(crate) struct Inputs<'a> {
@@ -27,6 +27,8 @@ pub(crate) struct Inputs<'a> {
     pub(crate) discovered: Arc<Discovered>,
     /// The workstation.
     pub(crate) environment: Arc<Environment>,
+    /// The notes the agent keeps.
+    pub(crate) notebook: Arc<Notebook>,
 }
 
 /// The tools and system prompt of a turn in each mode.
@@ -67,6 +69,8 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Live {
     let mut registry = base;
     registry.register(Todo::new(inputs.host.clone()));
     registry.register(Ask::new(inputs.host.clone()));
+    registry.register(ContextNotes::new(inputs.notebook.clone()));
+    registry.register(NewContext::new(inputs.notebook.clone()));
     if plan {
         let todo = !inputs.denied.iter().any(|name| name == "todo");
         registry.register(ExitPlanMode::new(inputs.host.clone(), todo));
@@ -152,6 +156,7 @@ mod tests {
             effort: None,
             discovered: Arc::new(Discovered::default()),
             environment: Arc::new(Environment::detect(&locations, "m")),
+            notebook: shared.notebook.clone(),
         })
     }
 
@@ -163,9 +168,11 @@ mod tests {
             tools.live(true).registry.names(),
             vec![
                 "ask",
+                "context_notes",
                 "exit_plan_mode",
                 "glob",
                 "grep",
+                "new_context",
                 "read",
                 "task",
                 "todo"
@@ -174,7 +181,17 @@ mod tests {
         assert_eq!(
             tools.live(false).registry.names(),
             vec![
-                "ask", "bash", "edit", "glob", "grep", "read", "task", "todo", "write"
+                "ask",
+                "bash",
+                "context_notes",
+                "edit",
+                "glob",
+                "grep",
+                "new_context",
+                "read",
+                "task",
+                "todo",
+                "write"
             ]
         );
         assert!(tools.live(true).system.contains("Plan mode active"));

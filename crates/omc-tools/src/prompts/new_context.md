@@ -1,0 +1,1 @@
+Request a new context window once the current batch of tool calls has finished. Takes no arguments. The conversation so far is then dropped and the next request holds only your notebook, and the task goes on from there. Save what you need with `context_notes` first; with an empty notebook the call fails and nothing changes.
