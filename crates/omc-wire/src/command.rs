@@ -39,6 +39,7 @@ pub struct Opening {
 }
 
 /// One request from the client, answered by [`crate::Event`]s.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Command {
     /// Opens the conversation, which must come before anything else.

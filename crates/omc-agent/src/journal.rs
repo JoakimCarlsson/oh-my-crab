@@ -1,7 +1,7 @@
 //! The history of one conversation, kept in an append-only file of JSON lines.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
@@ -127,11 +127,8 @@ impl Journal {
                 std::fs::TryLockError::Error(error) => error,
             })
         })?;
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => return Err(io_error(error)),
-        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(io_error)?;
         let complete = bytes
             .iter()
             .rposition(|&byte| byte == b'\n')
@@ -141,6 +138,7 @@ impl Journal {
         if complete < bytes.len() {
             file.set_len(complete as u64).map_err(io_error)?;
         }
+        file.seek(SeekFrom::End(0)).map_err(io_error)?;
         if let Some(turns) = keep {
             history.truncate(end_of_turns(&history, turns));
         }
@@ -260,14 +258,16 @@ fn create_folder(folder: &Path) -> io::Result<()> {
     builder.create(folder)
 }
 
-/// Opens `path` for appending, creating it readable by the owner only on systems that have file modes.
+/// Opens `path` for reading and writing, creating it readable by the owner only on systems that have file modes.
+///
+/// The file is not opened in append mode, because shortening it needs the right to write anywhere in it on Windows; the journal seeks to the end itself, and holds the only lock on the file.
 ///
 /// # Errors
 ///
 /// Returns the error of the open.
 fn open_private(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
-    options.create(true).append(true);
+    options.create(true).read(true).write(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     options.open(path)
