@@ -1,7 +1,7 @@
 //! The `crab` binary: the harness, served to another program over standard input and output.
 
 /// Usage text printed for `--help` and after a bad argument.
-const USAGE: &str = "usage: crab <serve|tools>\n\n  serve  hold a conversation: read commands from standard input, write events to standard output\n  tools  print the tools the agent can have, as a JSON list of name and description";
+const USAGE: &str = "usage: crab <serve|tools|history|rename|import>\n\n  serve                    hold a conversation: read commands from standard input, write events to standard output\n  tools                    print the tools the agent can have, as a JSON list of name and description\n  history <id> [folder]    print the saved conversation <id> as JSON: its title, saved settings and turns, which works while it is open elsewhere\n  rename <id> <folder> <title>  name the saved conversation <id>, which fails while it is open elsewhere\n  import <id> <folder>          save the conversation a client kept, read as JSON from standard input, as the conversation <id>";
 
 /// Runs the conversation the command line asks for.
 ///
@@ -19,6 +19,40 @@ async fn main() -> anyhow::Result<()> {
             let tools = omc_session::tools().map_err(|reason| anyhow::anyhow!(reason))?;
             println!("{}", serde_json::to_string(&tools)?);
             Ok(())
+        }
+        Some("history") => {
+            let mut arguments = std::env::args().skip(2);
+            let id = arguments
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("history needs a conversation id"))?;
+            let folder = arguments.next().map(std::path::PathBuf::from);
+            let saved =
+                omc_session::history(&id, folder).map_err(|reason| anyhow::anyhow!(reason))?;
+            println!("{}", serde_json::to_string(&saved)?);
+            Ok(())
+        }
+        Some("rename") => {
+            let mut arguments = std::env::args().skip(2);
+            let (Some(id), Some(folder), Some(title)) =
+                (arguments.next(), arguments.next(), arguments.next())
+            else {
+                return Err(anyhow::anyhow!(
+                    "rename needs a conversation id, a folder and a title"
+                ));
+            };
+            omc_session::rename(&id, Some(std::path::PathBuf::from(folder)), &title)
+                .map_err(|reason| anyhow::anyhow!(reason))
+        }
+        Some("import") => {
+            let mut arguments = std::env::args().skip(2);
+            let (Some(id), Some(folder)) = (arguments.next(), arguments.next()) else {
+                return Err(anyhow::anyhow!(
+                    "import needs a conversation id and a folder"
+                ));
+            };
+            let imported: omc_wire::Imported = serde_json::from_reader(std::io::stdin().lock())?;
+            omc_session::import(&id, Some(std::path::PathBuf::from(folder)), &imported)
+                .map_err(|reason| anyhow::anyhow!(reason))
         }
         Some("-h" | "--help") => {
             println!("{USAGE}");

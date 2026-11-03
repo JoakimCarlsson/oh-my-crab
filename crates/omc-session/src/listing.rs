@@ -66,6 +66,7 @@ pub fn tools() -> Result<Vec<ToolInfo>, String> {
         notebook: shared.notebook.clone(),
         checkpoint: None,
         jobs: shared.jobs.clone(),
+        unnamed: true,
     });
     let mut listed: Vec<ToolInfo> = Vec::new();
     for plan in [false, true] {
@@ -104,6 +105,7 @@ mod tests {
                 "grep",
                 "new_context",
                 "read",
+                "set_title",
                 "skill",
                 "task",
                 "todo",

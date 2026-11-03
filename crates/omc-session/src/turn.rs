@@ -92,6 +92,7 @@ impl Turn {
             notebook: self.shared.notebook.clone(),
             checkpoint: checkpoint.clone(),
             jobs: self.shared.jobs.clone(),
+            unnamed: self.shared.title().is_none(),
         });
         let shared = self.shared.clone();
         let refresh = move || toolset.live(shared.mode() == Mode::Plan);

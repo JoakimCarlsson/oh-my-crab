@@ -7,7 +7,7 @@ use omc_context::{Discovered, Environment, PromptInput, build_prompt, build_suba
 use omc_providers::{ChatModel, Effort};
 use omc_tools::{
     Ask, Checkpoint, CheckpointTool, ContextNotes, ExitPlanMode, Host, Jobs, NewContext, Notebook,
-    Registry, Rewind, Todo, Wait,
+    Registry, Rewind, SetTitle, Todo, Wait,
 };
 
 /// What the tools and prompts of a turn are built from.
@@ -34,6 +34,8 @@ pub(crate) struct Inputs<'a> {
     pub(crate) notebook: Arc<Notebook>,
     /// The checkpoint the agent marks, when it has the checkpoint and rewind tools.
     pub(crate) checkpoint: Option<Arc<Checkpoint>>,
+    /// Whether the conversation has no name yet, so that the agent is given the tool to name it.
+    pub(crate) unnamed: bool,
     /// The background runs of the conversation.
     pub(crate) jobs: Arc<Jobs>,
 }
@@ -79,6 +81,9 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Live {
     registry.register(ContextNotes::new(inputs.notebook.clone()));
     registry.register(NewContext::new(inputs.notebook.clone()));
     registry.register(Wait::new(inputs.jobs.clone()));
+    if inputs.unnamed {
+        registry.register(SetTitle::new(inputs.host.clone()));
+    }
     if let Some(checkpoint) = &inputs.checkpoint {
         registry.register(CheckpointTool::new(checkpoint.clone()));
         registry.register(Rewind::new(checkpoint.clone()));
@@ -103,6 +108,7 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Live {
                     discovered: &discovered,
                     tools,
                     plan: false,
+                    unnamed: false,
                 },
                 &agent.prompt,
             )
@@ -117,6 +123,7 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Live {
         discovered: &inputs.discovered,
         tools: &registry.names(),
         plan,
+        unnamed: inputs.unnamed,
     });
     Live {
         registry: Arc::new(registry),
@@ -177,6 +184,7 @@ mod tests {
             notebook: shared.notebook.clone(),
             checkpoint,
             jobs: shared.jobs.clone(),
+            unnamed: true,
         })
     }
 
@@ -210,6 +218,7 @@ mod tests {
                 "grep",
                 "new_context",
                 "read",
+                "set_title",
                 "task",
                 "todo",
                 "wait"
@@ -226,6 +235,7 @@ mod tests {
                 "grep",
                 "new_context",
                 "read",
+                "set_title",
                 "task",
                 "todo",
                 "wait",

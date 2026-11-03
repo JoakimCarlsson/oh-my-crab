@@ -84,11 +84,35 @@ impl Session {
     async fn handle(&mut self, command: Command) {
         match command {
             Command::Open(opening) => self.open(opening).await,
-            Command::Prompt { text, files } => self.prompt(compose(&text, &files)),
+            Command::Prompt {
+                text,
+                files,
+                turn,
+                context,
+            } => {
+                let names = files
+                    .iter()
+                    .filter_map(|file| file.file_name())
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .collect();
+                let mark = turn.map(|id| omc_agent::Mark {
+                    id,
+                    text: text.clone(),
+                    files: names,
+                });
+                let told = format!("{}{}", context.unwrap_or_default(), compose(&text, &files));
+                self.prompt(told, mark);
+            }
             Command::Choose { ticket, option } => {
                 self.shared.questions.answer(ticket, option.as_deref());
             }
             Command::Answer { ticket, replies } => self.shared.questions.reply(ticket, replies),
+            Command::Rename { title } => {
+                let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+                if !title.is_empty() {
+                    self.shared.name(&title, false);
+                }
+            }
             Command::Cancel => self.cancel(),
             Command::Set { setting, value } => self.set(&setting, &value),
             Command::Login { provider } => self.login(&provider),
@@ -115,6 +139,8 @@ impl Session {
             conversation,
             history,
             keep,
+            before,
+            defaults,
         } = opening;
         let provider = provider.as_str();
         if let Some(home) = home {
@@ -126,7 +152,7 @@ impl Session {
         self.journal = None;
         self.shared.jobs.stop_all();
         let saved = match conversation {
-            Some(id) => match load_history(&id, history, keep) {
+            Some(id) => match load_history(&id, history, keep, before.as_deref()) {
                 Ok(saved) => Some(saved),
                 Err(reason) => return self.say(Event::Failed(reason)),
             },
@@ -162,6 +188,7 @@ impl Session {
         let models = omc_providers::list_models(provider, &credentials)
             .await
             .unwrap_or_default();
+        let has_model = model.is_some();
         let model = match model.or_else(|| models.first().cloned()) {
             Some(model) => model,
             None => match omc_providers::default_model(provider, &credentials).await {
@@ -170,6 +197,7 @@ impl Session {
             },
         };
         let commands = commands_of(&discovered);
+        let commands_value = serde_json::to_value(&commands).unwrap_or_default();
         let (journal, messages) = saved.unzip();
         self.shared
             .notebook
@@ -177,6 +205,7 @@ impl Session {
         self.shared.checkpoint.clear();
         self.history = messages.unwrap_or_default();
         self.journal = journal;
+        self.shared.attach(self.journal.clone());
         self.open = Some(Open {
             provider,
             base: Arc::new(registry),
@@ -187,17 +216,92 @@ impl Session {
         });
         let mode = if yolo { Mode::Yolo } else { Mode::Asking };
         self.shared.open(provider, models, model, mode);
+        let chosen = self
+            .journal
+            .as_ref()
+            .map(|journal| journal.settings())
+            .unwrap_or_default();
+        let wanted = restored_settings(&defaults, &chosen);
+        for (id, value) in &wanted {
+            if id != MODEL || !has_model {
+                self.apply(id, value);
+            }
+        }
         self.shared.announce();
+        self.shared.save_fact("commands", &commands_value);
         self.say(Event::Commands(commands));
+        if self.journal.is_some() {
+            if let Some(title) = self.shared.title() {
+                self.say(Event::Titled(title));
+            }
+            self.say_history();
+        }
     }
 
-    /// Starts a turn with `prompt`, unless one is running or nothing is open.
-    fn prompt(&mut self, prompt: String) {
+    /// The value saved under `key`, or what `T` is by default when nothing readable is saved there.
+    fn fact<T: serde::de::DeserializeOwned + Default>(&self, key: &str) -> T {
+        self.journal
+            .as_ref()
+            .and_then(|journal| journal.fact(key))
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default()
+    }
+
+    /// Tells the client the conversation as it was saved, as the turns it holds.
+    fn say_history(&self) {
+        let (Some(open), Some((provider, model))) = (&self.open, self.shared.model()) else {
+            return;
+        };
+        let window = omc_providers::context_window(provider, &model);
+        let marks = self
+            .journal
+            .as_ref()
+            .map(|journal| journal.marks())
+            .unwrap_or_default();
+        let lost = self
+            .journal
+            .as_ref()
+            .map(|journal| journal.lost())
+            .unwrap_or_default();
+        self.say(Event::Resumed(omc_wire::Conversation {
+            title: self.shared.title(),
+            settings: self
+                .journal
+                .as_ref()
+                .map(|journal| journal.settings())
+                .unwrap_or_default(),
+            turns: crate::translate::replay(
+                &self.history,
+                &marks,
+                &lost,
+                &self
+                    .journal
+                    .as_ref()
+                    .map(|journal| journal.changes())
+                    .unwrap_or_default(),
+                &open.base,
+                Some(window),
+            ),
+            offered: self.fact("settings"),
+            commands: self.fact("commands"),
+            window: Some(window),
+        }));
+    }
+
+    /// Starts a turn with `prompt`, which the client described as `mark` when it did, unless one is running or nothing is open.
+    fn prompt(&mut self, prompt: String, mark: Option<omc_agent::Mark>) {
         let (true, Some((_, model))) = (self.open.is_some(), self.shared.model()) else {
             return self.say(Event::Failed("the conversation is not open".to_owned()));
         };
         if self.running.is_some() {
             return;
+        }
+        if let (Some(journal), Some(mark)) = (&self.journal, &mark)
+            && let Err(error) = journal.mark(self.history.len(), mark)
+        {
+            return self.say(Event::Failed(format!(
+                "cannot save the conversation: {error}"
+            )));
         }
         self.rescan();
         let Some(open) = &self.open else {
@@ -299,7 +403,11 @@ impl Session {
     fn forget_turn(&mut self) {
         self.shared.checkpoint.clear();
         self.keep_fresh_window();
-        if let Some(Err(error)) = self.journal.as_ref().map(|j| j.cut(self.history.len())) {
+        if let Some(Err(error)) = self
+            .journal
+            .as_ref()
+            .map(|j| j.cut_losing(self.history.len(), omc_agent::STOPPED))
+        {
             eprintln!("history not saved: {error}");
         }
         if let Some(Err(error)) = self
@@ -321,9 +429,17 @@ impl Session {
         }
     }
 
-    /// Gives the setting `setting` the value `value`; the new value applies from the next request.
+    /// Gives the setting `setting` the value `value` and saves the choice with the conversation; the new value applies from the next request.
     fn set(&mut self, setting: &str, value: &str) {
-        let applied = match setting {
+        if self.apply(setting, value) {
+            self.shared.save_setting(setting, value);
+            self.shared.announce();
+        }
+    }
+
+    /// Gives the setting `setting` the value `value` without saving it; whether the setting took it.
+    fn apply(&mut self, setting: &str, value: &str) -> bool {
+        match setting {
             MODEL if self.open.is_some() => {
                 self.shared.set_model(value);
                 true
@@ -341,9 +457,6 @@ impl Session {
                 _ => false,
             },
             _ => false,
-        };
-        if applied {
-            self.shared.announce();
         }
     }
 
@@ -376,16 +489,12 @@ const RESERVED_NAMES: [&str; 22] = [
     "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
-/// Opens the saved history of the conversation `id` in `folder`, or in a folder under the harness's own data folder, keeping `keep` turns when that is given.
+/// The file the saved history of the conversation `id` is kept in, inside `folder` or a folder under the harness's own data folder.
 ///
 /// # Errors
 ///
-/// Returns what to tell the client when `id` is not usable as a file name, there is no data folder, or the file cannot be read.
-fn load_history(
-    id: &str,
-    folder: Option<PathBuf>,
-    keep: Option<usize>,
-) -> Result<(Arc<Journal>, Vec<Message>), String> {
+/// Returns what to tell the client when `id` is not usable as a file name or there is no data folder.
+fn history_file(id: &str, folder: Option<PathBuf>) -> Result<PathBuf, String> {
     let usable = !id.is_empty()
         && !id.starts_with('.')
         && id
@@ -405,13 +514,153 @@ fn load_history(
             .join("oh-my-crab")
             .join("conversations"),
     };
-    Journal::open(&history_path(&folder, id), keep)
+    Ok(history_path(&folder, id))
+}
+
+/// Opens the saved history of the conversation `id` in `folder`, or in a folder under the harness's own data folder, keeping `keep` turns when that is given and cutting it back to before the turn `before` when that is.
+///
+/// # Errors
+///
+/// Returns what to tell the client when `id` is not usable as a file name, there is no data folder, or the file cannot be read.
+fn load_history(
+    id: &str,
+    folder: Option<PathBuf>,
+    keep: Option<usize>,
+    before: Option<&str>,
+) -> Result<(Arc<Journal>, Vec<Message>), String> {
+    Journal::open_before(&history_file(id, folder)?, keep, before)
         .map_err(|error| format!("cannot open the conversation: {error}"))
+}
+
+/// The saved conversation `id` in `folder`: its name, the choices made about it and its turns, as the events a live conversation would have sent for them, read without opening the conversation, so that it works while the conversation is open elsewhere; an empty conversation when nothing was saved. The context size is left out, since it depends on a model.
+///
+/// # Errors
+///
+/// Returns what to tell the client when `id` is not usable, the file cannot be read, or the built-in tools cannot be made.
+pub fn history(id: &str, folder: Option<PathBuf>) -> Result<omc_wire::Conversation, String> {
+    let path = history_file(id, folder)?;
+    if !path.exists() {
+        return Ok(omc_wire::Conversation::default());
+    }
+    let saved = Journal::read(&path).map_err(|error| error.to_string())?;
+    let directory = std::env::current_dir().map_err(|error| error.to_string())?;
+    let registry = Registry::builtin(&directory).map_err(|error| error.to_string())?;
+    let (offered, commands, window) = (
+        saved.fact("settings"),
+        saved.fact("commands"),
+        saved.window(),
+    );
+    Ok(omc_wire::Conversation {
+        title: saved.title,
+        settings: saved.settings,
+        turns: crate::translate::replay(
+            &saved.history,
+            &saved.marks,
+            &saved.lost,
+            &saved.changes,
+            &registry,
+            window,
+        ),
+        offered,
+        commands,
+        window,
+    })
+}
+
+/// Names the saved conversation `id` in `folder` `title`, which works on a conversation nobody has open.
+///
+/// # Errors
+///
+/// Returns what to tell the client when `id` is not usable, the conversation is open elsewhere, or the name cannot be written.
+pub fn rename(id: &str, folder: Option<PathBuf>, title: &str) -> Result<(), String> {
+    let path = history_file(id, folder)?;
+    Journal::rename(&path, title).map_err(|error| error.to_string())
+}
+
+/// Saves a conversation a client kept itself as the saved conversation `id` in `folder`: its turns as the reader's prompts and the agent's replies, without the tools the agent used, its name, its settings and what was offered.
+///
+/// # Errors
+///
+/// Returns what to tell the client when `id` is not usable, the conversation already holds a history or is open elsewhere, or it cannot be written.
+pub fn import(
+    id: &str,
+    folder: Option<PathBuf>,
+    imported: &omc_wire::Imported,
+) -> Result<(), String> {
+    let path = history_file(id, folder)?;
+    let (journal, existing) = Journal::open(&path, None)
+        .map_err(|error| format!("cannot open the conversation: {error}"))?;
+    if !existing.is_empty() || !journal.marks().is_empty() {
+        return Err("the conversation already has a history".to_owned());
+    }
+    let failed = |error: std::io::Error| format!("cannot save the conversation: {error}");
+    let mut length = 0;
+    for turn in &imported.turns {
+        let scribe = journal.scribe();
+        let mark = omc_agent::Mark {
+            id: turn.id.clone(),
+            text: turn.prompt.clone(),
+            files: turn.files.clone(),
+        };
+        journal.mark(length, &mark).map_err(failed)?;
+        scribe
+            .append(&Message::User(turn.prompt.clone()))
+            .map_err(failed)?;
+        match &turn.end {
+            None => {
+                scribe
+                    .append(&Message::Assistant(omc_providers::Reply {
+                        text: turn.said.clone(),
+                        ..omc_providers::Reply::default()
+                    }))
+                    .map_err(failed)?;
+                length += 2;
+            }
+            Some(reason) => scribe.cut_losing(length, reason).map_err(failed)?,
+        }
+    }
+    for (setting, value) in &imported.settings {
+        journal.save_setting(setting, value).map_err(failed)?;
+    }
+    let facts = [
+        ("settings", serde_json::to_value(&imported.offered)),
+        ("commands", serde_json::to_value(&imported.commands)),
+        ("window", serde_json::to_value(imported.window)),
+    ];
+    for (key, value) in facts {
+        let value = value.map_err(std::io::Error::other).map_err(failed)?;
+        if !value.is_null() && value != serde_json::json!([]) {
+            journal.save_fact(key, &value).map_err(failed)?;
+        }
+    }
+    if let Some(title) = imported.title.as_deref().filter(|title| !title.is_empty()) {
+        journal.save_title(title).map_err(failed)?;
+    }
+    Ok(())
 }
 
 /// The file the history of conversation `id` is kept in, inside `folder`.
 fn history_path(folder: &Path, id: &str) -> PathBuf {
     folder.join(format!("{id}.jsonl"))
+}
+
+/// The settings to apply when a conversation opens: the `defaults` for those the saved conversation has no choice for, then what was `chosen`, with the model before the effort that depends on it.
+fn restored_settings(
+    defaults: &[(String, String)],
+    chosen: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut wanted: Vec<(String, String)> = defaults
+        .iter()
+        .filter(|(id, _)| !chosen.iter().any(|(saved, _)| saved == id))
+        .cloned()
+        .collect();
+    wanted.extend(chosen.iter().cloned());
+    wanted.sort_by_key(|(id, _)| match id.as_str() {
+        MODEL => 0,
+        EFFORT => 2,
+        _ => 1,
+    });
+    wanted
 }
 
 /// The name the skill tool is registered under.
@@ -560,9 +809,9 @@ mod tests {
             .join("../../build/tests/omc-session/history");
         let _ = std::fs::remove_dir_all(&folder);
         for id in ["", "../x", "a/b", ".hidden", "nul", "Com1.txt"] {
-            assert!(load_history(id, Some(folder.clone()), None).is_err());
+            assert!(load_history(id, Some(folder.clone()), None, None).is_err());
         }
-        let (journal, history) = load_history("c-1", Some(folder.clone()), None).unwrap();
+        let (journal, history) = load_history("c-1", Some(folder.clone()), None, None).unwrap();
         assert!(history.is_empty());
         let scribe = journal.scribe();
         scribe.append(&Message::User("hi".into())).unwrap();
@@ -571,10 +820,92 @@ mod tests {
             .unwrap();
         drop(scribe);
         drop(journal);
-        let (_, history) = load_history("c-1", Some(folder.clone()), None).unwrap();
+        let (_, history) = load_history("c-1", Some(folder.clone()), None, None).unwrap();
         assert_eq!(history.len(), 2);
         std::fs::write(history_path(&folder, "bad"), "nonsense\n").unwrap();
-        assert!(load_history("bad", Some(folder.clone()), None).is_err());
+        assert!(load_history("bad", Some(folder.clone()), None, None).is_err());
         std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    /// Defaults fill only the settings nothing was chosen for, and the model comes before the effort that depends on it.
+    #[test]
+    fn restored_settings_prefer_what_was_chosen() {
+        let pair = |id: &str, value: &str| (id.to_owned(), value.to_owned());
+        let wanted = restored_settings(
+            &[pair("checkpoints", "on"), pair("mode", "yolo")],
+            &[
+                pair("effort", "high"),
+                pair("mode", "plan"),
+                pair("model", "m"),
+            ],
+        );
+        assert_eq!(
+            wanted,
+            vec![
+                pair("model", "m"),
+                pair("checkpoints", "on"),
+                pair("mode", "plan"),
+                pair("effort", "high"),
+            ]
+        );
+    }
+
+    /// A conversation a client kept comes back as saved: answered turns as prompts and replies, a stopped turn as lost, and the name, settings and offer with it; importing over a history is refused.
+    #[test]
+    fn an_imported_conversation_reads_back() {
+        let folder = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/import");
+        let _ = std::fs::remove_dir_all(&folder);
+        let turn = |id: &str, said: &str, end: Option<&str>| omc_wire::ImportedTurn {
+            id: id.into(),
+            prompt: format!("prompt {id}"),
+            files: vec!["a.txt".into()],
+            said: said.into(),
+            end: end.map(str::to_owned),
+        };
+        let imported = omc_wire::Imported {
+            title: Some("Old chat".into()),
+            settings: vec![("effort".into(), "high".into())],
+            offered: vec![omc_wire::Setting {
+                id: "effort".into(),
+                category: "thought_level".into(),
+                name: "Effort".into(),
+                current: "high".into(),
+                picks: Vec::new(),
+            }],
+            commands: Vec::new(),
+            window: Some(1000),
+            turns: vec![
+                turn("5", "first answer", None),
+                turn("9", "", Some("stopped")),
+                turn("12", "second answer", None),
+            ],
+        };
+        import("old", Some(folder.clone()), &imported).unwrap();
+        let conversation = history("old", Some(folder.clone())).unwrap();
+        assert_eq!(conversation.title.as_deref(), Some("Old chat"));
+        assert_eq!(conversation.settings, imported.settings);
+        assert_eq!(conversation.window, Some(1000));
+        assert_eq!(conversation.offered.len(), 1);
+        let prompts: Vec<(&str, &str)> = conversation
+            .turns
+            .iter()
+            .map(|turn| (turn.id.as_deref().unwrap_or(""), turn.prompt.as_str()))
+            .collect();
+        assert_eq!(
+            prompts,
+            vec![("5", "prompt 5"), ("9", "prompt 9"), ("12", "prompt 12")]
+        );
+        assert!(
+            conversation.turns[1]
+                .events
+                .contains(&omc_wire::Event::Halted)
+        );
+        assert!(
+            conversation.turns[2]
+                .events
+                .contains(&omc_wire::Event::Said("second answer".into()))
+        );
+        assert!(import("old", Some(folder), &imported).is_err());
     }
 }

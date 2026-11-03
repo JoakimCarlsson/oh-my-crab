@@ -47,8 +47,19 @@ pub(crate) struct Shared {
     pub(crate) checkpoint: Arc<Checkpoint>,
     /// The commands and subagents running in the background.
     pub(crate) jobs: Arc<Jobs>,
+    /// The conversation's name and the history it is saved in.
+    naming: Mutex<Naming>,
     /// What can be set, and how it stands.
     state: Mutex<State>,
+}
+
+/// The conversation's name, and the history file it and the settings are saved in.
+#[derive(Default)]
+struct Naming {
+    /// The name, when it has one.
+    title: Option<String>,
+    /// The history the name and the settings are saved in, when the conversation is saved.
+    journal: Option<Arc<omc_agent::Journal>>,
 }
 
 impl Shared {
@@ -65,6 +76,7 @@ impl Shared {
             jobs: Arc::new(Jobs::new(move |run| {
                 let _ = announce.send(Event::Background(run));
             })),
+            naming: Mutex::new(Naming::default()),
             state: Mutex::new(State {
                 opened: false,
                 provider: None,
@@ -85,6 +97,69 @@ impl Shared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         with(&mut state)
+    }
+
+    /// Takes the history the conversation is saved in, and the name it was saved with.
+    pub(crate) fn attach(&self, journal: Option<Arc<omc_agent::Journal>>) {
+        let mut naming = self.naming.lock().unwrap_or_else(|held| held.into_inner());
+        naming.title = journal.as_ref().and_then(|journal| journal.title());
+        naming.journal = journal;
+    }
+
+    /// The conversation's name, when it has one.
+    pub(crate) fn title(&self) -> Option<String> {
+        self.naming
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .title
+            .clone()
+    }
+
+    /// Names the conversation `title`, saves the name and tells the client; `only_if_unnamed` leaves a name that is there alone. Whether the name was taken.
+    pub(crate) fn name(&self, title: &str, only_if_unnamed: bool) -> bool {
+        let mut naming = self.naming.lock().unwrap_or_else(|held| held.into_inner());
+        if only_if_unnamed && naming.title.is_some() {
+            return false;
+        }
+        if let Some(journal) = &naming.journal
+            && let Err(error) = journal.save_title(title)
+        {
+            drop(naming);
+            self.say(Event::Failed(format!("cannot save the name: {error}")));
+            return false;
+        }
+        naming.title = Some(title.to_owned());
+        drop(naming);
+        self.say(Event::Titled(title.to_owned()));
+        true
+    }
+
+    /// Saves `value` under `key` with the conversation, when it is saved; the harness's own record of what it last found out, such as what can be set.
+    pub(crate) fn save_fact(&self, key: &str, value: &serde_json::Value) {
+        let journal = self
+            .naming
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .journal
+            .clone();
+        if let Some(Err(error)) = journal.map(|journal| journal.save_fact(key, value)) {
+            self.say(Event::Failed(format!(
+                "cannot save the conversation: {error}"
+            )));
+        }
+    }
+
+    /// Saves that the setting `id` was given the value `value`, when the conversation is saved.
+    pub(crate) fn save_setting(&self, id: &str, value: &str) {
+        let journal = self
+            .naming
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .journal
+            .clone();
+        if let Some(Err(error)) = journal.map(|journal| journal.save_setting(id, value)) {
+            self.say(Event::Failed(format!("cannot save the setting: {error}")));
+        }
     }
 
     /// Sends `event` to the client.
@@ -120,6 +195,16 @@ impl Shared {
             }))
         });
         if let Some(settings) = settings {
+            self.save_fact(
+                "settings",
+                &serde_json::to_value(&settings).unwrap_or_default(),
+            );
+            if let Some((provider, model)) = self.model() {
+                self.save_fact(
+                    "window",
+                    &serde_json::json!(omc_providers::context_window(provider, &model)),
+                );
+            }
             self.say(Event::Settings(settings));
         }
     }
@@ -218,6 +303,11 @@ impl Host for SessionHost {
     /// Sends the plan to the client.
     fn plan(&self, steps: Vec<PlanStep>) {
         self.shared.say(Event::Plan(steps));
+    }
+
+    /// Names the conversation when it has no name.
+    fn name(&self, title: &str) -> bool {
+        self.shared.name(title, true)
     }
 
     /// Puts the form to the client and waits for its replies.
@@ -333,5 +423,38 @@ mod tests {
             settings.iter().find(|s| s.id == "mode").unwrap().current,
             "yolo"
         );
+    }
+
+    /// The agent names an unnamed conversation once and the reader's name replaces it; both are saved and told to the client.
+    #[test]
+    fn naming_is_first_come_for_the_agent_and_always_for_the_reader() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/naming.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let (out, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared::new(out);
+        let (journal, _) = omc_agent::Journal::open(&path, None).unwrap();
+        shared.attach(Some(journal.clone()));
+        assert!(shared.name("Agent name", true));
+        assert!(!shared.name("Another", true));
+        assert_eq!(shared.title().as_deref(), Some("Agent name"));
+        assert!(shared.name("Reader name", false));
+        assert_eq!(journal.title().as_deref(), Some("Reader name"));
+        shared.save_setting("model", "m");
+        assert_eq!(
+            journal.settings(),
+            vec![("model".to_owned(), "m".to_owned())]
+        );
+        let told: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert_eq!(
+            told,
+            vec![
+                Event::Titled("Agent name".to_owned()),
+                Event::Titled("Reader name".to_owned())
+            ]
+        );
+        drop(journal);
+        shared.attach(None);
+        assert_eq!(shared.title(), None);
     }
 }

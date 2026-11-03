@@ -19,3 +19,4 @@ mod turn;
 pub use listing::tools;
 pub use serve::serve;
 pub use session::run;
+pub use session::{history, import, rename};
