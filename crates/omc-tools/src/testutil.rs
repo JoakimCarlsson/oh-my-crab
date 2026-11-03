@@ -24,6 +24,8 @@ pub struct RecordingHost {
     pub replies: std::sync::Mutex<Option<Vec<omc_wire::Reply>>>,
     /// The plans put for approval, in order.
     pub plans_proposed: std::sync::Mutex<Vec<String>>,
+    /// The name the agent gave the conversation.
+    pub named: std::sync::Mutex<Option<String>>,
     /// Whether the reader approves plans.
     pub approve: std::sync::Mutex<bool>,
 }
@@ -39,6 +41,16 @@ impl crate::Host for RecordingHost {
     async fn inquire(&self, questions: Vec<omc_wire::Question>) -> Option<Vec<omc_wire::Reply>> {
         self.asked.lock().unwrap().push(questions);
         self.replies.lock().unwrap().clone()
+    }
+
+    /// Records the name when none was recorded yet.
+    fn name(&self, title: &str) -> bool {
+        let mut named = self.named.lock().unwrap();
+        if named.is_some() {
+            return false;
+        }
+        *named = Some(title.to_owned());
+        true
     }
 
     /// Records `plan` and answers with the scripted verdict.

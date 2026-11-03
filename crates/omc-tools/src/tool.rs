@@ -8,7 +8,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::ToolError;
 
 /// How one file changed in a tool call.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileChange {
     /// The file, as shown to the user.
     pub path: String,

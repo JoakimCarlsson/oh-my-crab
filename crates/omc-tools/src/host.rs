@@ -12,6 +12,9 @@ pub trait Host: Send + Sync {
     /// Puts `questions` to the reader and waits; nothing when the reader abandons the form or is gone.
     async fn inquire(&self, questions: Vec<Question>) -> Option<Vec<Reply>>;
 
+    /// Names the conversation `title` when it has no name yet; whether it was named, which it is not when a name was already there, since a name the reader gave or the agent gave first stays.
+    fn name(&self, title: &str) -> bool;
+
     /// Puts `plan` to the reader for approval and waits; whether they approved, with plan mode ended when they did.
     async fn approve_plan(&self, plan: &str) -> bool;
 }

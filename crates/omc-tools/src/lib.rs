@@ -23,5 +23,5 @@ pub use sandbox::Sandbox;
 pub use tool::{FileChange, Tool, ToolOutput, marked_lines, parse_args, sanitize};
 pub use tools::{
     Ask, Bash, CheckpointTool, ContextNotes, Edit, ExitPlanMode, Glob, Grep, NewContext, Read,
-    Rewind, Skill, Todo, Wait, Write, snapshot_tag,
+    Rewind, SetTitle, Skill, Todo, Wait, Write, snapshot_tag,
 };
