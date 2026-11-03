@@ -1,0 +1,16 @@
+[package]
+name = "omc-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = "0.1.92"
+futures-util = "0.3.34"
+omc-tools = { version = "0.1.0", path = "../omc-tools" }
+omc-wire = { version = "0.1.0", path = "../omc-wire" }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt", "macros", "sync", "io-util", "process", "time"] }
