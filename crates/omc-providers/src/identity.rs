@@ -191,6 +191,11 @@ pub fn metadata_user_id(account_id: Option<&str>, session_id: &str) -> String {
 /// `0` when short) with the version, and the `cch` is left as the placeholder
 /// that [`attest`] fills in.
 pub fn billing_header(first_user: &str) -> String {
+    billing_header_for(&version(), first_user)
+}
+
+/// The billing header block text for the claimed `version` and a conversation whose first user message is `first_user`.
+fn billing_header_for(version: &str, first_user: &str) -> String {
     let units: Vec<u16> = first_user.encode_utf16().collect();
     let picked: String = [4usize, 7, 20]
         .iter()
@@ -201,7 +206,6 @@ pub fn billing_header(first_user: &str) -> String {
                 .unwrap_or('0')
         })
         .collect();
-    let version = version();
     let seed = format!("{FINGERPRINT_SALT}{picked}{version}");
     let suffix = &sha256_hex(&[&seed])[..3];
     format!("{BILLING_PREFIX} cc_version={version}.{suffix}; cc_entrypoint=cli; {CCH_PLACEHOLDER};")
@@ -449,9 +453,18 @@ mod tests {
         let first = "abcdXefYhijklmnopqrsZuvw";
         let same_picks = "zzzzXzzYzzzzzzzzzzzzZzzz";
         let other_pick = "abcdQefYhijklmnopqrsZuvw";
-        assert_eq!(billing_header(first), billing_header(same_picks));
-        assert_ne!(billing_header(first), billing_header(other_pick));
-        assert_eq!(billing_header(""), billing_header("abc"));
+        assert_eq!(
+            billing_header_for("1.0.0", first),
+            billing_header_for("1.0.0", same_picks)
+        );
+        assert_ne!(
+            billing_header_for("1.0.0", first),
+            billing_header_for("1.0.0", other_pick)
+        );
+        assert_eq!(
+            billing_header_for("1.0.0", ""),
+            billing_header_for("1.0.0", "abc")
+        );
     }
 
     /// Attestation fills five hex digits, hashed over the placeholder body.

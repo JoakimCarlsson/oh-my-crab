@@ -73,12 +73,13 @@ impl Sandbox {
     }
 
     /// Returns `path` relative to the root for display, or unchanged when it is
-    /// not under the root.
+    /// not under the root, with `/` between the parts on every system.
     pub fn display(&self, path: &Path) -> String {
         path.strip_prefix(&self.root)
             .unwrap_or(path)
             .display()
             .to_string()
+            .replace(std::path::MAIN_SEPARATOR, "/")
     }
 }
 
