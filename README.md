@@ -20,9 +20,18 @@ This installs `crab` under `~/.local/bin`. Set `PREFIX` to install elsewhere.
 ## Usage
 
 ```text
-crab serve    hold a conversation over standard input and output
-crab tools    print the tools the agent can have, as a JSON list
+crab serve                      hold a conversation over standard input and output
+crab tools                      print the tools the agent can have, as a JSON list
+crab history <id> [folder]      print a saved conversation: title, settings and turns
+crab rename <id> <folder> <t>   name a saved conversation nobody has open
+crab import <id> <folder>        save a conversation a client kept itself, read as JSON
 ```
+
+A conversation opened with an id is saved by `crab`: its messages, its turns,
+its title, the settings chosen for it and the list of what can be set, the commands it offers, the context window, its notebook, the files each tool call changed, and the turns that were stopped or failed, which the model never sees but a client still shows. It comes back as it was
+when the same id is opened again, so a client does not need to keep a copy. The
+agent names an unnamed conversation itself with `set_title`; a name the client
+sends with `Rename` always wins.
 
 The commands and events are defined in `crates/omc-wire`. `crates/omc-client`
 is a small blocking client for programs that start `crab` and talk to it.
