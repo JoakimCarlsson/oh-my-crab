@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-pub use omc_wire::{Command, Event, Opening, Reach, ToolServer};
+pub use omc_wire::{Command, Event, Opening, Reach, ToolInfo, ToolServer};
 use omc_wire::{decode, encode};
 
 /// How many characters of the harness's error stream are kept to explain a stop.

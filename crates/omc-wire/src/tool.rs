@@ -1,5 +1,14 @@
 //! What a tool the agent uses looks like, from the first call to its result.
 
+/// One tool the agent can be given, as a client lists it.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ToolInfo {
+    /// The name the agent calls the tool by.
+    pub name: String,
+    /// What the tool does, in a sentence.
+    pub description: String,
+}
+
 /// How far a tool the agent is using has got.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ToolState {

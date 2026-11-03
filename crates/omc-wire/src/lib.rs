@@ -22,6 +22,6 @@ pub use inquiry::{Alternative, Inquiry, Question, Reply, summary};
 pub use permission::{Choice, Permission, Verdict};
 pub use plan::{PlanStep, Progress};
 pub use setting::{Pick, Setting, Slash};
-pub use tool::{Background, Diff, Kind, Tool, ToolState};
+pub use tool::{Background, Diff, Kind, Tool, ToolInfo, ToolState};
 pub use toolserver::{Reach, ToolServer};
 pub use usage::Usage;
