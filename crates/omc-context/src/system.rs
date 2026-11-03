@@ -26,6 +26,8 @@ pub struct PromptInput<'a> {
     pub tools: &'a [String],
     /// Whether plan mode is on.
     pub plan: bool,
+    /// Whether the conversation has no name yet, which the prompt then asks the agent to give it.
+    pub unnamed: bool,
 }
 
 /// The system prompt of the main agent for `input`.
@@ -42,6 +44,7 @@ pub fn build_prompt(input: PromptInput<'_>) -> String {
     let mut vars = flags_ref(&flags);
     vars.extend([
         ("skills", skills.as_str()),
+        ("unnamed", if input.unnamed { "1" } else { "" }),
         ("project", project.as_str()),
         ("plan", plan.as_str()),
         ("tools", tools.as_str()),
@@ -175,6 +178,7 @@ mod tests {
             discovered: &discovered,
             tools: &tools,
             plan: false,
+            unnamed: false,
         });
         assert!(prompt.contains("- pdf: Reads PDFs"));
         assert!(prompt.contains("Use tabs. {{not_a_tag}}"));
@@ -212,8 +216,10 @@ mod tests {
             discovered: &discovered,
             tools: &tools,
             plan: true,
+            unnamed: false,
         });
         assert!(prompt.contains("Plan mode active"));
+        assert!(!prompt.contains("`set_title`"));
         assert!(!prompt.contains("# Delegation"));
         assert!(!prompt.contains("`bash`: real binaries"));
         assert!(prompt.contains("- `exit_plan_mode`"));
@@ -237,10 +243,35 @@ mod tests {
                 discovered: &discovered,
                 tools: &[],
                 plan: false,
+                unnamed: false,
             },
             "Be a scout.",
         );
         assert!(prompt.starts_with("§ Role\nBe a scout."));
         assert!(prompt.contains("<project-context>"));
+    }
+
+    /// An unnamed conversation is asked to name itself, and a named one is not.
+    #[test]
+    fn unnamed_conversations_are_asked_for_a_name() {
+        let locations = Locations {
+            directory: scratch("system-unnamed"),
+            root: None,
+            home: None,
+            claude: None,
+            codex: None,
+        };
+        let discovered = Discovered::default();
+        let environment = Environment::detect(&locations, "");
+        let tools: Vec<String> = vec!["read".to_owned(), "set_title".to_owned()];
+        let input = |unnamed| PromptInput {
+            environment: &environment,
+            discovered: &discovered,
+            tools: &tools,
+            plan: false,
+            unnamed,
+        };
+        assert!(build_prompt(input(true)).contains("call `set_title` once"));
+        assert!(!build_prompt(input(false)).contains("call `set_title` once"));
     }
 }

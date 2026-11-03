@@ -117,6 +117,12 @@ Before blocked: ensure info unreachable via tools/context; one failed check ≠ 
 - NEVER re-audit applied edit or routinely run git subcommands for validation. Tool results are verification.
 </critical>
 
+{{#if unnamed}}
+<critical>
+This conversation has no name. As soon as the task is clear, call `set_title` once with a short title for it; read a linked issue or pull request first when there is one. A name the reader gives always wins.
+</critical>
+{{/if}}
+
 {{project}}
 
 <critical>
