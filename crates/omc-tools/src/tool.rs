@@ -7,17 +7,39 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::ToolError;
 
+/// How one file changed in a tool call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChange {
+    /// The file, as shown to the user.
+    pub path: String,
+    /// What the file held before.
+    pub old: String,
+    /// What it holds after.
+    pub new: String,
+}
+
 /// What a successful tool call returns to the model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutput {
     /// The text the model reads as the tool result.
     pub text: String,
+    /// The files the call changed, for the client to show; empty for most tools.
+    pub changes: Vec<FileChange>,
 }
 
 impl ToolOutput {
-    /// Wraps `text` as a tool output.
+    /// Wraps `text` as a tool output that changed no files.
     pub fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into() }
+        Self {
+            text: text.into(),
+            changes: Vec::new(),
+        }
+    }
+
+    /// Records the files the call changed.
+    pub fn with_changes(mut self, changes: Vec<FileChange>) -> Self {
+        self.changes = changes;
+        self
     }
 }
 

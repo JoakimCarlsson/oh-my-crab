@@ -10,6 +10,7 @@ mod grep;
 mod notes;
 mod read;
 mod skill;
+mod snapshot;
 mod todo;
 mod write;
 
@@ -22,5 +23,6 @@ pub use grep::Grep;
 pub use notes::{ContextNotes, NewContext};
 pub use read::Read;
 pub use skill::Skill;
+pub use snapshot::tag as snapshot_tag;
 pub use todo::Todo;
 pub use write::Write;

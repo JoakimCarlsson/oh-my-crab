@@ -1,7 +1,7 @@
 //! What the agent loop reports, as the events the client reads.
 
 use omc_agent::AgentEvent;
-use omc_wire::{Event, Kind, Tool, ToolState, Usage};
+use omc_wire::{Diff, Event, Kind, Tool, ToolState, Usage};
 
 /// What kind of tool the tool called `name` is.
 fn kind_of(name: &str) -> Kind {
@@ -29,6 +29,38 @@ fn bare(id: String) -> Tool {
     }
 }
 
+/// The wire form of a file change.
+fn diff_of(change: omc_tools::FileChange) -> Diff {
+    Diff {
+        path: change.path,
+        old: Some(change.old),
+        new: change.new,
+    }
+}
+
+/// The events that say what `event` says: what [`translate`] gives, and one more tool event for each file after the first that a finished call changed.
+pub(crate) fn translate_all(event: AgentEvent, window: u64) -> Vec<Event> {
+    let extra: Vec<Event> = match &event {
+        AgentEvent::ToolDone { id, changes, .. } => changes
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(index, change)| {
+                Event::Tool(Tool {
+                    title: Some("edit".into()),
+                    kind: Some(Kind::Edit),
+                    state: Some(ToolState::Done),
+                    target: Some(change.path.clone()),
+                    diff: Some(diff_of(change.clone())),
+                    ..bare(format!("{id}:{index}"))
+                })
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    translate(event, window).into_iter().chain(extra).collect()
+}
+
 /// The event that says what `event` says, given a context window of `window` tokens; nothing when it says nothing the client shows.
 pub(crate) fn translate(event: AgentEvent, window: u64) -> Option<Event> {
     Some(match event {
@@ -46,8 +78,13 @@ pub(crate) fn translate(event: AgentEvent, window: u64) -> Option<Event> {
             ..bare(id)
         }),
         AgentEvent::ToolDone {
-            id, text, is_error, ..
+            id,
+            text,
+            is_error,
+            changes,
+            ..
         } => Event::Tool(Tool {
+            diff: changes.into_iter().next().map(diff_of),
             state: Some(if is_error {
                 ToolState::Failed
             } else {
@@ -102,6 +139,7 @@ mod tests {
                 name: "edit".into(),
                 text: "no".into(),
                 is_error: true,
+                changes: Vec::new(),
             },
             1,
         ) else {
@@ -174,5 +212,41 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// A finished edit carries its diff, and each further file gets an event of its own.
+    #[test]
+    fn changed_files_become_diffs() {
+        let change = |path: &str| omc_tools::FileChange {
+            path: path.into(),
+            old: "a\n".into(),
+            new: "b\n".into(),
+        };
+        let events = translate_all(
+            AgentEvent::ToolDone {
+                id: "7".into(),
+                name: "edit".into(),
+                text: "ok".into(),
+                is_error: false,
+                changes: vec![change("a.rs"), change("b.rs")],
+            },
+            1,
+        );
+        assert_eq!(events.len(), 2);
+        let Event::Tool(first) = &events[0] else {
+            panic!()
+        };
+        assert_eq!(
+            first.diff,
+            Some(Diff {
+                path: "a.rs".into(),
+                old: Some("a\n".into()),
+                new: "b\n".into()
+            })
+        );
+        let Event::Tool(second) = &events[1] else {
+            panic!()
+        };
+        assert_eq!(second.diff.as_ref().map(|d| d.path.as_str()), Some("b.rs"));
     }
 }

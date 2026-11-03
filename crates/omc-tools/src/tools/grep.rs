@@ -11,6 +11,7 @@ use ignore::overrides::OverrideBuilder;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::snapshot::tag_file;
 use crate::tool::parse_args;
 use crate::{Sandbox, Tool, ToolError, ToolOutput};
 
@@ -66,7 +67,8 @@ impl Tool for Grep {
     /// Describes the tool to the model.
     fn description(&self) -> &'static str {
         "Search file contents with a regular expression. Honors .gitignore and skips binary \
-         files. Returns matches as path:line:text, capped at the limit."
+         files. Returns matches as path:line:text, capped at the limit, followed by the snapshot \
+         tag of each file with matches; pass a tag to edit."
     }
 
     /// Returns the argument schema.
@@ -171,16 +173,24 @@ fn search(
         .binary_detection(BinaryDetection::quit(0))
         .build();
     let mut found = Vec::new();
+    let mut tags: Vec<(String, String)> = Vec::new();
     for entry in walker.build().flatten() {
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
+        let path = sandbox.display(entry.path());
+        let before = found.len();
         let sink = Collector {
-            path: sandbox.display(entry.path()),
+            path: path.clone(),
             found: &mut found,
             limit,
         };
         let _ = searcher.search_path(&matcher, entry.path(), sink);
+        if found.len() > before
+            && let Ok(file_tag) = tag_file(entry.path())
+        {
+            tags.push((path, file_tag));
+        }
         if found.len() >= limit {
             break;
         }
@@ -194,11 +204,16 @@ fn search(
             "\n[results truncated at {limit} matches; narrow the pattern, path or glob]"
         ));
     }
+    text.push_str("\n[tags]");
+    for (path, tag) in tags {
+        text.push_str(&format!("\n{path}: {tag}"));
+    }
     Ok(text)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::snapshot::tag;
     use super::*;
     use crate::testutil::scratch;
 
@@ -215,12 +230,28 @@ mod tests {
         std::fs::write(dir.join("a.rs"), "fn main() {}\nlet needle = 1;\n").unwrap();
         std::fs::write(dir.join("b.txt"), "needle here\n").unwrap();
         let all = tool.call(json!({ "pattern": "needle" })).await.unwrap();
-        assert_eq!(all.text, "a.rs:2:let needle = 1;\nb.txt:1:needle here");
+        assert!(
+            all.text
+                .starts_with("a.rs:2:let needle = 1;\nb.txt:1:needle here\n[tags]\n")
+        );
+        assert!(all.text.contains(&format!(
+            "a.rs: {}",
+            tag(b"fn main() {}\nlet needle = 1;\n")
+        )));
+        assert!(
+            all.text
+                .contains(&format!("b.txt: {}", tag(b"needle here\n")))
+        );
         let only_rs = tool
             .call(json!({ "pattern": "needle", "glob": "*.rs" }))
             .await
             .unwrap();
-        assert_eq!(only_rs.text, "a.rs:2:let needle = 1;");
+        assert!(
+            only_rs
+                .text
+                .starts_with("a.rs:2:let needle = 1;\n[tags]\na.rs: ")
+        );
+        assert!(!only_rs.text.contains("b.txt"));
     }
 
     /// The result is capped at the limit and says so.
@@ -235,7 +266,7 @@ mod tests {
         assert_eq!(
             out.text
                 .lines()
-                .filter(|l| l.starts_with("many.txt:"))
+                .filter(|l| l.starts_with("many.txt:") && !l.starts_with("many.txt: "))
                 .count(),
             5
         );
@@ -251,7 +282,8 @@ mod tests {
         std::fs::write(dir.join("bin.dat"), b"needle\0\x01\x02").unwrap();
         std::fs::write(dir.join("ok.txt"), "needle\n").unwrap();
         let out = tool.call(json!({ "pattern": "needle" })).await.unwrap();
-        assert_eq!(out.text, "ok.txt:1:needle");
+        assert!(out.text.starts_with("ok.txt:1:needle\n[tags]\nok.txt: "));
+        assert!(!out.text.contains("secret") && !out.text.contains("bin.dat"));
     }
 
     /// No match, a bad regex and an escaping path are reported plainly.

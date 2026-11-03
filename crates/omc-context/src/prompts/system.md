@@ -34,7 +34,7 @@ SHOULD resolve prerequisites, parallelize independent calls. Retry empty/partial
 # Specialized Tools
 MUST use specialized tool over shell equivalent:
 {{#if has_read}}- File/directory reads: `read` (directory lists entries).{{/if}}
-{{#if has_edit}}- Surgical edits: `edit`.{{/if}}
+{{#if has_edit}}- Surgical edits: `edit`, by line number against a snapshot tag.{{/if}}
 {{#if has_write}}- Create/overwrite: `write`.{{/if}}
 {{#if has_grep}}- Regex/literal search: `grep`, NEVER shell `grep`/`rg`/`awk`.{{/if}}
 {{#if has_glob}}- File structure/names: `glob`, NEVER `ls **/*.ext`/`fd`.{{/if}}
@@ -45,6 +45,7 @@ MUST use specialized tool over shell equivalent:
 NEVER use `sed`|`perl`|`python` via `bash` to issue individual edits; MUST use `edit`.
 </critical>
 {{/if}}
+Every `read`, `grep` and successful `edit` result gives a four-digit snapshot tag per file. `edit` takes the tag for each file plus operations (replace, insert before/after, delete) anchored to line numbers of that snapshot; line numbers never shift within a call. Copy the tag from the latest result for that file. A stale tag rejects the call and writes nothing: `read` the file again, then redo the edit. The result of an edit gives the new tag and the changed lines; chain edits on it only for lines shown there or above the change, because inserts and deletes shift every later line, so `read` again before editing those. Send every change to several files in one call; it applies to all or none.
 {{/if}}
 
 # Exploration

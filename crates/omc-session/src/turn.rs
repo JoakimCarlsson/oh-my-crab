@@ -12,7 +12,7 @@ use omc_tools::{Host, Registry};
 use crate::settings::Mode;
 use crate::shared::{SessionHost, Shared};
 use crate::toolset::{Inputs, Toolset};
-use crate::translate::translate;
+use crate::translate::translate_all;
 
 /// How a turn ended.
 pub(crate) enum Ended {
@@ -68,7 +68,7 @@ impl Turn {
         let effort = self.shared.effort_now();
         let out = self.shared.out.clone();
         let events: Arc<EventSink> = Arc::new(move |event| {
-            if let Some(event) = translate(event, window) {
+            for event in translate_all(event, window) {
                 let _ = out.send(event);
             }
         });
@@ -250,5 +250,120 @@ mod tests {
         shared.questions.answer(asked.ticket, Some("reject"));
         assert!(!asking.await.unwrap());
         assert_eq!(shared.mode(), Mode::Plan);
+    }
+
+    /// A model that reads a file, edits two lines with the tag it was given, then repeats the edit with that same tag.
+    struct Editor {
+        /// How many requests it has seen.
+        step: Mutex<usize>,
+    }
+
+    /// Returns a reply that calls `name` once with `arguments`.
+    fn calling(name: &str, arguments: serde_json::Value) -> Reply {
+        Reply {
+            tool_calls: vec![ToolCall {
+                id: name.into(),
+                name: name.into(),
+                arguments,
+            }],
+            ..Reply::default()
+        }
+    }
+
+    /// Returns the snapshot tag in the latest tool result of `messages`.
+    fn latest_tag(messages: &[Message]) -> String {
+        let Some(Message::ToolResults(results)) = messages.last() else {
+            panic!("no tool results");
+        };
+        let start = results[0].text.find("tag ").unwrap() + 4;
+        results[0].text[start..start + 4].to_string()
+    }
+
+    #[async_trait]
+    impl ChatModel for Editor {
+        /// Reads, edits two lines, then edits again with the tag the file no longer has.
+        async fn complete(
+            &self,
+            request: Request<'_>,
+            _: &mut dyn Sink,
+        ) -> Result<Reply, ProviderError> {
+            let mut step = self.step.lock().unwrap();
+            *step += 1;
+            let ops = json!([
+                { "op": "replace", "line": 1, "text": "A" },
+                { "op": "replace", "line": 3, "text": "C" }
+            ]);
+            Ok(match *step {
+                1 => calling("read", json!({ "path": "f.txt" })),
+                2 => calling(
+                    "edit",
+                    json!({ "files": [{ "path": "f.txt", "tag": latest_tag(request.messages), "ops": ops }] }),
+                ),
+                3 => calling(
+                    "edit",
+                    json!({ "files": [{ "path": "f.txt", "tag": "0000", "ops": ops }] }),
+                ),
+                _ => Reply {
+                    text: "done".into(),
+                    ..Reply::default()
+                },
+            })
+        }
+    }
+
+    /// Reading then editing two lines changes the file and sends a diff; an edit with a stale tag is refused with a message to read again.
+    #[tokio::test]
+    async fn edits_report_a_diff_and_stale_tags_are_refused() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/turn-edit");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.txt"), "a\nb\nc\n").unwrap();
+        let (out, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared::new(out);
+        shared.open(Provider::Claude, vec!["m".into()], "m".into(), Mode::Yolo);
+        let turn = Turn {
+            provider: Provider::Claude,
+            model: "m".into(),
+            base: Arc::new(Registry::builtin(&dir).unwrap()),
+            denied: Arc::new(Vec::new()),
+            discovered: Arc::new(Discovered::default()),
+            locations: Arc::new(Locations {
+                directory: dir.clone(),
+                root: None,
+                home: None,
+                claude: None,
+                codex: None,
+            }),
+            shared,
+            history: Vec::new(),
+            scribe: None,
+        };
+        let model = Arc::new(Editor {
+            step: Mutex::new(0),
+        });
+        let Ended::Done(history) = turn.run_with(model, "edit".into()).await else {
+            panic!("turn failed");
+        };
+        assert_eq!(
+            std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+            "A\nb\nC\n"
+        );
+        let Some(Message::ToolResults(last)) = history.get(history.len() - 2) else {
+            panic!("no results");
+        };
+        assert!(last[0].is_error && last[0].text.contains("read the file again"));
+        let mut diffs = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let Event::Tool(tool) = event
+                && let Some(diff) = tool.diff
+            {
+                diffs.push(diff);
+            }
+        }
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].old.as_deref(), Some("a\nb\nc\n"));
+        assert_eq!(diffs[0].new, "A\nb\nC\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

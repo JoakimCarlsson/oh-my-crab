@@ -7,7 +7,7 @@ use omc_providers::{
     ChatModel, Effort, Message, ProviderError, Request, Sink, Tokens, ToolCall, ToolResult,
     ToolSpec,
 };
-use omc_tools::{Notebook, Registry, sanitize};
+use omc_tools::{FileChange, Notebook, Registry, sanitize};
 use thiserror::Error;
 
 use crate::{ApprovalRequest, Approvals, Scribe};
@@ -56,6 +56,8 @@ pub enum AgentEvent {
         text: String,
         /// Whether the call failed.
         is_error: bool,
+        /// The files the call changed.
+        changes: Vec<FileChange>,
     },
 }
 
@@ -299,7 +301,7 @@ async fn run_calls(
         match tool {
             None => {
                 let message = format!("unknown tool: {}", call.name);
-                slots[index] = Some(finish(call, message, true, events));
+                slots[index] = Some(finish(call, message, true, Vec::new(), events));
             }
             Some(tool) if tool.needs_approval() => {
                 let request = ApprovalRequest {
@@ -310,7 +312,7 @@ async fn run_calls(
                     sequential.push(index);
                 } else {
                     let message = "the user denied this tool call".to_string();
-                    slots[index] = Some(finish(call, message, true, events));
+                    slots[index] = Some(finish(call, message, true, Vec::new(), events));
                 }
             }
             Some(_) => concurrent.push(index),
@@ -339,14 +341,14 @@ async fn run_call(
     call: &ToolCall,
     events: &(dyn Fn(AgentEvent) + Send + Sync),
 ) -> ToolResult {
-    let (text, is_error) = match registry
+    let (text, is_error, changes) = match registry
         .call_as(&call.id, &call.name, call.arguments.clone())
         .await
     {
-        Ok(output) => (output.text, false),
-        Err(error) => (error.to_string(), true),
+        Ok(output) => (output.text, false, output.changes),
+        Err(error) => (error.to_string(), true, Vec::new()),
     };
-    finish(call, text, is_error, events)
+    finish(call, text, is_error, changes, events)
 }
 
 /// Reports the outcome of `call` through `events` and builds its result.
@@ -354,6 +356,7 @@ fn finish(
     call: &ToolCall,
     text: String,
     is_error: bool,
+    changes: Vec<FileChange>,
     events: &(dyn Fn(AgentEvent) + Send + Sync),
 ) -> ToolResult {
     events(AgentEvent::ToolDone {
@@ -361,6 +364,7 @@ fn finish(
         name: call.name.clone(),
         text: text.clone(),
         is_error,
+        changes,
     });
     ToolResult {
         call_id: call.id.clone(),
@@ -606,7 +610,7 @@ mod tests {
         let dir = scratch("loop-denied");
         std::fs::write(dir.join("f.txt"), "before\n").unwrap();
         let registry = Registry::builtin(&dir).unwrap();
-        let edit = json!({ "path": "f.txt", "old_string": "before", "new_string": "after" });
+        let edit = json!({ "files": [{ "path": "f.txt", "tag": omc_tools::snapshot_tag(b"before\n"), "ops": [{ "op": "replace", "line": 1, "text": "after" }] }] });
         let model = Scripted::new(vec![call_reply("e", "edit", edit), Reply::default()]);
         let mut history = Vec::new();
         run_turn(
@@ -643,7 +647,7 @@ mod tests {
         let dir = scratch("loop-yolo");
         std::fs::write(dir.join("f.txt"), "before\n").unwrap();
         let registry = Registry::builtin(&dir).unwrap();
-        let edit = json!({ "path": "f.txt", "old_string": "before", "new_string": "after" });
+        let edit = json!({ "files": [{ "path": "f.txt", "tag": omc_tools::snapshot_tag(b"before\n"), "ops": [{ "op": "replace", "line": 1, "text": "after" }] }] });
         let model = Scripted::new(vec![call_reply("e", "edit", edit), Reply::default()]);
         let approvals = Approvals::new(Arc::new(DenyAll), true);
         let mut history = Vec::new();

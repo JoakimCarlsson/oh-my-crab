@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read as _};
 
+use super::snapshot::tag_file;
 use crate::tool::parse_args;
 use crate::{Sandbox, Tool, ToolError, ToolOutput};
 
@@ -58,8 +59,9 @@ impl Tool for Read {
 
     /// Describes the tool to the model.
     fn description(&self) -> &'static str {
-        "Read a text file and return its lines prefixed with line numbers. \
-         Use offset and limit to page through large files. Binary files are rejected."
+        "Read a text file and return its lines prefixed with line numbers, under a header with \
+         the file's snapshot tag. Pass that tag and those line numbers to edit. Use offset and \
+         limit to page through large files. Binary files are rejected."
     }
 
     /// Returns the argument schema.
@@ -93,7 +95,8 @@ impl Tool for Read {
     }
 }
 
-/// Reads up to `limit` lines of `path` starting at line `offset`, numbered.
+/// Reads up to `limit` lines of `path` starting at line `offset`, numbered, under a
+/// header with the snapshot tag of the whole file.
 ///
 /// Output stops early at [`MAX_BYTES`]; a trailing note says where to continue.
 ///
@@ -114,6 +117,7 @@ fn read_lines(path: &std::path::Path, offset: usize, limit: usize) -> Result<Str
     if sniff.contains(&0) {
         return Err(binary_error(path));
     }
+    let header = format!("[tag {}]\n", tag_file(path)?);
     let mut reader = BufReader::new(std::fs::File::open(path)?);
     let mut out = String::new();
     let mut number = 0usize;
@@ -132,7 +136,7 @@ fn read_lines(path: &std::path::Path, offset: usize, limit: usize) -> Result<Str
             out.push_str(&format!(
                 "[more lines remain; continue with offset={number}]\n"
             ));
-            return Ok(out);
+            return Ok(header + &out);
         }
         out.push_str(&format!(
             "{number:>6}\t{}\n",
@@ -141,12 +145,14 @@ fn read_lines(path: &std::path::Path, offset: usize, limit: usize) -> Result<Str
     }
     if out.is_empty() {
         return Ok(if number == 0 {
-            "[file is empty]".to_string()
+            format!("{header}[file is empty]")
         } else {
-            format!("[offset {offset} is past the end of the file, which has {number} lines]")
+            format!(
+                "{header}[offset {offset} is past the end of the file, which has {number} lines]"
+            )
         });
     }
-    Ok(out)
+    Ok(header + &out)
 }
 
 /// Builds the error for a file that is not text.
@@ -164,6 +170,7 @@ fn clip(line: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::snapshot::tag;
     use super::*;
     use crate::testutil::scratch;
 
@@ -179,12 +186,20 @@ mod tests {
         let (tool, dir) = tool("read-window");
         std::fs::write(dir.join("f.txt"), "a\nb\nc\nd\n").unwrap();
         let all = tool.call(json!({ "path": "f.txt" })).await.unwrap();
-        assert_eq!(all.text, "     1\ta\n     2\tb\n     3\tc\n     4\td\n");
+        let expected = format!(
+            "[tag {}]\n     1\ta\n     2\tb\n     3\tc\n     4\td\n",
+            tag(b"a\nb\nc\nd\n")
+        );
+        assert_eq!(all.text, expected);
         let part = tool
             .call(json!({ "path": "f.txt", "offset": 2, "limit": 2 }))
             .await
             .unwrap();
-        assert!(part.text.starts_with("     2\tb\n     3\tc\n"));
+        assert!(part.text.contains("]\n     2\tb\n     3\tc\n"));
+        assert!(
+            part.text
+                .starts_with(&format!("[tag {}]", tag(b"a\nb\nc\nd\n")))
+        );
         assert!(part.text.contains("continue with offset=4"));
     }
 
