@@ -4,7 +4,7 @@ mod agent;
 mod approval;
 mod task;
 
-pub use agent::{AgentError, AgentEvent, Context, Live, MAX_ITERATIONS, run_turn};
+pub use agent::{AgentError, AgentEvent, Context, Live, run_turn};
 pub use approval::{ApprovalRequest, Approvals, Decision, Prompter};
 pub use task::{EventSink, PromptBuilder, Task, TaskSettings};
 

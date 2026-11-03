@@ -12,9 +12,6 @@ use thiserror::Error;
 
 use crate::{ApprovalRequest, Approvals};
 
-/// Most model requests one user turn may make before the loop gives up.
-pub const MAX_ITERATIONS: usize = 25;
-
 /// Something the UI should show while a turn runs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
@@ -68,9 +65,6 @@ pub enum AgentError {
     /// The model request failed.
     #[error(transparent)]
     Provider(#[from] ProviderError),
-    /// The model kept calling tools past [`MAX_ITERATIONS`].
-    #[error("stopped after {0} model requests without a final answer")]
-    IterationLimit(usize),
 }
 
 /// The tools and system prompt to use for the next request, when they can change while a turn runs.
@@ -127,7 +121,8 @@ impl Sink for Chunks<'_> {
 /// # Errors
 ///
 /// Returns [`AgentError::Provider`] when a model request fails and
-/// [`AgentError::IterationLimit`] after [`MAX_ITERATIONS`] requests.
+/// A turn has no request limit: it ends when the model stops calling tools or
+/// when the task running it is aborted.
 pub async fn run_turn(
     context: &Context<'_>,
     history: &mut Vec<Message>,
@@ -153,7 +148,7 @@ async fn drive(
     history: &mut Vec<Message>,
     events: &(dyn Fn(AgentEvent) + Send + Sync),
 ) -> Result<(), AgentError> {
-    for _ in 0..MAX_ITERATIONS {
+    loop {
         let live = context.refresh.map(|refresh| refresh());
         let registry = live
             .as_ref()
@@ -179,7 +174,6 @@ async fn drive(
         let results = run_calls(registry, context.approvals, &calls, events).await;
         history.push(Message::ToolResults(results));
     }
-    Err(AgentError::IterationLimit(MAX_ITERATIONS))
 }
 
 /// Describes every registered tool in the provider-neutral form.
@@ -484,15 +478,22 @@ mod tests {
         assert_eq!(results[2].call_id, "3");
     }
 
-    /// A model that never stops calling tools is cut off and the history is restored.
+    /// A turn that needs many tool rounds keeps going until the model answers.
     #[tokio::test]
-    async fn stops_at_the_iteration_limit() {
-        let dir = scratch("loop-limit");
+    async fn long_turns_are_not_cut_off() {
+        let dir = scratch("long-turn");
         std::fs::write(dir.join("a.txt"), "a\n").unwrap();
         let registry = Registry::builtin(&dir).unwrap();
-        let model = Scripted::new(vec![call_reply("t", "read", json!({ "path": "a.txt" }))]);
-        let mut history = vec![Message::User("earlier".into())];
-        let result = run_turn(
+        let mut replies: Vec<Reply> = (0..60)
+            .map(|_| call_reply("t", "read", json!({ "path": "a.txt" })))
+            .collect();
+        replies.push(Reply {
+            text: "done".into(),
+            ..Reply::default()
+        });
+        let model = Scripted::new(replies);
+        let mut history = Vec::new();
+        run_turn(
             &Context {
                 model: &model,
                 registry: &registry,
@@ -502,13 +503,12 @@ mod tests {
                 refresh: None,
             },
             &mut history,
-            "loop".into(),
+            "go".into(),
             &|_| {},
         )
-        .await;
-        assert!(matches!(result, Err(AgentError::IterationLimit(_))));
-        assert_eq!(model.seen.lock().unwrap().len(), MAX_ITERATIONS);
-        assert_eq!(history, vec![Message::User("earlier".into())]);
+        .await
+        .unwrap();
+        assert_eq!(model.seen.lock().unwrap().len(), 61);
     }
 
     /// A denied edit does not touch the file and the model is told why.
