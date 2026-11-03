@@ -2,12 +2,17 @@
 
 use std::time::Duration;
 
-use oauth2::basic::{BasicClient, BasicTokenResponse};
+use oauth2::basic::{
+    BasicErrorResponse, BasicRevocationErrorResponse, BasicTokenIntrospectionResponse,
+    BasicTokenType,
+};
 use oauth2::{
-    AuthUrl, AuthorizationCode, ClientId, CsrfToken, EndpointNotSet, EndpointSet, ErrorResponse,
-    PkceCodeChallenge, RedirectUrl, RefreshToken, RequestTokenError, Scope, TokenResponse,
+    AuthUrl, AuthorizationCode, Client, ClientId, CsrfToken, EndpointNotSet, EndpointSet,
+    ErrorResponse, ExtraTokenFields, PkceCodeChallenge, RedirectUrl, RefreshToken,
+    RequestTokenError, Scope, StandardRevocableToken, StandardTokenResponse, TokenResponse,
     TokenUrl,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::AuthError;
 use crate::callback;
@@ -28,14 +33,56 @@ const EXPIRY_SKEW: Duration = Duration::from_secs(300);
 /// Lifetime assumed when the token response omits `expires_in`.
 const DEFAULT_LIFETIME: Duration = Duration::from_secs(3600);
 
+/// The account block Anthropic adds to its token responses.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct AccountInfo {
+    /// Stable account identifier.
+    uuid: Option<String>,
+    /// Account email address.
+    email_address: Option<String>,
+}
+
+/// The organization block Anthropic adds to its token responses.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct OrganizationInfo {
+    /// Organization identifier.
+    uuid: Option<String>,
+    /// Organization display name.
+    name: Option<String>,
+}
+
+/// Identity fields beyond the standard OAuth ones in a token response.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct IdentityFields {
+    /// The signed-in account, when the provider reports it.
+    account: Option<AccountInfo>,
+    /// The organization the token is scoped to, when reported.
+    organization: Option<OrganizationInfo>,
+}
+
+impl ExtraTokenFields for IdentityFields {}
+
+/// A token response that keeps the provider's identity fields.
+type Token = StandardTokenResponse<IdentityFields, BasicTokenType>;
+
 /// An oauth2 client with authorization and token endpoints configured.
-type ConfiguredClient =
-    BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
+type ConfiguredClient = Client<
+    BasicErrorResponse,
+    Token,
+    BasicTokenIntrospectionResponse,
+    StandardRevocableToken,
+    BasicRevocationErrorResponse,
+    EndpointSet,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointNotSet,
+    EndpointSet,
+>;
 
 /// Builds the oauth2 client for `spec`.
 fn client(spec: &Spec) -> Result<ConfiguredClient, AuthError> {
     let bad = |e: oauth2::url::ParseError| AuthError::Token(e.to_string());
-    Ok(BasicClient::new(ClientId::new(spec.client_id.to_string()))
+    Ok(Client::new(ClientId::new(spec.client_id.to_string()))
         .set_auth_uri(AuthUrl::new(spec.authorize_url.to_string()).map_err(bad)?)
         .set_token_uri(TokenUrl::new(spec.token_url.to_string()).map_err(bad)?)
         .set_redirect_uri(RedirectUrl::new(spec.redirect_uri.to_string()).map_err(bad)?))
@@ -86,7 +133,7 @@ fn http_for(
 /// response omits.
 fn credentials_from(
     spec: &Spec,
-    token: &BasicTokenResponse,
+    token: &Token,
     previous: Option<&Credentials>,
 ) -> Result<Credentials, AuthError> {
     let refresh = token
@@ -101,8 +148,24 @@ fn credentials_from(
         .account_from_jwt
         .then(|| jwt::chatgpt_account_id(&access))
         .flatten();
+    let identity = token.extra_fields();
+    let account = identity.account.as_ref();
+    let organization = identity.organization.as_ref();
     Ok(Credentials {
-        account_id: from_jwt.or_else(|| previous.and_then(|p| p.account_id.clone())),
+        account_id: from_jwt
+            .or_else(|| account.and_then(|a| a.uuid.clone()))
+            .or_else(|| previous.and_then(|p| p.account_id.clone())),
+        email: account
+            .and_then(|a| a.email_address.clone())
+            .or_else(|| previous.and_then(|p| p.email.clone())),
+        org_id: previous.map_or_else(
+            || organization.and_then(|o| o.uuid.clone()),
+            |p| p.org_id.clone(),
+        ),
+        org_name: previous.map_or_else(
+            || organization.and_then(|o| o.name.clone()),
+            |p| p.org_name.clone(),
+        ),
         access,
         refresh,
         expires_at_ms: now_ms() + usable.as_millis() as u64,
@@ -165,4 +228,57 @@ pub async fn refresh(spec: &'static Spec, stored: &Credentials) -> Result<Creden
         .await
         .map_err(describe)?;
     credentials_from(spec, &token, Some(stored))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::Provider;
+
+    /// Claude's token response yields account and organization identity.
+    #[test]
+    fn claude_identity_is_read_from_the_token_response() {
+        let body = r#"{"access_token":"a","refresh_token":"r","token_type":"Bearer","expires_in":28800,
+            "account":{"uuid":"acc","email_address":"me@example.com"},
+            "organization":{"uuid":"org","name":"Team"}}"#;
+        let token: Token = serde_json::from_str(body).unwrap();
+        let credentials = credentials_from(Provider::Claude.spec(), &token, None).unwrap();
+        assert_eq!(credentials.account_id.as_deref(), Some("acc"));
+        assert_eq!(credentials.email.as_deref(), Some("me@example.com"));
+        assert_eq!(credentials.org_id.as_deref(), Some("org"));
+        assert_eq!(credentials.org_name.as_deref(), Some("Team"));
+    }
+
+    /// A refresh keeps the organization fixed at login even when the response names another.
+    #[test]
+    fn refresh_keeps_login_organization() {
+        let body = r#"{"access_token":"a2","token_type":"Bearer","expires_in":60,
+            "organization":{"uuid":"other","name":"Other"}}"#;
+        let token: Token = serde_json::from_str(body).unwrap();
+        let previous = Credentials {
+            access: "a".into(),
+            refresh: "r".into(),
+            expires_at_ms: 0,
+            account_id: Some("acc".into()),
+            email: None,
+            org_id: Some("org".into()),
+            org_name: Some("Team".into()),
+        };
+        let credentials =
+            credentials_from(Provider::Claude.spec(), &token, Some(&previous)).unwrap();
+        assert_eq!(credentials.org_id.as_deref(), Some("org"));
+        assert_eq!(credentials.account_id.as_deref(), Some("acc"));
+        assert_eq!(credentials.refresh, "r");
+    }
+
+    /// The Claude login asks for the scopes, callback and state oh-my-pi uses.
+    #[test]
+    fn claude_spec_matches_the_reference() {
+        let spec = Provider::Claude.spec();
+        assert!(spec.scopes.contains(&"user:sessions:claude_code"));
+        assert_eq!(spec.port, 54545);
+        assert_eq!(spec.path, "/callback");
+        assert!(spec.state_in_exchange && spec.json_body);
+        assert!(spec.refresh_headers.iter().any(|(k, _)| *k == "user-agent"));
+    }
 }

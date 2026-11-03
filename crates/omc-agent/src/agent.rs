@@ -1,20 +1,26 @@
 //! The tool-calling loop.
 
+use std::sync::Arc;
+
 use futures_util::future::join_all;
-use omc_providers::{ChatModel, Message, ProviderError, ToolCall, ToolResult, ToolSpec};
+use omc_providers::{
+    ChatModel, Effort, Message, ProviderError, Request, Sink, Tokens, ToolCall, ToolResult,
+    ToolSpec,
+};
 use omc_tools::{Registry, sanitize};
 use thiserror::Error;
 
 use crate::{ApprovalRequest, Approvals};
-
-/// Most model requests one user turn may make before the loop gives up.
-pub const MAX_ITERATIONS: usize = 25;
 
 /// Something the UI should show while a turn runs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
     /// A chunk of streamed assistant text.
     Delta(String),
+    /// A chunk of what the model is thinking.
+    Thought(String),
+    /// What a model request cost.
+    Used(Tokens),
     /// The model asked for a tool call.
     ToolStart {
         /// Id of the call.
@@ -23,6 +29,22 @@ pub enum AgentEvent {
         name: String,
         /// One-line description of the call.
         summary: String,
+    },
+    /// A subagent was started by the tool call `id`.
+    Spawned {
+        /// Id of the `task` call that started it.
+        id: String,
+        /// The kind of subagent.
+        agent: String,
+    },
+    /// Something a subagent did, as the `task` call `parent` ran it.
+    Nested {
+        /// Id of the `task` call.
+        parent: String,
+        /// The kind of subagent.
+        agent: String,
+        /// What it did.
+        event: Box<AgentEvent>,
     },
     /// A tool call finished, successfully or not.
     ToolDone {
@@ -43,9 +65,48 @@ pub enum AgentError {
     /// The model request failed.
     #[error(transparent)]
     Provider(#[from] ProviderError),
-    /// The model kept calling tools past [`MAX_ITERATIONS`].
-    #[error("stopped after {0} model requests without a final answer")]
-    IterationLimit(usize),
+}
+
+/// The tools and system prompt to use for the next request, when they can change while a turn runs.
+pub struct Live {
+    /// The tools the model may call.
+    pub registry: Arc<Registry>,
+    /// The system prompt.
+    pub system: Arc<str>,
+}
+
+/// What a turn runs with.
+pub struct Context<'a> {
+    /// The model that answers.
+    pub model: &'a dyn ChatModel,
+    /// The tools it may call.
+    pub registry: &'a Registry,
+    /// What is allowed without asking.
+    pub approvals: &'a Approvals,
+    /// The system prompt.
+    pub system: &'a str,
+    /// How hard the model is asked to think.
+    pub effort: Option<Effort>,
+    /// Gives the tools and system prompt to use for the next request when they can change during the turn, instead of `registry` and `system`.
+    pub refresh: Option<&'a (dyn Fn() -> Live + Send + Sync)>,
+}
+
+/// Passes the chunks of a reply on as events.
+struct Chunks<'a> {
+    /// Where the events go.
+    events: &'a (dyn Fn(AgentEvent) + Send + Sync),
+}
+
+impl Sink for Chunks<'_> {
+    /// Reports text as it streams in.
+    fn text(&mut self, chunk: &str) {
+        (self.events)(AgentEvent::Delta(chunk.to_owned()));
+    }
+
+    /// Reports thinking as it streams in.
+    fn thinking(&mut self, chunk: &str) {
+        (self.events)(AgentEvent::Thought(chunk.to_owned()));
+    }
 }
 
 /// Runs one user turn: sends `prompt`, executes tool calls and loops until the
@@ -60,18 +121,17 @@ pub enum AgentError {
 /// # Errors
 ///
 /// Returns [`AgentError::Provider`] when a model request fails and
-/// [`AgentError::IterationLimit`] after [`MAX_ITERATIONS`] requests.
+/// A turn has no request limit: it ends when the model stops calling tools or
+/// when the task running it is aborted.
 pub async fn run_turn(
-    model: &dyn ChatModel,
-    registry: &Registry,
-    approvals: &Approvals,
+    context: &Context<'_>,
     history: &mut Vec<Message>,
     prompt: String,
     events: &(dyn Fn(AgentEvent) + Send + Sync),
 ) -> Result<(), AgentError> {
     let start = history.len();
     history.push(Message::User(prompt));
-    let result = drive(model, registry, approvals, history, events).await;
+    let result = drive(context, history, events).await;
     if result.is_err() {
         history.truncate(start);
     }
@@ -84,25 +144,36 @@ pub async fn run_turn(
 ///
 /// Same as [`run_turn`].
 async fn drive(
-    model: &dyn ChatModel,
-    registry: &Registry,
-    approvals: &Approvals,
+    context: &Context<'_>,
     history: &mut Vec<Message>,
     events: &(dyn Fn(AgentEvent) + Send + Sync),
 ) -> Result<(), AgentError> {
-    let specs = tool_specs(registry);
-    for _ in 0..MAX_ITERATIONS {
-        let mut on_delta = |delta: &str| events(AgentEvent::Delta(delta.to_string()));
-        let reply = model.complete(history, &specs, &mut on_delta).await?;
+    loop {
+        let live = context.refresh.map(|refresh| refresh());
+        let registry = live
+            .as_ref()
+            .map_or(context.registry, |live| &*live.registry);
+        let system = live.as_ref().map_or(context.system, |live| &*live.system);
+        let specs = tool_specs(registry);
+        let mut chunks = Chunks { events };
+        let request = Request {
+            system,
+            messages: history,
+            tools: &specs,
+            effort: context.effort,
+        };
+        let reply = context.model.complete(request, &mut chunks).await?;
+        if let Some(tokens) = reply.tokens {
+            events(AgentEvent::Used(tokens));
+        }
         let calls = reply.tool_calls.clone();
         history.push(Message::Assistant(reply));
         if calls.is_empty() {
             return Ok(());
         }
-        let results = run_calls(registry, approvals, &calls, events).await;
+        let results = run_calls(registry, context.approvals, &calls, events).await;
         history.push(Message::ToolResults(results));
     }
-    Err(AgentError::IterationLimit(MAX_ITERATIONS))
 }
 
 /// Describes every registered tool in the provider-neutral form.
@@ -185,7 +256,10 @@ async fn run_call(
     call: &ToolCall,
     events: &(dyn Fn(AgentEvent) + Send + Sync),
 ) -> ToolResult {
-    let (text, is_error) = match registry.call(&call.name, call.arguments.clone()).await {
+    let (text, is_error) = match registry
+        .call_as(&call.id, &call.name, call.arguments.clone())
+        .await
+    {
         Ok(output) => (output.text, false),
         Err(error) => (error.to_string(), true),
     };
@@ -219,7 +293,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use omc_providers::{DeltaSink, Reply};
+    use omc_providers::Reply;
     use serde_json::json;
 
     use super::*;
@@ -248,11 +322,10 @@ mod tests {
         /// Records the history length and returns the next scripted reply.
         async fn complete(
             &self,
-            messages: &[Message],
-            _tools: &[ToolSpec],
-            on_delta: DeltaSink<'_>,
+            request: Request<'_>,
+            sink: &mut dyn Sink,
         ) -> Result<Reply, ProviderError> {
-            self.seen.lock().unwrap().push(messages.len());
+            self.seen.lock().unwrap().push(request.messages.len());
             let mut replies = self.replies.lock().unwrap();
             let reply = if replies.len() > 1 {
                 replies.remove(0)
@@ -260,7 +333,7 @@ mod tests {
                 replies[0].clone()
             };
             if !reply.text.is_empty() {
-                on_delta(&reply.text);
+                sink.text(&reply.text);
             }
             Ok(reply)
         }
@@ -269,12 +342,12 @@ mod tests {
     /// Builds a reply that calls `tool` with `arguments`.
     fn call_reply(id: &str, tool: &str, arguments: serde_json::Value) -> Reply {
         Reply {
-            text: String::new(),
             tool_calls: vec![ToolCall {
                 id: id.into(),
                 name: tool.into(),
                 arguments,
             }],
+            ..Reply::default()
         }
     }
 
@@ -314,16 +387,21 @@ mod tests {
             call_reply("t1", "read", json!({ "path": "hello.txt" })),
             Reply {
                 text: "it says hello".into(),
-                tool_calls: Vec::new(),
+                ..Reply::default()
             },
         ]);
         let log = Mutex::new(Vec::new());
         let events = |event: AgentEvent| log.lock().unwrap().push(event);
         let mut history = Vec::new();
         run_turn(
-            &model,
-            &registry,
-            &deny_all(),
+            &Context {
+                model: &model,
+                registry: &registry,
+                approvals: &deny_all(),
+                system: "",
+                effort: None,
+                refresh: None,
+            },
             &mut history,
             "read it".into(),
             &events,
@@ -356,7 +434,6 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "a\n").unwrap();
         let registry = Registry::builtin(&dir).unwrap();
         let first = Reply {
-            text: String::new(),
             tool_calls: vec![
                 ToolCall {
                     id: "1".into(),
@@ -374,13 +451,19 @@ mod tests {
                     arguments: json!({}),
                 },
             ],
+            ..Reply::default()
         };
         let model = Scripted::new(vec![first, Reply::default()]);
         let mut history = Vec::new();
         run_turn(
-            &model,
-            &registry,
-            &deny_all(),
+            &Context {
+                model: &model,
+                registry: &registry,
+                approvals: &deny_all(),
+                system: "",
+                effort: None,
+                refresh: None,
+            },
             &mut history,
             "go".into(),
             &|_| {},
@@ -395,26 +478,37 @@ mod tests {
         assert_eq!(results[2].call_id, "3");
     }
 
-    /// A model that never stops calling tools is cut off and the history is restored.
+    /// A turn that needs many tool rounds keeps going until the model answers.
     #[tokio::test]
-    async fn stops_at_the_iteration_limit() {
-        let dir = scratch("loop-limit");
+    async fn long_turns_are_not_cut_off() {
+        let dir = scratch("long-turn");
         std::fs::write(dir.join("a.txt"), "a\n").unwrap();
         let registry = Registry::builtin(&dir).unwrap();
-        let model = Scripted::new(vec![call_reply("t", "read", json!({ "path": "a.txt" }))]);
-        let mut history = vec![Message::User("earlier".into())];
-        let result = run_turn(
-            &model,
-            &registry,
-            &deny_all(),
+        let mut replies: Vec<Reply> = (0..60)
+            .map(|_| call_reply("t", "read", json!({ "path": "a.txt" })))
+            .collect();
+        replies.push(Reply {
+            text: "done".into(),
+            ..Reply::default()
+        });
+        let model = Scripted::new(replies);
+        let mut history = Vec::new();
+        run_turn(
+            &Context {
+                model: &model,
+                registry: &registry,
+                approvals: &deny_all(),
+                system: "",
+                effort: None,
+                refresh: None,
+            },
             &mut history,
-            "loop".into(),
+            "go".into(),
             &|_| {},
         )
-        .await;
-        assert!(matches!(result, Err(AgentError::IterationLimit(_))));
-        assert_eq!(model.seen.lock().unwrap().len(), MAX_ITERATIONS);
-        assert_eq!(history, vec![Message::User("earlier".into())]);
+        .await
+        .unwrap();
+        assert_eq!(model.seen.lock().unwrap().len(), 61);
     }
 
     /// A denied edit does not touch the file and the model is told why.
@@ -427,9 +521,14 @@ mod tests {
         let model = Scripted::new(vec![call_reply("e", "edit", edit), Reply::default()]);
         let mut history = Vec::new();
         run_turn(
-            &model,
-            &registry,
-            &deny_all(),
+            &Context {
+                model: &model,
+                registry: &registry,
+                approvals: &deny_all(),
+                system: "",
+                effort: None,
+                refresh: None,
+            },
             &mut history,
             "edit".into(),
             &|_| {},
@@ -458,9 +557,14 @@ mod tests {
         let approvals = Approvals::new(Arc::new(DenyAll), true);
         let mut history = Vec::new();
         run_turn(
-            &model,
-            &registry,
-            &approvals,
+            &Context {
+                model: &model,
+                registry: &registry,
+                approvals: &approvals,
+                system: "",
+                effort: None,
+                refresh: None,
+            },
             &mut history,
             "edit".into(),
             &|_| {},

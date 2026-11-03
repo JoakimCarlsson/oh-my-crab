@@ -51,6 +51,11 @@ impl Tool for Read {
         "read"
     }
 
+    /// Reading changes nothing.
+    fn read_only(&self) -> bool {
+        true
+    }
+
     /// Describes the tool to the model.
     fn description(&self) -> &'static str {
         "Read a text file and return its lines prefixed with line numbers. \

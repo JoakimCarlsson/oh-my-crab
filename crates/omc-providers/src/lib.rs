@@ -4,11 +4,19 @@ mod chat;
 mod claude;
 mod codex;
 mod error;
+mod identity;
+mod models;
 mod prompt;
 mod sse;
+mod xxh64;
 
-pub use chat::{ChatModel, DeltaSink, Message, RemoteModel, Reply, ToolCall, ToolResult, ToolSpec};
+pub use chat::{
+    ChatModel, DeltaSink, Effort, Message, RemoteModel, Reply, Request, Sink, Tokens, ToolCall,
+    ToolResult, ToolSpec,
+};
 pub use error::ProviderError;
+pub use models::{context_window, efforts};
+pub use prompt::PROMPT;
 
 use omc_auth::{Credentials, Provider};
 

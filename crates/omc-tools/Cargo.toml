@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+omc-context = { version = "0.1.0", path = "../omc-context" }
+omc-wire = { version = "0.1.0", path = "../omc-wire" }
 async-trait = "0.1.92"
 globset = "0.4.21"
 grep-regex = "0.1.14"

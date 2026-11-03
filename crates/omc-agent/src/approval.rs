@@ -1,6 +1,7 @@
 //! Asking the user before tools that change things run.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -38,7 +39,7 @@ pub trait Prompter: Send + Sync {
 /// The approval policy of a session.
 pub struct Approvals {
     /// Whether to allow everything without asking.
-    yolo: bool,
+    yolo: AtomicBool,
     /// Tools the user allowed for the rest of the session.
     always: Mutex<HashSet<String>>,
     /// Where questions go.
@@ -49,10 +50,20 @@ impl Approvals {
     /// Creates a policy that asks `prompter`, or never asks when `yolo` is set.
     pub fn new(prompter: Arc<dyn Prompter>, yolo: bool) -> Self {
         Self {
-            yolo,
+            yolo: AtomicBool::new(yolo),
             always: Mutex::new(HashSet::new()),
             prompter,
         }
+    }
+
+    /// Whether everything is allowed without asking.
+    pub fn yolo(&self) -> bool {
+        self.yolo.load(Ordering::Relaxed)
+    }
+
+    /// Allows everything without asking when `yolo` is set, and asks again when it is not.
+    pub fn set_yolo(&self, yolo: bool) {
+        self.yolo.store(yolo, Ordering::Relaxed);
     }
 
     /// Returns whether the call described by `request` may run.
@@ -60,7 +71,7 @@ impl Approvals {
     /// Skips the question in yolo mode and for tools already allowed for the
     /// session; remembers [`Decision::AllowAlways`] answers.
     pub async fn allows(&self, request: &ApprovalRequest) -> bool {
-        if self.yolo || self.always.lock().unwrap().contains(&request.tool) {
+        if self.yolo() || self.always.lock().unwrap().contains(&request.tool) {
             return true;
         }
         match self.prompter.ask(request).await {
