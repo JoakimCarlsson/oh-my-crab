@@ -7,6 +7,43 @@ use crate::setting::{Setting, Slash};
 use crate::tool::{Background, Tool};
 use crate::usage::Usage;
 
+/// One turn of a saved conversation: what the reader prompted and what the agent did, as the events it would have sent live.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PastTurn {
+    /// The id the client gave the turn when it prompted, when it gave one.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// What the reader prompted with.
+    pub prompt: String,
+    /// The names of the files the reader attached.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// What the agent did for it, in order.
+    pub events: Vec<Event>,
+}
+
+/// A saved conversation: its name, the choices made about it and its turns.
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Conversation {
+    /// The conversation's name, when it has one.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// The latest value chosen for each setting, by the setting's id.
+    #[serde(default)]
+    pub settings: Vec<(String, String)>,
+    /// The turns, oldest first.
+    pub turns: Vec<PastTurn>,
+    /// What can be set, as it was last offered, with the choices made.
+    #[serde(default)]
+    pub offered: Vec<Setting>,
+    /// The commands and skills that were last offered behind a slash.
+    #[serde(default)]
+    pub commands: Vec<Slash>,
+    /// The context window of the model the conversation last used, in tokens.
+    #[serde(default)]
+    pub window: Option<u64>,
+}
+
 /// What the agent did, in the order it did it.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Event {
@@ -54,6 +91,8 @@ pub enum Event {
     },
     /// The harness could not start or went on, for this reason.
     Failed(String),
+    /// The conversation as it was saved: each turn the reader prompted and what the agent did in it, oldest first, sent when a saved conversation is opened and again when it is cut back.
+    Resumed(Conversation),
     /// The agent named the conversation, or named it again.
     Titled(String),
 }

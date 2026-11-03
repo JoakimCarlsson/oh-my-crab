@@ -7,6 +7,7 @@
 mod command;
 mod event;
 mod frame;
+mod import;
 mod inquiry;
 mod permission;
 mod plan;
@@ -16,8 +17,9 @@ mod toolserver;
 mod usage;
 
 pub use command::{Command, Opening};
-pub use event::Event;
+pub use event::{Conversation, Event, PastTurn};
 pub use frame::{decode, encode};
+pub use import::{Imported, ImportedTurn};
 pub use inquiry::{Alternative, Inquiry, Question, Reply, summary};
 pub use permission::{Choice, Permission, Verdict};
 pub use plan::{PlanStep, Progress};

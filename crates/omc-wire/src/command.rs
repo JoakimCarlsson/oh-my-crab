@@ -36,6 +36,12 @@ pub struct Opening {
     /// The number of turns of the saved history to keep, or all of it when there is none; a turn is one prompt and everything the agent did for it.
     #[serde(default)]
     pub keep: Option<usize>,
+    /// The values to give settings the saved conversation has no choice for, as setting ids and values; a choice that was saved wins over these.
+    #[serde(default)]
+    pub defaults: Vec<(String, String)>,
+    /// The id of the turn to go back to before when the saved history is loaded: it and everything after it is cut from the history and from the file. Opening fails when no turn has the id.
+    #[serde(default)]
+    pub before: Option<String>,
 }
 
 /// One request from the client, answered by [`crate::Event`]s.
@@ -50,6 +56,12 @@ pub enum Command {
         text: String,
         /// The files attached, by path.
         files: Vec<PathBuf>,
+        /// The id the client knows the turn by, which is saved with the turn so that the client can go back to before it, or leave it out to have none.
+        #[serde(default)]
+        turn: Option<String>,
+        /// Words the model is told before the reader's, which are not the reader's and so are not saved as what they wrote.
+        #[serde(default)]
+        context: Option<String>,
     },
     /// Answers the question under `ticket` with the choice `option`, or declines it.
     Choose {
@@ -64,6 +76,11 @@ pub enum Command {
         ticket: u64,
         /// What the reader answered, or nothing to abandon the form.
         replies: Option<Vec<Reply>>,
+    },
+    /// Names the conversation, replacing any name it has, and says so with a [`crate::Event::Titled`].
+    Rename {
+        /// The new name.
+        title: String,
     },
     /// Stops the turn that is running.
     Cancel,
