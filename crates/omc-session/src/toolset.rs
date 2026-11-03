@@ -5,7 +5,10 @@ use std::sync::Arc;
 use omc_agent::{Approvals, EventSink, Live, Task, TaskSettings};
 use omc_context::{Discovered, Environment, PromptInput, build_prompt, build_subagent_prompt};
 use omc_providers::{ChatModel, Effort};
-use omc_tools::{Ask, ContextNotes, ExitPlanMode, Host, NewContext, Notebook, Registry, Todo};
+use omc_tools::{
+    Ask, Checkpoint, CheckpointTool, ContextNotes, ExitPlanMode, Host, NewContext, Notebook,
+    Registry, Rewind, Todo,
+};
 
 /// What the tools and prompts of a turn are built from.
 pub(crate) struct Inputs<'a> {
@@ -29,6 +32,8 @@ pub(crate) struct Inputs<'a> {
     pub(crate) environment: Arc<Environment>,
     /// The notes the agent keeps.
     pub(crate) notebook: Arc<Notebook>,
+    /// The checkpoint the agent marks, when it has the checkpoint and rewind tools.
+    pub(crate) checkpoint: Option<Arc<Checkpoint>>,
 }
 
 /// The tools and system prompt of a turn in each mode.
@@ -71,6 +76,10 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Live {
     registry.register(Ask::new(inputs.host.clone()));
     registry.register(ContextNotes::new(inputs.notebook.clone()));
     registry.register(NewContext::new(inputs.notebook.clone()));
+    if let Some(checkpoint) = &inputs.checkpoint {
+        registry.register(CheckpointTool::new(checkpoint.clone()));
+        registry.register(Rewind::new(checkpoint.clone()));
+    }
     if plan {
         let todo = !inputs.denied.iter().any(|name| name == "todo");
         registry.register(ExitPlanMode::new(inputs.host.clone(), todo));
@@ -131,6 +140,11 @@ mod tests {
 
     /// Builds the toolset for the built-in tools in a scratch folder, denying `denied`.
     fn toolset(denied: &[String]) -> Toolset {
+        toolset_with(denied, None)
+    }
+
+    /// Builds the toolset like [`toolset`], with `checkpoint` given to the agent when it is set.
+    fn toolset_with(denied: &[String], checkpoint: Option<Arc<Checkpoint>>) -> Toolset {
         let (out, _events) = tokio::sync::mpsc::unbounded_channel();
         let shared = Shared::new(out);
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -157,7 +171,24 @@ mod tests {
             discovered: Arc::new(Discovered::default()),
             environment: Arc::new(Environment::detect(&locations, "m")),
             notebook: shared.notebook.clone(),
+            checkpoint,
         })
+    }
+
+    /// The checkpoint and rewind tools are there in both modes when they are given and in neither otherwise.
+    #[test]
+    fn checkpoint_tools_follow_the_setting() {
+        for plan in [false, true] {
+            let names = toolset(&[]).live(plan).registry.names();
+            assert!(
+                !names.iter().any(|n| n == "checkpoint") && !names.iter().any(|n| n == "rewind")
+            );
+            let names = toolset_with(&[], Some(Arc::new(Checkpoint::new())))
+                .live(plan)
+                .registry
+                .names();
+            assert!(names.iter().any(|n| n == "checkpoint") && names.iter().any(|n| n == "rewind"));
+        }
     }
 
     /// Plan mode keeps the read-only tools and the plan tool; the rest of the time the plan tool is absent and writing is possible.

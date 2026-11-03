@@ -275,6 +275,27 @@ impl Scribe {
         write_record(&mut state.file, &Written::Message(first))
     }
 
+    /// Replaces the messages from index `keep` on with `messages`: the history is cut back to `keep` messages and `messages` are appended, in one step that keeps this scribe writing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the write, or of a cut-back that was waiting to be written.
+    pub fn replace(&self, keep: usize, messages: &[Message]) -> io::Result<()> {
+        let Some(journal) = self.journal.upgrade() else {
+            return Ok(());
+        };
+        let mut state = journal.lock();
+        if state.epoch != self.epoch {
+            return Ok(());
+        }
+        state.settle()?;
+        write_record(&mut state.file, &Written::Cut(keep))?;
+        for message in messages {
+            write_record(&mut state.file, &Written::Message(message))?;
+        }
+        Ok(())
+    }
+
     /// Syncs the file to disk, which is done when a turn ends.
     ///
     /// # Errors

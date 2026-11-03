@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use omc_agent::Approvals;
 use omc_providers::Effort;
 use omc_providers::Provider;
-use omc_tools::{Host, Notebook};
+use omc_tools::{Checkpoint, Host, Notebook};
 use omc_wire::{Event, PlanStep, Question, Reply};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -29,6 +29,8 @@ struct State {
     resume: Mode,
     /// The effort the reader picked, when they did.
     effort: Option<Effort>,
+    /// Whether the agent has the checkpoint and rewind tools.
+    checkpoints: bool,
 }
 
 /// What a conversation's commands, turns and tools share.
@@ -41,6 +43,8 @@ pub(crate) struct Shared {
     pub(crate) approvals: Arc<Approvals>,
     /// The notes the agent keeps, and its request for a fresh context window.
     pub(crate) notebook: Arc<Notebook>,
+    /// The checkpoint the agent marks, and its request to rewind to it.
+    pub(crate) checkpoint: Arc<Checkpoint>,
     /// What can be set, and how it stands.
     state: Mutex<State>,
 }
@@ -54,6 +58,7 @@ impl Shared {
             approvals: Arc::new(Approvals::new(questions.clone(), false)),
             questions,
             notebook: Arc::new(Notebook::new()),
+            checkpoint: Arc::new(Checkpoint::new()),
             state: Mutex::new(State {
                 opened: false,
                 provider: None,
@@ -62,6 +67,7 @@ impl Shared {
                 mode: Mode::Asking,
                 resume: Mode::Asking,
                 effort: None,
+                checkpoints: false,
             }),
         })
     }
@@ -104,6 +110,7 @@ impl Shared {
                 mode: state.mode,
                 efforts: &efforts,
                 effort: state.effort,
+                checkpoints: state.checkpoints,
             }))
         });
         if let Some(settings) = settings {
@@ -168,6 +175,17 @@ impl Shared {
             }
             taken
         })
+    }
+
+    /// Whether the agent has the checkpoint and rewind tools.
+    pub(crate) fn checkpoints(&self) -> bool {
+        self.state(|state| state.checkpoints)
+    }
+
+    /// Turns the checkpoint and rewind tools on or off for the turns that start from now on, and ends the checkpoint that is active.
+    pub(crate) fn set_checkpoints(&self, enabled: bool) {
+        self.state(|state| state.checkpoints = enabled);
+        self.checkpoint.clear();
     }
 
     /// The effort the next turn thinks at; nothing when the model takes none.
@@ -277,6 +295,21 @@ mod tests {
             "n"
         );
         assert_eq!(shared.model(), Some((Provider::Claude, "n".to_owned())));
+    }
+
+    /// The checkpoint tools are off until the setting turns them on, and turning the setting either way ends an active checkpoint.
+    #[test]
+    fn checkpoints_are_a_setting() {
+        let (shared, mut events) = opened();
+        assert!(!shared.checkpoints());
+        shared.checkpoint.begin().unwrap();
+        shared.set_checkpoints(true);
+        assert!(shared.checkpoints());
+        assert!(!shared.checkpoint.active());
+        shared.announce();
+        let settings = announced(&mut events);
+        let setting = settings.iter().find(|s| s.id == "checkpoints").unwrap();
+        assert_eq!(setting.current, "on");
     }
 
     /// Plan mode remembers the mode it came from and gives it back.

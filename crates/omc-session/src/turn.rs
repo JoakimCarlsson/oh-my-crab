@@ -75,6 +75,10 @@ impl Turn {
         let host: Arc<dyn Host> = Arc::new(SessionHost {
             shared: self.shared.clone(),
         });
+        let checkpoint = self
+            .shared
+            .checkpoints()
+            .then(|| self.shared.checkpoint.clone());
         let toolset = Toolset::build(&Inputs {
             base: &self.base,
             denied: &self.denied,
@@ -86,6 +90,7 @@ impl Turn {
             discovered: self.discovered.clone(),
             environment: Arc::new(Environment::detect(&self.locations, &self.model)),
             notebook: self.shared.notebook.clone(),
+            checkpoint: checkpoint.clone(),
         });
         let shared = self.shared.clone();
         let refresh = move || toolset.live(shared.mode() == Mode::Plan);
@@ -99,6 +104,7 @@ impl Turn {
             refresh: Some(&refresh),
             notebook: Some(&self.shared.notebook),
             window: Some(window),
+            checkpoint: checkpoint.as_deref(),
         };
         let result = run_turn_recorded(
             &context,

@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use futures_util::future::join_all;
 use omc_providers::{
-    ChatModel, Effort, Message, ProviderError, Request, Sink, Tokens, ToolCall, ToolResult,
+    ChatModel, Effort, Message, ProviderError, Reply, Request, Sink, Tokens, ToolCall, ToolResult,
     ToolSpec,
 };
-use omc_tools::{FileChange, Notebook, Registry, sanitize};
+use omc_tools::{Checkpoint, FileChange, Notebook, Registry, sanitize};
 use thiserror::Error;
 
 use crate::{ApprovalRequest, Approvals, Scribe};
@@ -93,6 +93,8 @@ pub struct Context<'a> {
     pub refresh: Option<&'a (dyn Fn() -> Live + Send + Sync)>,
     /// The notebook whose reset requests are carried out when a batch of tool calls has finished, by dropping the history for a message holding the notes.
     pub notebook: Option<&'a Notebook>,
+    /// The checkpoint whose rewind requests are carried out when a batch of tool calls has finished, by replacing the history since the checkpoint with the report. It is forgotten when the turn ends.
+    pub checkpoint: Option<&'a Checkpoint>,
     /// The size of the model's context window in tokens, when it is known; the agent is reminded to save its notes when a request fills most of it.
     pub window: Option<u64>,
 }
@@ -125,6 +127,43 @@ const CONTEXT_REMINDER: &str = "
 The current context window is nearing its rollover threshold. Before important details fall out of the live tail, use context_notes to save a concise durable notebook: current task state, decisions, changed files, evidence, blockers, and exact next steps. Keep the notebook a compact index with one line per item, no copied logs or file bodies, and replace stale entries instead of appending so it stays well under the 16 KiB cap. Do not call new_context until the notebook is current.
 </context-window-reminder>";
 
+/// Replaces the history since a checkpoint with `report`: the history is cut back to `length` messages, which end with the results of the `checkpoint` call, and a user message holding the report follows.
+///
+/// The `rewind` call is dropped with the exploration, but the other calls of its batch have already run, so their calls and results are kept after the checkpoint, before the report. A journal that cannot be written to is reported on standard error and does not stop the turn.
+fn rewind(history: &mut Vec<Message>, length: usize, report: &str, scribe: Option<&Scribe>) {
+    let [.., Message::Assistant(reply), Message::ToolResults(results)] = history.as_slice() else {
+        return;
+    };
+    let siblings: Vec<ToolResult> = results
+        .iter()
+        .filter(|result| result.name != "rewind")
+        .cloned()
+        .collect();
+    let calls: Vec<ToolCall> = reply
+        .tool_calls
+        .iter()
+        .filter(|call| siblings.iter().any(|result| result.call_id == call.id))
+        .cloned()
+        .collect();
+    let mut kept = Vec::new();
+    if !calls.is_empty() {
+        kept.push(Message::Assistant(Reply {
+            tool_calls: calls,
+            tokens: None,
+            ..reply.clone()
+        }));
+        kept.push(Message::ToolResults(siblings));
+    }
+    kept.push(Message::User(format!(
+        "Checkpoint called and rewound. The messages since the checkpoint were removed from the conversation and your report stands in their place. The investigation is finished; carry on from the report, and call checkpoint again only to start a new one.\n\nReport:\n{report}"
+    )));
+    history.truncate(length);
+    history.extend(kept.iter().cloned());
+    if let Some(Err(error)) = scribe.map(|scribe| scribe.replace(length, &kept)) {
+        eprintln!("history not saved: {error}");
+    }
+}
+
 /// Runs one user turn: sends `prompt`, executes tool calls and loops until the
 /// model answers without calling a tool.
 ///
@@ -150,7 +189,7 @@ pub async fn run_turn(
 
 /// Runs a turn like [`run_turn`], and appends what is added to `history` to `scribe`'s journal as it happens: the prompt, each model reply and each batch of tool results.
 ///
-/// When the turn fails, the journal is cut back to the history before the turn, or to the notes message when the turn started a fresh context window. The journal is synced when the turn ends. A journal that cannot be written to is reported on standard error and does not stop the turn.
+/// When the turn fails, the journal is cut back to the history before the turn, or to the notes message when the turn started a fresh context window. The checkpoint, when there is one, is forgotten when the turn ends. The journal is synced when the turn ends. A journal that cannot be written to is reported on standard error and does not stop the turn.
 ///
 /// # Errors
 ///
@@ -167,6 +206,9 @@ pub async fn run_turn_recorded(
     history.push(Message::User(prompt));
     record(scribe, &history[start]);
     let result = drive(context, history, events, scribe).await;
+    if let Some(checkpoint) = context.checkpoint {
+        checkpoint.clear();
+    }
     if result.is_err() {
         let keep = if context.notebook.map_or(0, Notebook::resets) == resets {
             start
@@ -241,6 +283,12 @@ async fn drive(
         }
         history.push(Message::ToolResults(results));
         record(scribe, &history[history.len() - 1]);
+        if let Some(checkpoint) = context.checkpoint {
+            checkpoint.settle(history.len());
+            if let Some((length, report)) = checkpoint.take_rewind() {
+                rewind(history, length, &report, scribe);
+            }
+        }
         if let Some(notebook) = context.notebook
             && notebook.revision() != saved
         {
@@ -251,6 +299,9 @@ async fn drive(
         }
         if let Some(opening) = context.notebook.and_then(Notebook::take_reset) {
             reminded = false;
+            if let Some(checkpoint) = context.checkpoint {
+                checkpoint.clear();
+            }
             let opening = Message::User(opening);
             if let Some(Err(error)) = scribe.map(|scribe| scribe.restart(&opening)) {
                 eprintln!("history not saved: {error}");
@@ -380,7 +431,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use omc_providers::Reply;
     use serde_json::json;
 
     use super::*;
@@ -490,6 +540,7 @@ mod tests {
                 refresh: None,
                 notebook: None,
                 window: None,
+                checkpoint: None,
             },
             &mut history,
             "read it".into(),
@@ -554,6 +605,7 @@ mod tests {
                 refresh: None,
                 notebook: None,
                 window: None,
+                checkpoint: None,
             },
             &mut history,
             "go".into(),
@@ -594,6 +646,7 @@ mod tests {
                 refresh: None,
                 notebook: None,
                 window: None,
+                checkpoint: None,
             },
             &mut history,
             "go".into(),
@@ -623,6 +676,7 @@ mod tests {
                 refresh: None,
                 notebook: None,
                 window: None,
+                checkpoint: None,
             },
             &mut history,
             "edit".into(),
@@ -661,6 +715,7 @@ mod tests {
                 refresh: None,
                 notebook: None,
                 window: None,
+                checkpoint: None,
             },
             &mut history,
             "edit".into(),
@@ -703,6 +758,7 @@ mod tests {
                 refresh: None,
                 notebook: None,
                 window: None,
+                checkpoint: None,
             },
             history,
             prompt.into(),

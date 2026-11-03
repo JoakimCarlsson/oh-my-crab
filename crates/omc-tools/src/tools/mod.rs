@@ -3,6 +3,7 @@
 mod ask;
 mod atomic;
 mod bash;
+mod checkpoint;
 mod edit;
 mod exit_plan;
 mod glob;
@@ -16,6 +17,7 @@ mod write;
 
 pub use ask::Ask;
 pub use bash::Bash;
+pub use checkpoint::{CheckpointTool, Rewind};
 pub use edit::Edit;
 pub use exit_plan::ExitPlanMode;
 pub use glob::Glob;

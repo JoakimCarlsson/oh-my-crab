@@ -19,6 +19,8 @@ const WITHHELD: &[&str] = &[
     "todo",
     "context_notes",
     "new_context",
+    "checkpoint",
+    "rewind",
 ];
 
 /// The kind of subagent used when the call names none.
@@ -210,6 +212,7 @@ impl Tool for Task {
             refresh: None,
             notebook: None,
             window: None,
+            checkpoint: None,
         };
         run_turn(
             &context,
@@ -288,6 +291,7 @@ mod tests {
                 refresh: None,
                 notebook: None,
                 window: None,
+                checkpoint: None,
             },
             &mut history,
             prompt.into(),
@@ -537,6 +541,7 @@ mod tests {
                         refresh: None,
                         notebook: None,
                         window: None,
+                        checkpoint: None,
                     },
                     &mut mine,
                     "go".into(),

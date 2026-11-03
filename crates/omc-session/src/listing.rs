@@ -64,6 +64,7 @@ pub fn tools() -> Result<Vec<ToolInfo>, String> {
         discovered: Arc::new(Discovered::default()),
         environment: Arc::new(Environment::detect(&locations, "")),
         notebook: shared.notebook.clone(),
+        checkpoint: None,
     });
     let mut listed: Vec<ToolInfo> = Vec::new();
     for plan in [false, true] {

@@ -14,7 +14,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::AbortHandle;
 
 use crate::prompt::compose;
-use crate::settings::{EFFORT, MODE, MODEL, Mode};
+use crate::settings::{CHECKPOINTS, EFFORT, MODE, MODEL, Mode, OFF, ON};
 use crate::shared::Shared;
 use crate::turn::{Ended, Turn};
 
@@ -172,6 +172,7 @@ impl Session {
         self.shared
             .notebook
             .load(journal.as_ref().map_or("", |journal| journal.notes()));
+        self.shared.checkpoint.clear();
         self.history = messages.unwrap_or_default();
         self.journal = journal;
         self.open = Some(Open {
@@ -262,6 +263,7 @@ impl Session {
                 account: None,
             }),
             Ended::Failed(reason) => {
+                self.shared.checkpoint.clear();
                 self.keep_fresh_window();
                 self.say(Event::Finished(Some(reason)));
             }
@@ -292,6 +294,7 @@ impl Session {
 
     /// Records in the saved history that the turn that was stopped never happened.
     fn forget_turn(&mut self) {
+        self.shared.checkpoint.clear();
         self.keep_fresh_window();
         if let Some(Err(error)) = self.journal.as_ref().map(|j| j.cut(self.history.len())) {
             eprintln!("history not saved: {error}");
@@ -327,6 +330,13 @@ impl Session {
                 true
             }),
             EFFORT => self.shared.set_effort(value),
+            CHECKPOINTS => match value {
+                ON | OFF => {
+                    self.shared.set_checkpoints(value == ON);
+                    true
+                }
+                _ => false,
+            },
             _ => false,
         };
         if applied {
@@ -480,6 +490,30 @@ mod tests {
         session.rescan();
         assert!(events.try_recv().is_err());
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Cancelling a running turn leaves no active checkpoint behind.
+    #[tokio::test]
+    async fn cancelling_a_turn_clears_the_checkpoint() {
+        let (out, _events) = unbounded_channel();
+        let (ended, _finished) = unbounded_channel();
+        let mut session = Session {
+            shared: Shared::new(out),
+            history: Vec::new(),
+            journal: None,
+            open: None,
+            running: None,
+            turns: 0,
+            resets_at_start: 0,
+            ended,
+        };
+        let task = tokio::spawn(std::future::pending::<()>());
+        session.running = Some((1, task.abort_handle()));
+        session.shared.checkpoint.begin().unwrap();
+        session.shared.checkpoint.settle(2);
+        assert!(session.shared.checkpoint.active());
+        session.cancel();
+        assert!(!session.shared.checkpoint.active());
     }
 
     /// A conversation id is a file name, so it may not climb out of the folder, and the history of an id is found again by the same id.

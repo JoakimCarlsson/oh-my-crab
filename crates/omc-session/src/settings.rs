@@ -12,6 +12,15 @@ pub(crate) const MODE: &str = "mode";
 /// The id of the setting that picks how hard the model thinks.
 pub(crate) const EFFORT: &str = "effort";
 
+/// The id of the setting that turns the checkpoint and rewind tools on or off.
+pub(crate) const CHECKPOINTS: &str = "checkpoints";
+
+/// The value of the checkpoints setting that gives the agent the tools.
+pub(crate) const ON: &str = "on";
+
+/// The value of the checkpoints setting that withholds the tools.
+pub(crate) const OFF: &str = "off";
+
 /// The category of the setting that picks how hard the model thinks.
 const THOUGHT_LEVEL: &str = "thought_level";
 
@@ -56,6 +65,8 @@ pub(crate) struct Offer<'a> {
     pub(crate) efforts: &'a [Effort],
     /// The effort level in use.
     pub(crate) effort: Option<Effort>,
+    /// Whether the agent has the checkpoint and rewind tools.
+    pub(crate) checkpoints: bool,
 }
 
 /// The effort a model thinks at when the reader has not picked one: medium when it offers it, otherwise its lightest.
@@ -118,6 +129,20 @@ pub(crate) fn offered(offer: &Offer<'_>) -> Vec<Setting> {
                 .collect(),
         });
     }
+    settings.push(Setting {
+        id: CHECKPOINTS.to_owned(),
+        category: CHECKPOINTS.to_owned(),
+        name: "Checkpoints".to_owned(),
+        current: if offer.checkpoints { ON } else { OFF }.to_owned(),
+        picks: vec![
+            pick(OFF, "Off", "The agent has no checkpoint and rewind tools"),
+            pick(
+                ON,
+                "On",
+                "The agent may mark a checkpoint and later replace the exploration since it with a report; files are never restored",
+            ),
+        ],
+    });
     settings
 }
 
@@ -152,6 +177,7 @@ mod tests {
             mode: Mode::Asking,
             efforts,
             effort,
+            checkpoints: false,
         }
     }
 
@@ -168,7 +194,7 @@ mod tests {
     /// Effort is hidden when the model takes none, and otherwise falls back to medium.
     #[test]
     fn effort_follows_the_model() {
-        assert_eq!(offered(&offer(&[], &[], None)).len(), 2);
+        assert_eq!(offered(&offer(&[], &[], None)).len(), 3);
         let settings = offered(&offer(&[], &Effort::ALL, None));
         let effort = &settings[2];
         assert_eq!(
@@ -181,6 +207,21 @@ mod tests {
         assert_eq!(picked[2].current, "high");
         let narrowed = offered(&offer(&[], &[Effort::Low, Effort::High], Some(Effort::Max)));
         assert_eq!(narrowed[2].current, "low");
+    }
+
+    /// The checkpoints setting is last, off unless it was turned on.
+    #[test]
+    fn checkpoints_are_off_by_default() {
+        let models = [];
+        let mut offer = offer(&models, &[], None);
+        let off = offered(&offer);
+        let last = off.last().unwrap();
+        assert_eq!(
+            (last.id.as_str(), last.current.as_str()),
+            ("checkpoints", "off")
+        );
+        offer.checkpoints = true;
+        assert_eq!(offered(&offer).last().unwrap().current, "on");
     }
 
     /// Modes round-trip through their values.
