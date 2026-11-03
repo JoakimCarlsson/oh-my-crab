@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use omc_agent::{Context, EventSink, Live, run_turn};
+use omc_agent::{Context, EventSink, Live, Scribe, run_turn_recorded};
 use omc_auth::{AuthError, Provider};
 use omc_context::{Discovered, Environment, Locations};
 use omc_providers::{ChatModel, Message, RemoteModel};
@@ -41,6 +41,8 @@ pub(crate) struct Turn {
     pub(crate) shared: Arc<Shared>,
     /// What was said before this turn.
     pub(crate) history: Vec<Message>,
+    /// Where the turn's messages are saved, when the conversation is saved.
+    pub(crate) scribe: Option<Scribe>,
 }
 
 impl Turn {
@@ -94,7 +96,15 @@ impl Turn {
             effort,
             refresh: Some(&refresh),
         };
-        match run_turn(&context, &mut self.history, prompt, events.as_ref()).await {
+        let result = run_turn_recorded(
+            &context,
+            &mut self.history,
+            prompt,
+            events.as_ref(),
+            self.scribe.as_ref(),
+        )
+        .await;
+        match result {
             Ok(()) => Ended::Done(self.history),
             Err(error) => Ended::Failed(error.to_string()),
         }
@@ -173,6 +183,7 @@ mod tests {
             }),
             shared: shared.clone(),
             history: Vec::new(),
+            scribe: None,
         };
         let model = Arc::new(Planner {
             seen: Mutex::new(Vec::new()),

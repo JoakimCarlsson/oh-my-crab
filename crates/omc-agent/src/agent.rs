@@ -10,7 +10,7 @@ use omc_providers::{
 use omc_tools::{Registry, sanitize};
 use thiserror::Error;
 
-use crate::{ApprovalRequest, Approvals};
+use crate::{ApprovalRequest, Approvals, Scribe};
 
 /// Something the UI should show while a turn runs.
 #[derive(Debug, Clone, PartialEq)]
@@ -129,16 +129,47 @@ pub async fn run_turn(
     prompt: String,
     events: &(dyn Fn(AgentEvent) + Send + Sync),
 ) -> Result<(), AgentError> {
+    run_turn_recorded(context, history, prompt, events, None).await
+}
+
+/// Runs a turn like [`run_turn`], and appends what is added to `history` to `scribe`'s journal as it happens: the prompt, each model reply and each batch of tool results.
+///
+/// When the turn fails, the journal is cut back to the history before the turn. The journal is synced when the turn ends. A journal that cannot be written to is reported on standard error and does not stop the turn.
+///
+/// # Errors
+///
+/// Same as [`run_turn`].
+pub async fn run_turn_recorded(
+    context: &Context<'_>,
+    history: &mut Vec<Message>,
+    prompt: String,
+    events: &(dyn Fn(AgentEvent) + Send + Sync),
+    scribe: Option<&Scribe>,
+) -> Result<(), AgentError> {
     let start = history.len();
     history.push(Message::User(prompt));
-    let result = drive(context, history, events).await;
+    record(scribe, &history[start]);
+    let result = drive(context, history, events, scribe).await;
     if result.is_err() {
         history.truncate(start);
+        if let Some(Err(error)) = scribe.map(|scribe| scribe.cut(start)) {
+            eprintln!("history not saved: {error}");
+        }
+    }
+    if let Some(Err(error)) = scribe.map(Scribe::sync) {
+        eprintln!("history not saved: {error}");
     }
     result
 }
 
-/// Repeats model request and tool execution until no tool is requested.
+/// Appends `message` to the journal of `scribe`, when there is one, and reports a failure on standard error.
+fn record(scribe: Option<&Scribe>, message: &Message) {
+    if let Some(Err(error)) = scribe.map(|scribe| scribe.append(message)) {
+        eprintln!("history not saved: {error}");
+    }
+}
+
+/// Repeats model request and tool execution until no tool is requested, recording each step with `scribe`.
 ///
 /// # Errors
 ///
@@ -147,6 +178,7 @@ async fn drive(
     context: &Context<'_>,
     history: &mut Vec<Message>,
     events: &(dyn Fn(AgentEvent) + Send + Sync),
+    scribe: Option<&Scribe>,
 ) -> Result<(), AgentError> {
     loop {
         let live = context.refresh.map(|refresh| refresh());
@@ -168,11 +200,13 @@ async fn drive(
         }
         let calls = reply.tool_calls.clone();
         history.push(Message::Assistant(reply));
+        record(scribe, &history[history.len() - 1]);
         if calls.is_empty() {
             return Ok(());
         }
         let results = run_calls(registry, context.approvals, &calls, events).await;
         history.push(Message::ToolResults(results));
+        record(scribe, &history[history.len() - 1]);
     }
 }
 
@@ -297,7 +331,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::{Decision, Prompter};
+    use crate::{Decision, Journal, Prompter};
 
     /// A model that plays back a fixed list of replies.
     struct Scripted {
@@ -575,5 +609,68 @@ mod tests {
             std::fs::read_to_string(dir.join("f.txt")).unwrap(),
             "after\n"
         );
+    }
+
+    /// A model whose requests all fail.
+    struct Failing;
+
+    #[async_trait]
+    impl ChatModel for Failing {
+        /// Always fails.
+        async fn complete(&self, _: Request<'_>, _: &mut dyn Sink) -> Result<Reply, ProviderError> {
+            Err(ProviderError::NoModels)
+        }
+    }
+
+    /// Runs one recorded turn for `prompt` against `model` with an empty registry.
+    async fn recorded_turn(
+        model: &dyn ChatModel,
+        history: &mut Vec<Message>,
+        journal: &Arc<Journal>,
+        prompt: &str,
+    ) -> Result<(), AgentError> {
+        let registry = Registry::builtin(scratch("recorded")).unwrap();
+        run_turn_recorded(
+            &Context {
+                model,
+                registry: &registry,
+                approvals: &deny_all(),
+                system: "",
+                effort: None,
+                refresh: None,
+            },
+            history,
+            prompt.into(),
+            &|_| {},
+            Some(&journal.scribe()),
+        )
+        .await
+    }
+
+    /// A failed turn is cut back in the file, and a later open continues from the history before it with the earlier turn in the request.
+    #[tokio::test]
+    async fn a_failed_turn_is_cut_back_in_the_file() {
+        let path = scratch("journal-failed").join("c.jsonl");
+        let (journal, mut history) = Journal::open(&path, None).unwrap();
+        let answer = Scripted::new(vec![Reply {
+            text: "fine".into(),
+            ..Reply::default()
+        }]);
+        recorded_turn(&answer, &mut history, &journal, "one")
+            .await
+            .unwrap();
+        assert!(
+            recorded_turn(&Failing, &mut history, &journal, "two")
+                .await
+                .is_err()
+        );
+        assert_eq!(history.len(), 2);
+        drop(journal);
+        let (journal, mut reopened) = Journal::open(&path, None).unwrap();
+        assert_eq!(reopened, history);
+        recorded_turn(&answer, &mut reopened, &journal, "three")
+            .await
+            .unwrap();
+        assert_eq!(*answer.seen.lock().unwrap(), vec![1, 3]);
     }
 }

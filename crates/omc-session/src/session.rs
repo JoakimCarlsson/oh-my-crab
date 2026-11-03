@@ -1,7 +1,9 @@
 //! One conversation: the commands the client sends, and the turns they start.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use omc_agent::Journal;
 use omc_auth::{AuthError, Provider};
 use omc_context::{Discovered, Locations, discover, expand_skill};
 use omc_providers::Message;
@@ -37,6 +39,8 @@ struct Session {
     shared: Arc<Shared>,
     /// What was said so far.
     history: Vec<Message>,
+    /// The file the history is saved in, when the conversation is saved.
+    journal: Option<Arc<Journal>>,
     /// The conversation once it is opened.
     open: Option<Open>,
     /// The turn that is running and its number, when one is.
@@ -53,6 +57,7 @@ pub async fn run(mut commands: UnboundedReceiver<Command>, out: UnboundedSender<
     let mut session = Session {
         shared: Shared::new(out),
         history: Vec::new(),
+        journal: None,
         open: None,
         running: None,
         turns: 0,
@@ -103,6 +108,9 @@ impl Session {
             tools: servers,
             denied,
             disabled,
+            conversation,
+            history,
+            keep,
         } = opening;
         let provider = provider.as_str();
         if let Some(home) = home {
@@ -110,6 +118,13 @@ impl Session {
         }
         let Some(provider) = parse_provider(provider) else {
             return self.say(Event::Failed(format!("unknown provider: {provider}")));
+        };
+        let saved = match conversation {
+            Some(id) => match load_history(&id, history, keep) {
+                Ok(saved) => Some(saved),
+                Err(reason) => return self.say(Event::Failed(reason)),
+            },
+            None => None,
         };
         let mut registry = match Registry::builtin(&directory) {
             Ok(registry) => registry,
@@ -148,6 +163,9 @@ impl Session {
             },
         };
         let commands = commands_of(&discovered);
+        let (journal, messages) = saved.unzip();
+        self.history = messages.unwrap_or_default();
+        self.journal = journal;
         self.open = Some(Open {
             provider,
             base: Arc::new(registry),
@@ -186,6 +204,7 @@ impl Session {
             locations: open.locations.clone(),
             shared: self.shared.clone(),
             history: self.history.clone(),
+            scribe: self.journal.as_ref().map(Journal::scribe),
         };
         let ended = self.ended.clone();
         let task = tokio::spawn(async move {
@@ -244,6 +263,7 @@ impl Session {
         self.shared.questions.decline_all();
         if let Some((_, task)) = self.running.take() {
             task.abort();
+            self.forget_turn();
             self.say(Event::Halted);
             self.say(Event::Finished(None));
         }
@@ -254,6 +274,14 @@ impl Session {
         self.shared.questions.decline_all();
         if let Some((_, task)) = self.running.take() {
             task.abort();
+            self.forget_turn();
+        }
+    }
+
+    /// Records in the saved history that the turn that was stopped never happened.
+    fn forget_turn(&self) {
+        if let Some(Err(error)) = self.journal.as_ref().map(|j| j.cut(self.history.len())) {
+            eprintln!("history not saved: {error}");
         }
     }
 
@@ -294,6 +322,40 @@ impl Session {
             });
         });
     }
+}
+
+/// Opens the saved history of the conversation `id` in `folder`, or in a folder under the harness's own data folder, keeping `keep` turns when that is given.
+///
+/// # Errors
+///
+/// Returns what to tell the client when `id` is not usable as a file name, there is no data folder, or the file cannot be read.
+fn load_history(
+    id: &str,
+    folder: Option<PathBuf>,
+    keep: Option<usize>,
+) -> Result<(Arc<Journal>, Vec<Message>), String> {
+    let usable = !id.is_empty()
+        && !id.starts_with('.')
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !usable {
+        return Err(format!("unusable conversation id: {id}"));
+    }
+    let folder = match folder {
+        Some(folder) => folder,
+        None => dirs::data_dir()
+            .ok_or_else(|| "no data folder available".to_owned())?
+            .join("oh-my-crab")
+            .join("conversations"),
+    };
+    Journal::open(&history_path(&folder, id), keep)
+        .map_err(|error| format!("cannot open the conversation: {error}"))
+}
+
+/// The file the history of conversation `id` is kept in, inside `folder`.
+fn history_path(folder: &Path, id: &str) -> PathBuf {
+    folder.join(format!("{id}.jsonl"))
 }
 
 /// The name the skill tool is registered under.
@@ -356,6 +418,7 @@ mod tests {
         let mut session = Session {
             shared: Shared::new(out),
             history: Vec::new(),
+            journal: None,
             open: Some(Open {
                 provider: Provider::Claude,
                 base: Arc::new(Registry::builtin(&directory).unwrap()),
@@ -382,5 +445,29 @@ mod tests {
         session.rescan();
         assert!(events.try_recv().is_err());
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A conversation id is a file name, so it may not climb out of the folder, and the history of an id is found again by the same id.
+    #[test]
+    fn load_history_checks_the_id_and_finds_the_file_again() {
+        let folder = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/history");
+        let _ = std::fs::remove_dir_all(&folder);
+        for id in ["", "../x", "a/b", ".hidden"] {
+            assert!(load_history(id, Some(folder.clone()), None).is_err());
+        }
+        let (journal, history) = load_history("c-1", Some(folder.clone()), None).unwrap();
+        assert!(history.is_empty());
+        let scribe = journal.scribe();
+        scribe.append(&Message::User("hi".into())).unwrap();
+        scribe
+            .append(&Message::Assistant(omc_providers::Reply::default()))
+            .unwrap();
+        drop(journal);
+        let (_, history) = load_history("c-1", Some(folder.clone()), None).unwrap();
+        assert_eq!(history.len(), 2);
+        std::fs::write(history_path(&folder, "bad"), "nonsense\n").unwrap();
+        assert!(load_history("bad", Some(folder.clone()), None).is_err());
+        std::fs::remove_dir_all(&folder).unwrap();
     }
 }

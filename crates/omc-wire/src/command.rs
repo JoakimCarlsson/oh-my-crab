@@ -27,6 +27,15 @@ pub struct Opening {
     /// The instruction files (by path), skills and agent definitions (by name) the reader turned off.
     #[serde(default)]
     pub disabled: Vec<String>,
+    /// The id the client gave the conversation; its history is saved under it and loaded again when it is opened, and nothing is saved when there is none.
+    #[serde(default)]
+    pub conversation: Option<String>,
+    /// The folder the history files are kept in, or a folder under the harness's own data folder when there is none.
+    #[serde(default)]
+    pub history: Option<PathBuf>,
+    /// The number of turns of the saved history to keep, or all of it when there is none; a turn is one prompt and everything the agent did for it.
+    #[serde(default)]
+    pub keep: Option<usize>,
 }
 
 /// One request from the client, answered by [`crate::Event`]s.
@@ -71,4 +80,22 @@ pub enum Command {
     },
     /// Ends the conversation and the harness.
     Close,
+}
+
+#[cfg(test)]
+/// Tests for the opening request.
+mod tests {
+    use super::*;
+
+    /// An opening request from a client that predates the conversation fields still reads, and the fields are empty.
+    #[test]
+    fn an_opening_without_the_history_fields_reads() {
+        let opening: Opening = serde_json::from_str(
+            r#"{"directory":"/w","home":null,"provider":"claude","model":null,"yolo":false}"#,
+        )
+        .unwrap();
+        assert_eq!(opening.conversation, None);
+        assert_eq!(opening.history, None);
+        assert_eq!(opening.keep, None);
+    }
 }

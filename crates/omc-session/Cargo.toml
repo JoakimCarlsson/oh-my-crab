@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 async-trait = "0.1.92"
+dirs = "7.0.0"
 omc-agent = { version = "0.1.0", path = "../omc-agent" }
 omc-context = { version = "0.1.0", path = "../omc-context" }
 omc-auth = { version = "0.1.0", path = "../omc-auth" }
