@@ -10,5 +10,5 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
-omc-ui.workspace = true
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros"] }
+omc-session = { version = "0.1.0", path = "../omc-session" }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "io-std"] }
