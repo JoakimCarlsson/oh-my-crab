@@ -58,6 +58,11 @@ impl Tool for Grep {
         "grep"
     }
 
+    /// Reading changes nothing.
+    fn read_only(&self) -> bool {
+        true
+    }
+
     /// Describes the tool to the model.
     fn description(&self) -> &'static str {
         "Search file contents with a regular expression. Honors .gitignore and skips binary \

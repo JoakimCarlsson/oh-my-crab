@@ -49,6 +49,11 @@ impl Tool for Glob {
         "glob"
     }
 
+    /// Reading changes nothing.
+    fn read_only(&self) -> bool {
+        true
+    }
+
     /// Describes the tool to the model.
     fn description(&self) -> &'static str {
         "Find files by glob pattern. Honors .gitignore. A pattern without a slash, such as \

@@ -43,6 +43,38 @@ impl Registry {
         self.tools.insert(tool.name(), Arc::new(tool));
     }
 
+    /// Adds a tool that is already shared, replacing any tool with the same name.
+    pub fn register_shared(&mut self, tool: Arc<dyn Tool>) {
+        self.tools.insert(tool.name(), tool);
+    }
+
+    /// Takes the tool called `name` out, when it is registered.
+    pub fn remove(&mut self, name: &str) {
+        self.tools.remove(name);
+    }
+
+    /// A registry with only the tools that satisfy `keep`.
+    pub fn filtered(&self, keep: impl Fn(&dyn Tool) -> bool) -> Self {
+        Self {
+            tools: self
+                .tools
+                .iter()
+                .filter(|(_, tool)| keep(tool.as_ref()))
+                .map(|(name, tool)| (*name, tool.clone()))
+                .collect(),
+        }
+    }
+
+    /// A registry with only the tools that never change anything.
+    pub fn read_only(&self) -> Self {
+        self.filtered(|tool| tool.read_only())
+    }
+
+    /// The names of the registered tools, in name order.
+    pub fn names(&self) -> Vec<String> {
+        self.tools.keys().map(|name| (*name).to_owned()).collect()
+    }
+
     /// Returns the tool called `name`, if registered.
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
         self.tools.get(name)
@@ -51,6 +83,24 @@ impl Registry {
     /// Iterates over the registered tools in name order.
     pub fn iter(&self) -> impl Iterator<Item = &Arc<dyn Tool>> {
         self.tools.values()
+    }
+
+    /// Runs the tool called `name` with `args` for the call numbered `id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Unknown`] when no such tool exists, or whatever the
+    /// tool itself fails with.
+    pub async fn call_as(
+        &self,
+        id: &str,
+        name: &str,
+        args: Value,
+    ) -> Result<ToolOutput, ToolError> {
+        let tool = self
+            .get(name)
+            .ok_or_else(|| ToolError::Unknown(name.to_string()))?;
+        tool.call_as(id, args).await
     }
 
     /// Runs the tool called `name` with `args`.
@@ -98,6 +148,14 @@ mod tests {
         async fn call(&self, args: Value) -> Result<ToolOutput, ToolError> {
             Ok(ToolOutput::new(args["text"].as_str().unwrap_or_default()))
         }
+    }
+
+    /// Read-only filtering keeps the tools that look and drops those that change things.
+    #[test]
+    fn read_only_filtering() {
+        let registry = Registry::builtin(crate::testutil::scratch("registry-read-only")).unwrap();
+        assert_eq!(registry.read_only().names(), vec!["glob", "grep", "read"]);
+        assert_eq!(registry.names().len(), 6);
     }
 
     /// A registered tool runs by name and an unknown name is an error.

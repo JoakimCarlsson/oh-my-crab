@@ -28,10 +28,15 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// What the tool does, written for the model.
-    fn description(&self) -> &'static str;
+    fn description(&self) -> &str;
 
     /// The JSON schema of the arguments object.
     fn schema(&self) -> Value;
+
+    /// Whether the tool only looks and never changes anything, so that plan mode and read-only agents may use it.
+    fn read_only(&self) -> bool {
+        false
+    }
 
     /// Whether the user must approve a call before it runs.
     fn needs_approval(&self) -> bool {
@@ -50,6 +55,15 @@ pub trait Tool: Send + Sync {
     /// Returns [`ToolError`] when the arguments are invalid or the operation
     /// fails; the caller reports it to the model instead of aborting.
     async fn call(&self, args: Value) -> Result<ToolOutput, ToolError>;
+
+    /// Runs the tool for the model's call numbered `id`, for tools that report on their own work under that id.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Tool::call`].
+    async fn call_as(&self, _id: &str, args: Value) -> Result<ToolOutput, ToolError> {
+        self.call(args).await
+    }
 }
 
 /// Deserializes `args` into the tool's argument struct.
