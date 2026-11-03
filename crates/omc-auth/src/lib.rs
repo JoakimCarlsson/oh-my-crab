@@ -13,4 +13,5 @@ mod store;
 pub use credentials::Credentials;
 pub use error::AuthError;
 pub use provider::Provider;
-pub use session::{active_credentials, active_provider, login};
+pub use session::{active_credentials, active_provider, credentials_for, login};
+pub use store::set_home;

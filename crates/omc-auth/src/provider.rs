@@ -80,7 +80,13 @@ static CLAUDE: Spec = Spec {
     redirect_uri: "http://localhost:54545/callback",
     json_body: true,
     state_in_exchange: true,
-    refresh_headers: &[("anthropic-beta", "oauth-2025-04-20")],
+    refresh_headers: &[
+        ("anthropic-beta", "oauth-2025-04-20"),
+        (
+            "user-agent",
+            "anthropic-sdk-typescript/0.112.1 userOAuthProvider",
+        ),
+    ],
     account_from_jwt: false,
 };
 

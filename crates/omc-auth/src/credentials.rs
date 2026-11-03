@@ -15,6 +15,15 @@ pub struct Credentials {
     pub expires_at_ms: u64,
     /// Provider account identifier, when the provider uses one.
     pub account_id: Option<String>,
+    /// Account email address, when the provider reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// Organization the token is scoped to, fixed at login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<String>,
+    /// Display name of that organization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_name: Option<String>,
 }
 
 impl Credentials {

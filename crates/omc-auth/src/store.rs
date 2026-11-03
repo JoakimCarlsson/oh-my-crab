@@ -1,10 +1,11 @@
-//! Persistent credential storage in `~/.config/oh-my-crab/auth.json`.
+//! Persistent credential storage in `auth.json`, in the folder set with [`set_home`] or `~/.config/oh-my-crab`.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -19,12 +20,23 @@ pub struct AuthFile {
     pub credentials: BTreeMap<Provider, Credentials>,
 }
 
+/// The folder `auth.json` lives in, when the host chose one.
+static HOME: OnceLock<PathBuf> = OnceLock::new();
+
+/// Keeps credentials in `home` for the rest of the process; the first call wins.
+pub fn set_home(home: PathBuf) {
+    let _ = HOME.set(home);
+}
+
 /// Returns the path of `auth.json`.
 ///
 /// # Errors
 ///
 /// Returns [`AuthError::Storage`] when no config directory can be determined.
 pub fn path() -> Result<PathBuf, AuthError> {
+    if let Some(home) = HOME.get() {
+        return Ok(home.join("auth.json"));
+    }
     let base = dirs::config_dir()
         .ok_or_else(|| AuthError::Storage("no config directory available".into()))?;
     Ok(base.join("oh-my-crab").join("auth.json"))

@@ -27,20 +27,32 @@ pub async fn login(provider: Provider, notify: impl Fn(String)) -> Result<(), Au
 /// Returns [`AuthError::NotLoggedIn`] when nothing is stored, or another
 /// [`AuthError`] when refreshing or saving fails.
 pub async fn active_credentials() -> Result<(Provider, Credentials), AuthError> {
+    let provider = store::load()?.active.ok_or(AuthError::NotLoggedIn)?;
+    Ok((provider, credentials_for(provider).await?))
+}
+
+/// Returns credentials for `provider` that are valid right now.
+///
+/// Expired tokens are refreshed and the refreshed credentials are saved.
+///
+/// # Errors
+///
+/// Returns [`AuthError::NotLoggedIn`] when nothing is stored for `provider`,
+/// or another [`AuthError`] when refreshing or saving fails.
+pub async fn credentials_for(provider: Provider) -> Result<Credentials, AuthError> {
     let mut file = store::load()?;
-    let provider = file.active.ok_or(AuthError::NotLoggedIn)?;
     let stored = file
         .credentials
         .get(&provider)
         .cloned()
         .ok_or(AuthError::NotLoggedIn)?;
     if !stored.is_expired() {
-        return Ok((provider, stored));
+        return Ok(stored);
     }
     let renewed = flow::refresh(provider.spec(), &stored).await?;
     file.credentials.insert(provider, renewed.clone());
     store::save(&file)?;
-    Ok((provider, renewed))
+    Ok(renewed)
 }
 
 /// Returns the provider messages are currently sent to, if any.
