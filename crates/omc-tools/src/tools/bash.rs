@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 use crate::tool::parse_args;
-use crate::{Sandbox, Tool, ToolError, ToolOutput};
+use crate::{Jobs, Sandbox, Tool, ToolError, ToolOutput};
 
 /// Timeout in seconds when the caller gives none.
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -25,16 +25,42 @@ const MAX_STREAM_BYTES: usize = 30_000;
 /// How long to wait for output pipes to close after the shell has exited.
 const DRAIN_GRACE: Duration = Duration::from_secs(1);
 
+/// What the model is told about the tool.
+const DESCRIPTION: &str = "Run a shell command in the working directory, with bash (cmd on Windows). Returns the exit code, stdout \
+     and stderr. The command is killed after the timeout, and long output is truncated. \
+     The user is asked to approve each command.";
+
+/// What the model is told about the `background` flag, when the tool has it.
+const BACKGROUND_NOTE: &str = " Pass `background: true` to start a long-running command (a dev server, a long build) and get a handle \
+     back at once; it has no timeout unless you give one, and `wait` returns its exit code and the tail of its output when it ends.";
+
 /// Runs shell commands in the working directory.
 pub struct Bash {
     /// The directory commands run in.
     sandbox: Sandbox,
+    /// Where background commands run, when the tool may start them.
+    jobs: Option<Arc<Jobs>>,
+    /// What the model is told it does.
+    description: String,
 }
 
 impl Bash {
-    /// Creates the tool running commands in the root of `sandbox`.
+    /// Creates the tool running commands in the root of `sandbox`, in the foreground only.
     pub fn new(sandbox: Sandbox) -> Self {
-        Self { sandbox }
+        Self {
+            sandbox,
+            jobs: None,
+            description: DESCRIPTION.to_owned(),
+        }
+    }
+
+    /// Creates the tool running commands in the root of `sandbox`, which can also start them as background runs in `jobs`.
+    pub fn with_jobs(sandbox: Sandbox, jobs: Arc<Jobs>) -> Self {
+        Self {
+            sandbox,
+            jobs: Some(jobs),
+            description: format!("{DESCRIPTION}{BACKGROUND_NOTE}"),
+        }
     }
 }
 
@@ -45,15 +71,20 @@ struct Args {
     command: String,
     /// Seconds before the command is killed.
     timeout: Option<u64>,
+    /// Whether to start the command in the background and return a handle.
+    #[serde(default)]
+    background: bool,
 }
 
 /// The head of one output stream plus the number of bytes it produced.
 #[derive(Default)]
 struct Capture {
-    /// The first [`MAX_STREAM_BYTES`] bytes.
+    /// The first [`MAX_STREAM_BYTES`] bytes, or the last ones when `tail` is set.
     data: Vec<u8>,
     /// Total bytes the stream produced.
     total: usize,
+    /// Whether the end of the stream is kept instead of the start.
+    tail: bool,
 }
 
 #[async_trait]
@@ -64,22 +95,27 @@ impl Tool for Bash {
     }
 
     /// Describes the tool to the model.
-    fn description(&self) -> &'static str {
-        "Run a shell command in the working directory, with bash (cmd on Windows). Returns the exit code, stdout \
-         and stderr. The command is killed after the timeout, and long output is truncated. \
-         The user is asked to approve each command."
+    fn description(&self) -> &str {
+        &self.description
     }
 
     /// Returns the argument schema.
     fn schema(&self) -> Value {
-        json!({
+        let mut schema = json!({
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "The command line to run." },
-                "timeout": { "type": "integer", "minimum": 1, "description": "Timeout in seconds. Defaults to 120, at most 600." }
+                "timeout": { "type": "integer", "minimum": 1, "description": "Timeout in seconds. Defaults to 120, at most 600; a background command has none unless given." }
             },
             "required": ["command"]
-        })
+        });
+        if self.jobs.is_some() {
+            schema["properties"]["background"] = json!({
+                "type": "boolean",
+                "description": "Start the command in the background and return a handle at once; `wait` returns its result."
+            });
+        }
+        schema
     }
 
     /// Commands can do anything, so they need approval.
@@ -92,24 +128,98 @@ impl Tool for Bash {
         args["command"].as_str().unwrap_or("?").to_string()
     }
 
-    /// Runs the command, killing its whole process group on timeout.
+    /// A copy that runs commands in the foreground only, when this one can start background runs.
+    fn foreground(&self) -> Option<Arc<dyn Tool>> {
+        self.jobs
+            .as_ref()
+            .map(|_| Arc::new(Bash::new(self.sandbox.clone())) as Arc<dyn Tool>)
+    }
+
+    /// Runs the call without an id, which only loses the link from a background run to the call that started it.
     async fn call(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        self.call_as("", args).await
+    }
+
+    /// Runs the command, killing its whole process group on timeout, or starts it in the background under the call `id`.
+    async fn call_as(&self, id: &str, args: Value) -> Result<ToolOutput, ToolError> {
         let args: Args = parse_args(args)?;
-        let seconds = args
+        if !args.background {
+            let seconds = args
+                .timeout
+                .unwrap_or(DEFAULT_TIMEOUT_SECS)
+                .clamp(1, MAX_TIMEOUT_SECS);
+            return run(
+                self.sandbox.root(),
+                &args.command,
+                Some(Duration::from_secs(seconds)),
+                false,
+            )
+            .await;
+        }
+        let jobs = self.jobs.as_ref().ok_or_else(|| {
+            ToolError::Failed("this agent cannot start background runs".to_owned())
+        })?;
+        let timeout = args
             .timeout
-            .unwrap_or(DEFAULT_TIMEOUT_SECS)
-            .clamp(1, MAX_TIMEOUT_SECS);
-        run(self.sandbox.root(), &args.command, seconds).await
+            .map(|seconds| Duration::from_secs(seconds.clamp(1, MAX_TIMEOUT_SECS)));
+        let dir = self.sandbox.root().to_path_buf();
+        let command = args.command;
+        let label: String = command
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(120)
+            .collect();
+        let work = {
+            let command = command.clone();
+            async move {
+                run(&dir, &command, timeout, true)
+                    .await
+                    .map(|output| output.text)
+                    .map_err(|error| error.to_string())
+            }
+        };
+        let handle = jobs.spawn(label, Some(id.to_owned()).filter(|id| !id.is_empty()), work);
+        Ok(ToolOutput::new(format!(
+            "Started in the background as {handle}. Call `wait` to get its result when it ends."
+        )))
     }
 }
 
-/// Runs `command` in `dir`, waiting at most `seconds`.
+/// Kills the process group of a command when dropped, so that a command whose run is cancelled does not outlive it.
+struct GroupGuard(Option<u32>);
+
+impl GroupGuard {
+    /// Stops the guard from killing anything, once the command has been waited for.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupGuard {
+    /// Kills the group when the guard is still armed.
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            kill_group(pid);
+        }
+    }
+}
+
+/// Runs `command` in `dir`, waiting at most `limit` when there is one.
+///
+/// With `tail` set the end of each output stream is kept when it is too long, instead of the start. The command is killed, with its process group, when the returned future is dropped.
 ///
 /// # Errors
 ///
 /// Returns [`ToolError::Io`] when the shell cannot start and
 /// [`ToolError::Failed`], carrying the partial output, on timeout.
-async fn run(dir: &std::path::Path, command: &str, seconds: u64) -> Result<ToolOutput, ToolError> {
+async fn run(
+    dir: &std::path::Path,
+    command: &str,
+    limit: Option<Duration>,
+    tail: bool,
+) -> Result<ToolOutput, ToolError> {
     let mut child = shell(command)
         .current_dir(dir)
         .stdin(Stdio::null())
@@ -118,16 +228,26 @@ async fn run(dir: &std::path::Path, command: &str, seconds: u64) -> Result<ToolO
         .kill_on_drop(true)
         .spawn()?;
     let pid = child.id();
-    let stdout = Arc::new(Mutex::new(Capture::default()));
-    let stderr = Arc::new(Mutex::new(Capture::default()));
+    let mut guard = GroupGuard(pid);
+    let fresh = || {
+        Arc::new(Mutex::new(Capture {
+            tail,
+            ..Capture::default()
+        }))
+    };
+    let stdout = fresh();
+    let stderr = fresh();
     let readers = [
         tokio::spawn(capture(child.stdout.take(), stdout.clone())),
         tokio::spawn(capture(child.stderr.take(), stderr.clone())),
     ];
-    let waited = tokio::time::timeout(Duration::from_secs(seconds), child.wait()).await;
+    let waited = match limit {
+        Some(limit) => tokio::time::timeout(limit, child.wait()).await.ok(),
+        None => Some(child.wait().await),
+    };
     let status = match waited {
-        Ok(status) => Some(status?),
-        Err(_) => {
+        Some(status) => Some(status?),
+        None => {
             if let Some(pid) = pid {
                 kill_group(pid);
             }
@@ -135,6 +255,7 @@ async fn run(dir: &std::path::Path, command: &str, seconds: u64) -> Result<ToolO
             None
         }
     };
+    guard.disarm();
     for reader in readers {
         let _ = tokio::time::timeout(DRAIN_GRACE, reader).await;
     }
@@ -142,12 +263,13 @@ async fn run(dir: &std::path::Path, command: &str, seconds: u64) -> Result<ToolO
     match status {
         Some(_) => Ok(ToolOutput::new(report)),
         None => Err(ToolError::Failed(format!(
-            "command timed out after {seconds}s and was killed\n{report}"
+            "command timed out after {}s and was killed\n{report}",
+            limit.unwrap_or_default().as_secs()
         ))),
     }
 }
 
-/// Reads `source` to the end, keeping the head of it in `into`.
+/// Reads `source` to the end, keeping the head of it in `into`, or the tail when `into` asks for it.
 async fn capture<R: AsyncRead + Unpin>(source: Option<R>, into: Arc<Mutex<Capture>>) {
     let Some(mut source) = source else { return };
     let mut chunk = [0u8; 8192];
@@ -156,8 +278,14 @@ async fn capture<R: AsyncRead + Unpin>(source: Option<R>, into: Arc<Mutex<Captur
             break;
         }
         let mut capture = into.lock().unwrap();
-        let room = MAX_STREAM_BYTES.saturating_sub(capture.data.len());
-        capture.data.extend_from_slice(&chunk[..read.min(room)]);
+        if capture.tail {
+            capture.data.extend_from_slice(&chunk[..read]);
+            let excess = capture.data.len().saturating_sub(MAX_STREAM_BYTES);
+            capture.data.drain(..excess);
+        } else {
+            let room = MAX_STREAM_BYTES.saturating_sub(capture.data.len());
+            capture.data.extend_from_slice(&chunk[..read.min(room)]);
+        }
         capture.total += read;
     }
 }
@@ -218,8 +346,9 @@ fn format_output(
             String::from_utf8_lossy(&capture.data).trim_end()
         ));
         if capture.total > capture.data.len() {
+            let part = if capture.tail { "the last " } else { "" };
             text.push_str(&format!(
-                "\n[{label} truncated: showing {} of {} bytes]",
+                "\n[{label} truncated: showing {part}{} of {} bytes]",
                 capture.data.len(),
                 capture.total
             ));
@@ -286,6 +415,82 @@ mod tests {
                 .contains("stdout truncated: showing 30000 of 100000 bytes")
         );
         assert!(out.text.len() < 31_000);
+    }
+
+    /// A background command returns a handle at once, `wait` reports its exit code and output, and a failing command is reported as failed.
+    #[tokio::test]
+    async fn background_commands_report_through_wait() {
+        let dir = scratch("bash-bg");
+        let jobs = Arc::new(Jobs::new(|_| {}));
+        let tool = Bash::with_jobs(Sandbox::new(&dir).unwrap(), jobs.clone());
+        let started = Instant::now();
+        let out = tool
+            .call(json!({ "command": "sleep 1; echo hello; exit 2", "background": true }))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(out.text.contains("bg-1"));
+        let finished = jobs.wait().await.unwrap();
+        assert!(finished.ok);
+        assert!(finished.text.starts_with("exit code: 2"));
+        assert!(finished.text.contains("hello"));
+        tool.call(json!({ "command": "sleep 5", "background": true, "timeout": 1 }))
+            .await
+            .unwrap();
+        let finished = jobs.wait().await.unwrap();
+        assert!(!finished.ok);
+        assert!(finished.text.contains("timed out after 1s"));
+    }
+
+    /// A background command keeps the tail of long output and says so.
+    #[tokio::test]
+    async fn background_output_keeps_the_tail() {
+        let dir = scratch("bash-bg-tail");
+        let jobs = Arc::new(Jobs::new(|_| {}));
+        let tool = Bash::with_jobs(Sandbox::new(&dir).unwrap(), jobs.clone());
+        tool.call(json!({
+            "command": "head -c 100000 /dev/zero | tr '\\0' x; echo END",
+            "background": true
+        }))
+        .await
+        .unwrap();
+        let text = jobs.wait().await.unwrap().text;
+        assert!(text.contains("stdout truncated: showing the last 30000 of 100004 bytes"));
+        assert!(text.contains("xxxEND"));
+    }
+
+    /// The foreground copy of the tool refuses background runs and does not offer them.
+    #[tokio::test]
+    async fn the_foreground_copy_cannot_background() {
+        let dir = scratch("bash-fg");
+        let jobs = Arc::new(Jobs::new(|_| {}));
+        let tool = Bash::with_jobs(Sandbox::new(&dir).unwrap(), jobs);
+        assert!(tool.schema()["properties"]["background"].is_object());
+        let plain = tool.foreground().unwrap();
+        assert!(plain.schema()["properties"]["background"].is_null());
+        let result = plain
+            .call(json!({ "command": "true", "background": true }))
+            .await;
+        assert!(matches!(result, Err(ToolError::Failed(_))));
+    }
+
+    /// Dropping the runs kills a background command along with the processes it started.
+    #[tokio::test]
+    async fn dropping_the_runs_kills_the_command_group() {
+        let dir = scratch("bash-bg-kill");
+        let marker = dir.join("alive");
+        let jobs = Arc::new(Jobs::new(|_| {}));
+        let tool = Bash::with_jobs(Sandbox::new(&dir).unwrap(), jobs.clone());
+        tool.call(json!({
+            "command": "(sleep 2; touch alive) & sleep 30",
+            "background": true
+        }))
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        jobs.stop_all();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!marker.exists());
     }
 
     /// A command that leaves a background process holding the pipes still returns.

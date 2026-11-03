@@ -70,6 +70,11 @@ pub trait Tool: Send + Sync {
         args.to_string()
     }
 
+    /// A copy of the tool that cannot start background runs, for a tool that can; nothing for the rest.
+    fn foreground(&self) -> Option<std::sync::Arc<dyn Tool>> {
+        None
+    }
+
     /// Runs the tool with `args`.
     ///
     /// # Errors

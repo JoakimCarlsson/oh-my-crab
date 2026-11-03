@@ -124,6 +124,7 @@ impl Session {
             return self.say(Event::Failed(format!("unknown provider: {provider}")));
         };
         self.journal = None;
+        self.shared.jobs.stop_all();
         let saved = match conversation {
             Some(id) => match load_history(&id, history, keep) {
                 Ok(saved) => Some(saved),
@@ -131,7 +132,8 @@ impl Session {
             },
             None => None,
         };
-        let mut registry = match Registry::builtin(&directory) {
+        let mut registry = match Registry::builtin_with(&directory, Some(self.shared.jobs.clone()))
+        {
             Ok(registry) => registry,
             Err(error) => return self.say(Event::Failed(error.to_string())),
         };
@@ -283,9 +285,10 @@ impl Session {
         }
     }
 
-    /// Ends whatever is running, for good.
+    /// Ends whatever is running, for good, background runs included.
     fn stop(&mut self) {
         self.shared.questions.decline_all();
+        self.shared.jobs.stop_all();
         if let Some((_, task)) = self.running.take() {
             task.abort();
             self.forget_turn();
@@ -514,6 +517,40 @@ mod tests {
         assert!(session.shared.checkpoint.active());
         session.cancel();
         assert!(!session.shared.checkpoint.active());
+    }
+
+    /// A session with nothing open, for the tests of how cancelling and stopping treat background runs.
+    fn bare_session() -> Session {
+        let (out, _events) = unbounded_channel();
+        let (ended, _finished) = unbounded_channel();
+        Session {
+            shared: Shared::new(out),
+            history: Vec::new(),
+            journal: None,
+            open: None,
+            running: None,
+            turns: 0,
+            resets_at_start: 0,
+            ended,
+        }
+    }
+
+    /// Cancelling a turn leaves background runs going, and stopping the session kills them.
+    #[tokio::test]
+    async fn cancelling_keeps_background_runs_and_stopping_kills_them() {
+        let mut session = bare_session();
+        let jobs = session.shared.jobs.clone();
+        jobs.spawn("slow".into(), None, async {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            Ok("done".to_owned())
+        });
+        let task = tokio::spawn(std::future::pending::<()>());
+        session.running = Some((1, task.abort_handle()));
+        session.cancel();
+        assert_eq!(jobs.wait().await.unwrap().text, "done");
+        jobs.spawn("forever".into(), None, std::future::pending());
+        session.stop();
+        assert!(jobs.wait().await.is_err());
     }
 
     /// A conversation id is a file name, so it may not climb out of the folder, and the history of an id is found again by the same id.

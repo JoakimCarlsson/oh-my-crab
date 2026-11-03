@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use omc_agent::Approvals;
 use omc_providers::Effort;
 use omc_providers::Provider;
-use omc_tools::{Checkpoint, Host, Notebook};
+use omc_tools::{Checkpoint, Host, Jobs, Notebook};
 use omc_wire::{Event, PlanStep, Question, Reply};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -45,6 +45,8 @@ pub(crate) struct Shared {
     pub(crate) notebook: Arc<Notebook>,
     /// The checkpoint the agent marks, and its request to rewind to it.
     pub(crate) checkpoint: Arc<Checkpoint>,
+    /// The commands and subagents running in the background.
+    pub(crate) jobs: Arc<Jobs>,
     /// What can be set, and how it stands.
     state: Mutex<State>,
 }
@@ -53,12 +55,16 @@ impl Shared {
     /// The shared state of a conversation that has not been opened.
     pub(crate) fn new(out: UnboundedSender<Event>) -> Arc<Self> {
         let questions = Arc::new(Questions::new(out.clone()));
+        let announce = out.clone();
         Arc::new(Self {
             out,
             approvals: Arc::new(Approvals::new(questions.clone(), false)),
             questions,
             notebook: Arc::new(Notebook::new()),
             checkpoint: Arc::new(Checkpoint::new()),
+            jobs: Arc::new(Jobs::new(move |run| {
+                let _ = announce.send(Event::Background(run));
+            })),
             state: Mutex::new(State {
                 opened: false,
                 provider: None,

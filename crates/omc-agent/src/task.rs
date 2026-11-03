@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use omc_context::{AgentDefinition, render, subagent_assignment};
 use omc_providers::{ChatModel, Effort, Message};
-use omc_tools::{Registry, Tool, ToolError, ToolOutput, parse_args};
+use omc_tools::{Jobs, Registry, Tool, ToolError, ToolOutput, parse_args};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -21,6 +21,7 @@ const WITHHELD: &[&str] = &[
     "new_context",
     "checkpoint",
     "rewind",
+    "wait",
 ];
 
 /// The kind of subagent used when the call names none.
@@ -48,6 +49,8 @@ pub struct TaskSettings {
     pub effort: Option<Effort>,
     /// Builds the system prompt of a subagent.
     pub prompt: Arc<PromptBuilder>,
+    /// Where subagents started in the background run.
+    pub jobs: Arc<Jobs>,
 }
 
 /// Arguments of a `task` call.
@@ -57,6 +60,94 @@ struct Args {
     agent: Option<String>,
     /// What it is to do.
     task: String,
+    /// A few words naming the work.
+    description: Option<String>,
+    /// Whether to start it in the background and return a handle.
+    #[serde(default)]
+    background: bool,
+}
+
+/// A subagent, owning everything it needs so that it can run on a task of its own.
+struct Run {
+    /// The model it asks.
+    model: Arc<dyn ChatModel>,
+    /// The tools it has.
+    registry: Registry,
+    /// What is allowed without asking.
+    approvals: Arc<Approvals>,
+    /// Where its work is reported.
+    events: Arc<EventSink>,
+    /// Its system prompt.
+    system: String,
+    /// How hard it thinks.
+    effort: Option<Effort>,
+    /// The call that started it.
+    parent: String,
+    /// The kind of subagent.
+    kind: String,
+    /// What it is to do.
+    assignment: String,
+}
+
+impl Run {
+    /// Runs the subagent to the end and returns what it said last.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Failed`] when a model request fails.
+    async fn go(self) -> Result<String, ToolError> {
+        let Run {
+            model,
+            registry,
+            approvals,
+            events,
+            system,
+            effort,
+            parent,
+            kind,
+            assignment,
+        } = self;
+        let name = kind.clone();
+        let nested = move |event: AgentEvent| {
+            if matches!(
+                event,
+                AgentEvent::Delta(_) | AgentEvent::Thought(_) | AgentEvent::Used(_)
+            ) {
+                return;
+            }
+            events(AgentEvent::Nested {
+                parent: parent.clone(),
+                agent: name.clone(),
+                event: Box::new(event),
+            });
+        };
+        let mut history = Vec::new();
+        let context = Context {
+            model: model.as_ref(),
+            registry: &registry,
+            approvals: &approvals,
+            system: &system,
+            effort,
+            refresh: None,
+            notebook: None,
+            window: None,
+            checkpoint: None,
+        };
+        run_turn(
+            &context,
+            &mut history,
+            subagent_assignment(&assignment),
+            &nested,
+        )
+        .await
+        .map_err(|error| ToolError::Failed(format!("the {kind} agent failed: {error}")))?;
+        let reply = last_reply(&history);
+        if reply.is_empty() {
+            Ok("The agent finished without a reply.".to_owned())
+        } else {
+            Ok(reply)
+        }
+    }
 }
 
 /// Starts subagents.
@@ -136,7 +227,8 @@ impl Tool for Task {
             "properties": {
                 "agent": { "type": "string", "description": "The kind of subagent; omit for the default." },
                 "task": { "type": "string", "description": "The self-contained assignment." },
-                "description": { "type": "string", "description": "A few words naming the work, shown to the user." }
+                "description": { "type": "string", "description": "A few words naming the work, shown to the user." },
+                "background": { "type": "boolean", "description": "Start the subagent in the background and return a handle at once; `wait` returns its result." }
             },
             "required": ["task"]
         })
@@ -182,52 +274,34 @@ impl Tool for Task {
             })?;
         let registry = self.tools_for(agent);
         let system = (self.settings.prompt)(agent, &registry.names());
-        let events = self.settings.events.clone();
-        (events)(AgentEvent::Spawned {
+        (self.settings.events)(AgentEvent::Spawned {
             id: id.to_owned(),
             agent: agent.name.clone(),
         });
-        let parent = id.to_owned();
-        let name = agent.name.clone();
-        let nested = move |event: AgentEvent| {
-            if matches!(
-                event,
-                AgentEvent::Delta(_) | AgentEvent::Thought(_) | AgentEvent::Used(_)
-            ) {
-                return;
-            }
-            events(AgentEvent::Nested {
-                parent: parent.clone(),
-                agent: name.clone(),
-                event: Box::new(event),
-            });
-        };
-        let mut history = Vec::new();
-        let context = Context {
-            model: self.settings.model.as_ref(),
-            registry: &registry,
-            approvals: &self.settings.approvals,
-            system: &system,
+        let run = Run {
+            model: self.settings.model.clone(),
+            registry,
+            approvals: self.settings.approvals.clone(),
+            events: self.settings.events.clone(),
+            system,
             effort: self.settings.effort,
-            refresh: None,
-            notebook: None,
-            window: None,
-            checkpoint: None,
+            parent: id.to_owned(),
+            kind: agent.name.clone(),
+            assignment: args.task,
         };
-        run_turn(
-            &context,
-            &mut history,
-            subagent_assignment(&args.task),
-            &nested,
-        )
-        .await
-        .map_err(|error| ToolError::Failed(format!("the {kind} agent failed: {error}")))?;
-        let reply = last_reply(&history);
-        if reply.is_empty() {
-            Ok(ToolOutput::new("The agent finished without a reply."))
-        } else {
-            Ok(ToolOutput::new(reply))
+        if !args.background {
+            return run.go().await.map(ToolOutput::new);
         }
+        let label =
+            self.describe(&json!({ "description": args.description, "task": run.assignment }));
+        let handle = self.settings.jobs.spawn(
+            label,
+            Some(id.to_owned()).filter(|id| !id.is_empty()),
+            async move { run.go().await.map_err(|error| error.to_string()) },
+        );
+        Ok(ToolOutput::new(format!(
+            "Started the {kind} agent in the background as {handle}. Call `wait` to get its result when it ends."
+        )))
     }
 }
 
@@ -268,6 +342,7 @@ mod tests {
             agents: builtin_agents(),
             effort: None,
             prompt: Arc::new(|agent, _| format!("SUB:{}", agent.name)),
+            jobs: Arc::new(Jobs::new(|_| {})),
         }));
         (registry, dir)
     }
@@ -462,6 +537,42 @@ mod tests {
         assert!(results[0].text.contains("scout"));
     }
 
+    /// A background subagent returns a handle at once, its events are filed under the call, and `wait` reports its last words.
+    #[tokio::test]
+    async fn a_background_subagent_is_reported_through_wait() {
+        let model = Router::new(|_| say("found it"));
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink = log.clone();
+        let dir = scratch("task-background");
+        let jobs = Arc::new(Jobs::new(|_| {}));
+        let task = Task::new(TaskSettings {
+            model,
+            registry: Arc::new(Registry::builtin(&dir).unwrap()),
+            approvals: deny_all(),
+            events: Arc::new(move |event| sink.lock().unwrap().push(event)),
+            agents: builtin_agents(),
+            effort: None,
+            prompt: Arc::new(|agent, _| format!("SUB:{}", agent.name)),
+            jobs: jobs.clone(),
+        });
+        let started = task
+            .call_as(
+                "t1",
+                json!({"agent": "scout", "task": "look", "background": true}),
+            )
+            .await
+            .unwrap();
+        assert!(started.text.contains("bg-1"));
+        let finished = jobs.wait().await.unwrap();
+        assert!(finished.ok);
+        assert_eq!(finished.text, "found it");
+        assert!(matches!(
+            log.lock().unwrap().first(),
+            Some(AgentEvent::Spawned { id, .. }) if id == "t1"
+        ));
+        assert!(jobs.wait().await.is_err());
+    }
+
     /// A drop guard that counts how many were dropped.
     struct Guard(Arc<std::sync::atomic::AtomicUsize>);
 
@@ -525,6 +636,7 @@ mod tests {
             agents: builtin_agents(),
             effort: None,
             prompt: Arc::new(|agent, _| format!("SUB:{}", agent.name)),
+            jobs: Arc::new(Jobs::new(|_| {})),
         }));
         let history = Arc::new(Mutex::new(vec![Message::User("earlier".into())]));
         let handle = {

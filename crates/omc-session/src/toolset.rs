@@ -6,8 +6,8 @@ use omc_agent::{Approvals, EventSink, Live, Task, TaskSettings};
 use omc_context::{Discovered, Environment, PromptInput, build_prompt, build_subagent_prompt};
 use omc_providers::{ChatModel, Effort};
 use omc_tools::{
-    Ask, Checkpoint, CheckpointTool, ContextNotes, ExitPlanMode, Host, NewContext, Notebook,
-    Registry, Rewind, Todo,
+    Ask, Checkpoint, CheckpointTool, ContextNotes, ExitPlanMode, Host, Jobs, NewContext, Notebook,
+    Registry, Rewind, Todo, Wait,
 };
 
 /// What the tools and prompts of a turn are built from.
@@ -34,6 +34,8 @@ pub(crate) struct Inputs<'a> {
     pub(crate) notebook: Arc<Notebook>,
     /// The checkpoint the agent marks, when it has the checkpoint and rewind tools.
     pub(crate) checkpoint: Option<Arc<Checkpoint>>,
+    /// The background runs of the conversation.
+    pub(crate) jobs: Arc<Jobs>,
 }
 
 /// The tools and system prompt of a turn in each mode.
@@ -70,12 +72,13 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Live {
     } else {
         inputs.base.clone()
     };
-    let sub_base = Arc::new(base.clone());
+    let sub_base = Arc::new(base.foreground());
     let mut registry = base;
     registry.register(Todo::new(inputs.host.clone()));
     registry.register(Ask::new(inputs.host.clone()));
     registry.register(ContextNotes::new(inputs.notebook.clone()));
     registry.register(NewContext::new(inputs.notebook.clone()));
+    registry.register(Wait::new(inputs.jobs.clone()));
     if let Some(checkpoint) = &inputs.checkpoint {
         registry.register(CheckpointTool::new(checkpoint.clone()));
         registry.register(Rewind::new(checkpoint.clone()));
@@ -104,6 +107,7 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Live {
                 &agent.prompt,
             )
         }),
+        jobs: inputs.jobs.clone(),
     }));
     for name in inputs.denied {
         registry.remove(name);
@@ -172,6 +176,7 @@ mod tests {
             environment: Arc::new(Environment::detect(&locations, "m")),
             notebook: shared.notebook.clone(),
             checkpoint,
+            jobs: shared.jobs.clone(),
         })
     }
 
@@ -206,7 +211,8 @@ mod tests {
                 "new_context",
                 "read",
                 "task",
-                "todo"
+                "todo",
+                "wait"
             ]
         );
         assert_eq!(
@@ -222,6 +228,7 @@ mod tests {
                 "read",
                 "task",
                 "todo",
+                "wait",
                 "write"
             ]
         );

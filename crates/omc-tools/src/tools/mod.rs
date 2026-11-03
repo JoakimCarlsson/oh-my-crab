@@ -13,6 +13,7 @@ mod read;
 mod skill;
 mod snapshot;
 mod todo;
+mod wait;
 mod write;
 
 pub use ask::Ask;
@@ -27,4 +28,5 @@ pub use read::Read;
 pub use skill::Skill;
 pub use snapshot::tag as snapshot_tag;
 pub use todo::Todo;
+pub use wait::Wait;
 pub use write::Write;

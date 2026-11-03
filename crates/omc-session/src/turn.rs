@@ -91,6 +91,7 @@ impl Turn {
             environment: Arc::new(Environment::detect(&self.locations, &self.model)),
             notebook: self.shared.notebook.clone(),
             checkpoint: checkpoint.clone(),
+            jobs: self.shared.jobs.clone(),
         });
         let shared = self.shared.clone();
         let refresh = move || toolset.live(shared.mode() == Mode::Plan);

@@ -65,6 +65,7 @@ pub fn tools() -> Result<Vec<ToolInfo>, String> {
         environment: Arc::new(Environment::detect(&locations, "")),
         notebook: shared.notebook.clone(),
         checkpoint: None,
+        jobs: shared.jobs.clone(),
     });
     let mut listed: Vec<ToolInfo> = Vec::new();
     for plan in [false, true] {
@@ -106,6 +107,7 @@ mod tests {
                 "skill",
                 "task",
                 "todo",
+                "wait",
                 "write"
             ]
         );

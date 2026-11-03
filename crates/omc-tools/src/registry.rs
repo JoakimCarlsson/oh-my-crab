@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::tools::{Bash, Edit, Glob, Grep, Read, Write};
-use crate::{Sandbox, Tool, ToolError, ToolOutput};
+use crate::{Jobs, Sandbox, Tool, ToolError, ToolOutput};
 
 /// A set of tools addressable by name.
 #[derive(Clone, Default)]
@@ -27,12 +27,27 @@ impl Registry {
     ///
     /// Returns [`ToolError::Io`] when `root` cannot be canonicalized.
     pub fn builtin(root: impl AsRef<std::path::Path>) -> Result<Self, ToolError> {
+        Self::builtin_with(root, None)
+    }
+
+    /// Creates a registry holding every built-in tool, confined to `root`, in which `bash` can start background runs in `jobs` when they are given.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Io`] when `root` cannot be canonicalized.
+    pub fn builtin_with(
+        root: impl AsRef<std::path::Path>,
+        jobs: Option<Arc<Jobs>>,
+    ) -> Result<Self, ToolError> {
         let sandbox = Sandbox::new(root)?;
         let mut registry = Self::new();
         registry.register(Read::new(sandbox.clone()));
         registry.register(Grep::new(sandbox.clone()));
         registry.register(Glob::new(sandbox.clone()));
-        registry.register(Bash::new(sandbox.clone()));
+        registry.register(match jobs {
+            Some(jobs) => Bash::with_jobs(sandbox.clone(), jobs),
+            None => Bash::new(sandbox.clone()),
+        });
         registry.register(Edit::new(sandbox.clone()));
         registry.register(Write::new(sandbox));
         Ok(registry)
@@ -61,6 +76,17 @@ impl Registry {
                 .iter()
                 .filter(|(_, tool)| keep(tool.as_ref()))
                 .map(|(name, tool)| (*name, tool.clone()))
+                .collect(),
+        }
+    }
+
+    /// A registry in which every tool that can start background runs is replaced by a copy that cannot.
+    pub fn foreground(&self) -> Self {
+        Self {
+            tools: self
+                .tools
+                .iter()
+                .map(|(name, tool)| (*name, tool.foreground().unwrap_or_else(|| tool.clone())))
                 .collect(),
         }
     }
