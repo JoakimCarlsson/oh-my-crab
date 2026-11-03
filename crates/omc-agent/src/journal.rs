@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use omc_providers::Message;
+use omc_tools::FileChange;
 use thiserror::Error;
 
 /// Why a history file could not be opened.
@@ -31,28 +32,128 @@ pub enum JournalError {
     },
 }
 
+/// What a client said about a turn when it prompted: the id it knows the turn by and what the reader wrote.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Mark {
+    /// The id the client gave the turn.
+    pub id: String,
+    /// What the reader wrote, as they wrote it.
+    pub text: String,
+    /// The names of the files the reader attached.
+    #[serde(default)]
+    pub files: Vec<String>,
+}
+
+/// What a saved conversation holds besides its messages: its turns' marks, its name, the choices made about it and its notebook.
+#[derive(Clone, Debug, Default)]
+pub struct Saved {
+    /// The messages.
+    pub history: Vec<Message>,
+    /// The marks of the turns, with the position of the message each starts at.
+    pub marks: Vec<Marked>,
+    /// The turns that were stopped or failed, oldest first.
+    pub lost: Vec<Lost>,
+    /// The conversation's name, when it has one.
+    pub title: Option<String>,
+    /// The latest value of each setting that was chosen, oldest choice first.
+    pub settings: Vec<(String, String)>,
+    /// The notebook.
+    pub notes: String,
+    /// The files each tool call changed, by the id of the call.
+    pub changes: std::collections::HashMap<String, Vec<FileChange>>,
+    /// What the harness last found out and saved under each key, such as the settings it offers; the latest value of each, oldest first.
+    pub facts: Vec<(String, serde_json::Value)>,
+}
+
+/// A turn that was stopped or failed, which is no part of the history the model is given but is part of the conversation the client shows.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Lost {
+    /// The length the history had when the turn was lost, which is where the turn would have started.
+    pub at: usize,
+    /// What the client said about the turn when it prompted.
+    pub mark: Mark,
+    /// Why the turn ended: [`STOPPED`] for a turn the reader stopped, and the failure for one that failed.
+    pub reason: String,
+}
+
+/// The reason given for a turn the reader stopped.
+pub const STOPPED: &str = "stopped";
+
+/// The reason given for a turn that was still running when the conversation stopped.
+pub const INTERRUPTED: &str = "interrupted";
+
+impl Saved {
+    /// The value saved under `key`, read as a `T`, or what `T` is by default when nothing readable is saved there.
+    pub fn fact<T: serde::de::DeserializeOwned + Default>(&self, key: &str) -> T {
+        self.facts
+            .iter()
+            .find(|(held, _)| held == key)
+            .and_then(|(_, value)| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    /// The context window saved with the conversation, when one was.
+    pub fn window(&self) -> Option<u64> {
+        self.facts
+            .iter()
+            .find(|(held, _)| held == "window")
+            .and_then(|(_, value)| value.as_u64())
+    }
+}
+
+/// The mark of a turn and the position in the history of the message that starts the turn.
+pub type Marked = (usize, Mark);
+
 /// One line of a history file, borrowing the message it writes.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 enum Written<'a> {
+    /// The next message starts the turn this describes.
+    Turn(&'a Mark),
     /// A message added to the history.
     Message(&'a Message),
     /// The history is cut back to this many messages.
     Cut(usize),
     /// The notebook now holds this text.
     Notes(&'a str),
+    /// The conversation is named this.
+    Title(&'a str),
+    /// The setting named first was given the value named second.
+    Setting(&'a str, &'a str),
+    /// A turn was stopped or failed.
+    Lost(&'a Lost),
+    /// The lost turn with this id, and every lost turn after it, is gone.
+    Forget(&'a str),
+    /// The tool call with this id changed these files.
+    Changes(&'a str, &'a [FileChange]),
+    /// The value saved under this key is now this.
+    Fact(&'a str, &'a serde_json::Value),
 }
 
 /// One line of a history file, as it is read.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Record {
+    /// The next message starts the turn this describes.
+    Turn(Mark),
     /// A message added to the history.
     Message(Message),
     /// The history is cut back to this many messages.
     Cut(usize),
     /// The notebook now holds this text.
     Notes(String),
+    /// The conversation is named this.
+    Title(String),
+    /// The setting named first was given the value named second.
+    Setting(String, String),
+    /// A turn was stopped or failed.
+    Lost(Lost),
+    /// The lost turn with this id, and every lost turn after it, is gone.
+    Forget(String),
+    /// The tool call with this id changed these files.
+    Changes(String, Vec<FileChange>),
+    /// The value saved under this key is now this.
+    Fact(String, serde_json::Value),
 }
 
 /// The file a conversation's history is appended to.
@@ -73,6 +174,18 @@ struct State {
     epoch: u64,
     /// A cut-back that could not be written yet, which is tried again before anything else is written so that a failed turn never comes back.
     pending: Option<usize>,
+    /// The marks of the turns in the history, in order.
+    marks: Vec<Marked>,
+    /// The turns that were stopped or failed, oldest first.
+    lost: Vec<Lost>,
+    /// The conversation's name.
+    title: Option<String>,
+    /// The latest value of each chosen setting, oldest choice first.
+    settings: Vec<(String, String)>,
+    /// The files each tool call changed, by the id of the call.
+    changes: std::collections::HashMap<String, Vec<FileChange>>,
+    /// The latest value saved under each key, oldest first.
+    facts: Vec<(String, serde_json::Value)>,
 }
 
 impl State {
@@ -114,6 +227,19 @@ impl Journal {
         path: &Path,
         keep: Option<usize>,
     ) -> Result<(Arc<Self>, Vec<Message>), JournalError> {
+        Self::open_before(path, keep, None)
+    }
+
+    /// Opens the history like [`Journal::open`], and when `before` names the id of a turn, cuts the history back to before that turn as well, whichever of that and `keep` leaves less.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Journal::open`] does, and [`JournalError::Io`] when no turn has the id `before`.
+    pub fn open_before(
+        path: &Path,
+        keep: Option<usize>,
+        before: Option<&str>,
+    ) -> Result<(Arc<Self>, Vec<Message>), JournalError> {
         let io_error = |source| JournalError::Io {
             path: path.to_path_buf(),
             source,
@@ -139,7 +265,16 @@ impl Journal {
             .iter()
             .rposition(|&byte| byte == b'\n')
             .map_or(0, |end| end + 1);
-        let (mut history, notes) = replay(path, &bytes[..complete])?;
+        let Saved {
+            mut history,
+            mut marks,
+            mut lost,
+            title,
+            settings,
+            notes,
+            changes,
+            facts,
+        } = replay(path, &bytes[..complete])?;
         let saved = history.len();
         if complete < bytes.len() {
             file.set_len(complete as u64).map_err(io_error)?;
@@ -147,16 +282,50 @@ impl Journal {
         file.seek(SeekFrom::End(0)).map_err(io_error)?;
         if let Some(turns) = keep {
             history.truncate(end_of_turns(&history, turns));
+            lost.retain(|held| held.at <= history.len());
         }
+        let mut forgotten: Option<String> = None;
+        if let Some(id) = before {
+            if let Some((at, _)) = marks.iter().find(|(_, mark)| mark.id == id) {
+                history.truncate(history.len().min(*at));
+                lost.retain(|held| held.at <= history.len());
+            } else if let Some(index) = lost.iter().position(|held| held.mark.id == id) {
+                history.truncate(history.len().min(lost[index].at));
+                lost.truncate(index);
+                forgotten = Some(id.to_owned());
+            } else {
+                return Err(io_error(io::Error::other(format!(
+                    "no turn has the id {id}"
+                ))));
+            }
+        }
+        let intended = history.len();
         while matches!(history.last(), Some(Message::User(_)))
             || matches!(history.last(), Some(Message::Assistant(reply)) if !reply.tool_calls.is_empty())
         {
             history.pop();
         }
+        let interrupted: Vec<Lost> = marks
+            .iter()
+            .filter(|(at, _)| *at >= history.len() && *at < intended)
+            .map(|(_, mark)| Lost {
+                at: history.len(),
+                mark: mark.clone(),
+                reason: INTERRUPTED.to_owned(),
+            })
+            .collect();
+        if let Some(id) = &forgotten {
+            write_record(&mut file, &Written::Forget(id)).map_err(io_error)?;
+        }
         if history.len() < saved {
             write_record(&mut file, &Written::Cut(history.len())).map_err(io_error)?;
+            for turn in &interrupted {
+                write_record(&mut file, &Written::Lost(turn)).map_err(io_error)?;
+            }
             file.sync_data().map_err(io_error)?;
         }
+        lost.extend(interrupted);
+        marks.retain(|(at, _)| *at < history.len());
         let journal = Arc::new(Self {
             path: path.to_path_buf(),
             notes,
@@ -164,9 +333,155 @@ impl Journal {
                 file,
                 epoch: 0,
                 pending: None,
+                marks,
+                lost,
+                title,
+                settings,
+                changes,
+                facts,
             }),
         });
         Ok((journal, history))
+    }
+
+    /// Reads the history in the file at `path` without opening it for writing or locking it, so that a conversation that is open elsewhere can be read; an incomplete last line is left out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::Io`] when the file cannot be read, and [`JournalError::Corrupt`] when a line is not a record.
+    pub fn read(path: &Path) -> Result<Saved, JournalError> {
+        let bytes = std::fs::read(path).map_err(|source| JournalError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let complete = bytes
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+            .map_or(0, |end| end + 1);
+        replay(path, &bytes[..complete])
+    }
+
+    /// Names the conversation saved at `path` `title`, which works on a conversation nobody has open; a turn that was left unanswered is cut back, as it is whenever the history is opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Journal::open`] does, and [`JournalError::Io`] when the name cannot be written.
+    pub fn rename(path: &Path, title: &str) -> Result<(), JournalError> {
+        let (journal, _) = Self::open(path, None)?;
+        journal
+            .save_title(title)
+            .map_err(|source| JournalError::Io {
+                path: path.to_path_buf(),
+                source,
+            })
+    }
+
+    /// The conversation's name, when it has one.
+    pub fn title(&self) -> Option<String> {
+        self.lock().title.clone()
+    }
+
+    /// The latest value of each setting that was chosen, oldest choice first.
+    pub fn settings(&self) -> Vec<(String, String)> {
+        self.lock().settings.clone()
+    }
+
+    /// Records that the conversation is named `title` and syncs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the write or the sync, or of a cut-back that was waiting to be written.
+    pub fn save_title(&self, title: &str) -> io::Result<()> {
+        let mut state = self.lock();
+        state.settle()?;
+        write_record(&mut state.file, &Written::Title(title))?;
+        state.title = Some(title.to_owned());
+        state.file.sync_data()
+    }
+
+    /// Records that the setting `id` was given the value `value` and syncs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the write or the sync, or of a cut-back that was waiting to be written.
+    pub fn save_setting(&self, id: &str, value: &str) -> io::Result<()> {
+        let mut state = self.lock();
+        state.settle()?;
+        write_record(&mut state.file, &Written::Setting(id, value))?;
+        state.settings.retain(|(held, _)| held != id);
+        state.settings.push((id.to_owned(), value.to_owned()));
+        state.file.sync_data()
+    }
+
+    /// The files each tool call changed, by the id of the call.
+    pub fn changes(&self) -> std::collections::HashMap<String, Vec<FileChange>> {
+        self.lock().changes.clone()
+    }
+
+    /// The value last saved under `key`, when there is one.
+    pub fn fact(&self, key: &str) -> Option<serde_json::Value> {
+        self.lock()
+            .facts
+            .iter()
+            .find(|(held, _)| held == key)
+            .map(|(_, value)| value.clone())
+    }
+
+    /// Saves `value` under `key`, replacing what was saved there, unless it is what is saved already.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the write or the sync, or of a cut-back that was waiting to be written.
+    pub fn save_fact(&self, key: &str, value: &serde_json::Value) -> io::Result<()> {
+        let mut state = self.lock();
+        if state
+            .facts
+            .iter()
+            .any(|(held, old)| held == key && old == value)
+        {
+            return Ok(());
+        }
+        state.settle()?;
+        write_record(&mut state.file, &Written::Fact(key, value))?;
+        state.facts.retain(|(held, _)| held != key);
+        state.facts.push((key.to_owned(), value.clone()));
+        state.file.sync_data()
+    }
+
+    /// Records that the tool call `call` changed `files`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the write, or of a cut-back that was waiting to be written.
+    pub fn save_changes(&self, call: &str, files: &[FileChange]) -> io::Result<()> {
+        let mut state = self.lock();
+        state.settle()?;
+        write_record(&mut state.file, &Written::Changes(call, files))?;
+        state.changes.insert(call.to_owned(), files.to_vec());
+        Ok(())
+    }
+
+    /// The turns that were stopped or failed, oldest first.
+    pub fn lost(&self) -> Vec<Lost> {
+        self.lock().lost.clone()
+    }
+
+    /// The marks of the turns in the history now, in order.
+    pub fn marks(&self) -> Vec<Marked> {
+        self.lock().marks.clone()
+    }
+
+    /// Records that the turn that starts with the next message, which will be message number `at`, is the one `mark` describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the write, or of a cut-back that was waiting to be written.
+    pub fn mark(&self, at: usize, mark: &Mark) -> io::Result<()> {
+        let mut state = self.lock();
+        state.settle()?;
+        write_record(&mut state.file, &Written::Turn(mark))?;
+        state.marks.push((at, mark.clone()));
+        Ok(())
     }
 
     /// The notebook the history was opened with, empty when none was saved.
@@ -210,7 +525,36 @@ impl Journal {
         let mut state = self.lock();
         state.epoch += 1;
         state.pending = Some(length);
+        state.marks.retain(|(at, _)| *at < length);
         state.settle()
+    }
+
+    /// Records that the history is cut back to `length` messages like [`Journal::cut`], and that the turns it cut off were lost for `reason`, so that a client can still show them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the write or the sync.
+    pub fn cut_losing(&self, length: usize, reason: &str) -> io::Result<()> {
+        let removed: Vec<Lost> = {
+            let state = self.lock();
+            state
+                .marks
+                .iter()
+                .filter(|(at, _)| *at >= length)
+                .map(|(_, mark)| Lost {
+                    at: length,
+                    mark: mark.clone(),
+                    reason: reason.to_owned(),
+                })
+                .collect()
+        };
+        self.cut(length)?;
+        let mut state = self.lock();
+        for turn in removed {
+            write_record(&mut state.file, &Written::Lost(&turn))?;
+            state.lost.push(turn);
+        }
+        state.file.sync_data()
     }
 
     /// Takes the state, whatever a panicking writer left.
@@ -272,6 +616,7 @@ impl Scribe {
         }
         state.settle()?;
         write_record(&mut state.file, &Written::Cut(0))?;
+        state.marks.clear();
         write_record(&mut state.file, &Written::Message(first))
     }
 
@@ -290,6 +635,7 @@ impl Scribe {
         }
         state.settle()?;
         write_record(&mut state.file, &Written::Cut(keep))?;
+        state.marks.retain(|(at, _)| *at < keep);
         for message in messages {
             write_record(&mut state.file, &Written::Message(message))?;
         }
@@ -323,6 +669,36 @@ impl Scribe {
             return Ok(());
         }
         journal.cut(length)
+    }
+
+    /// Records that the tool call `call` changed `files`, unless the history was cut back past this scribe already.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the write.
+    pub fn changes(&self, call: &str, files: &[FileChange]) -> io::Result<()> {
+        let Some(journal) = self.journal.upgrade() else {
+            return Ok(());
+        };
+        if journal.lock().epoch != self.epoch {
+            return Ok(());
+        }
+        journal.save_changes(call, files)
+    }
+
+    /// Cuts the history back like [`Journal::cut_losing`], unless it was cut back past this scribe already.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the write or the sync.
+    pub fn cut_losing(&self, length: usize, reason: &str) -> io::Result<()> {
+        let Some(journal) = self.journal.upgrade() else {
+            return Ok(());
+        };
+        if journal.lock().epoch != self.epoch {
+            return Ok(());
+        }
+        journal.cut_losing(length, reason)
     }
 }
 
@@ -361,14 +737,22 @@ fn write_record(file: &mut File, record: &Written<'_>) -> io::Result<()> {
     file.write_all(&line)
 }
 
-/// Builds the history and the notebook the complete lines in `bytes` add up to.
+/// Builds the saved conversation the complete lines in `bytes` add up to.
 ///
 /// # Errors
 ///
 /// Returns [`JournalError::Corrupt`] for a line that is not a record, or a cut-back past the start or past the end.
-fn replay(path: &Path, bytes: &[u8]) -> Result<(Vec<Message>, String), JournalError> {
+fn replay(path: &Path, bytes: &[u8]) -> Result<Saved, JournalError> {
     let mut history = Vec::new();
     let mut notes = String::new();
+    let mut title = None;
+    let mut settings: Vec<(String, String)> = Vec::new();
+    let mut marks: Vec<Marked> = Vec::new();
+    let mut lost: Vec<Lost> = Vec::new();
+    let mut changes: std::collections::HashMap<String, Vec<FileChange>> =
+        std::collections::HashMap::new();
+    let mut facts: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut waiting: Option<Mark> = None;
     for (index, line) in bytes.split_inclusive(|&byte| byte == b'\n').enumerate() {
         let corrupt = |reason: String| JournalError::Corrupt {
             path: path.to_path_buf(),
@@ -376,9 +760,40 @@ fn replay(path: &Path, bytes: &[u8]) -> Result<(Vec<Message>, String), JournalEr
             reason,
         };
         match serde_json::from_slice(line).map_err(|error| corrupt(error.to_string()))? {
-            Record::Message(message) => history.push(message),
+            Record::Turn(mark) => waiting = Some(mark),
+            Record::Message(message) => {
+                if matches!(message, Message::User(_))
+                    && let Some(mark) = waiting.take()
+                {
+                    marks.push((history.len(), mark));
+                }
+                history.push(message);
+            }
             Record::Notes(text) => notes = text,
-            Record::Cut(length) if length <= history.len() => history.truncate(length),
+            Record::Title(text) => title = Some(text),
+            Record::Setting(id, value) => {
+                settings.retain(|(held, _)| *held != id);
+                settings.push((id, value));
+            }
+            Record::Lost(turn) => lost.push(turn),
+            Record::Changes(call, files) => {
+                changes.insert(call, files);
+            }
+            Record::Fact(key, value) => {
+                facts.retain(|(held, _)| *held != key);
+                facts.push((key, value));
+            }
+            Record::Forget(id) => {
+                if let Some(index) = lost.iter().position(|held| held.mark.id == id) {
+                    lost.truncate(index);
+                }
+            }
+            Record::Cut(length) if length <= history.len() => {
+                history.truncate(length);
+                marks.retain(|(at, _)| *at < length);
+                lost.retain(|held| held.at <= length);
+                waiting = None;
+            }
             Record::Cut(length) => {
                 return Err(corrupt(format!(
                     "cut back to {length} of {} messages",
@@ -387,7 +802,16 @@ fn replay(path: &Path, bytes: &[u8]) -> Result<(Vec<Message>, String), JournalEr
             }
         }
     }
-    Ok((history, notes))
+    Ok(Saved {
+        history,
+        marks,
+        lost,
+        title,
+        settings,
+        notes,
+        changes,
+        facts,
+    })
 }
 
 /// The length of the first `turns` turns of `history`.
@@ -647,5 +1071,190 @@ mod tests {
         drop(journal);
         let (journal, _) = Journal::open(&path, None).unwrap();
         assert_eq!(journal.notes(), "third");
+    }
+
+    /// A mark of a turn is saved, comes back with its turn, goes with it when the history is cut back, and a history can be opened cut back to before a turn by its id.
+    #[test]
+    fn marks_follow_their_turns() {
+        let path = scratch("marks.jsonl");
+        let mark = |id: &str| Mark {
+            id: id.into(),
+            text: format!("prompt {id}"),
+            files: vec!["a.txt".into()],
+        };
+        let (journal, _) = Journal::open(&path, None).unwrap();
+        let scribe = journal.scribe();
+        for (at, id) in [(0, "1"), (2, "2"), (4, "3")] {
+            journal.mark(at, &mark(id)).unwrap();
+            scribe.append(&Message::User(format!("u{id}"))).unwrap();
+            scribe
+                .append(&Message::Assistant(Reply::default()))
+                .unwrap();
+        }
+        assert_eq!(journal.marks().len(), 3);
+        journal.cut(4).unwrap();
+        assert_eq!(journal.marks().len(), 2);
+        drop(scribe);
+        drop(journal);
+        let saved = Journal::read(&path).unwrap();
+        assert_eq!((saved.history.len(), saved.marks.len()), (4, 2));
+    }
+
+    /// Opening before a turn cuts that turn and what follows it from the history and from the file, and an id nobody has fails.
+    #[test]
+    fn opening_before_a_turn_cuts_it() {
+        let path = scratch("before.jsonl");
+        let (journal, _) = Journal::open(&path, None).unwrap();
+        let scribe = journal.scribe();
+        for (at, id) in [(0, "a"), (2, "b")] {
+            journal
+                .mark(
+                    at,
+                    &Mark {
+                        id: id.into(),
+                        text: id.into(),
+                        files: Vec::new(),
+                    },
+                )
+                .unwrap();
+            scribe.append(&Message::User(id.into())).unwrap();
+            scribe
+                .append(&Message::Assistant(Reply::default()))
+                .unwrap();
+        }
+        drop(scribe);
+        drop(journal);
+        assert!(Journal::open_before(&path, None, Some("zzz")).is_err());
+        let (journal, history) = Journal::open_before(&path, None, Some("b")).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(journal.marks().len(), 1);
+        drop(journal);
+        let saved = Journal::read(&path).unwrap();
+        assert_eq!((saved.history.len(), saved.marks.len()), (2, 1));
+    }
+
+    /// A name and the latest value of each setting are saved, come back when the history is opened or read, and a nameless history can be named without opening a conversation.
+    #[test]
+    fn title_and_settings_are_saved() {
+        let path = scratch("facts.jsonl");
+        let (journal, _) = Journal::open(&path, None).unwrap();
+        journal.save_setting("model", "a").unwrap();
+        journal.save_setting("effort", "high").unwrap();
+        journal.save_setting("model", "b").unwrap();
+        journal.save_title("First").unwrap();
+        journal.save_title("Second").unwrap();
+        drop(journal);
+        let saved = Journal::read(&path).unwrap();
+        assert_eq!(saved.title.as_deref(), Some("Second"));
+        assert_eq!(
+            saved.settings,
+            vec![
+                ("effort".to_owned(), "high".to_owned()),
+                ("model".to_owned(), "b".to_owned())
+            ]
+        );
+        Journal::rename(&path, "Third").unwrap();
+        let (journal, _) = Journal::open(&path, None).unwrap();
+        assert_eq!(journal.title().as_deref(), Some("Third"));
+        assert_eq!(journal.settings().len(), 2);
+    }
+
+    /// A turn cut off for a reason is saved as lost with its prompt, stays out of the history, comes back when the file is read, and a history can be opened before it by its id.
+    #[test]
+    fn lost_turns_are_saved_and_can_be_rewound_to() {
+        let path = scratch("lost.jsonl");
+        let mark = |id: &str| Mark {
+            id: id.into(),
+            text: format!("prompt {id}"),
+            files: Vec::new(),
+        };
+        let (journal, _) = Journal::open(&path, None).unwrap();
+        let scribe = journal.scribe();
+        journal.mark(0, &mark("1")).unwrap();
+        scribe.append(&Message::User("u1".into())).unwrap();
+        scribe.append(&said("a1")).unwrap();
+        journal.mark(2, &mark("2")).unwrap();
+        scribe.append(&Message::User("u2".into())).unwrap();
+        journal.cut_losing(2, STOPPED).unwrap();
+        let scribe = journal.scribe();
+        journal.mark(2, &mark("3")).unwrap();
+        scribe.append(&Message::User("u3".into())).unwrap();
+        scribe.append(&said("a3")).unwrap();
+        drop(scribe);
+        drop(journal);
+        let saved = Journal::read(&path).unwrap();
+        assert_eq!(saved.history.len(), 4);
+        assert_eq!(saved.lost.len(), 1);
+        assert_eq!(
+            (
+                saved.lost[0].mark.id.as_str(),
+                saved.lost[0].at,
+                saved.lost[0].reason.as_str()
+            ),
+            ("2", 2, STOPPED)
+        );
+        let (journal, history) = Journal::open_before(&path, None, Some("3")).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(journal.lost().len(), 1);
+        drop(journal);
+        let (journal, history) = Journal::open_before(&path, None, Some("2")).unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(journal.lost().is_empty());
+        drop(journal);
+        let saved = Journal::read(&path).unwrap();
+        assert!(saved.lost.is_empty());
+    }
+
+    /// A turn a crash left unanswered is kept as interrupted when the history is opened again.
+    #[test]
+    fn an_unanswered_turn_is_kept_as_interrupted() {
+        let path = scratch("interrupted.jsonl");
+        let (journal, _) = Journal::open(&path, None).unwrap();
+        let scribe = journal.scribe();
+        journal
+            .mark(
+                0,
+                &Mark {
+                    id: "9".into(),
+                    text: "asked".into(),
+                    files: Vec::new(),
+                },
+            )
+            .unwrap();
+        scribe.append(&Message::User("asked".into())).unwrap();
+        drop(scribe);
+        drop(journal);
+        let (journal, history) = Journal::open(&path, None).unwrap();
+        assert!(history.is_empty());
+        assert_eq!(journal.lost()[0].reason, INTERRUPTED);
+        drop(journal);
+        assert_eq!(Journal::read(&path).unwrap().lost.len(), 1);
+    }
+
+    /// The files a tool call changed and the facts the harness saved come back when the file is read, a fact keeps only its latest value, and saving the same value again writes nothing.
+    #[test]
+    fn changes_and_facts_are_saved() {
+        let path = scratch("changes.jsonl");
+        let (journal, _) = Journal::open(&path, None).unwrap();
+        journal
+            .save_changes(
+                "c1",
+                &[FileChange {
+                    path: "a.rs".into(),
+                    old: "x\n".into(),
+                    new: "y\n".into(),
+                }],
+            )
+            .unwrap();
+        journal.save_fact("window", &json!(1000)).unwrap();
+        journal.save_fact("window", &json!(2000)).unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        journal.save_fact("window", &json!(2000)).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
+        drop(journal);
+        let saved = Journal::read(&path).unwrap();
+        assert_eq!(saved.changes["c1"][0].new, "y\n");
+        assert_eq!(saved.window(), Some(2000));
+        assert_eq!(saved.facts.len(), 1);
     }
 }

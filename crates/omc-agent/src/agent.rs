@@ -216,7 +216,12 @@ pub async fn run_turn_recorded(
             1
         };
         history.truncate(keep);
-        if let Some(Err(error)) = scribe.map(|scribe| scribe.cut(keep)) {
+        let reason = result
+            .as_ref()
+            .err()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        if let Some(Err(error)) = scribe.map(|scribe| scribe.cut_losing(keep, &reason)) {
             eprintln!("history not saved: {error}");
         }
     }
@@ -274,7 +279,28 @@ async fn drive(
         if calls.is_empty() {
             return Ok(());
         }
-        let mut results = run_calls(registry, context.approvals, &calls, events).await;
+        let changed: std::sync::Mutex<Vec<(String, Vec<FileChange>)>> =
+            std::sync::Mutex::new(Vec::new());
+        let capture = |event: AgentEvent| {
+            if let AgentEvent::ToolDone { id, changes, .. } = &event
+                && !changes.is_empty()
+            {
+                changed
+                    .lock()
+                    .unwrap_or_else(|held| held.into_inner())
+                    .push((id.clone(), changes.clone()));
+            }
+            events(event);
+        };
+        let mut results = run_calls(registry, context.approvals, &calls, &capture).await;
+        for (call, files) in changed
+            .into_inner()
+            .unwrap_or_else(|held| held.into_inner())
+        {
+            if let Some(Err(error)) = scribe.map(|scribe| scribe.changes(&call, &files)) {
+                eprintln!("history not saved: {error}");
+            }
+        }
         if nearly_full && !reminded && context.notebook.is_some() {
             reminded = true;
             if let Some(last) = results.last_mut() {
