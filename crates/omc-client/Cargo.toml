@@ -1,0 +1,8 @@
+[package]
+name = "omc-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+omc-wire = { version = "0.1.0", path = "../omc-wire" }
