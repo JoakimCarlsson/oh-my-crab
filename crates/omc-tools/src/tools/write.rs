@@ -155,6 +155,7 @@ mod tests {
     }
 
     /// A dangling symlink pointing outside cannot be used to write outside.
+    #[cfg(unix)]
     #[tokio::test]
     async fn rejects_writing_through_a_dangling_symlink() {
         let (tool, dir) = tool("write-dangling");

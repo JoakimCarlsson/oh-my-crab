@@ -142,6 +142,7 @@ mod tests {
     }
 
     /// A symlink pointing out of the root is rejected.
+    #[cfg(unix)]
     #[test]
     fn rejects_symlinks_that_leave_the_root() {
         let dir = scratch("sandbox-symlink");
@@ -155,6 +156,7 @@ mod tests {
     }
 
     /// A dangling symlink is rejected even though its target does not exist.
+    #[cfg(unix)]
     #[test]
     fn rejects_dangling_symlinks() {
         let dir = scratch("sandbox-dangling");

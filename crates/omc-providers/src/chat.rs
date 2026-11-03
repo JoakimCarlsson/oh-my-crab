@@ -38,6 +38,7 @@ pub struct ToolResult {
     /// Result text or error description.
     pub text: String,
     /// Whether the call failed.
+    #[serde(default)]
     pub is_error: bool,
 }
 
@@ -86,6 +87,7 @@ impl Effort {
 
 /// What a request cost in tokens, as the provider counted it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Tokens {
     /// Input that was not read from a cache.
     pub input: u64,
@@ -106,6 +108,7 @@ impl Tokens {
 
 /// What the model produced in one request.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Reply {
     /// The text part of the answer.
     pub text: String,

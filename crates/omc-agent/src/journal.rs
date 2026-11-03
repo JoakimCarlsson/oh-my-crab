@@ -2,9 +2,8 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use omc_providers::Message;
 use thiserror::Error;
@@ -32,8 +31,18 @@ pub enum JournalError {
     },
 }
 
-/// One line of a history file.
-#[derive(serde::Serialize, serde::Deserialize)]
+/// One line of a history file, borrowing the message it writes.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Written<'a> {
+    /// A message added to the history.
+    Message(&'a Message),
+    /// The history is cut back to this many messages.
+    Cut(usize),
+}
+
+/// One line of a history file, as it is read.
+#[derive(serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Record {
     /// A message added to the history.
@@ -54,17 +63,35 @@ pub struct Journal {
 struct State {
     /// The file, open for appending.
     file: File,
-    /// How many cut-backs were written; a [`Scribe`] from before the last one is out of date.
+    /// How many cut-backs were asked for; a [`Scribe`] from before the last one is out of date.
     epoch: u64,
+    /// A cut-back that could not be written yet, which is tried again before anything else is written so that a failed turn never comes back.
+    pending: Option<usize>,
 }
 
-/// A way to append to a [`Journal`] that stops working once the history has been cut back past it.
+impl State {
+    /// Writes the cut-back that is waiting, if there is one.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the write or the sync; the cut-back then stays waiting.
+    fn settle(&mut self) -> io::Result<()> {
+        if let Some(length) = self.pending {
+            write_record(&mut self.file, &Written::Cut(length))?;
+            self.file.sync_data()?;
+            self.pending = None;
+        }
+        Ok(())
+    }
+}
+
+/// A way to append to a [`Journal`] that stops working once the history has been cut back past it, or once the journal is dropped, so that a turn that is still winding down does not keep the file locked.
 ///
 /// A turn that is cancelled may still run for an instant after the cut-back was written; its late records must not land after it.
 #[derive(Clone)]
 pub struct Scribe {
     /// The journal written to.
-    journal: Arc<Journal>,
+    journal: Weak<Journal>,
     /// The epoch this scribe was made in.
     epoch: u64,
 }
@@ -76,7 +103,7 @@ impl Journal {
     ///
     /// # Errors
     ///
-    /// Returns [`JournalError::Io`] when the file cannot be read or opened, and [`JournalError::Corrupt`] when a line is not a record or cuts back past the start; the file is left as it was.
+    /// Returns [`JournalError::Io`] when the file cannot be read or opened, is not a regular file, or is open in another conversation, and [`JournalError::Corrupt`] when a line is not a record or cuts back past the start; the file is left as it was.
     pub fn open(
         path: &Path,
         keep: Option<usize>,
@@ -86,12 +113,20 @@ impl Journal {
             source,
         };
         if let Some(folder) = path.parent() {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(folder)
-                .map_err(io_error)?;
+            create_folder(folder).map_err(io_error)?;
         }
+        let mut file = open_private(path).map_err(io_error)?;
+        if !file.metadata().map_err(io_error)?.is_file() {
+            return Err(io_error(io::Error::other("not a regular file")));
+        }
+        file.try_lock().map_err(|error| {
+            io_error(match error {
+                std::fs::TryLockError::WouldBlock => {
+                    io::Error::other("the conversation is open elsewhere")
+                }
+                std::fs::TryLockError::Error(error) => error,
+            })
+        })?;
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
@@ -103,12 +138,6 @@ impl Journal {
             .map_or(0, |end| end + 1);
         let mut history = replay(path, &bytes[..complete])?;
         let saved = history.len();
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(io_error)?;
         if complete < bytes.len() {
             file.set_len(complete as u64).map_err(io_error)?;
         }
@@ -121,12 +150,16 @@ impl Journal {
             history.pop();
         }
         if history.len() < saved {
-            write_record(&mut file, &Record::Cut(history.len())).map_err(io_error)?;
+            write_record(&mut file, &Written::Cut(history.len())).map_err(io_error)?;
             file.sync_data().map_err(io_error)?;
         }
         let journal = Arc::new(Self {
             path: path.to_path_buf(),
-            state: Mutex::new(State { file, epoch: 0 }),
+            state: Mutex::new(State {
+                file,
+                epoch: 0,
+                pending: None,
+            }),
         });
         Ok((journal, history))
     }
@@ -139,12 +172,14 @@ impl Journal {
     /// A scribe for what is written from now until the history is next cut back.
     pub fn scribe(self: &Arc<Self>) -> Scribe {
         Scribe {
-            journal: self.clone(),
+            journal: Arc::downgrade(self),
             epoch: self.lock().epoch,
         }
     }
 
     /// Records that the history is cut back to `length` messages, syncs the file, and retires every scribe made before.
+    ///
+    /// When the write fails the cut-back is kept and written before the next record of any scribe, which fails until it can be.
     ///
     /// # Errors
     ///
@@ -152,8 +187,8 @@ impl Journal {
     pub fn cut(&self, length: usize) -> io::Result<()> {
         let mut state = self.lock();
         state.epoch += 1;
-        write_record(&mut state.file, &Record::Cut(length))?;
-        state.file.sync_data()
+        state.pending = Some(length);
+        state.settle()
     }
 
     /// Takes the state, whatever a panicking writer left.
@@ -169,13 +204,17 @@ impl Scribe {
     ///
     /// # Errors
     ///
-    /// Returns the error of the write.
+    /// Returns the error of the write, or of a cut-back that was waiting to be written.
     pub fn append(&self, message: &Message) -> io::Result<()> {
-        let mut state = self.journal.lock();
+        let Some(journal) = self.journal.upgrade() else {
+            return Ok(());
+        };
+        let mut state = journal.lock();
         if state.epoch != self.epoch {
             return Ok(());
         }
-        write_record(&mut state.file, &Record::Message(message.clone()))
+        state.settle()?;
+        write_record(&mut state.file, &Written::Message(message))
     }
 
     /// Syncs the file to disk, which is done when a turn ends.
@@ -184,7 +223,12 @@ impl Scribe {
     ///
     /// Returns the error of the sync.
     pub fn sync(&self) -> io::Result<()> {
-        self.journal.lock().file.sync_data()
+        let Some(journal) = self.journal.upgrade() else {
+            return Ok(());
+        };
+        let mut state = journal.lock();
+        state.settle()?;
+        state.file.sync_data()
     }
 
     /// Records that the history is cut back to `length` messages and syncs; this scribe and the ones cloned from it stop writing.
@@ -193,18 +237,44 @@ impl Scribe {
     ///
     /// Returns the error of the write or the sync.
     pub fn cut(&self, length: usize) -> io::Result<()> {
-        {
-            let state = self.journal.lock();
-            if state.epoch != self.epoch {
-                return Ok(());
-            }
+        let Some(journal) = self.journal.upgrade() else {
+            return Ok(());
+        };
+        if journal.lock().epoch != self.epoch {
+            return Ok(());
         }
-        self.journal.cut(length)
+        journal.cut(length)
     }
 }
 
+/// Creates `folder` and its parents, readable by the owner only on systems that have file modes.
+///
+/// # Errors
+///
+/// Returns the error of the creation.
+fn create_folder(folder: &Path) -> io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(folder)
+}
+
+/// Opens `path` for appending, creating it readable by the owner only on systems that have file modes.
+///
+/// # Errors
+///
+/// Returns the error of the open.
+fn open_private(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
+}
+
 /// Writes `record` as one line with a single write, which is flushed as the file is not buffered.
-fn write_record(file: &mut File, record: &Record) -> io::Result<()> {
+fn write_record(file: &mut File, record: &Written<'_>) -> io::Result<()> {
     let mut line = serde_json::to_vec(record).map_err(io::Error::other)?;
     line.push(b'\n');
     file.write_all(&line)
@@ -354,6 +424,7 @@ mod tests {
         scribe.append(&Message::User("q".into())).unwrap();
         journal.cut(0).unwrap();
         scribe.append(&Message::User("late".into())).unwrap();
+        drop(scribe);
         drop(journal);
         let (_, loaded) = Journal::open(&path, None).unwrap();
         assert!(loaded.is_empty());
@@ -444,5 +515,31 @@ mod tests {
             Err(JournalError::Io { .. })
         ));
         std::fs::remove_dir(&path).unwrap();
+    }
+
+    /// A history open in one conversation cannot be opened in another until the first lets go of it.
+    #[test]
+    fn a_history_opens_once_at_a_time() {
+        let path = scratch("locked.jsonl");
+        let (journal, _) = Journal::open(&path, None).unwrap();
+        assert!(matches!(
+            Journal::open(&path, None),
+            Err(JournalError::Io { .. })
+        ));
+        drop(journal);
+        assert!(Journal::open(&path, None).is_ok());
+    }
+
+    /// A record written before a field was added to the message types still loads.
+    #[test]
+    fn records_without_newer_fields_load() {
+        let path = scratch("older.jsonl");
+        std::fs::write(
+            &path,
+            "{\"message\":{\"User\":\"q\"}}\n{\"message\":{\"Assistant\":{\"text\":\"a\"}}}\n",
+        )
+        .unwrap();
+        let (_, loaded) = Journal::open(&path, None).unwrap();
+        assert_eq!(loaded, [Message::User("q".into()), said("a")]);
     }
 }

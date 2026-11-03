@@ -119,6 +119,7 @@ impl Session {
         let Some(provider) = parse_provider(provider) else {
             return self.say(Event::Failed(format!("unknown provider: {provider}")));
         };
+        self.journal = None;
         let saved = match conversation {
             Some(id) => match load_history(&id, history, keep) {
                 Ok(saved) => Some(saved),
@@ -324,6 +325,12 @@ impl Session {
     }
 }
 
+/// The names Windows keeps for devices, which cannot be file names there whatever the extension.
+const RESERVED_NAMES: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
 /// Opens the saved history of the conversation `id` in `folder`, or in a folder under the harness's own data folder, keeping `keep` turns when that is given.
 ///
 /// # Errors
@@ -339,7 +346,11 @@ fn load_history(
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-    if !usable {
+    let device = id
+        .split('.')
+        .next()
+        .is_some_and(|stem| RESERVED_NAMES.contains(&stem.to_ascii_uppercase().as_str()));
+    if !usable || device {
         return Err(format!("unusable conversation id: {id}"));
     }
     let folder = match folder {
@@ -453,7 +464,7 @@ mod tests {
         let folder = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../build/tests/omc-session/history");
         let _ = std::fs::remove_dir_all(&folder);
-        for id in ["", "../x", "a/b", ".hidden"] {
+        for id in ["", "../x", "a/b", ".hidden", "nul", "Com1.txt"] {
             assert!(load_history(id, Some(folder.clone()), None).is_err());
         }
         let (journal, history) = load_history("c-1", Some(folder.clone()), None).unwrap();
@@ -463,6 +474,7 @@ mod tests {
         scribe
             .append(&Message::Assistant(omc_providers::Reply::default()))
             .unwrap();
+        drop(scribe);
         drop(journal);
         let (_, history) = load_history("c-1", Some(folder.clone()), None).unwrap();
         assert_eq!(history.len(), 2);
