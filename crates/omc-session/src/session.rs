@@ -143,9 +143,7 @@ impl Session {
             defaults,
         } = opening;
         let provider = provider.as_str();
-        if let Some(home) = home {
-            omc_auth::set_home(home);
-        }
+        self.shared.set_home(home);
         let Some(provider) = Provider::from_id(provider) else {
             return self.say(Event::Failed(format!("unknown provider: {provider}")));
         };
@@ -175,7 +173,11 @@ impl Session {
         if !discovered.skills.is_empty() {
             registry.register(Skill::new(discovered.skills.clone()));
         }
-        let credentials = match omc_providers::credentials_for(provider).await {
+        let credentials = match self
+            .shared
+            .with_home(omc_providers::credentials_for(provider))
+            .await
+        {
             Ok(credentials) => credentials,
             Err(AuthError::NotLoggedIn) => {
                 return self.say(Event::SignedOut {
@@ -466,15 +468,17 @@ impl Session {
             return self.say(Event::Failed(format!("unknown provider: {provider}")));
         };
         let out = self.shared.out.clone();
+        let shared = self.shared.clone();
         tokio::spawn(async move {
             let address = out.clone();
-            let outcome = omc_providers::login(provider, move |prompt| {
-                let _ = address.send(match prompt {
-                    LoginPrompt::Url(url) => Event::LoginUrl(url),
-                    LoginPrompt::Code { url, code } => Event::LoginCode { url, code },
-                });
-            })
-            .await;
+            let outcome = shared
+                .with_home(omc_providers::login(provider, move |prompt| {
+                    let _ = address.send(match prompt {
+                        LoginPrompt::Url(url) => Event::LoginUrl(url),
+                        LoginPrompt::Code { url, code } => Event::LoginCode { url, code },
+                    });
+                }))
+                .await;
             let _ = out.send(match outcome {
                 Ok(()) => Event::SignedIn,
                 Err(error) => Event::Failed(error.to_string()),

@@ -15,4 +15,4 @@ pub use credentials::Credentials;
 pub use error::AuthError;
 pub use method::{Auth, Device, LoginPrompt, Spec};
 pub use session::{active_id, credentials_for, login};
-pub use store::set_home;
+pub use store::with_home;

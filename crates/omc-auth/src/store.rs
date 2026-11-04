@@ -1,10 +1,9 @@
-//! Persistent credential storage in `auth.json`, in the folder set with [`set_home`] or `~/.config/oh-my-crab`.
+//! Persistent credential storage in `auth.json`, in the folder of the work being done under [`with_home`] or `~/.config/oh-my-crab`.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
@@ -19,12 +18,16 @@ pub struct AuthFile {
     pub credentials: BTreeMap<String, Credentials>,
 }
 
-/// The folder `auth.json` lives in, when the host chose one.
-static HOME: OnceLock<PathBuf> = OnceLock::new();
+tokio::task_local! {
+    /// The folder `auth.json` lives in for the work running in this task, when the host chose one.
+    static HOME: Option<PathBuf>;
+}
 
-/// Keeps credentials in `home` for the rest of the process; the first call wins.
-pub fn set_home(home: PathBuf) {
-    let _ = HOME.set(home);
+/// Runs `work` with its credentials kept in `home`, or in the default folder when there is none.
+///
+/// The folder belongs to `work` alone, so conversations of one process may each keep their own logins. It does not reach tasks `work` spawns.
+pub async fn with_home<F: std::future::Future>(home: Option<PathBuf>, work: F) -> F::Output {
+    HOME.scope(home, work).await
 }
 
 /// Returns the path of `auth.json`.
@@ -33,7 +36,7 @@ pub fn set_home(home: PathBuf) {
 ///
 /// Returns [`AuthError::Storage`] when no config directory can be determined.
 pub fn path() -> Result<PathBuf, AuthError> {
-    if let Some(home) = HOME.get() {
+    if let Ok(Some(home)) = HOME.try_with(Clone::clone) {
         return Ok(home.join("auth.json"));
     }
     let base = dirs::config_dir()
@@ -99,5 +102,25 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&file).unwrap()).unwrap();
         assert_eq!(again["active"], "claude");
         assert!(again["credentials"]["claude"].is_object());
+    }
+}
+
+#[cfg(test)]
+/// Tests for where credentials are kept.
+mod home_tests {
+    use super::*;
+
+    /// Work that runs side by side keeps its credentials in its own folder, and work outside any scope in the default one.
+    #[tokio::test]
+    async fn homes_belong_to_the_work_that_names_them() {
+        let one = with_home(Some(PathBuf::from("/one")), async { path().unwrap() });
+        let two = with_home(Some(PathBuf::from("/two")), async {
+            tokio::task::yield_now().await;
+            path().unwrap()
+        });
+        let (one, two) = tokio::join!(one, two);
+        assert_eq!(one, PathBuf::from("/one/auth.json"));
+        assert_eq!(two, PathBuf::from("/two/auth.json"));
+        assert!(path().unwrap().ends_with("oh-my-crab/auth.json"));
     }
 }

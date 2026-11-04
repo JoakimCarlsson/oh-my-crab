@@ -49,8 +49,17 @@ pub(crate) struct Shared {
     pub(crate) jobs: Arc<Jobs>,
     /// The conversation's name and the history it is saved in.
     naming: Mutex<Naming>,
+    /// Where the conversation keeps its logins.
+    login: Mutex<Login>,
     /// What can be set, and how it stands.
     state: Mutex<State>,
+}
+
+/// Where the conversation keeps its logins.
+#[derive(Default)]
+struct Login {
+    /// The folder, or the default one when there is none.
+    home: Option<std::path::PathBuf>,
 }
 
 /// The conversation's name, and the history file it and the settings are saved in.
@@ -77,6 +86,7 @@ impl Shared {
                 let _ = announce.send(Event::Background(run));
             })),
             naming: Mutex::new(Naming::default()),
+            login: Mutex::new(Login::default()),
             state: Mutex::new(State {
                 opened: false,
                 provider: None,
@@ -97,6 +107,25 @@ impl Shared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         with(&mut state)
+    }
+
+    /// Keeps the conversation's logins in `home`, or in the default folder when there is none.
+    pub(crate) fn set_home(&self, home: Option<std::path::PathBuf>) {
+        self.login
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .home = home;
+    }
+
+    /// Runs `work` against the folder the conversation keeps its logins in.
+    pub(crate) async fn with_home<F: std::future::Future>(&self, work: F) -> F::Output {
+        let home = self
+            .login
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .home
+            .clone();
+        omc_auth::with_home(home, work).await
     }
 
     /// Takes the history the conversation is saved in, and the name it was saved with.

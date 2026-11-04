@@ -49,7 +49,11 @@ pub(crate) struct Turn {
 impl Turn {
     /// Runs the turn for `prompt` against the hosted model and says how it ended.
     pub(crate) async fn run(self, prompt: String) -> Ended {
-        let credentials = match omc_providers::credentials_for(self.provider).await {
+        let credentials = match self
+            .shared
+            .with_home(omc_providers::credentials_for(self.provider))
+            .await
+        {
             Ok(credentials) => credentials,
             Err(AuthError::NotLoggedIn) => return Ended::SignedOut("not logged in".to_owned()),
             Err(error) => return Ended::Failed(error.to_string()),
