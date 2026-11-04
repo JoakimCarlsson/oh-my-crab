@@ -89,6 +89,7 @@ mod tests {
             path: base.join("pdf/SKILL.md"),
             base: base.join("pdf"),
             hidden: false,
+            origin: crate::Origin::User,
         }
     }
 

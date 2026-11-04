@@ -7,7 +7,9 @@ mod environment;
 mod frontmatter;
 mod instructions;
 mod invoke;
+mod origin;
 mod place;
+mod plugins;
 mod scope;
 mod skills;
 mod system;
@@ -25,6 +27,8 @@ pub use instructions::Instruction;
 pub use invoke::{
     expand_skill, plan_approved, plan_rejected, skill_invocation, subagent_assignment,
 };
+pub use origin::Origin;
+pub use place::{agent_places, instruction_places, skill_places};
 pub use scope::Locations;
 pub use skills::Skill;
 pub use system::{PromptInput, build_prompt, build_subagent_prompt};

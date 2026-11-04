@@ -74,6 +74,49 @@ pub(crate) const AGENTS: &[Place] = &[
     at(Root::Codex, "agents", Shape::Toml),
 ];
 
+/// Where instruction files are read from, written for a reader: a path in the project, or one under `~`.
+pub fn instruction_places() -> Vec<String> {
+    described(INSTRUCTIONS)
+}
+
+/// Where skills are read from, written for a reader, installed Claude Code plugins last.
+pub fn skill_places() -> Vec<String> {
+    let mut places = described(SKILLS);
+    places.push(PLUGINS.to_owned());
+    places
+}
+
+/// Where agent definitions are read from, written for a reader, installed Claude Code plugins last.
+pub fn agent_places() -> Vec<String> {
+    let mut places = described(AGENTS);
+    places.push(PLUGINS.to_owned());
+    places
+}
+
+/// How a reader is told that installed Claude Code plugins are read too.
+const PLUGINS: &str = "installed Claude Code plugins";
+
+/// `places` written for a reader: a path in the project, or one under `~`.
+fn described(places: &[Place]) -> Vec<String> {
+    places
+        .iter()
+        .map(|place| {
+            let folder = match place.root {
+                Root::Project => "",
+                Root::Claude => "~/.claude/",
+                Root::Codex => "~/.codex/",
+                Root::Home => "~/",
+            };
+            match place.shape {
+                Shape::File => format!("{folder}{}", place.path),
+                Shape::Files(suffix) => format!("{folder}{}/<name>{suffix}", place.path),
+                Shape::Skills => format!("{folder}{}/<name>/SKILL.md", place.path),
+                Shape::Toml => format!("{folder}{}/<name>.toml", place.path),
+            }
+        })
+        .collect()
+}
+
 impl crate::Locations {
     /// The folders `root` stands for, nearest first.
     pub(crate) fn folders(&self, root: Root) -> Vec<std::path::PathBuf> {

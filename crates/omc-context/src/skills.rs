@@ -2,9 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::Locations;
 use crate::frontmatter::parse;
 use crate::place::{SKILLS, Shape};
+use crate::plugins::installed;
+use crate::{Locations, Origin};
 
 /// One skill found on disk.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -19,6 +20,8 @@ pub struct Skill {
     pub base: PathBuf,
     /// Whether the skill is kept out of the prompt's list and loaded only when the reader asks for it.
     pub hidden: bool,
+    /// Where the skill came from.
+    pub origin: Origin,
 }
 
 impl Skill {
@@ -32,24 +35,37 @@ impl Skill {
     }
 }
 
-/// The skills available for work in `locations`, the nearest first; a name found twice keeps its first, and names in `disabled` are skipped.
+/// The skills available for work in `locations`, the nearest first and those Claude Code plugins bring last, named `plugin:skill`; a name found twice keeps its first, and names in `disabled` are skipped.
 pub(crate) fn find(locations: &Locations, disabled: &[String]) -> Vec<Skill> {
     let mut found: Vec<Skill> = Vec::new();
     for place in SKILLS.iter().filter(|place| place.shape == Shape::Skills) {
         for folder in locations.folders(place.root) {
-            for skill in in_folder(&folder.join(place.path)) {
-                let taken = found.iter().any(|held| held.name == skill.name);
-                if !taken && !disabled.contains(&skill.name) {
-                    found.push(skill);
-                }
+            for skill in in_folder(&folder.join(place.path), place.root.into()) {
+                keep(&mut found, skill, disabled);
+            }
+        }
+    }
+    for plugin in installed(locations) {
+        for folder in plugin.skill_folders() {
+            for mut skill in in_folder(&folder, Origin::Plugin) {
+                skill.name = plugin.qualify(&skill.name);
+                keep(&mut found, skill, disabled);
             }
         }
     }
     found
 }
 
-/// The skills in the folders of `skills`, by folder name.
-fn in_folder(skills: &Path) -> Vec<Skill> {
+/// Adds `skill` to `found` unless its name is taken or in `disabled`.
+fn keep(found: &mut Vec<Skill>, skill: Skill, disabled: &[String]) {
+    let taken = found.iter().any(|held| held.name == skill.name);
+    if !taken && !disabled.contains(&skill.name) {
+        found.push(skill);
+    }
+}
+
+/// The skills in the folders of `skills`, by folder name, each marked as coming from `origin`.
+fn in_folder(skills: &Path, origin: Origin) -> Vec<Skill> {
     let Ok(entries) = std::fs::read_dir(skills) else {
         return Vec::new();
     };
@@ -59,11 +75,14 @@ fn in_folder(skills: &Path) -> Vec<Skill> {
         .filter(|path| path.is_dir())
         .collect();
     folders.sort();
-    folders.iter().filter_map(|base| read(base)).collect()
+    folders
+        .iter()
+        .filter_map(|base| read(base, origin))
+        .collect()
 }
 
-/// The skill in `base`, when it holds a readable `SKILL.md`.
-fn read(base: &Path) -> Option<Skill> {
+/// The skill in `base`, coming from `origin`, when it holds a readable `SKILL.md`.
+fn read(base: &Path, origin: Origin) -> Option<Skill> {
     let path = base.join("SKILL.md");
     let parsed = parse(&std::fs::read_to_string(&path).ok()?);
     let folder_name = base.file_name()?.to_str()?.to_owned();
@@ -80,6 +99,7 @@ fn read(base: &Path) -> Option<Skill> {
         path,
         base: base.to_path_buf(),
         hidden,
+        origin,
     })
 }
 
@@ -139,6 +159,8 @@ mod tests {
         let names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["pdf", "other", "lint", "mine", "shared"]);
         assert_eq!(found[0].description, "Reads PDFs");
+        assert_eq!(found[0].origin, Origin::Project);
+        assert_eq!(found[3].origin, Origin::User);
         assert_eq!(found[0].body().unwrap(), "Use pdftotext.");
     }
 
@@ -159,5 +181,40 @@ mod tests {
         let found = find(&locations(&base), &["a".to_owned()]);
         assert_eq!(found.len(), 1);
         assert!(found[0].hidden);
+    }
+
+    /// Skills that installed Claude Code plugins bring come after the others, named after their plugin, and can be disabled by that name.
+    #[test]
+    fn finds_plugin_skills() {
+        let base = scratch("skills-plugins");
+        put(
+            &base,
+            "home/.claude/plugins/installed_plugins.json",
+            &format!(
+                r#"{{"plugins":{{"kit@market":[{{"installPath":"{}/kit"}}]}}}}"#,
+                base.display()
+            ),
+        );
+        put(
+            &base,
+            "kit/skills/commit/SKILL.md",
+            "---\nname: commit\ndescription: Commits\n---\nCommit it.",
+        );
+        put(
+            &base,
+            "kit/skills/review/SKILL.md",
+            "---\ndescription: Reviews\n---\nx",
+        );
+        put(
+            &base,
+            "home/.claude/skills/commit/SKILL.md",
+            "---\ndescription: mine\n---\nx",
+        );
+        let found = find(&locations(&base), &["kit:review".to_owned()]);
+        let names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["commit", "kit:commit"]);
+        assert_eq!(found[1].description, "Commits");
+        assert_eq!(found[1].origin, Origin::Plugin);
+        assert_eq!(found[1].body().unwrap(), "Commit it.");
     }
 }

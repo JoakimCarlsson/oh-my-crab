@@ -1050,6 +1050,9 @@ dependencies = [
 [[package]]
 name = "omc-context"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "omc-mcp"

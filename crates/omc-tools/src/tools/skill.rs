@@ -134,6 +134,7 @@ mod tests {
             path: base.join("SKILL.md"),
             base,
             hidden: false,
+            origin: omc_context::Origin::User,
         }])
     }
 

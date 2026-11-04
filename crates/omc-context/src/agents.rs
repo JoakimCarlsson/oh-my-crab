@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 use crate::frontmatter::parse;
 use crate::place::{AGENTS, Shape, files_under};
-use crate::{Locations, toml};
+use crate::plugins::installed;
+use crate::{Locations, Origin, toml};
 
 /// The tools that only look and never change anything.
 pub const READ_ONLY_TOOLS: &[&str] = &["read", "grep", "glob", "skill", "ask", "todo"];
@@ -22,6 +23,8 @@ pub struct AgentDefinition {
     pub prompt: String,
     /// Where the definition is, or nothing for a built-in one.
     pub path: Option<PathBuf>,
+    /// Where the definition came from.
+    pub origin: Origin,
 }
 
 impl AgentDefinition {
@@ -44,11 +47,11 @@ pub fn builtin_agents() -> Vec<AgentDefinition> {
         include_str!("prompts/agent_reviewer.md"),
     ]
     .into_iter()
-    .filter_map(|text| from_markdown(text, "builtin", None))
+    .filter_map(|text| from_markdown(text, "builtin", None, Origin::BuiltIn))
     .collect()
 }
 
-/// The agent kinds available for work in `locations`: the project's, then the reader's, then the built-in ones; a name found twice keeps its first, and names in `disabled` are skipped.
+/// The agent kinds available for work in `locations`: the project's, then the reader's, then those Claude Code plugins bring, named `plugin:agent`, then the built-in ones; a name found twice keeps its first, and names in `disabled` are skipped.
 pub(crate) fn find(locations: &Locations, disabled: &[String]) -> Vec<AgentDefinition> {
     let mut found: Vec<AgentDefinition> = Vec::new();
     for place in AGENTS {
@@ -69,12 +72,29 @@ pub(crate) fn find(locations: &Locations, disabled: &[String]) -> Vec<AgentDefin
                     .trim_end_matches(".agent")
                     .to_owned();
                 let agent = if suffix == ".toml" {
-                    from_toml(&text, &stem, &path)
+                    from_toml(&text, &stem, &path, place.root.into())
                 } else {
-                    from_markdown(&text, &stem, Some(path))
+                    from_markdown(&text, &stem, Some(path), place.root.into())
                 };
                 keep(&mut found, agent, disabled);
             }
+        }
+    }
+    for plugin in installed(locations) {
+        for path in files_under(&plugin.folder.join("agents"), ".md") {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let stem = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default()
+                .to_owned();
+            let agent = from_markdown(&text, &stem, Some(path), Origin::Plugin).map(|mut agent| {
+                agent.name = plugin.qualify(&agent.name);
+                agent
+            });
+            keep(&mut found, agent, disabled);
         }
     }
     for agent in builtin_agents() {
@@ -93,8 +113,13 @@ fn keep(found: &mut Vec<AgentDefinition>, agent: Option<AgentDefinition>, disabl
     }
 }
 
-/// The definition `text` holds as markdown with front matter, named `stem` unless it names itself.
-fn from_markdown(text: &str, stem: &str, path: Option<PathBuf>) -> Option<AgentDefinition> {
+/// The definition `text` holds as markdown with front matter, named `stem` unless it names itself, coming from `origin`.
+fn from_markdown(
+    text: &str,
+    stem: &str,
+    path: Option<PathBuf>,
+    origin: Origin,
+) -> Option<AgentDefinition> {
     let parsed = parse(text);
     let name = parsed
         .get("name")
@@ -111,11 +136,17 @@ fn from_markdown(text: &str, stem: &str, path: Option<PathBuf>) -> Option<AgentD
         tools,
         prompt,
         path,
+        origin,
     })
 }
 
-/// The definition `text` holds as TOML, named `stem` unless it names itself.
-fn from_toml(text: &str, stem: &str, path: &std::path::Path) -> Option<AgentDefinition> {
+/// The definition `text` holds as TOML, named `stem` unless it names itself, coming from `origin`.
+fn from_toml(
+    text: &str,
+    stem: &str,
+    path: &std::path::Path,
+    origin: Origin,
+) -> Option<AgentDefinition> {
     let fields = toml::strings(text);
     let get = |key: &str| {
         fields
@@ -132,6 +163,7 @@ fn from_toml(text: &str, stem: &str, path: &std::path::Path) -> Option<AgentDefi
         tools: None,
         prompt,
         path: Some(path.to_path_buf()),
+        origin,
     })
 }
 
@@ -178,11 +210,27 @@ mod tests {
             claude: Some(base.join("home/.claude")),
             codex: Some(base.join("home/.codex")),
         };
+        put(
+            &base,
+            "home/.claude/plugins/installed_plugins.json",
+            &format!(
+                r#"{{"plugins":{{"kit@market":[{{"installPath":"{}/kit"}}]}}}}"#,
+                base.display()
+            ),
+        );
+        put(
+            &base,
+            "kit/agents/auditor.md",
+            "---\ndescription: audits\n---\nAudit.",
+        );
         let found = find(&locations, &["reviewer".to_owned()]);
         let names: Vec<&str> = found.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, vec!["scout", "tester", "doc", "task"]);
+        assert_eq!(names, vec!["scout", "tester", "doc", "kit:auditor", "task"]);
         assert_eq!(found[0].description, "mine");
         assert_eq!(found[0].tools, Some(vec!["read".into(), "grep".into()]));
         assert_eq!(found[1].prompt, "Run them.");
+        assert_eq!(found[2].origin, Origin::User);
+        assert_eq!(found[3].origin, Origin::Plugin);
+        assert_eq!(found[4].origin, Origin::BuiltIn);
     }
 }
