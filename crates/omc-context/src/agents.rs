@@ -51,7 +51,7 @@ pub fn builtin_agents() -> Vec<AgentDefinition> {
     .collect()
 }
 
-/// The agent kinds available for work in `locations`: the project's, then the reader's, then those Claude Code plugins bring, named `plugin:agent`, then the built-in ones; a name found twice keeps its first, and names in `disabled` are skipped.
+/// The agent kinds available for work in `locations`: the project's, then the reader's, then those Claude Code plugins bring, then the built-in ones; a name found twice keeps its first, and names in `disabled` are skipped.
 pub(crate) fn find(locations: &Locations, disabled: &[String]) -> Vec<AgentDefinition> {
     let mut found: Vec<AgentDefinition> = Vec::new();
     for place in AGENTS {
@@ -90,10 +90,7 @@ pub(crate) fn find(locations: &Locations, disabled: &[String]) -> Vec<AgentDefin
                 .and_then(|stem| stem.to_str())
                 .unwrap_or_default()
                 .to_owned();
-            let agent = from_markdown(&text, &stem, Some(path), Origin::Plugin).map(|mut agent| {
-                agent.name = plugin.qualify(&agent.name);
-                agent
-            });
+            let agent = from_markdown(&text, &stem, Some(path), Origin::Plugin);
             keep(&mut found, agent, disabled);
         }
     }
@@ -225,7 +222,7 @@ mod tests {
         );
         let found = find(&locations, &["reviewer".to_owned()]);
         let names: Vec<&str> = found.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, vec!["scout", "tester", "doc", "kit:auditor", "task"]);
+        assert_eq!(names, vec!["scout", "tester", "doc", "auditor", "task"]);
         assert_eq!(found[0].description, "mine");
         assert_eq!(found[0].tools, Some(vec!["read".into(), "grep".into()]));
         assert_eq!(found[1].prompt, "Run them.");

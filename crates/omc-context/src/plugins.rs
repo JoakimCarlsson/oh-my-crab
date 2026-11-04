@@ -1,4 +1,4 @@
-//! Claude Code plugins: installed packages whose skills and agent definitions are offered under the plugin's name.
+//! Claude Code plugins: installed packages that bring skills and agent definitions.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -10,24 +10,33 @@ use crate::Locations;
 /// One install of a plugin for Claude Code that applies to the working folder.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Plugin {
-    /// What the plugin is called, without its marketplace; what its skills and agents are named after.
+    /// What the plugin is called, without its marketplace; what its skills are named after when their own names are taken.
     pub(crate) name: String,
     /// The folder it is installed in.
     pub(crate) folder: PathBuf,
 }
 
 impl Plugin {
-    /// `item` as this plugin offers it: `plugin:item`.
-    pub(crate) fn qualify(&self, item: &str) -> String {
-        format!("{}:{item}", self.name)
-    }
-
-    /// The folders its skills are in: `skills`, then those its manifest names that lie inside the plugin, each once.
+    /// The folders its skills are in, each either a skill itself or a folder of skills.
+    ///
+    /// Those its manifest, `.claude-plugin/plugin.json`, names under `skills`, then those the entry for it in a marketplace kept in its own folder names, each once and only inside the plugin. `skills` comes first, unless such a marketplace entry exists and some folder is named; when none is, `skills` alone.
     pub(crate) fn skill_folders(&self) -> Vec<PathBuf> {
-        let mut folders = vec![self.folder.join("skills")];
-        let named = json(&self.folder.join(".claude-plugin/plugin.json"))
+        let fallback = self.folder.join("skills");
+        let catalogued = self.catalogued_skills();
+        let named: Vec<String> = json(&self.folder.join(".claude-plugin/plugin.json"))
             .map(|manifest| strings(&manifest["skills"]))
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .chain(catalogued.clone().unwrap_or_default())
+            .collect();
+        if named.is_empty() {
+            return vec![fallback];
+        }
+        let mut folders = if catalogued.is_none() {
+            vec![fallback]
+        } else {
+            Vec::new()
+        };
         for entry in named {
             let folder = normalized(&self.folder.join(entry));
             if folder.starts_with(&self.folder) && !folders.contains(&folder) {
@@ -35,6 +44,20 @@ impl Plugin {
             }
         }
         folders
+    }
+
+    /// The skill folders named by the entry for this plugin in a marketplace kept in its own folder, `marketplace.json` or `.claude-plugin/marketplace.json`, that installs it from that folder; nothing when there is no such entry.
+    fn catalogued_skills(&self) -> Option<Vec<String>> {
+        ["marketplace.json", ".claude-plugin/marketplace.json"]
+            .into_iter()
+            .filter_map(|file| json(&self.folder.join(file)))
+            .find_map(|catalog| {
+                let entry = catalog["plugins"].as_array()?.iter().find(|entry| {
+                    entry["name"].as_str() == Some(self.name.as_str())
+                        && entry["source"].as_str() == Some("./")
+                })?;
+                Some(strings(&entry["skills"]))
+            })
     }
 }
 
@@ -273,6 +296,30 @@ mod tests {
             plugin.skill_folders(),
             vec![base.join("kit/skills"), base.join("kit/extra")]
         );
-        assert_eq!(plugin.qualify("lint"), "kit:lint");
+    }
+
+    /// A plugin that is its own marketplace takes only the folders named, without `skills`, and `skills` alone when none is.
+    #[test]
+    fn own_marketplace_names_the_only_folders() {
+        let base = scratch("plugins-marketplace");
+        let plugin = Plugin {
+            name: "kit".to_owned(),
+            folder: base.join("kit"),
+        };
+        put(
+            &base,
+            "kit/.claude-plugin/marketplace.json",
+            r#"{"plugins":[{"name":"kit","source":"./"}]}"#,
+        );
+        assert_eq!(plugin.skill_folders(), vec![base.join("kit/skills")]);
+        put(
+            &base,
+            "kit/.claude-plugin/plugin.json",
+            r#"{"skills":["./skills/commit","./skills/pr"]}"#,
+        );
+        assert_eq!(
+            plugin.skill_folders(),
+            vec![base.join("kit/skills/commit"), base.join("kit/skills/pr")]
+        );
     }
 }
