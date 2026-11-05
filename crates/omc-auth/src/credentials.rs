@@ -44,6 +44,11 @@ impl Credentials {
         }
     }
 
+    /// The name the reader knows the account by: its organization or its address, whichever the provider reported.
+    pub fn account_name(&self) -> Option<&str> {
+        self.org_name.as_deref().or(self.email.as_deref())
+    }
+
     /// Returns whether the access token has expired or is about to.
     pub fn is_expired(&self) -> bool {
         self.expires_at_ms <= now_ms()

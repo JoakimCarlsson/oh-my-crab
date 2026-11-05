@@ -4,12 +4,17 @@ use crate::store::{self, AuthFile};
 use crate::{Auth, AuthError, Credentials, LoginPrompt, device, flow};
 
 /// Returns the first of the environment variables `names` that holds a key.
-fn env_key(names: &[&str]) -> Option<String> {
+pub fn env_key(names: &[&str]) -> Option<String> {
+    env_key_named(names).map(|(_, key)| key)
+}
+
+/// Returns the first of the environment variables `names` that holds a key, with the name of the variable it was read from.
+pub fn env_key_named<'a>(names: &[&'a str]) -> Option<(&'a str, String)> {
     names
         .iter()
-        .filter_map(|name| std::env::var(name).ok())
-        .map(|value| value.trim().to_string())
-        .find(|value| !value.is_empty())
+        .filter_map(|name| Some((*name, std::env::var(name).ok()?)))
+        .map(|(name, value)| (name, value.trim().to_string()))
+        .find(|(_, value)| !value.is_empty())
 }
 
 /// Signs in to the provider `id` the way `auth` says and stores the result as active.
@@ -94,4 +99,39 @@ pub async fn credentials_for(id: &str, auth: &'static Auth) -> Result<Credential
 /// Returns [`AuthError::Storage`] when `auth.json` cannot be read.
 pub fn active_id() -> Result<Option<String>, AuthError> {
     Ok(store::load()?.active)
+}
+
+/// Returns the credentials stored for the provider `id` in the folder `home`, or in the default folder when there is none, as they were saved and without refreshing them.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Storage`] when `auth.json` cannot be read.
+pub fn stored(
+    id: &str,
+    home: Option<std::path::PathBuf>,
+) -> Result<Option<Credentials>, AuthError> {
+    Ok(store::load_in(home)?.credentials.remove(id))
+}
+
+/// Keeps `key` as the API key of the provider `id` in the folder `home`, or in the default folder when there is none, or forgets the key kept for it when `key` is nothing or blank.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Storage`] when `auth.json` cannot be read or written.
+pub fn save_key(
+    id: &str,
+    key: Option<&str>,
+    home: Option<std::path::PathBuf>,
+) -> Result<(), AuthError> {
+    let mut file = store::load_in(home.clone())?;
+    match key.map(str::trim).filter(|key| !key.is_empty()) {
+        Some(key) => {
+            file.credentials
+                .insert(id.to_string(), Credentials::static_key(key.to_string()));
+        }
+        None => {
+            file.credentials.remove(id);
+        }
+    }
+    store::save_in(home, &file)
 }

@@ -7,7 +7,7 @@ use crate::provider::{Def, Wire};
 /// The definition of the Claude provider.
 pub(super) static DEF: Def = Def {
     id: "claude",
-    label: "Claude (Anthropic OAuth)",
+    label: "Claude",
     wire: Wire::AnthropicMessages,
     default_model: Some("claude-haiku-5-5"),
     auth: Auth::OAuth(&SPEC),
@@ -49,9 +49,10 @@ static SPEC: Spec = Spec {
 mod tests {
     use super::*;
 
-    /// The Claude login asks for the scopes, callback and state oh-my-pi uses.
+    /// The Claude login asks for the scopes, callback port and path, and
+    /// token exchange format that Claude's OAuth server expects.
     #[test]
-    fn spec_matches_the_reference() {
+    fn spec_matches_the_claude_oauth_flow() {
         assert!(SPEC.scopes.contains(&"user:sessions:claude_code"));
         assert_eq!(SPEC.port, 54545);
         assert_eq!(SPEC.path, "/callback");

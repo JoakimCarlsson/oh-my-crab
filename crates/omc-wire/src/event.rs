@@ -80,7 +80,7 @@ pub enum Event {
     },
     /// The account was signed in.
     SignedIn,
-    /// The address the reader opens in a browser to sign in.
+    /// The address the reader opens in a browser to sign in; the client opens it, since the harness does not.
     LoginUrl(String),
     /// The page the reader opens to sign in, and the code to enter there.
     LoginCode {

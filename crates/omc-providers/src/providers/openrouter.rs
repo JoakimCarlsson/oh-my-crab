@@ -7,7 +7,7 @@ use crate::provider::{Def, Wire};
 /// The definition of the OpenRouter provider; `OMC_OPENROUTER_URL` points it at another host.
 pub(super) static DEF: Def = Def {
     id: "openrouter",
-    label: "OpenRouter (API key)",
+    label: "OpenRouter",
     wire: Wire::ChatCompletions,
     default_model: Some("openrouter/auto"),
     auth: Auth::ApiKey {

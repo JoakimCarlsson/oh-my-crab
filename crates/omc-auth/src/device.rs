@@ -124,7 +124,8 @@ async fn discover_endpoint(
 }
 
 /// Runs the device-code login: shows the user a code through `notify`, polls until
-/// the user approves, and returns credentials that do not expire.
+/// the user approves, and returns credentials that do not expire. Opening the page
+/// is left to the client.
 ///
 /// # Errors
 ///
@@ -149,7 +150,6 @@ pub async fn login(
         url: issued.verification_uri.clone(),
         code: issued.user_code.clone(),
     });
-    let _ = open::that(&issued.verification_uri);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(issued.expires_in);
     let mut interval = issued.interval.max(1);
     while tokio::time::Instant::now() < deadline {

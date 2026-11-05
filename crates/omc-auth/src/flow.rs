@@ -58,6 +58,8 @@ struct IdentityFields {
     account: Option<AccountInfo>,
     /// The organization the token is scoped to, when reported.
     organization: Option<OrganizationInfo>,
+    /// The OpenID token that names the signed-in account, when the provider sends one.
+    id_token: Option<String>,
 }
 
 impl ExtraTokenFields for IdentityFields {}
@@ -157,6 +159,7 @@ fn credentials_from(
             .or_else(|| previous.and_then(|p| p.account_id.clone())),
         email: account
             .and_then(|a| a.email_address.clone())
+            .or_else(|| identity.id_token.as_deref().and_then(jwt::email))
             .or_else(|| previous.and_then(|p| p.email.clone())),
         org_id: previous.map_or_else(
             || organization.and_then(|o| o.uuid.clone()),
@@ -175,7 +178,7 @@ fn credentials_from(
 
 /// Runs the browser login for `spec` and returns the new credentials.
 ///
-/// `notify` receives the authorization URL; the browser is also opened.
+/// `notify` receives the authorization URL; opening it is left to the client.
 ///
 /// # Errors
 ///
@@ -197,7 +200,6 @@ pub async fn login(spec: &'static Spec, notify: impl Fn(String)) -> Result<Crede
     let listener =
         tokio::task::spawn_blocking(move || callback::wait_for_code(spec.port, spec.path));
     notify(url.to_string());
-    let _ = open::that(url.as_str());
     let params = listener
         .await
         .map_err(|e| AuthError::Callback(e.to_string()))??;
@@ -263,6 +265,21 @@ mod tests {
         assert_eq!(credentials.email.as_deref(), Some("me@example.com"));
         assert_eq!(credentials.org_id.as_deref(), Some("org"));
         assert_eq!(credentials.org_name.as_deref(), Some("Team"));
+    }
+
+    /// An OpenID token in the response gives the account's address when no account block does.
+    #[test]
+    fn the_address_is_read_from_the_id_token() {
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"email":"me@example.com"}"#);
+        let body = format!(
+            r#"{{"access_token":"a","refresh_token":"r","token_type":"Bearer","id_token":"h.{payload}.s"}}"#
+        );
+        let token: Token = serde_json::from_str(&body).unwrap();
+        let credentials = credentials_from(&TEST_SPEC, &token, None).unwrap();
+        assert_eq!(credentials.email.as_deref(), Some("me@example.com"));
+        assert_eq!(credentials.account_name(), Some("me@example.com"));
     }
 
     /// A refresh keeps the organization fixed at login even when the response names another.

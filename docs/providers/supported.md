@@ -31,7 +31,11 @@ A wire is a protocol. Several providers can share one.
 
 | Method        | Used by                  | How it works                                                              |
 | ------------- | ------------------------ | ------------------------------------------------------------------------- |
-| OAuth         | `claude`, `codex`        | Opens a browser, waits for the callback, refreshes the token when it expires. |
-| Device code   | `copilot`                | Shows a short code to enter on a web page, then polls until approved.     |
-| API key       | `openrouter`             | Reads the key from an environment variable; signing in fails when it is not set. |
+| OAuth         | `claude`, `codex`        | Reports the login page as `LoginUrl`, waits for the callback, refreshes the token when it expires. |
+| Device code   | `copilot`                | Reports the page and a short code as `LoginCode`, then polls until approved. |
+| API key       | `openrouter`             | Reads the key from an environment variable, or from one a client saved with `omc_session::save_key`; the variable wins. |
 | None          | `ollama`                 | A local server that needs no credentials.                                 |
+
+crab never opens a browser itself. The client is told what to open with
+`LoginUrl` or `LoginCode` and opens it where the reader is, which also works
+when crab runs on another machine.

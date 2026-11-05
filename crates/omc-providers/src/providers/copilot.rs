@@ -7,7 +7,7 @@ use crate::provider::{Def, Wire};
 /// The definition of the Copilot provider.
 pub(super) static DEF: Def = Def {
     id: "copilot",
-    label: "GitHub Copilot (device code)",
+    label: "GitHub Copilot",
     wire: Wire::ChatCompletions,
     default_model: None,
     auth: Auth::DeviceCode(&DEVICE),

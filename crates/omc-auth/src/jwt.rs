@@ -6,12 +6,21 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 /// Claim namespace OpenAI uses for ChatGPT account data.
 const AUTH_CLAIM: &str = "https://api.openai.com/auth";
 
-/// Extracts `chatgpt_account_id` from an OpenAI access token, if present.
-pub fn chatgpt_account_id(token: &str) -> Option<String> {
+/// The claims in the payload of `token`, when it is a readable JWT.
+fn claims(token: &str) -> Option<serde_json::Value> {
     let payload = token.split('.').nth(1)?;
     let bytes = URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    claims
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Extracts the `email` claim from an OpenID token, if present.
+pub fn email(token: &str) -> Option<String> {
+    claims(token)?.get("email")?.as_str().map(str::to_owned)
+}
+
+/// Extracts `chatgpt_account_id` from an OpenAI access token, if present.
+pub fn chatgpt_account_id(token: &str) -> Option<String> {
+    claims(token)?
         .get(AUTH_CLAIM)?
         .get("chatgpt_account_id")?
         .as_str()

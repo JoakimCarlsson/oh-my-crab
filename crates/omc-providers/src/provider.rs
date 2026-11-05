@@ -19,7 +19,7 @@ pub enum Wire {
 pub struct Def {
     /// Stable identifier used on the command line and in saved files; equals the variant name in lowercase.
     pub id: &'static str,
-    /// Human-readable name shown in the UI.
+    /// The name a client shows for the provider, such as `GitHub Copilot`.
     pub label: &'static str,
     /// The wire protocol the provider speaks.
     pub wire: Wire,

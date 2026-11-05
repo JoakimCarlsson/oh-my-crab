@@ -22,6 +22,8 @@ This installs `crab` under `~/.local/bin`. Set `PREFIX` to install elsewhere.
 ```text
 crab serve                      hold a conversation over standard input and output
 crab tools                      print the tools the agent can have, as a JSON list
+crab providers                  print the providers, as a JSON list of id, name and sign-in
+crab account <p> [folder]       print who provider <p> is signed in as, or nothing
 crab history <id> [folder]      print a saved conversation: title, settings and turns
 crab rename <id> <folder> <t>   name a saved conversation nobody has open
 crab import <id> <folder>        save a conversation a client kept itself, read as JSON
@@ -40,6 +42,10 @@ is a small blocking client for programs that start `crab` and talk to it.
 
 `claude`, `codex`, `copilot`, `openrouter` and `ollama`. See
 [docs/providers](docs/providers/supported.md) for sign-in and how to add one.
+
+A client lists them with `crab providers`, or `omc_session::providers()` when it
+links the harness, so a provider added to crab shows up in every client without
+a change there.
 
 ## Development
 

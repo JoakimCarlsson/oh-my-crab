@@ -7,7 +7,7 @@ use crate::provider::{Def, Wire};
 /// The definition of the Codex provider.
 pub(super) static DEF: Def = Def {
     id: "codex",
-    label: "Codex (OpenAI/ChatGPT OAuth)",
+    label: "Codex",
     wire: Wire::OpenAiResponses,
     default_model: None,
     auth: Auth::OAuth(&SPEC),

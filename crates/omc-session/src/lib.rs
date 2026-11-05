@@ -8,6 +8,7 @@
 mod bridge;
 mod listing;
 mod prompt;
+mod providers;
 mod serve;
 mod session;
 mod settings;
@@ -17,6 +18,7 @@ mod translate;
 mod turn;
 
 pub use listing::tools;
+pub use providers::{account, key_source, providers, save_key, signed_in};
 pub use serve::serve;
 pub use session::run;
 pub use session::{history, import, rename};

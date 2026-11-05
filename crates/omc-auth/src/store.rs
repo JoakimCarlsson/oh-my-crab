@@ -36,7 +36,16 @@ pub async fn with_home<F: std::future::Future>(home: Option<PathBuf>, work: F) -
 ///
 /// Returns [`AuthError::Storage`] when no config directory can be determined.
 pub fn path() -> Result<PathBuf, AuthError> {
-    if let Ok(Some(home)) = HOME.try_with(Clone::clone) {
+    path_in(HOME.try_with(Clone::clone).ok().flatten())
+}
+
+/// Returns the path of `auth.json` in `home`, or in the default folder when there is none.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Storage`] when there is no `home` and no config directory can be determined.
+pub fn path_in(home: Option<PathBuf>) -> Result<PathBuf, AuthError> {
+    if let Some(home) = home {
         return Ok(home.join("auth.json"));
     }
     let base = dirs::config_dir()
@@ -50,8 +59,25 @@ pub fn path() -> Result<PathBuf, AuthError> {
 ///
 /// Returns [`AuthError::Storage`] when the file exists but cannot be read or parsed.
 pub fn load() -> Result<AuthFile, AuthError> {
-    let path = path()?;
-    match fs::read(&path) {
+    read(&path()?)
+}
+
+/// Loads the credential file kept in `home`, or in the default folder when there is none, returning an empty one when it does not exist.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Storage`] when the file exists but cannot be read or parsed.
+pub fn load_in(home: Option<PathBuf>) -> Result<AuthFile, AuthError> {
+    read(&path_in(home)?)
+}
+
+/// Reads the credential file at `path`, returning an empty one when it does not exist.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Storage`] when the file exists but cannot be read or parsed.
+fn read(path: &Path) -> Result<AuthFile, AuthError> {
+    match fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map_err(|e| AuthError::Storage(format!("{}: {e}", path.display()))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AuthFile::default()),
@@ -65,7 +91,24 @@ pub fn load() -> Result<AuthFile, AuthError> {
 ///
 /// Returns [`AuthError::Storage`] when the directory or file cannot be written.
 pub fn save(file: &AuthFile) -> Result<(), AuthError> {
-    let path = path()?;
+    write(&path()?, file)
+}
+
+/// Writes the credential file kept in `home`, or in the default folder when there is none, atomically with `0600` permissions.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Storage`] when the directory or file cannot be written.
+pub fn save_in(home: Option<PathBuf>, file: &AuthFile) -> Result<(), AuthError> {
+    write(&path_in(home)?, file)
+}
+
+/// Writes `file` to `path` atomically with `0600` permissions.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Storage`] when the directory or file cannot be written.
+fn write(path: &Path, file: &AuthFile) -> Result<(), AuthError> {
     let dir = path
         .parent()
         .ok_or_else(|| AuthError::Storage("auth path has no parent".into()))?;
@@ -73,7 +116,7 @@ pub fn save(file: &AuthFile) -> Result<(), AuthError> {
     let staging = path.with_extension("json.tmp");
     let json = serde_json::to_vec_pretty(file).map_err(|e| AuthError::Storage(e.to_string()))?;
     write_private(&staging, &json).map_err(|e| AuthError::Storage(e.to_string()))?;
-    fs::rename(&staging, &path).map_err(|e| AuthError::Storage(e.to_string()))
+    fs::rename(&staging, path).map_err(|e| AuthError::Storage(e.to_string()))
 }
 
 /// Creates `path` and writes `bytes` to it; on systems with file modes the file is readable by its owner only (`0600`).

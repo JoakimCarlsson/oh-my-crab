@@ -31,7 +31,7 @@ This is the common case. Add one file and one line.
    /// The definition of the Groq provider.
    pub(super) static DEF: Def = Def {
        id: "groq",
-       label: "Groq (API key)",
+       label: "Groq",
        wire: Wire::ChatCompletions,
        default_model: None,
        auth: Auth::ApiKey { env: &["GROQ_API_KEY"] },
@@ -43,18 +43,21 @@ This is the common case. Add one file and one line.
 
 2. In `crates/omc-providers/src/providers.rs`, add `mod groq;` and an entry
    `Groq => groq::DEF,` to the `providers!` list. The macro declares the
-   `Provider` variant and `Provider::ALL`; the order of the list is the login
-   picker's order.
+   `Provider` variant and `Provider::ALL`; the order of the list is the order
+   clients offer the providers in.
 
 The `id` is the name saved to disk and equals the variant name in lowercase, so
 pick it once and keep it; a test checks this. Then run `cargo test --workspace`
 and add a row to [supported.md](supported.md).
 
+Clients list providers with `crab providers` or `omc_session::providers()`, so
+the new one shows up in them without a change on their side.
+
 The fields of a definition:
 
 | Field           | Meaning                                                                       |
 | --------------- | ----------------------------------------------------------------------------- |
-| `label`         | What the login picker shows.                                                  |
+| `label`         | The name clients show for the provider, such as `GitHub Copilot`.             |
 | `wire`          | Which `Wire` the provider speaks.                                             |
 | `default_model` | `Some(id)` for a fixed default, `None` to take the first model the server lists. |
 | `auth`          | `Auth::OAuth(&SPEC)`, `Auth::DeviceCode(&DEVICE)`, `Auth::ApiKey { env: &[...] }` or `Auth::None`. |
