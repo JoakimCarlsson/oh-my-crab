@@ -11,6 +11,9 @@ use async_trait::async_trait;
 pub struct ApprovalRequest {
     /// Name of the tool.
     pub tool: String,
+    /// What approving the call allows, such as the tool's name or a site; an
+    /// "always allow" answer covers later calls with the same scope only.
+    pub scope: String,
     /// One-line description of the call.
     pub summary: String,
 }
@@ -20,7 +23,7 @@ pub struct ApprovalRequest {
 pub enum Decision {
     /// Run this call only.
     AllowOnce,
-    /// Run this call and every later call of the same tool this session.
+    /// Run this call and every later call with the same scope this session.
     AllowAlways,
     /// Do not run the call.
     Deny,
@@ -40,7 +43,7 @@ pub trait Prompter: Send + Sync {
 pub struct Approvals {
     /// Whether to allow everything without asking.
     yolo: AtomicBool,
-    /// Tools the user allowed for the rest of the session.
+    /// Scopes the user allowed for the rest of the session.
     always: Mutex<HashSet<String>>,
     /// Where questions go.
     prompter: Arc<dyn Prompter>,
@@ -68,16 +71,16 @@ impl Approvals {
 
     /// Returns whether the call described by `request` may run.
     ///
-    /// Skips the question in yolo mode and for tools already allowed for the
-    /// session; remembers [`Decision::AllowAlways`] answers.
+    /// Skips the question in yolo mode and for scopes already allowed for the
+    /// session; remembers [`Decision::AllowAlways`] answers by scope.
     pub async fn allows(&self, request: &ApprovalRequest) -> bool {
-        if self.yolo() || self.always.lock().unwrap().contains(&request.tool) {
+        if self.yolo() || self.always.lock().unwrap().contains(&request.scope) {
             return true;
         }
         match self.prompter.ask(request).await {
             Decision::AllowOnce => true,
             Decision::AllowAlways => {
-                self.always.lock().unwrap().insert(request.tool.clone());
+                self.always.lock().unwrap().insert(request.scope.clone());
                 true
             }
             Decision::Deny => false,
@@ -122,12 +125,41 @@ mod tests {
         }
     }
 
-    /// Builds a request for `tool`.
+    /// Builds a request for `tool`, scoped to the tool itself.
     fn request(tool: &str) -> ApprovalRequest {
+        scoped(tool, tool)
+    }
+
+    /// Builds a request for `tool` with the approval scope `scope`.
+    fn scoped(tool: &str, scope: &str) -> ApprovalRequest {
         ApprovalRequest {
             tool: tool.into(),
+            scope: scope.into(),
             summary: String::new(),
         }
+    }
+
+    /// Allow-always covers its own scope and not another scope of the same tool.
+    #[tokio::test]
+    async fn always_is_remembered_per_scope() {
+        let prompter = Scripted::new(&[Decision::AllowAlways, Decision::Deny]);
+        let approvals = Approvals::new(prompter.clone(), false);
+        assert!(
+            approvals
+                .allows(&scoped("read", "read https://a.example"))
+                .await
+        );
+        assert!(
+            approvals
+                .allows(&scoped("read", "read https://a.example"))
+                .await
+        );
+        assert!(
+            !approvals
+                .allows(&scoped("read", "read http://localhost:8080"))
+                .await
+        );
+        assert_eq!(*prompter.asked.lock().unwrap(), 2);
     }
 
     /// Allow-once asks every time and deny blocks.

@@ -7,7 +7,23 @@ license.workspace = true
 [dependencies]
 omc-context = { version = "0.1.0", path = "../omc-context" }
 omc-wire = { version = "0.1.0", path = "../omc-wire" }
+ast-grep-core = "0.51.1"
+ast-grep-language = { version = "0.51.1", default-features = false, features = [
+    "tree-sitter-c",
+    "tree-sitter-cpp",
+    "tree-sitter-css",
+    "tree-sitter-go",
+    "tree-sitter-html",
+    "tree-sitter-java",
+    "tree-sitter-javascript",
+    "tree-sitter-json",
+    "tree-sitter-lua",
+    "tree-sitter-python",
+    "tree-sitter-rust",
+    "tree-sitter-typescript",
+] }
 async-trait = "0.1.92"
+bit-set = "0.11.1"
 globset = "0.4.21"
 grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
@@ -17,6 +33,13 @@ serde_json = "1.0.154"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt", "macros", "fs", "io-util", "process", "time", "sync"] }
 unicode-width = "0.2.3"
+base64 = "0.23.1"
+htmd = "0.5.6"
+pdf-extract = "0.12.1"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.191"
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["net", "rt-multi-thread"] }

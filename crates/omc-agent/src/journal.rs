@@ -892,6 +892,7 @@ mod tests {
                 name: "read".into(),
                 text: "contents".into(),
                 is_error: false,
+                images: Vec::new(),
             }]),
             said("done"),
         ];

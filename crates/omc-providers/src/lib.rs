@@ -12,7 +12,7 @@ mod wires;
 mod xxh64;
 
 pub use chat::{
-    ChatModel, DeltaSink, Effort, Message, Part, RemoteModel, Reply, Request, Sink, Tokens,
+    ChatModel, DeltaSink, Effort, Image, Message, Part, RemoteModel, Reply, Request, Sink, Tokens,
     ToolCall, ToolResult, ToolSpec,
 };
 pub use error::ProviderError;

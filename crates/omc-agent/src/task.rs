@@ -1,15 +1,19 @@
-//! The `task` tool: runs a subagent in a loop of its own and returns what it said last.
+//! The `task` tool: runs subagents, alone or several at once, each in a loop of its own, and returns what they said last or the structured result they handed back.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures_util::{StreamExt, stream};
 use omc_context::{AgentDefinition, render, subagent_assignment};
 use omc_providers::{ChatModel, Effort, Message};
 use omc_tools::{Jobs, Registry, Tool, ToolError, ToolOutput, parse_args};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::Semaphore;
 
-use crate::{AgentEvent, Approvals, Context, run_turn};
+use crate::schema::check_schema;
+use crate::submit::{Slot, SubmitResult};
+use crate::{AgentError, AgentEvent, Approvals, Context, run_turn};
 
 /// The tools a subagent never gets: starting subagents of its own, and the ones that talk to the reader about the main agent's work.
 const WITHHELD: &[&str] = &[
@@ -26,6 +30,18 @@ const WITHHELD: &[&str] = &[
 
 /// The kind of subagent used when the call names none.
 const DEFAULT_AGENT: &str = "task";
+
+/// The most subagents one call may start.
+pub const MAX_TASKS: usize = 16;
+
+/// How many subagents of one call run at once; the rest wait for one of them to end.
+pub const MAX_CONCURRENT: usize = 8;
+
+/// What a subagent asked for a structured result is told about handing it back.
+const STRUCTURED: &str = include_str!("prompts/structured.md");
+
+/// What a subagent asked for a structured result is told when it ends without handing one back.
+const NUDGE: &str = include_str!("prompts/submit_nudge.md");
 
 /// How the prompt of a subagent is built from its role and the names of its tools.
 pub type PromptBuilder = dyn Fn(&AgentDefinition, &[String]) -> String + Send + Sync;
@@ -56,15 +72,191 @@ pub struct TaskSettings {
 /// Arguments of a `task` call.
 #[derive(Deserialize)]
 struct Args {
+    /// The kind of subagent, for the single assignment or for the items of `tasks` that name none.
+    agent: Option<String>,
+    /// What a single subagent is to do.
+    task: Option<String>,
+    /// A few words naming the single assignment.
+    description: Option<String>,
+    /// The schema of the single subagent's result, or of the results of the items of `tasks` that give none.
+    output_schema: Option<Value>,
+    /// Several assignments, run at once.
+    tasks: Option<Vec<Item>>,
+    /// Whether to start the subagents in the background and return a handle for each.
+    #[serde(default)]
+    background: bool,
+}
+
+/// One assignment of a `task` call.
+#[derive(Deserialize)]
+struct Item {
     /// The kind of subagent.
     agent: Option<String>,
     /// What it is to do.
     task: String,
     /// A few words naming the work.
     description: Option<String>,
-    /// Whether to start it in the background and return a handle.
-    #[serde(default)]
-    background: bool,
+    /// The schema its result must match, when it is to hand back data.
+    output_schema: Option<Value>,
+}
+
+impl Args {
+    /// The assignments the call asks for: the single `task`, or the items of `tasks` with the call's `agent` and `output_schema` filled in where they give none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::InvalidArguments`] when the call gives both forms or neither, or more than [`MAX_TASKS`] items.
+    fn items(self) -> Result<Vec<Item>, ToolError> {
+        let Args {
+            agent,
+            task,
+            description,
+            output_schema,
+            tasks,
+            ..
+        } = self;
+        let invalid = |reason: String| Err(ToolError::InvalidArguments(reason));
+        match (task, tasks) {
+            (Some(_), Some(_)) => invalid("give either `task` or `tasks`, not both".to_owned()),
+            (None, None) => invalid("missing `task`, or `tasks` for several".to_owned()),
+            (Some(task), None) => Ok(vec![Item {
+                agent,
+                task,
+                description,
+                output_schema,
+            }]),
+            (None, Some(list)) if list.is_empty() => invalid("`tasks` is empty".to_owned()),
+            (None, Some(list)) if list.len() > MAX_TASKS => invalid(format!(
+                "`tasks` holds {} assignments; one call runs at most {MAX_TASKS}",
+                list.len()
+            )),
+            (None, Some(list)) => Ok(list
+                .into_iter()
+                .map(|item| Item {
+                    agent: item.agent.or_else(|| agent.clone()),
+                    output_schema: item.output_schema.or_else(|| output_schema.clone()),
+                    ..item
+                })
+                .collect()),
+        }
+    }
+}
+
+/// Where the work of one subagent is reported.
+#[derive(Clone)]
+struct Lane {
+    /// The id of the `task` call that started it.
+    call: String,
+    /// Its place in the call's list, counted from one, when the call started several.
+    place: Option<usize>,
+    /// The kind of subagent.
+    kind: String,
+    /// What it is doing, in a few words.
+    label: String,
+}
+
+impl Lane {
+    /// The event announcing the subagent: the call itself starting it when it is alone, or a step of the call when it is one of several.
+    fn opened(&self) -> AgentEvent {
+        match self.place {
+            None => AgentEvent::Spawned {
+                id: self.call.clone(),
+                agent: self.kind.clone(),
+            },
+            Some(place) => self.under_call(AgentEvent::ToolStart {
+                id: place.to_string(),
+                name: "task".to_owned(),
+                summary: self.label.clone(),
+            }),
+        }
+    }
+
+    /// The event ending the step of a subagent that is one of several with `outcome`; nothing for a lone one, whose call reports its own end.
+    fn closed(&self, outcome: &Result<String, ToolError>) -> Option<AgentEvent> {
+        let place = self.place?;
+        let (text, is_error) = match outcome {
+            Ok(text) => (text.clone(), false),
+            Err(error) => (error.to_string(), true),
+        };
+        Some(self.under_call(AgentEvent::ToolDone {
+            id: place.to_string(),
+            name: "task".to_owned(),
+            text,
+            is_error,
+            changes: Vec::new(),
+        }))
+    }
+
+    /// `event`, something the subagent did, filed under it: under the call when it is alone, and under its step of the call when it is one of several.
+    fn file(&self, event: AgentEvent) -> AgentEvent {
+        match self.place {
+            None => self.under_call(event),
+            Some(place) => self.under_call(AgentEvent::Nested {
+                parent: place.to_string(),
+                agent: self.kind.clone(),
+                event: Box::new(event),
+            }),
+        }
+    }
+
+    /// `event` filed under the call.
+    fn under_call(&self, event: AgentEvent) -> AgentEvent {
+        AgentEvent::Nested {
+            parent: self.call.clone(),
+            agent: self.kind.clone(),
+            event: Box::new(event),
+        }
+    }
+
+    /// The heading of the subagent's part of a combined result, which ended `ok` or not.
+    fn heading(&self, ok: bool) -> String {
+        let status = if ok { "completed" } else { "failed" };
+        format!(
+            "## {}. {}: {} ({status})",
+            self.place.unwrap_or(1),
+            self.kind,
+            self.label
+        )
+    }
+}
+
+/// The schema a subagent's result must match, and where the result it hands back is kept.
+struct Structured {
+    /// The schema.
+    schema: Value,
+    /// Where `submit_result` keeps what it accepted.
+    slot: Slot,
+}
+
+impl Structured {
+    /// The result accepted so far, as the text the main agent reads.
+    fn accepted(&self) -> Option<String> {
+        self.slot.lock().value.as_ref().map(pretty)
+    }
+
+    /// The failure of a `kind` subagent that ended, even after a reminder, without an accepted result, with `history` as its conversation.
+    fn missing(&self, kind: &str, history: &[Message]) -> ToolError {
+        let why = match &self.slot.lock().rejected {
+            Some(reasons) => format!("its last result did not match the schema:\n{reasons}"),
+            None => match last_reply(history) {
+                said if said.is_empty() => "it never called submit_result".to_owned(),
+                said => format!("it never called submit_result; its last message was:\n{said}"),
+            },
+        };
+        ToolError::Failed(format!(
+            "the {kind} agent ended without a result matching output_schema, even after a reminder; {why}"
+        ))
+    }
+}
+
+/// `value` as indented JSON.
+fn pretty(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+/// The failure of a `kind` subagent whose turn failed with `error`.
+fn failed(kind: &str, error: &AgentError) -> ToolError {
+    ToolError::Failed(format!("the {kind} agent failed: {error}"))
 }
 
 /// A subagent, owning everything it needs so that it can run on a task of its own.
@@ -77,38 +269,38 @@ struct Run {
     approvals: Arc<Approvals>,
     /// Where its work is reported.
     events: Arc<EventSink>,
+    /// How its work is filed.
+    lane: Lane,
     /// Its system prompt.
     system: String,
     /// How hard it thinks.
     effort: Option<Effort>,
-    /// The call that started it.
-    parent: String,
-    /// The kind of subagent.
-    kind: String,
     /// What it is to do.
     assignment: String,
+    /// The schema its result must match, when it is to hand back data.
+    structured: Option<Structured>,
 }
 
 impl Run {
-    /// Runs the subagent to the end and returns what it said last.
+    /// Runs the subagent to the end and returns what it said last, or the result it handed back when it was asked for one; one that ends without handing back a result is reminded once.
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Failed`] when a model request fails.
+    /// Returns [`ToolError::Failed`] when a model request fails, or when a subagent asked for a result ends twice without one that matches the schema.
     async fn go(self) -> Result<String, ToolError> {
         let Run {
             model,
             registry,
             approvals,
             events,
+            lane,
             system,
             effort,
-            parent,
-            kind,
             assignment,
+            structured,
         } = self;
-        let name = kind.clone();
-        let nested = move |event: AgentEvent| {
+        let kind = lane.kind.clone();
+        let report = move |event: AgentEvent| {
             if matches!(
                 event,
                 AgentEvent::Started(_)
@@ -118,13 +310,8 @@ impl Run {
             ) {
                 return;
             }
-            events(AgentEvent::Nested {
-                parent: parent.clone(),
-                agent: name.clone(),
-                event: Box::new(event),
-            });
+            events(lane.file(event));
         };
-        let mut history = Vec::new();
         let context = Context {
             model: model.as_ref(),
             registry: &registry,
@@ -136,21 +323,59 @@ impl Run {
             window: None,
             checkpoint: None,
         };
-        run_turn(
-            &context,
-            &mut history,
-            subagent_assignment(&assignment),
-            &nested,
-        )
-        .await
-        .map_err(|error| ToolError::Failed(format!("the {kind} agent failed: {error}")))?;
-        let reply = last_reply(&history);
-        if reply.is_empty() {
-            Ok("The agent finished without a reply.".to_owned())
-        } else {
-            Ok(reply)
+        let mut history = Vec::new();
+        let opening = match &structured {
+            Some(wanted) => format!(
+                "{}\n\n{}",
+                subagent_assignment(&assignment),
+                render(STRUCTURED, &[("schema", pretty(&wanted.schema).as_str())])
+            ),
+            None => subagent_assignment(&assignment),
+        };
+        run_turn(&context, &mut history, opening, &report)
+            .await
+            .map_err(|error| failed(&kind, &error))?;
+        let Some(wanted) = structured else {
+            let reply = last_reply(&history);
+            return Ok(if reply.is_empty() {
+                "The agent finished without a reply.".to_owned()
+            } else {
+                reply
+            });
+        };
+        if let Some(result) = wanted.accepted() {
+            return Ok(result);
         }
+        run_turn(&context, &mut history, NUDGE.trim().to_owned(), &report)
+            .await
+            .map_err(|error| failed(&kind, &error))?;
+        wanted
+            .accepted()
+            .ok_or_else(|| wanted.missing(&kind, &history))
     }
+}
+
+/// Runs `run`, reports the end of its step through `events` when it is one of several, and returns its lane with how it ended.
+async fn finish(run: Run, events: Arc<EventSink>) -> (Lane, Result<String, ToolError>) {
+    let lane = run.lane.clone();
+    let outcome = run.go().await;
+    if let Some(event) = lane.closed(&outcome) {
+        events(event);
+    }
+    (lane, outcome)
+}
+
+/// A few words naming an assignment: its `description`, or the start of its `task`.
+fn headline(description: Option<&str>, task: &str) -> String {
+    description
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or(task)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(120)
+        .collect()
 }
 
 /// Starts subagents.
@@ -173,13 +398,25 @@ impl Task {
                 } else {
                     ""
                 };
-                format!("- `{}`{only_looks}: {}", agent.name, agent.description)
+                let structured = if agent.output_schema.is_some() {
+                    " (returns structured JSON)"
+                } else {
+                    ""
+                };
+                format!(
+                    "- `{}`{only_looks}{structured}: {}",
+                    agent.name, agent.description
+                )
             })
             .collect::<Vec<_>>()
             .join("\n");
         let description = render(
             include_str!("prompts/task.md"),
-            &[("agents", agents.as_str())],
+            &[
+                ("agents", agents.as_str()),
+                ("most", MAX_TASKS.to_string().as_str()),
+                ("parallel", MAX_CONCURRENT.to_string().as_str()),
+            ],
         );
         Self {
             settings,
@@ -197,6 +434,121 @@ impl Task {
                     .is_none_or(|listed| listed.iter().any(|name| name == tool.name()))
         })
     }
+
+    /// The definition of the subagent kind `kind`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Failed`], listing the kinds there are, when there is no such kind.
+    fn agent(&self, kind: &str) -> Result<&AgentDefinition, ToolError> {
+        self.settings
+            .agents
+            .iter()
+            .find(|agent| agent.name == kind)
+            .ok_or_else(|| {
+                let known: Vec<&str> = self
+                    .settings
+                    .agents
+                    .iter()
+                    .map(|agent| agent.name.as_str())
+                    .collect();
+                ToolError::Failed(format!(
+                    "unknown agent {kind}; available: {}",
+                    known.join(", ")
+                ))
+            })
+    }
+
+    /// The subagent for `item`, reporting under the call `call` at `place` in its list when it is one of several.
+    ///
+    /// A subagent asked for a structured result, by the item or by its kind's definition, gets the `submit_result` tool for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Failed`] for an unknown kind and [`ToolError::InvalidArguments`] for a schema that is not one.
+    fn prepare(&self, call: &str, place: Option<usize>, item: Item) -> Result<Run, ToolError> {
+        let agent = self.agent(item.agent.as_deref().unwrap_or(DEFAULT_AGENT))?;
+        let schema = item.output_schema.or_else(|| agent.output_schema.clone());
+        if let Some(schema) = &schema {
+            check_schema(schema).map_err(|reason| {
+                ToolError::InvalidArguments(format!("output_schema: {reason}"))
+            })?;
+        }
+        let mut registry = self.tools_for(agent);
+        let structured = schema.map(|schema| {
+            let slot = Slot::default();
+            registry.register(SubmitResult::new(schema.clone(), slot.clone()));
+            Structured { schema, slot }
+        });
+        let system = (self.settings.prompt)(agent, &registry.names());
+        Ok(Run {
+            model: self.settings.model.clone(),
+            registry,
+            approvals: self.settings.approvals.clone(),
+            events: self.settings.events.clone(),
+            lane: Lane {
+                call: call.to_owned(),
+                place,
+                kind: agent.name.clone(),
+                label: headline(item.description.as_deref(), &item.task),
+            },
+            system,
+            effort: self.settings.effort,
+            assignment: item.task,
+            structured,
+        })
+    }
+
+    /// Runs `runs` together, at most [`MAX_CONCURRENT`] at a time, and returns each one's lane and outcome in the order given.
+    async fn run_together(&self, runs: Vec<Run>) -> Vec<(Lane, Result<String, ToolError>)> {
+        let events = &self.settings.events;
+        stream::iter(runs.into_iter().map(|run| finish(run, events.clone())))
+            .buffered(MAX_CONCURRENT)
+            .collect()
+            .await
+    }
+
+    /// Starts `runs`, started by the call `call`, in the background, at most [`MAX_CONCURRENT`] at a time, and says which handle each got.
+    fn start_in_background(&self, call: &str, runs: Vec<Run>) -> ToolOutput {
+        let gate = Arc::new(Semaphore::new(MAX_CONCURRENT));
+        let call = Some(call.to_owned()).filter(|call| !call.is_empty());
+        let started: Vec<(String, Lane)> = runs
+            .into_iter()
+            .map(|run| {
+                let lane = run.lane.clone();
+                let gate = gate.clone();
+                let events = self.settings.events.clone();
+                let handle =
+                    self.settings
+                        .jobs
+                        .spawn(lane.label.clone(), call.clone(), async move {
+                            let _turn = gate.acquire_owned().await.ok();
+                            finish(run, events)
+                                .await
+                                .1
+                                .map_err(|error| error.to_string())
+                        });
+                (handle, lane)
+            })
+            .collect();
+        if let [(handle, lane)] = started.as_slice()
+            && lane.place.is_none()
+        {
+            return ToolOutput::new(format!(
+                "Started the {} agent in the background as {handle}. Call `wait` to get its result when it ends.",
+                lane.kind
+            ));
+        }
+        let handles: Vec<String> = started
+            .iter()
+            .map(|(handle, lane)| format!("- {handle}: {}: {}", lane.kind, lane.label))
+            .collect();
+        ToolOutput::new(format!(
+            "Started {} subagents in the background:\n{}\nCall `wait` once per handle to get each result as it ends.",
+            started.len(),
+            handles.join("\n")
+        ))
+    }
 }
 
 /// The text of the last reply in `history`.
@@ -209,6 +561,32 @@ fn last_reply(history: &[Message]) -> String {
             _ => None,
         })
         .unwrap_or_default()
+}
+
+/// The combined result of several subagents, from each one's lane and outcome: every outcome under a heading, failing as a whole only when all of them failed.
+fn combine(outcomes: Vec<(Lane, Result<String, ToolError>)>) -> Result<ToolOutput, ToolError> {
+    let total = outcomes.len();
+    let completed = outcomes
+        .iter()
+        .filter(|(_, outcome)| outcome.is_ok())
+        .count();
+    let parts: Vec<String> = outcomes
+        .into_iter()
+        .map(|(lane, outcome)| {
+            let ok = outcome.is_ok();
+            let text = outcome.unwrap_or_else(|error| error.to_string());
+            format!("{}\n{text}", lane.heading(ok))
+        })
+        .collect();
+    let report = format!(
+        "{completed} of {total} subagents completed.\n\n{}",
+        parts.join("\n\n")
+    );
+    if completed == 0 {
+        Err(ToolError::Failed(report))
+    } else {
+        Ok(ToolOutput::new(report))
+    }
 }
 
 #[async_trait]
@@ -225,86 +603,98 @@ impl Tool for Task {
 
     /// Returns the argument schema.
     fn schema(&self) -> Value {
+        let agent = json!({ "type": "string", "description": "The kind of subagent; omit for the default." });
+        let description = json!({ "type": "string", "description": "A few words naming the work, shown to the user." });
+        let output_schema = json!({
+            "type": "object",
+            "description": "A JSON Schema the result must match. The subagent hands its result to `submit_result`, and you get the checked JSON back instead of prose."
+        });
         json!({
             "type": "object",
             "properties": {
-                "agent": { "type": "string", "description": "The kind of subagent; omit for the default." },
-                "task": { "type": "string", "description": "The self-contained assignment." },
-                "description": { "type": "string", "description": "A few words naming the work, shown to the user." },
-                "background": { "type": "boolean", "description": "Start the subagent in the background and return a handle at once; `wait` returns its result." }
-            },
-            "required": ["task"]
+                "agent": agent,
+                "task": { "type": "string", "description": "The self-contained assignment of a single subagent." },
+                "description": description,
+                "output_schema": output_schema,
+                "tasks": {
+                    "type": "array",
+                    "description": "Several independent assignments, run in parallel; give this instead of `task`. Call-level `agent` and `output_schema` apply to items that omit them.",
+                    "maxItems": MAX_TASKS,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "agent": agent,
+                            "task": { "type": "string", "description": "The self-contained assignment." },
+                            "description": description,
+                            "output_schema": output_schema
+                        },
+                        "required": ["task"]
+                    }
+                },
+                "background": { "type": "boolean", "description": "Start the subagents in the background and return a handle for each at once; `wait` returns their results." }
+            }
         })
     }
 
-    /// Describes a call by its description, or the start of its assignment.
+    /// Describes a call by its description, or the start of its assignment; a call starting several names how many and what they do.
     fn describe(&self, args: &Value) -> String {
-        let named = args["description"].as_str().filter(|text| !text.is_empty());
-        let said = named.or_else(|| args["task"].as_str()).unwrap_or_default();
-        said.lines()
-            .next()
-            .unwrap_or_default()
-            .chars()
-            .take(120)
-            .collect()
+        let named = |item: &Value| {
+            headline(
+                item["description"].as_str(),
+                item["task"].as_str().unwrap_or_default(),
+            )
+        };
+        match args["tasks"].as_array() {
+            Some(list) if list.len() > 1 => {
+                let labels: Vec<String> = list.iter().map(named).collect();
+                format!("{} subagents: {}", list.len(), labels.join(", "))
+                    .chars()
+                    .take(120)
+                    .collect()
+            }
+            Some(list) if !list.is_empty() => named(&list[0]),
+            _ => named(args),
+        }
     }
 
-    /// Runs the call without an id, which only loses the grouping of the subagent's work.
+    /// Runs the call without an id, which only loses the grouping of the subagents' work.
     async fn call(&self, args: Value) -> Result<ToolOutput, ToolError> {
         self.call_as("", args).await
     }
 
-    /// Runs the subagent the call asks for and returns its last message; its tool activity is reported under the call `id`.
+    /// Runs the subagents the call asks for, their tool activity reported under the call `id`, and returns what they came to.
+    ///
+    /// Every assignment is checked before any subagent starts. A single subagent's result is its last message or its structured result; several run at once and their outcomes are combined under headings, one failing leaving the others be. In the background, each gets a handle for `wait` and the call returns at once.
     async fn call_as(&self, id: &str, args: Value) -> Result<ToolOutput, ToolError> {
         let args: Args = parse_args(args)?;
-        let kind = args.agent.as_deref().unwrap_or(DEFAULT_AGENT);
-        let agent = self
-            .settings
-            .agents
-            .iter()
-            .find(|agent| agent.name == kind)
-            .ok_or_else(|| {
-                let known: Vec<&str> = self
-                    .settings
-                    .agents
-                    .iter()
-                    .map(|a| a.name.as_str())
-                    .collect();
-                ToolError::Failed(format!(
-                    "unknown agent {kind}; available: {}",
-                    known.join(", ")
-                ))
-            })?;
-        let registry = self.tools_for(agent);
-        let system = (self.settings.prompt)(agent, &registry.names());
-        (self.settings.events)(AgentEvent::Spawned {
-            id: id.to_owned(),
-            agent: agent.name.clone(),
-        });
-        let run = Run {
-            model: self.settings.model.clone(),
-            registry,
-            approvals: self.settings.approvals.clone(),
-            events: self.settings.events.clone(),
-            system,
-            effort: self.settings.effort,
-            parent: id.to_owned(),
-            kind: agent.name.clone(),
-            assignment: args.task,
-        };
-        if !args.background {
-            return run.go().await.map(ToolOutput::new);
+        let background = args.background;
+        let items = args.items()?;
+        let several = items.len() > 1;
+        let runs = items
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let place = several.then_some(index + 1);
+                self.prepare(id, place, item).map_err(|error| match place {
+                    Some(_) => ToolError::Failed(format!("tasks[{index}]: {error}")),
+                    None => error,
+                })
+            })
+            .collect::<Result<Vec<Run>, ToolError>>()?;
+        for run in &runs {
+            (self.settings.events)(run.lane.opened());
         }
-        let label =
-            self.describe(&json!({ "description": args.description, "task": run.assignment }));
-        let handle = self.settings.jobs.spawn(
-            label,
-            Some(id.to_owned()).filter(|id| !id.is_empty()),
-            async move { run.go().await.map_err(|error| error.to_string()) },
-        );
-        Ok(ToolOutput::new(format!(
-            "Started the {kind} agent in the background as {handle}. Call `wait` to get its result when it ends."
-        )))
+        if background {
+            return Ok(self.start_in_background(id, runs));
+        }
+        let mut outcomes = self.run_together(runs).await;
+        if several {
+            return combine(outcomes);
+        }
+        outcomes.pop().map_or_else(
+            || Err(ToolError::Failed("nothing to run".to_owned())),
+            |(_, outcome)| outcome.map(ToolOutput::new),
+        )
     }
 }
 
@@ -474,10 +864,15 @@ mod tests {
                 .map(|request| request.tools.clone())
                 .unwrap()
         };
-        assert_eq!(tools_of("SUB:scout"), vec!["glob", "grep", "read"]);
+        assert_eq!(
+            tools_of("SUB:scout"),
+            vec!["ast_grep", "glob", "grep", "read"]
+        );
         assert_eq!(
             tools_of("SUB:task"),
-            vec!["bash", "edit", "glob", "grep", "read", "write"]
+            vec![
+                "ast_edit", "ast_grep", "bash", "edit", "glob", "grep", "read", "write"
+            ]
         );
     }
 

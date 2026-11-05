@@ -40,8 +40,10 @@ pub enum AgentEvent {
         agent: String,
     },
     /// Something a subagent did, as the `task` call `parent` ran it.
+    ///
+    /// A call that starts several subagents reports each as a `task` step of its own, whose id is the subagent's place in the list counted from one; what that subagent does is nested once more, under its step.
     Nested {
-        /// Id of the `task` call.
+        /// Id of the `task` call, or of the step within it.
         parent: String,
         /// The kind of subagent.
         agent: String,
@@ -69,6 +71,9 @@ pub enum AgentError {
     /// The model request failed.
     #[error(transparent)]
     Provider(#[from] ProviderError),
+    /// The model answered the prompt with nothing: no text and no tool calls.
+    #[error("the model returned an empty answer; the provider may have filtered or dropped it")]
+    Empty,
 }
 
 /// The tools and system prompt to use for the next request, when they can change while a turn runs.
@@ -182,7 +187,10 @@ fn rewind(history: &mut Vec<Message>, length: usize, report: &str, scribe: Optio
 ///
 /// # Errors
 ///
-/// Returns [`AgentError::Provider`] when a model request fails and
+/// Returns [`AgentError::Provider`] when a model request fails, and
+/// [`AgentError::Empty`] when the model answers the prompt with neither text
+/// nor tool calls.
+///
 /// A turn has no request limit: it ends when the model stops calling tools or
 /// when the task running it is aborted.
 pub async fn run_turn(
@@ -245,11 +253,59 @@ fn record(scribe: Option<&Scribe>, message: &Message) {
     }
 }
 
+/// Whether `error` is the provider refusing the request itself, as it does
+/// when the model takes no image input, rather than a limit, a sign-in
+/// problem or a failure to reach it.
+fn refuses_request(error: &ProviderError) -> bool {
+    let ProviderError::Status { status, .. } = error else {
+        return false;
+    };
+    status.starts_with('4')
+        && !["401", "403", "429"]
+            .iter()
+            .any(|code| status.starts_with(code))
+}
+
+/// Takes every image out of the tool results in `history`, leaving a note in
+/// each result that had some, so that a model without image input can go on;
+/// whether there was any image to take out.
+fn strip_images(history: &mut [Message]) -> bool {
+    let mut any = false;
+    for message in history.iter_mut() {
+        let Message::ToolResults(results) = message else {
+            continue;
+        };
+        for result in results
+            .iter_mut()
+            .filter(|result| !result.images.is_empty())
+        {
+            result.text.push_str(&format!(
+                "\n[{} image(s) removed: the model does not accept image input]",
+                result.images.len()
+            ));
+            result.images.clear();
+            any = true;
+        }
+    }
+    any
+}
+
+/// Whether `reply` holds nothing for the reader or the turn: no text beyond
+/// whitespace and no tool calls.
+fn is_empty(reply: &Reply) -> bool {
+    reply.text.trim().is_empty() && reply.tool_calls.is_empty()
+}
+
 /// Repeats model request and tool execution until no tool is requested, recording each step with `scribe`.
 ///
 /// # Errors
 ///
-/// Same as [`run_turn`].
+/// Same as [`run_turn`], and [`AgentError::Empty`] when the first reply of
+/// the turn is empty.
+///
+/// When the provider refuses a request while the history holds images, the
+/// images are taken out, with a note left in their place, and the request is
+/// sent once more, since the usual cause is a model without image input.
 async fn drive(
     context: &Context<'_>,
     history: &mut Vec<Message>,
@@ -258,6 +314,8 @@ async fn drive(
 ) -> Result<(), AgentError> {
     let mut saved = context.notebook.map_or(0, Notebook::revision);
     let mut reminded = false;
+    let mut first = true;
+    let mut stripped = false;
     loop {
         let live = context.refresh.map(|refresh| refresh());
         let registry = live
@@ -272,7 +330,17 @@ async fn drive(
             tools: &specs,
             effort: context.effort,
         };
-        let reply = context.model.complete(request, &mut chunks).await?;
+        let reply = match context.model.complete(request, &mut chunks).await {
+            Ok(reply) => reply,
+            Err(error) if !stripped && refuses_request(&error) && strip_images(history) => {
+                stripped = true;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if std::mem::take(&mut first) && is_empty(&reply) {
+            return Err(AgentError::Empty);
+        }
         let nearly_full = reply
             .tokens
             .zip(context.window)
@@ -387,9 +455,10 @@ async fn run_calls(
                 let message = format!("unknown tool: {}", call.name);
                 slots[index] = Some(finish(call, message, true, Vec::new(), events));
             }
-            Some(tool) if tool.needs_approval() => {
+            Some(tool) if let Some(scope) = tool.approval_scope(&call.arguments) => {
                 let request = ApprovalRequest {
                     tool: call.name.clone(),
+                    scope,
                     summary,
                 };
                 if approvals.allows(&request).await {
@@ -425,14 +494,26 @@ async fn run_call(
     call: &ToolCall,
     events: &(dyn Fn(AgentEvent) + Send + Sync),
 ) -> ToolResult {
-    let (text, is_error, changes) = match registry
+    match registry
         .call_as(&call.id, &call.name, call.arguments.clone())
         .await
     {
-        Ok(output) => (output.text, false, output.changes),
-        Err(error) => (error.to_string(), true, Vec::new()),
-    };
-    finish(call, text, is_error, changes, events)
+        Ok(output) => {
+            let images = output.images.into_iter().map(image).collect();
+            let mut result = finish(call, output.text, false, output.changes, events);
+            result.images = images;
+            result
+        }
+        Err(error) => finish(call, error.to_string(), true, Vec::new(), events),
+    }
+}
+
+/// Converts an image a tool returned into the form sent to the model.
+fn image(image: omc_tools::Image) -> omc_providers::Image {
+    omc_providers::Image {
+        media_type: image.media_type,
+        data: image.data,
+    }
 }
 
 /// Reports the outcome of `call` through `events` and builds its result.
@@ -455,6 +536,7 @@ fn finish(
         name: call.name.clone(),
         text,
         is_error,
+        images: Vec::new(),
     }
 }
 
@@ -619,6 +701,200 @@ mod tests {
             }
         ));
         assert_eq!(log[2], AgentEvent::Delta("it says hello".into()));
+    }
+
+    /// Runs one turn of `model` on the built-in tools in `dir` with `history`.
+    async fn turn_of(
+        model: &Scripted,
+        dir: &std::path::Path,
+        history: &mut Vec<Message>,
+    ) -> Result<(), AgentError> {
+        let registry = Registry::builtin(dir).unwrap();
+        run_turn(
+            &Context {
+                model,
+                registry: &registry,
+                approvals: &deny_all(),
+                system: "",
+                effort: None,
+                refresh: None,
+                notebook: None,
+                window: None,
+                checkpoint: None,
+            },
+            history,
+            "go".into(),
+            &|_| {},
+        )
+        .await
+    }
+
+    /// A model without image input: it refuses every request whose history
+    /// holds an image, and otherwise answers with the text of the last tool
+    /// result it was sent.
+    struct Blind {
+        /// Whether each request held an image, in order.
+        saw_images: Mutex<Vec<bool>>,
+    }
+
+    #[async_trait]
+    impl ChatModel for Blind {
+        /// Refuses requests with images; asks to read `dot.png` first, then
+        /// repeats the last tool result.
+        async fn complete(
+            &self,
+            request: Request<'_>,
+            _: &mut dyn Sink,
+        ) -> Result<Reply, ProviderError> {
+            let results: Vec<&ToolResult> = request
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::ToolResults(results) => Some(results),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            let images = results.iter().any(|result| !result.images.is_empty());
+            self.saw_images.lock().unwrap().push(images);
+            if images {
+                return Err(ProviderError::Status {
+                    status: "404 Not Found".into(),
+                    body: "No endpoints found that support image input".into(),
+                });
+            }
+            Ok(match results.last() {
+                None => call_reply("t1", "read", json!({ "path": "dot.png" })),
+                Some(result) => Reply {
+                    text: result.text.clone(),
+                    ..Reply::default()
+                },
+            })
+        }
+    }
+
+    /// When the provider refuses a request because of an image, the image is
+    /// replaced by a note and the request is sent once more.
+    #[tokio::test]
+    async fn drops_images_a_model_refuses() {
+        let dir = scratch("loop-blind");
+        let png = [
+            0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n', 0, 0, 0, 13, b'I', b'H', b'D', b'R',
+        ];
+        std::fs::write(dir.join("dot.png"), png).unwrap();
+        let registry = Registry::builtin(&dir).unwrap();
+        let model = Blind {
+            saw_images: Mutex::new(Vec::new()),
+        };
+        let mut history = Vec::new();
+        run_turn(
+            &Context {
+                model: &model,
+                registry: &registry,
+                approvals: &deny_all(),
+                system: "",
+                effort: None,
+                refresh: None,
+                notebook: None,
+                window: None,
+                checkpoint: None,
+            },
+            &mut history,
+            "look".into(),
+            &|_| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(*model.saw_images.lock().unwrap(), vec![false, true, false]);
+        let Message::Assistant(answer) = &history[3] else {
+            panic!("expected the answer, got {:?}", history[3]);
+        };
+        assert!(
+            answer.text.contains("1 image(s) removed"),
+            "{}",
+            answer.text
+        );
+    }
+
+    /// A first answer with neither text nor tool calls fails the turn and
+    /// leaves the history as it was; an empty answer after tool calls ends the
+    /// turn normally.
+    #[tokio::test]
+    async fn an_empty_first_answer_fails_the_turn() {
+        let dir = scratch("loop-empty");
+        std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+        let mut history = Vec::new();
+        let blank = Reply {
+            text: "  \n".into(),
+            ..Reply::default()
+        };
+        let error = turn_of(&Scripted::new(vec![blank]), &dir, &mut history)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AgentError::Empty), "{error}");
+        assert!(history.is_empty());
+        let model = Scripted::new(vec![
+            call_reply("t1", "read", json!({ "path": "a.txt" })),
+            Reply::default(),
+        ]);
+        turn_of(&model, &dir, &mut history).await.unwrap();
+        assert_eq!(history.len(), 4);
+    }
+
+    /// Runs one turn in which the model calls `read` with `arguments` in `dir`,
+    /// denying every approval, and returns the result of that call.
+    async fn read_once(dir: &std::path::Path, arguments: serde_json::Value) -> ToolResult {
+        let registry = Registry::builtin(dir).unwrap();
+        let model = Scripted::new(vec![
+            call_reply("t1", "read", arguments),
+            Reply {
+                text: "done".into(),
+                ..Reply::default()
+            },
+        ]);
+        let mut history = Vec::new();
+        run_turn(
+            &Context {
+                model: &model,
+                registry: &registry,
+                approvals: &deny_all(),
+                system: "",
+                effort: None,
+                refresh: None,
+                notebook: None,
+                window: None,
+                checkpoint: None,
+            },
+            &mut history,
+            "read it".into(),
+            &|_| {},
+        )
+        .await
+        .unwrap();
+        let Message::ToolResults(results) = &history[2] else {
+            panic!("expected tool results, got {:?}", history[2]);
+        };
+        results[0].clone()
+    }
+
+    /// An image a tool returns reaches the result sent to the model.
+    #[tokio::test]
+    async fn passes_tool_images_to_the_model() {
+        let dir = scratch("loop-image");
+        std::fs::write(dir.join("dot.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+        let result = read_once(&dir, json!({ "path": "dot.png" })).await;
+        assert!(!result.is_error, "{}", result.text);
+        assert_eq!(result.images.len(), 1);
+        assert_eq!(result.images[0].media_type, "image/png");
+    }
+
+    /// Reading a URL asks first, while reading a file does not.
+    #[tokio::test]
+    async fn asks_before_reading_urls() {
+        let dir = scratch("loop-url");
+        let result = read_once(&dir, json!({ "path": "http://127.0.0.1:9/x" })).await;
+        assert!(result.is_error);
+        assert!(result.text.contains("denied"), "{}", result.text);
     }
 
     /// Several calls in one reply all run and all get a result, tool errors included.

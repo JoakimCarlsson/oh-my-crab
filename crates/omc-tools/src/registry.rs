@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::tools::{Bash, Edit, Glob, Grep, Read, Write};
+use crate::tools::{AstEdit, AstGrep, Bash, Edit, Glob, Grep, Read, Write};
 use crate::{Jobs, Sandbox, Tool, ToolError, ToolOutput};
 
 /// A set of tools addressable by name.
@@ -44,11 +44,13 @@ impl Registry {
         registry.register(Read::new(sandbox.clone()));
         registry.register(Grep::new(sandbox.clone()));
         registry.register(Glob::new(sandbox.clone()));
+        registry.register(AstGrep::new(sandbox.clone()));
         registry.register(match jobs {
             Some(jobs) => Bash::with_jobs(sandbox.clone(), jobs),
             None => Bash::new(sandbox.clone()),
         });
         registry.register(Edit::new(sandbox.clone()));
+        registry.register(AstEdit::new(sandbox.clone()));
         registry.register(Write::new(sandbox));
         Ok(registry)
     }
@@ -180,8 +182,11 @@ mod tests {
     #[test]
     fn read_only_filtering() {
         let registry = Registry::builtin(crate::testutil::scratch("registry-read-only")).unwrap();
-        assert_eq!(registry.read_only().names(), vec!["glob", "grep", "read"]);
-        assert_eq!(registry.names().len(), 6);
+        assert_eq!(
+            registry.read_only().names(),
+            vec!["ast_grep", "glob", "grep", "read"]
+        );
+        assert_eq!(registry.names().len(), 8);
     }
 
     /// A registered tool runs by name and an unknown name is an error.

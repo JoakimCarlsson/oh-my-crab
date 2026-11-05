@@ -212,6 +212,7 @@ mod tests {
             tools.live(true).registry.names(),
             vec![
                 "ask",
+                "ast_grep",
                 "context_notes",
                 "exit_plan_mode",
                 "glob",
@@ -228,6 +229,8 @@ mod tests {
             tools.live(false).registry.names(),
             vec![
                 "ask",
+                "ast_edit",
+                "ast_grep",
                 "bash",
                 "context_notes",
                 "edit",

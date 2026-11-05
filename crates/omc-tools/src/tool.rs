@@ -18,6 +18,15 @@ pub struct FileChange {
     pub new: String,
 }
 
+/// An image a tool hands the model to look at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Image {
+    /// The MIME type, such as `image/png`.
+    pub media_type: String,
+    /// The image's bytes, base64-encoded.
+    pub data: String,
+}
+
 /// What a successful tool call returns to the model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutput {
@@ -25,15 +34,24 @@ pub struct ToolOutput {
     pub text: String,
     /// The files the call changed, for the client to show; empty for most tools.
     pub changes: Vec<FileChange>,
+    /// Images the model sees after the text; empty for most tools.
+    pub images: Vec<Image>,
 }
 
 impl ToolOutput {
-    /// Wraps `text` as a tool output that changed no files.
+    /// Wraps `text` as a tool output that changed no files and holds no images.
     pub fn new(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
             changes: Vec::new(),
+            images: Vec::new(),
         }
+    }
+
+    /// Attaches `images` for the model to look at.
+    pub fn with_images(mut self, images: Vec<Image>) -> Self {
+        self.images = images;
+        self
     }
 
     /// Records the files the call changed.
@@ -63,6 +81,18 @@ pub trait Tool: Send + Sync {
     /// Whether the user must approve a call before it runs.
     fn needs_approval(&self) -> bool {
         false
+    }
+
+    /// What the user approves when they approve the call with `args`, or
+    /// nothing when the call needs no approval.
+    ///
+    /// An "always allow" answer is remembered under this scope, so it covers
+    /// later calls with the same scope and no others. By default a tool that
+    /// [`Tool::needs_approval`] has one scope, its own name; a tool where calls
+    /// differ in what they reach, or where only some calls need approval,
+    /// returns a narrower scope per call.
+    fn approval_scope(&self, _args: &Value) -> Option<String> {
+        self.needs_approval().then(|| self.name().to_owned())
     }
 
     /// Returns a one-line description of a call with `args`, shown to the user.

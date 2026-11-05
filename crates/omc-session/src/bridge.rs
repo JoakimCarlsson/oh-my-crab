@@ -126,7 +126,7 @@ impl Prompter for Questions {
             title: format!("{}: {}", request.tool, first_line(&request.summary)),
             command: (request.tool == "bash").then(|| request.summary.clone()),
             plan: None,
-            choices: choices(),
+            choices: choices(request),
         });
         if self.out.send(asked).is_err() {
             return Decision::Deny;
@@ -149,11 +149,17 @@ fn choice(id: &str, name: &str, verdict: Verdict) -> Choice {
     }
 }
 
-/// The answers a permission question offers.
-fn choices() -> Vec<Choice> {
+/// The answers a permission question about `request` offers; "always" names
+/// its scope when that is narrower than the whole tool.
+fn choices(request: &ApprovalRequest) -> Vec<Choice> {
+    let always = if request.scope == request.tool {
+        "Always allow".to_owned()
+    } else {
+        format!("Always allow {}", request.scope)
+    };
     vec![
         choice(ALLOW, "Allow once", Verdict::Allow),
-        choice(ALWAYS, "Always allow", Verdict::Always),
+        choice(ALWAYS, &always, Verdict::Always),
         choice(REJECT, "Reject", Verdict::Reject),
     ]
 }
@@ -174,6 +180,7 @@ mod tests {
                 questions
                     .ask(&ApprovalRequest {
                         tool: "bash".into(),
+                        scope: "bash".into(),
                         summary: "ls".into(),
                     })
                     .await
@@ -197,6 +204,7 @@ mod tests {
                 questions
                     .ask(&ApprovalRequest {
                         tool: "edit".into(),
+                        scope: "edit".into(),
                         summary: "x".into(),
                     })
                     .await

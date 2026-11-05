@@ -76,6 +76,7 @@ pub fn build_subagent_prompt(input: PromptInput<'_>, role: &str) -> String {
 fn flags(input: &PromptInput<'_>) -> Vec<(String, String)> {
     [
         "read", "grep", "glob", "bash", "edit", "write", "todo", "ask", "task", "skill",
+        "ast_grep", "ast_edit",
     ]
     .iter()
     .map(|tool| {

@@ -1,6 +1,9 @@
 //! The built-in tools.
 
 mod ask;
+mod ast;
+mod ast_edit;
+mod ast_grep;
 mod atomic;
 mod bash;
 mod checkpoint;
@@ -18,6 +21,8 @@ mod wait;
 mod write;
 
 pub use ask::Ask;
+pub use ast_edit::AstEdit;
+pub use ast_grep::AstGrep;
 pub use bash::Bash;
 pub use checkpoint::{CheckpointTool, Rewind};
 pub use edit::Edit;

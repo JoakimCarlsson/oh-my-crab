@@ -195,13 +195,29 @@ pub(crate) fn input_json(messages: &[Message]) -> Vec<Value> {
                     items.push(json!({
                         "type": "function_call_output",
                         "call_id": result.call_id,
-                        "output": result.text,
+                        "output": result_output(result),
                     }));
                 }
             }
         }
     }
     items
+}
+
+/// The `output` of the `function_call_output` item for `result`: its text
+/// alone, or an `input_text` part followed by one `input_image` part per image
+/// when it carries images.
+fn result_output(result: &crate::ToolResult) -> Value {
+    if result.images.is_empty() {
+        return Value::String(result.text.clone());
+    }
+    let text =
+        (!result.text.is_empty()).then(|| json!({ "type": "input_text", "text": result.text }));
+    let images = result
+        .images
+        .iter()
+        .map(|image| json!({ "type": "input_image", "image_url": image.data_url() }));
+    Value::Array(text.into_iter().chain(images).collect())
 }
 
 /// Translates `tools` into the Responses API `tools` array.
@@ -491,6 +507,7 @@ mod tests {
                 name: "read".into(),
                 text: "ok".into(),
                 is_error: false,
+                images: Vec::new(),
             }]),
         ];
         let items = input_json(&messages);
@@ -498,6 +515,30 @@ mod tests {
         assert_eq!(items[1]["type"], "function_call");
         assert_eq!(items[1]["arguments"], "{\"path\":\"a\"}");
         assert_eq!(items[2]["call_id"], "c1");
+    }
+
+    /// A tool result that carries one PNG image.
+    fn pictured() -> ToolResult {
+        ToolResult {
+            call_id: "c1".into(),
+            name: "read".into(),
+            text: "[image]".into(),
+            is_error: false,
+            images: vec![crate::Image {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            }],
+        }
+    }
+
+    /// A result with images becomes an output list of text and data-URL image parts.
+    #[test]
+    fn translates_tool_result_images() {
+        let items = input_json(&[Message::ToolResults(vec![pictured()])]);
+        let output = &items[0]["output"];
+        assert_eq!(output[0]["type"], "input_text");
+        assert_eq!(output[1]["type"], "input_image");
+        assert_eq!(output[1]["image_url"], "data:image/png;base64,AAAA");
     }
 
     /// Tool specs become function tools with a `parameters` schema.

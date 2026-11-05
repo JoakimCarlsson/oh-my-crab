@@ -97,6 +97,8 @@ mod tests {
             names,
             [
                 "ask",
+                "ast_edit",
+                "ast_grep",
                 "bash",
                 "context_notes",
                 "edit",

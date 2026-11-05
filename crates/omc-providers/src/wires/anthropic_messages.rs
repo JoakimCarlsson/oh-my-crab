@@ -453,7 +453,7 @@ pub(crate) fn messages_json(messages: &[Message], prefixed: bool, replay: bool) 
                         json!({
                             "type": "tool_result",
                             "tool_use_id": result.call_id,
-                            "content": result.text,
+                            "content": result_content(result),
                             "is_error": result.is_error,
                         })
                     })
@@ -462,6 +462,26 @@ pub(crate) fn messages_json(messages: &[Message], prefixed: bool, replay: bool) 
             }
         })
         .collect()
+}
+
+/// The `content` of the `tool_result` block for `result`: its text alone, or a
+/// text block followed by one `image` block per image when it carries images.
+fn result_content(result: &crate::ToolResult) -> Value {
+    if result.images.is_empty() {
+        return Value::String(result.text.clone());
+    }
+    let text = (!result.text.is_empty()).then(|| json!({ "type": "text", "text": result.text }));
+    let images = result.images.iter().map(|image| {
+        json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": image.media_type,
+                "data": image.data,
+            },
+        })
+    });
+    Value::Array(text.into_iter().chain(images).collect())
 }
 
 /// Whether `block` is a Claude thinking or redacted thinking block.
@@ -783,6 +803,7 @@ mod tests {
                 name: "read".into(),
                 text: "ok".into(),
                 is_error: false,
+                images: Vec::new(),
             }]),
         ];
         let out = messages_json(&messages, false, true);
@@ -792,6 +813,33 @@ mod tests {
         assert_eq!(out[2]["content"][0]["tool_use_id"], "t1");
         let prefixed = messages_json(&messages, true, true);
         assert_eq!(prefixed[1]["content"][0]["name"], "_read");
+    }
+
+    /// A tool result that carries one PNG image.
+    fn pictured() -> ToolResult {
+        ToolResult {
+            call_id: "c1".into(),
+            name: "read".into(),
+            text: "[image]".into(),
+            is_error: false,
+            images: vec![crate::Image {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            }],
+        }
+    }
+
+    /// A result with images becomes a text block followed by base64 image blocks.
+    #[test]
+    fn translates_tool_result_images() {
+        let out = messages_json(&[Message::ToolResults(vec![pictured()])], false, true);
+        let content = &out[0]["content"][0]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "[image]");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["source"]["type"], "base64");
+        assert_eq!(content[1]["source"]["media_type"], "image/png");
+        assert_eq!(content[1]["source"]["data"], "AAAA");
     }
 
     /// Tool specs use the `input_schema` field and the prefix when asked.

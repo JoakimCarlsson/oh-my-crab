@@ -41,6 +41,25 @@ pub struct ToolResult {
     /// Whether the call failed.
     #[serde(default)]
     pub is_error: bool,
+    /// Images the tool returned for the model to look at, after the text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<Image>,
+}
+
+/// An image sent to the model, such as a picture a tool read.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Image {
+    /// The MIME type, such as `image/png`.
+    pub media_type: String,
+    /// The image's bytes, base64-encoded.
+    pub data: String,
+}
+
+impl Image {
+    /// The image as a `data:` URL, the form the OpenAI wires take images in.
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.media_type, self.data)
+    }
 }
 
 /// How hard the model is asked to think.

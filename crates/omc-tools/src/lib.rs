@@ -20,8 +20,8 @@ pub use jobs::{Finished, Jobs};
 pub use notebook::{NOTEBOOK_LIMIT, Notebook};
 pub use registry::Registry;
 pub use sandbox::Sandbox;
-pub use tool::{FileChange, Tool, ToolOutput, marked_lines, parse_args, sanitize};
+pub use tool::{FileChange, Image, Tool, ToolOutput, marked_lines, parse_args, sanitize};
 pub use tools::{
-    Ask, Bash, CheckpointTool, ContextNotes, Edit, ExitPlanMode, Glob, Grep, NewContext, Read,
-    Rewind, SetTitle, Skill, Todo, Wait, Write, snapshot_tag,
+    Ask, AstEdit, AstGrep, Bash, CheckpointTool, ContextNotes, Edit, ExitPlanMode, Glob, Grep,
+    NewContext, Read, Rewind, SetTitle, Skill, Todo, Wait, Write, snapshot_tag,
 };

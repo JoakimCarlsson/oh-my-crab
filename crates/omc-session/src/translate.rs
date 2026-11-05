@@ -8,8 +8,8 @@ use omc_wire::{Diff, Event, Kind, PastTurn, Tool, ToolState, Usage};
 fn kind_of(name: &str) -> Kind {
     match name {
         "read" | "skill" => Kind::Read,
-        "edit" | "write" => Kind::Edit,
-        "grep" | "glob" => Kind::Search,
+        "edit" | "write" | "ast_edit" => Kind::Edit,
+        "grep" | "glob" | "ast_grep" => Kind::Search,
         "bash" => Kind::Execute,
         _ => Kind::Other,
     }
@@ -239,7 +239,10 @@ pub(crate) fn translate(event: AgentEvent, window: u64) -> Option<Event> {
         } => match translate(*event, window)? {
             Event::Tool(tool) => Event::Tool(Tool {
                 id: format!("{parent}:{}", tool.id),
-                parent: Some(parent),
+                parent: Some(match tool.parent {
+                    Some(inner) => format!("{parent}:{inner}"),
+                    None => parent,
+                }),
                 agent: Some(agent),
                 ..tool
             }),
@@ -349,6 +352,52 @@ mod tests {
         );
     }
 
+    /// A subagent that is one of several is a step of the call, and its own work is filed under that step.
+    #[test]
+    fn subagents_of_a_batch_nest_under_their_step() {
+        let nested = |event: AgentEvent| AgentEvent::Nested {
+            parent: "c1".into(),
+            agent: "scout".into(),
+            event: Box::new(event),
+        };
+        let Some(Event::Tool(step)) = translate(
+            nested(AgentEvent::ToolStart {
+                id: "2".into(),
+                name: "task".into(),
+                summary: "look".into(),
+            }),
+            1,
+        ) else {
+            panic!()
+        };
+        assert_eq!(
+            (
+                step.id.as_str(),
+                step.parent.as_deref(),
+                step.agent.as_deref()
+            ),
+            ("c1:2", Some("c1"), Some("scout"))
+        );
+        let Some(Event::Tool(work)) = translate(
+            nested(AgentEvent::Nested {
+                parent: "2".into(),
+                agent: "scout".into(),
+                event: Box::new(AgentEvent::ToolStart {
+                    id: "t".into(),
+                    name: "grep".into(),
+                    summary: "x".into(),
+                }),
+            }),
+            1,
+        ) else {
+            panic!()
+        };
+        assert_eq!(
+            (work.id.as_str(), work.parent.as_deref()),
+            ("c1:2:t", Some("c1:2"))
+        );
+    }
+
     /// A finished edit carries its diff, and each further file gets an event of its own.
     #[test]
     fn changed_files_become_diffs() {
@@ -404,6 +453,7 @@ mod tests {
                 name: "read".into(),
                 text: "alpha".into(),
                 is_error: false,
+                images: Vec::new(),
             }]),
             Message::Assistant(Reply {
                 text: "it says alpha".into(),

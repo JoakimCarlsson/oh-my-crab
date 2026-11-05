@@ -122,10 +122,34 @@ pub(crate) fn messages_json(system: &str, messages: &[Message]) -> Vec<Value> {
                         "content": result.text,
                     }));
                 }
+                out.extend(result_images(results));
             }
         }
     }
     out
+}
+
+/// A user message carrying the images `results` returned, when any did.
+///
+/// Tool messages take only text on this wire, so the images follow the tool
+/// messages of the batch in one user message, each after a line naming the
+/// call it came from.
+fn result_images(results: &[crate::ToolResult]) -> Option<Value> {
+    let parts: Vec<Value> = results
+        .iter()
+        .filter(|result| !result.images.is_empty())
+        .flat_map(|result| {
+            let label = json!({
+                "type": "text",
+                "text": format!("Images returned by the {} call {}:", result.name, result.call_id),
+            });
+            let images = result.images.iter().map(
+                |image| json!({ "type": "image_url", "image_url": { "url": image.data_url() } }),
+            );
+            std::iter::once(label).chain(images)
+        })
+        .collect();
+    (!parts.is_empty()).then(|| json!({ "role": "user", "content": parts }))
 }
 
 /// Converts the tool specs into the `tools` array.
@@ -204,6 +228,8 @@ pub(crate) struct Accumulator {
     tokens: Option<Tokens>,
     /// The block chunks go to now.
     blocks: Blocks,
+    /// Why the server said the answer ended, when it said.
+    finish_reason: Option<String>,
 }
 
 impl Accumulator {
@@ -230,6 +256,12 @@ impl Accumulator {
         }
         if let Some(usage) = chunk.get("usage").filter(|usage| !usage.is_null()) {
             self.tokens = tokens_from(usage);
+        }
+        if let Some(reason) = chunk
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+        {
+            self.finish_reason = Some(reason.to_owned());
         }
         let Some(delta) = chunk.pointer("/choices/0/delta") else {
             return Ok(false);
@@ -283,7 +315,23 @@ impl Accumulator {
     }
 
     /// Ends the stream and returns the reply it described.
-    pub(crate) fn finish(self) -> Reply {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Stream`] when the server says its content
+    /// filter cut the answer, which would otherwise pass for a short or empty
+    /// answer.
+    pub(crate) fn finish(self) -> Result<Reply, ProviderError> {
+        if self.finish_reason.as_deref() == Some("content_filter") {
+            return Err(ProviderError::Stream(
+                "the provider's content filter stopped the answer".to_owned(),
+            ));
+        }
+        Ok(self.reply())
+    }
+
+    /// The reply the chunks so far describe.
+    fn reply(self) -> Reply {
         let tool_calls = self
             .calls
             .into_iter()
@@ -339,7 +387,7 @@ pub(crate) async fn complete(
             break;
         }
     }
-    Ok(accumulator.finish())
+    accumulator.finish()
 }
 
 #[cfg(test)]
@@ -393,6 +441,7 @@ mod tests {
                 name: "read".into(),
                 text: "data".into(),
                 is_error: false,
+                images: Vec::new(),
             }]),
         ];
         let out = messages_json("sys", &messages);
@@ -406,6 +455,37 @@ mod tests {
         assert_eq!(out[3]["tool_call_id"], "c1");
         assert_eq!(initiator(&messages), "agent");
         assert_eq!(initiator(&messages[..1]), "user");
+    }
+
+    /// A tool result that carries one PNG image.
+    fn pictured() -> ToolResult {
+        ToolResult {
+            call_id: "c1".into(),
+            name: "read".into(),
+            text: "[image]".into(),
+            is_error: false,
+            images: vec![crate::Image {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            }],
+        }
+    }
+
+    /// Images follow the tool messages in one user message, since tool messages take only text.
+    #[test]
+    fn sends_tool_result_images_in_a_user_message() {
+        let out = messages_json("sys", &[Message::ToolResults(vec![pictured()])]);
+        assert_eq!(out[1]["role"], "tool");
+        assert_eq!(out[1]["content"], "[image]");
+        assert_eq!(out[2]["role"], "user");
+        assert_eq!(out[2]["content"][0]["type"], "text");
+        assert_eq!(out[2]["content"][1]["type"], "image_url");
+        assert_eq!(
+            out[2]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,AAAA"
+        );
+        let plain = messages_json("sys", &[Message::ToolResults(Vec::new())]);
+        assert_eq!(plain.len(), 1);
     }
 
     /// An empty reasoning field gives way to a later one that holds the text, and empty content is not streamed.
@@ -463,7 +543,7 @@ mod tests {
             assert!(!accumulator.feed(&chunk.to_string(), &mut sink).unwrap());
         }
         assert!(accumulator.feed("[DONE]", &mut sink).unwrap());
-        let reply = accumulator.finish();
+        let reply = accumulator.finish().unwrap();
         assert_eq!(reply.text, "hi");
         assert_eq!(reply.thinking, "hm");
         assert_eq!(sink.starts, [Part::Thinking, Part::Text]);
@@ -477,6 +557,21 @@ mod tests {
                 cache_write: 0
             })
         );
+    }
+
+    /// An answer the provider's content filter cut is an error, not an empty answer.
+    #[test]
+    fn content_filter_is_an_error() {
+        let mut accumulator = Accumulator::default();
+        let mut sink = Recorder::default();
+        let chunk = json!({"choices": [{"delta": {}, "finish_reason": "content_filter"}]});
+        assert!(!accumulator.feed(&chunk.to_string(), &mut sink).unwrap());
+        let error = accumulator.finish().unwrap_err();
+        assert!(error.to_string().contains("content filter"), "{error}");
+        let mut plain = Accumulator::default();
+        let chunk = json!({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]});
+        plain.feed(&chunk.to_string(), &mut sink).unwrap();
+        assert_eq!(plain.finish().unwrap().text, "ok");
     }
 
     /// An error object inside the stream is reported.

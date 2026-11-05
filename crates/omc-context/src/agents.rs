@@ -8,7 +8,7 @@ use crate::plugins::installed;
 use crate::{Locations, Origin, toml};
 
 /// The tools that only look and never change anything.
-pub const READ_ONLY_TOOLS: &[&str] = &["read", "grep", "glob", "skill", "ask", "todo"];
+pub const READ_ONLY_TOOLS: &[&str] = &["read", "grep", "glob", "ast_grep", "skill", "ask", "todo"];
 
 /// One kind of subagent.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -21,6 +21,8 @@ pub struct AgentDefinition {
     pub tools: Option<Vec<String>>,
     /// The instructions it is given as its role.
     pub prompt: String,
+    /// The JSON Schema its result must match, when it hands back structured data instead of prose.
+    pub output_schema: Option<serde_json::Value>,
     /// Where the definition is, or nothing for a built-in one.
     pub path: Option<PathBuf>,
     /// Where the definition came from.
@@ -132,9 +134,17 @@ fn from_markdown(
         description: parsed.get("description").unwrap_or_default().to_owned(),
         tools,
         prompt,
+        output_schema: schema_of(parsed.get("output_schema")),
         path,
         origin,
     })
+}
+
+/// The JSON Schema `text` holds, when it holds a JSON object; anything else declares none.
+fn schema_of(text: Option<&str>) -> Option<serde_json::Value> {
+    serde_json::from_str(text?)
+        .ok()
+        .filter(serde_json::Value::is_object)
 }
 
 /// The definition `text` holds as TOML, named `stem` unless it names itself, coming from `origin`.
@@ -158,6 +168,7 @@ fn from_toml(
             .unwrap_or_else(|| stem.to_owned()),
         description: get("description").unwrap_or_default(),
         tools: None,
+        output_schema: schema_of(get("output_schema").as_deref()),
         prompt,
         path: Some(path.to_path_buf()),
         origin,
@@ -229,5 +240,44 @@ mod tests {
         assert_eq!(found[2].origin, Origin::User);
         assert_eq!(found[3].origin, Origin::Plugin);
         assert_eq!(found[4].origin, Origin::BuiltIn);
+    }
+
+    /// A definition may declare the schema of its result as JSON in its front matter, on one line or indented below the key.
+    #[test]
+    fn reads_an_output_schema() {
+        let inline = from_markdown(
+            "---\noutput_schema: {\"type\": \"object\"}\n---\nWork.",
+            "a",
+            None,
+            Origin::User,
+        )
+        .unwrap();
+        assert_eq!(
+            inline.output_schema,
+            Some(serde_json::json!({ "type": "object" }))
+        );
+        let indented = from_markdown(
+            "---\noutput_schema:\n  {\"type\": \"object\",\n   \"required\": [\"files\"]}\n---\nWork.",
+            "a",
+            None,
+            Origin::User,
+        )
+        .unwrap();
+        assert_eq!(
+            indented.output_schema,
+            Some(serde_json::json!({ "type": "object", "required": ["files"] }))
+        );
+        let broken = from_markdown(
+            "---\noutput_schema: nope\n---\nWork.",
+            "a",
+            None,
+            Origin::User,
+        );
+        assert_eq!(broken.unwrap().output_schema, None);
+        assert!(
+            builtin_agents()
+                .iter()
+                .all(|agent| agent.output_schema.is_none())
+        );
     }
 }

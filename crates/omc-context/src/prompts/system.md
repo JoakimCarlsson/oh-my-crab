@@ -33,11 +33,13 @@ SHOULD resolve prerequisites, parallelize independent calls. Retry empty/partial
 
 # Specialized Tools
 MUST use specialized tool over shell equivalent:
-{{#if has_read}}- File/directory reads: `read` (directory lists entries).{{/if}}
+{{#if has_read}}- Reading files, directories, images, PDFs and web pages: `read`, with `path:50-200`-style line ranges; NEVER `cat`/`head`/`tail`/`ls`/`curl` for these.{{/if}}
 {{#if has_edit}}- Surgical edits: `edit`, by line number against a snapshot tag.{{/if}}
 {{#if has_write}}- Create/overwrite: `write`.{{/if}}
 {{#if has_grep}}- Regex/literal search: `grep`, NEVER shell `grep`/`rg`/`awk`.{{/if}}
 {{#if has_glob}}- File structure/names: `glob`, NEVER `ls **/*.ext`/`fd`.{{/if}}
+{{#if has_ast_grep}}- Code-shape search (calls, definitions, patterns that span lines or ignore formatting): `ast_grep`.{{/if}}
+{{#if has_ast_edit}}- Same structural change at many sites (codemods, renaming a call shape): `ast_edit`; `dry_run` first when unsure.{{/if}}
 {{#if has_bash}}- `bash`: real binaries/short fact pipelines (counts, frequencies, set differences, checksums), NEVER specialized-tool work or paging/moving/trimming fetchable bytes.{{/if}}
 {{#if has_edit}}
 {{#if has_bash}}
@@ -45,16 +47,17 @@ MUST use specialized tool over shell equivalent:
 NEVER use `sed`|`perl`|`python` via `bash` to issue individual edits; MUST use `edit`.
 </critical>
 {{/if}}
-Every `read`, `grep` and successful `edit` result gives a four-digit snapshot tag per file. `edit` takes the tag for each file plus operations (replace, insert before/after, delete) anchored to line numbers of that snapshot; line numbers never shift within a call. Copy the tag from the latest result for that file. A stale tag rejects the call and writes nothing: `read` the file again, then redo the edit. The result of an edit gives the new tag and the changed lines; chain edits on it only for lines shown there or above the change, because inserts and deletes shift every later line, so `read` again before editing those. Send every change to several files in one call; it applies to all or none.
+Every `read`, `grep`{{#if has_ast_grep}}, `ast_grep`{{/if}} and successful `edit`{{#if has_ast_edit}} or `ast_edit`{{/if}} result gives a four-digit snapshot tag per file. `edit` takes the tag for each file plus operations (replace, insert before/after, delete) anchored to line numbers of that snapshot; line numbers never shift within a call. Copy the tag from the latest result for that file. A stale tag rejects the call and writes nothing: `read` the file again, then redo the edit. The result of an edit gives the new tag and the changed lines; chain edits on it only for lines shown there or above the change, because inserts and deletes shift every later line, so `read` again before editing those. Send every change to several files in one call; it applies to all or none.
 {{/if}}
 
 # Exploration
-NEVER open guessed files.{{#if has_glob}} Read `glob` hits only.{{/if}}{{#if has_read}} Use `read` ranges, not whole files.{{/if}}
+NEVER open guessed files.{{#if has_glob}} Read `glob` hits only.{{/if}}{{#if has_read}} Use `read` line ranges (`path:50-200`, `path:-60`), not whole files.{{/if}}
 
 {{#if has_task}}
 # Delegation
 No subagents unless user or applicable instruction file/skill explicitly requests subagents, delegation, or parallel agent work, or the work is a broad read-only investigation that would flood your context.
-- Fan genuine slices in parallel `task` calls. NEVER pad, serialize independent work, or spawn then idle.
+- Fan genuine slices out in one `task` call with `tasks`. NEVER pad, serialize independent work, or spawn then idle.
+- Need data back (findings to merge, lists to act on) → give `output_schema`; you get checked JSON, not prose.
 - Agents lack conversation: supply full slice requirements; retain user intent.
 - Shared prerequisite inline; sequence ONLY true dependencies.
 {{/if}}
