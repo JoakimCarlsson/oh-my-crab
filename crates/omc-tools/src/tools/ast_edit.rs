@@ -122,8 +122,7 @@ impl Tool for AstEdit {
     fn describe(&self, args: &Value) -> String {
         let pattern = args["pattern"].as_str().unwrap_or("?");
         let rewrite = args["rewrite"].as_str().unwrap_or("?");
-        let first = |code: &str| code.lines().next().unwrap_or("?").trim().to_owned();
-        let mut head = format!("{} → {}", first(pattern), first(rewrite));
+        let mut head = format!("{} → {}", headline(pattern), headline(rewrite));
         let place = self.sandbox.describe(args["path"].as_str().unwrap_or("."));
         if !place.is_empty() && place != "." {
             head.push_str(&format!(" in {place}"));
@@ -153,6 +152,17 @@ impl Tool for AstEdit {
         tokio::task::spawn_blocking(move || apply(&sandbox, &target, &args))
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))?
+    }
+}
+
+/// The first non-blank line of `code`, trimmed, followed by how many more
+/// non-blank lines it has, so that a title never hides that there is more.
+fn headline(code: &str) -> String {
+    let mut lines = code.lines().map(str::trim).filter(|line| !line.is_empty());
+    let first = lines.next().unwrap_or("?");
+    match lines.count() {
+        0 => first.to_owned(),
+        more => format!("{first} (+{more} more lines)"),
     }
 }
 
@@ -439,6 +449,17 @@ mod tests {
             scoped.lines().next(),
             Some("print($$$A) → log($$$A) in py (*.py)")
         );
+    }
+
+    /// A title never hides extra lines of a pattern or rewrite, blank lines first included.
+    #[test]
+    fn titles_say_when_there_is_more() {
+        let (tool, _dir) = tool("ast-edit-headline");
+        let hidden = tool.describe(&json!({
+            "pattern": "f($X)", "rewrite": "\n\ng($X)\nevil()"
+        }));
+        assert_eq!(hidden.lines().next(), Some("f($X) → g($X) (+1 more lines)"));
+        assert!(hidden.contains("+ evil()"), "{hidden}");
     }
 
     /// Metavariables carry the matched code into the rewrite, across files, and the result reports counts, a preview, tags and changes.

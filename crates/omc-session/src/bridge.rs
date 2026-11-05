@@ -124,7 +124,8 @@ impl Prompter for Questions {
         let asked = Event::Ask(Permission {
             ticket,
             title: format!("{}: {}", request.tool, first_line(&request.summary)),
-            command: (request.tool == "bash").then(|| request.summary.clone()),
+            command: (request.tool == "bash" || request.summary.lines().nth(1).is_some())
+                .then(|| request.summary.clone()),
             plan: None,
             choices: choices(request),
         });
@@ -191,6 +192,33 @@ mod tests {
         };
         questions.answer(asked.ticket, Some(ALWAYS));
         assert_eq!(asking.await.unwrap(), Decision::AllowAlways);
+    }
+
+    /// A summary of several lines is shown whole, not only the first line in the title.
+    #[tokio::test]
+    async fn long_summaries_are_shown_whole() {
+        let (out, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let questions = std::sync::Arc::new(Questions::new(out));
+        let summary = "f($X) → g($X)\n- f($X)\n+ g($X)\n+ evil()";
+        let asking = {
+            let questions = questions.clone();
+            tokio::spawn(async move {
+                questions
+                    .ask(&ApprovalRequest {
+                        tool: "ast_edit".into(),
+                        scope: "ast_edit".into(),
+                        summary: summary.into(),
+                    })
+                    .await
+            })
+        };
+        let Some(Event::Ask(asked)) = seen.recv().await else {
+            panic!("no question");
+        };
+        assert_eq!(asked.title, "ast_edit: f($X) → g($X)");
+        assert_eq!(asked.command.as_deref(), Some(summary));
+        questions.answer(asked.ticket, None);
+        assert_eq!(asking.await.unwrap(), Decision::Deny);
     }
 
     /// A question nobody answers is declined when the session clears them.
