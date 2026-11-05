@@ -289,6 +289,9 @@ mod tests {
     }
 
     /// A file whose name ends in what looks like a selector is read whole.
+    ///
+    /// Unix only: on Windows a colon in a name opens an alternate data stream, so such a file cannot exist.
+    #[cfg(unix)]
     #[tokio::test]
     async fn prefers_existing_names_with_colons() {
         let (tool, dir) = tool("read-colon");
@@ -300,6 +303,12 @@ mod tests {
                 .ends_with("     1\tx\n     2\ty\n")
         );
         assert!(text(&tool, "notes:2-2").await.ends_with("     2\tq\n"));
+    }
+
+    /// A missing file with a selector is reported by its name without the selector.
+    #[tokio::test]
+    async fn names_a_missing_file_without_its_selector() {
+        let (tool, _dir) = tool("read-missing");
         let missing = tool.call(json!({ "path": "gone.txt:5" })).await;
         assert!(
             matches!(missing, Err(ToolError::Failed(m)) if m.contains("gone.txt does not exist"))

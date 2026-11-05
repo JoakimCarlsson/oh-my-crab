@@ -18,3 +18,9 @@ pub fn put(base: &std::path::Path, path: &str, text: &str) {
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
     std::fs::write(file, text).unwrap();
 }
+
+/// `path` written as the inside of a JSON string, its backslashes and quotes escaped, so a Windows path can go into JSON text.
+pub fn json_path(path: &std::path::Path) -> String {
+    let quoted = serde_json::to_string(&path.display().to_string()).unwrap();
+    quoted[1..quoted.len() - 1].to_owned()
+}

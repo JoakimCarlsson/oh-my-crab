@@ -187,7 +187,7 @@ fn read(base: &Path, origin: Origin) -> Option<Skill> {
 /// Tests for skill discovery.
 mod tests {
     use super::*;
-    use crate::testutil::{put, scratch};
+    use crate::testutil::{json_path, put, scratch};
 
     /// Builds locations for `base`, with the working folder `base/repo`.
     fn locations(base: &Path) -> Locations {
@@ -275,8 +275,8 @@ mod tests {
             &base,
             "home/.claude/plugins/installed_plugins.json",
             &format!(
-                r#"{{"plugins":{{"kit@market":[{{"installPath":"{}/kit"}}]}}}}"#,
-                base.display()
+                r#"{{"plugins":{{"kit@market":[{{"installPath":"{}"}}]}}}}"#,
+                json_path(&base.join("kit"))
             ),
         );
         let same = "---\ndescription: Shared\n---\nSame.";

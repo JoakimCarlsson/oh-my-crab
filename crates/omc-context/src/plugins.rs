@@ -180,7 +180,7 @@ fn json(path: &Path) -> Option<Value> {
 /// Tests for finding installed plugins.
 mod tests {
     use super::*;
-    use crate::testutil::{put, scratch};
+    use crate::testutil::{json_path, put, scratch};
 
     /// Locations for work in `base/repo`, with Claude's config folder at `base/home/.claude`.
     fn locations(base: &Path) -> Locations {
@@ -193,13 +193,13 @@ mod tests {
         }
     }
 
-    /// Writes the plugin record under `base` with `plugins` as its `plugins` object, `{base}` standing for `base`.
+    /// Writes the plugin record under `base` with `plugins` as its `plugins` object, `{base}/` standing for `base` and a separator.
     fn record(base: &Path, plugins: &str) {
         put(
             base,
             "home/.claude/plugins/installed_plugins.json",
             &format!(r#"{{"version":2,"plugins":{plugins}}}"#)
-                .replace("{base}", &base.display().to_string()),
+                .replace("{base}/", &json_path(&base.join(""))),
         );
     }
 
