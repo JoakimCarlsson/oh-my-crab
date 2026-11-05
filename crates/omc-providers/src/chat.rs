@@ -147,13 +147,65 @@ pub enum Message {
     ToolResults(Vec<ToolResult>),
 }
 
+/// The kind of a block of a streamed reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Part {
+    /// What the model is thinking.
+    Thinking,
+    /// The reply's text.
+    Text,
+}
+
 /// Where the chunks of a reply go as they stream in.
+///
+/// Each block of the reply is announced with [`Sink::start`] before its first chunk, so the chunks that follow belong to that block until the next one starts.
 pub trait Sink: Send {
+    /// A new block of the reply, of the kind `part`, starts.
+    fn start(&mut self, part: Part);
+
     /// Some more of the reply's text.
     fn text(&mut self, chunk: &str);
 
     /// Some more of what the model is thinking.
     fn thinking(&mut self, chunk: &str);
+}
+
+/// Tracks the block a stream is in and announces each new one to a [`Sink`] before its first chunk.
+#[derive(Debug, Default)]
+pub(crate) struct Blocks {
+    /// The kind and the server's position of the block chunks go to now.
+    open: Option<(Part, usize)>,
+}
+
+impl Blocks {
+    /// Whether the block open now is the one at the server's position `block`, of the kind `part`.
+    pub(crate) fn is_open(&self, part: Part, block: usize) -> bool {
+        self.open == Some((part, block))
+    }
+
+    /// Sends `chunk` of the block at the server's position `block`, of the kind `part`, to `sink`, starting the block first when it is not the one open.
+    ///
+    /// An empty chunk is dropped and does not start a block. Returns whether the chunk was sent.
+    pub(crate) fn send(
+        &mut self,
+        sink: &mut dyn Sink,
+        part: Part,
+        block: usize,
+        chunk: &str,
+    ) -> bool {
+        if chunk.is_empty() {
+            return false;
+        }
+        if !self.is_open(part, block) {
+            self.open = Some((part, block));
+            sink.start(part);
+        }
+        match part {
+            Part::Thinking => sink.thinking(chunk),
+            Part::Text => sink.text(chunk),
+        }
+        true
+    }
 }
 
 /// A model that can continue a conversation.

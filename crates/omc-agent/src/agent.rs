@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use futures_util::future::join_all;
 use omc_providers::{
-    ChatModel, Effort, Message, ProviderError, Reply, Request, Sink, Tokens, ToolCall, ToolResult,
-    ToolSpec,
+    ChatModel, Effort, Message, Part, ProviderError, Reply, Request, Sink, Tokens, ToolCall,
+    ToolResult, ToolSpec,
 };
 use omc_tools::{Checkpoint, FileChange, Notebook, Registry, sanitize};
 use thiserror::Error;
@@ -15,6 +15,8 @@ use crate::{ApprovalRequest, Approvals, Scribe};
 /// Something the UI should show while a turn runs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentEvent {
+    /// A new block of the reply starts, of the kind given; the chunks that follow belong to it.
+    Started(Part),
     /// A chunk of streamed assistant text.
     Delta(String),
     /// A chunk of what the model is thinking.
@@ -106,6 +108,11 @@ struct Chunks<'a> {
 }
 
 impl Sink for Chunks<'_> {
+    /// Reports that a new block of the reply starts.
+    fn start(&mut self, part: Part) {
+        (self.events)(AgentEvent::Started(part));
+    }
+
     /// Reports text as it streams in.
     fn text(&mut self, chunk: &str) {
         (self.events)(AgentEvent::Delta(chunk.to_owned()));
@@ -461,6 +468,27 @@ mod tests {
 
     use super::*;
     use crate::{Decision, Journal, Prompter};
+
+    /// The start of each block is passed on as an event before its chunks.
+    #[test]
+    fn block_starts_are_reported() {
+        let seen = Mutex::new(Vec::new());
+        let events = |event: AgentEvent| seen.lock().unwrap().push(event);
+        let mut chunks = Chunks { events: &events };
+        chunks.start(Part::Thinking);
+        chunks.thinking("hm");
+        chunks.start(Part::Text);
+        chunks.text("hi");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                AgentEvent::Started(Part::Thinking),
+                AgentEvent::Thought("hm".into()),
+                AgentEvent::Started(Part::Text),
+                AgentEvent::Delta("hi".into())
+            ]
+        );
+    }
 
     /// A model that plays back a fixed list of replies.
     struct Scripted {

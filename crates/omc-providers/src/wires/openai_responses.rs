@@ -6,11 +6,11 @@ use omc_auth::Credentials;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::chat::parse_arguments;
+use crate::chat::{Blocks, parse_arguments};
 use crate::identity;
 use crate::models::codex_efforts;
 use crate::{
-    Effort, Message, ProviderError, Reply, Request, Sink, Tokens, ToolCall, ToolSpec, sse,
+    Effort, Message, Part, ProviderError, Reply, Request, Sink, Tokens, ToolCall, ToolSpec, sse,
 };
 
 /// Responses endpoint of the Codex backend.
@@ -278,6 +278,14 @@ pub(crate) fn tokens_from(usage: &Value) -> Option<Tokens> {
     })
 }
 
+/// The position of the output item a stream event `event` belongs to, or nought when it names none.
+fn item(event: &Value) -> usize {
+    event
+        .get("output_index")
+        .and_then(Value::as_u64)
+        .map_or(0, |position| position as usize)
+}
+
 /// Builds a [`Reply`] from the events of one Responses stream.
 #[derive(Default)]
 pub(crate) struct Accumulator {
@@ -291,6 +299,10 @@ pub(crate) struct Accumulator {
     opaque: Vec<Value>,
     /// Usage from the completed response.
     tokens: Option<Tokens>,
+    /// The block chunks go to now.
+    blocks: Blocks,
+    /// Whether a new summary part began since the last reasoning chunk, so the next one is set apart from the text before it.
+    parted: bool,
 }
 
 impl Accumulator {
@@ -308,20 +320,32 @@ impl Accumulator {
         let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
         match kind {
             "response.output_text.delta" => {
-                if let Some(chunk) = event.get("delta").and_then(Value::as_str) {
-                    sink.text(chunk);
+                if let Some(chunk) = event.get("delta").and_then(Value::as_str)
+                    && self.blocks.send(sink, Part::Text, item(&event), chunk)
+                {
                     self.text.push_str(chunk);
                 }
             }
             "response.reasoning_summary_part.added" => {
                 if !self.thinking.is_empty() {
-                    sink.thinking("\n\n");
                     self.thinking.push_str("\n\n");
+                    self.parted = true;
                 }
             }
             "response.reasoning_summary_text.delta" => {
-                if let Some(chunk) = event.get("delta").and_then(Value::as_str) {
-                    sink.thinking(chunk);
+                if let Some(chunk) = event
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .filter(|chunk| !chunk.is_empty())
+                {
+                    let position = item(&event);
+                    let apart = std::mem::take(&mut self.parted)
+                        && self.blocks.is_open(Part::Thinking, position);
+                    let shown = match apart {
+                        true => format!("\n\n{chunk}"),
+                        false => chunk.to_owned(),
+                    };
+                    self.blocks.send(sink, Part::Thinking, position, &shown);
                     self.thinking.push_str(chunk);
                 }
             }
@@ -427,9 +451,16 @@ mod tests {
         text: Vec<String>,
         /// Thinking chunks received.
         thinking: Vec<String>,
+        /// The kinds of the blocks started, in order.
+        starts: Vec<Part>,
     }
 
     impl Sink for Recorder {
+        /// Records the start of a block.
+        fn start(&mut self, part: Part) {
+            self.starts.push(part);
+        }
+
         /// Records a text chunk.
         fn text(&mut self, chunk: &str) {
             self.text.push(chunk.to_string());
@@ -610,7 +641,8 @@ mod tests {
         ];
         let mut sink = Recorder::default();
         let reply = run(&events, &mut sink);
-        assert_eq!(sink.thinking, ["Looking ", "at it", "\n\n", "Then more"]);
+        assert_eq!(sink.thinking, ["Looking ", "at it", "\n\nThen more"]);
+        assert_eq!(sink.starts, [Part::Thinking, Part::Text]);
         assert_eq!(reply.thinking, "Looking at it\n\nThen more");
         assert_eq!(sink.text, ["done"]);
         assert_eq!(reply.opaque.len(), 1);

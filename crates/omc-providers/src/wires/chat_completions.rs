@@ -4,9 +4,9 @@ use futures_util::StreamExt;
 use omc_auth::Credentials;
 use serde_json::{Value, json};
 
-use crate::chat::parse_arguments;
+use crate::chat::{Blocks, parse_arguments};
 use crate::{
-    Message, Provider, ProviderError, Reply, Request, Sink, Tokens, ToolCall, ToolSpec, sse,
+    Message, Part, Provider, ProviderError, Reply, Request, Sink, Tokens, ToolCall, ToolSpec, sse,
 };
 
 /// Where a request goes and who it is sent as.
@@ -202,6 +202,8 @@ pub(crate) struct Accumulator {
     calls: Vec<PartialCall>,
     /// Usage, when the server reported it.
     tokens: Option<Tokens>,
+    /// The block chunks go to now.
+    blocks: Blocks,
 }
 
 impl Accumulator {
@@ -232,16 +234,21 @@ impl Accumulator {
         let Some(delta) = chunk.pointer("/choices/0/delta") else {
             return Ok(false);
         };
-        if let Some(text) = delta.get("content").and_then(Value::as_str) {
-            sink.text(text);
-            self.text.push_str(text);
-        }
-        let reasoning = ["reasoning_content", "reasoning"]
-            .iter()
-            .find_map(|key| delta.get(key).and_then(Value::as_str));
-        if let Some(text) = reasoning {
-            sink.thinking(text);
+        let reasoning = ["reasoning_content", "reasoning"].iter().find_map(|key| {
+            delta
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+        });
+        if let Some(text) = reasoning
+            && self.blocks.send(sink, Part::Thinking, 0, text)
+        {
             self.thinking.push_str(text);
+        }
+        if let Some(text) = delta.get("content").and_then(Value::as_str)
+            && self.blocks.send(sink, Part::Text, 0, text)
+        {
+            self.text.push_str(text);
         }
         for fragment in delta
             .get("tool_calls")
@@ -347,9 +354,16 @@ mod tests {
         text: Vec<String>,
         /// Thinking chunks received.
         thinking: Vec<String>,
+        /// The kinds of the blocks started, in order.
+        starts: Vec<Part>,
     }
 
     impl Sink for Recorder {
+        /// Records the start of a block.
+        fn start(&mut self, part: Part) {
+            self.starts.push(part);
+        }
+
         /// Records a text chunk.
         fn text(&mut self, chunk: &str) {
             self.text.push(chunk.to_string());
@@ -394,6 +408,38 @@ mod tests {
         assert_eq!(initiator(&messages[..1]), "user");
     }
 
+    /// An empty reasoning field gives way to a later one that holds the text, and empty content is not streamed.
+    #[test]
+    fn skips_empty_reasoning_and_content() {
+        let mut accumulator = Accumulator::default();
+        let mut sink = Recorder::default();
+        let chunk = json!({"choices": [{"delta": {
+            "content": "", "reasoning_content": "", "reasoning": "hm"
+        }}]});
+        accumulator.feed(&chunk.to_string(), &mut sink).unwrap();
+        assert_eq!(sink.thinking, ["hm"]);
+        assert!(sink.text.is_empty());
+        assert_eq!(sink.starts, [Part::Thinking]);
+    }
+
+    /// Reasoning streamed beside empty content stays one thinking block, and the answer that follows starts a text block.
+    #[test]
+    fn reasoning_beside_empty_content_is_one_block() {
+        let mut accumulator = Accumulator::default();
+        let mut sink = Recorder::default();
+        let chunks = [
+            json!({"choices": [{"delta": {"content": "", "reasoning": "The"}}]}),
+            json!({"choices": [{"delta": {"content": "", "reasoning": " user"}}]}),
+            json!({"choices": [{"delta": {"content": "Hey!", "reasoning": ""}}]}),
+        ];
+        for chunk in &chunks {
+            accumulator.feed(&chunk.to_string(), &mut sink).unwrap();
+        }
+        assert_eq!(sink.starts, [Part::Thinking, Part::Text]);
+        assert_eq!(sink.thinking, ["The", " user"]);
+        assert_eq!(sink.text, ["Hey!"]);
+    }
+
     /// Streamed text, reasoning, split tool-call fragments and usage are assembled.
     #[test]
     fn assembles_a_stream() {
@@ -420,6 +466,7 @@ mod tests {
         let reply = accumulator.finish();
         assert_eq!(reply.text, "hi");
         assert_eq!(reply.thinking, "hm");
+        assert_eq!(sink.starts, [Part::Thinking, Part::Text]);
         assert_eq!(reply.tool_calls[0].arguments, json!({"path": "a"}));
         assert_eq!(
             reply.tokens,

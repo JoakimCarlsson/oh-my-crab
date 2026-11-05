@@ -18,7 +18,7 @@ mod toolserver;
 mod usage;
 
 pub use command::{Command, Opening};
-pub use event::{Conversation, Event, PastTurn};
+pub use event::{Conversation, Event, Part, PastTurn};
 pub use frame::{decode, encode};
 pub use import::{Imported, ImportedTurn};
 pub use inquiry::{Alternative, Inquiry, Question, Reply, summary};

@@ -1,6 +1,7 @@
 //! What the agent loop reports, as the events the client reads.
 
 use omc_agent::AgentEvent;
+use omc_providers::Part;
 use omc_wire::{Diff, Event, Kind, PastTurn, Tool, ToolState, Usage};
 
 /// What kind of tool the tool called `name` is.
@@ -115,9 +116,11 @@ pub(crate) fn replay(
                     continue;
                 };
                 if !reply.thinking.is_empty() {
+                    turn.events.push(Event::Started(omc_wire::Part::Thinking));
                     turn.events.push(Event::Thought(reply.thinking.clone()));
                 }
                 if !reply.text.is_empty() {
+                    turn.events.push(Event::Started(omc_wire::Part::Text));
                     turn.events.push(Event::Said(reply.text.clone()));
                 }
                 for call in &reply.tool_calls {
@@ -194,6 +197,8 @@ fn plan_of(arguments: &serde_json::Value) -> Option<Vec<omc_wire::PlanStep>> {
 /// The event that says what `event` says, given a context window of `window` tokens; nothing when it says nothing the client shows.
 pub(crate) fn translate(event: AgentEvent, window: u64) -> Option<Event> {
     Some(match event {
+        AgentEvent::Started(Part::Thinking) => Event::Started(omc_wire::Part::Thinking),
+        AgentEvent::Started(Part::Text) => Event::Started(omc_wire::Part::Text),
         AgentEvent::Delta(text) => Event::Said(text),
         AgentEvent::Thought(text) => Event::Thought(text),
         AgentEvent::Used(tokens) => Event::Used(Usage {
@@ -428,8 +433,9 @@ mod tests {
         assert_eq!(turns[0].prompt, "read a");
         assert_eq!(turns[1].prompt, "thanks");
         let events = &turns[0].events;
-        assert_eq!(events[0], Event::Thought("hm".into()));
-        let Event::Tool(started) = &events[1] else {
+        assert_eq!(events[0], Event::Started(omc_wire::Part::Thinking));
+        assert_eq!(events[1], Event::Thought("hm".into()));
+        let Event::Tool(started) = &events[2] else {
             panic!("no tool start");
         };
         assert_eq!(
@@ -437,7 +443,7 @@ mod tests {
             ("c1", Some(ToolState::Running))
         );
         assert_eq!(started.kind, Some(Kind::Read));
-        let Event::Tool(done) = &events[2] else {
+        let Event::Tool(done) = &events[3] else {
             panic!("no tool result");
         };
         assert_eq!(
@@ -445,8 +451,15 @@ mod tests {
             ("c1", Some(ToolState::Done))
         );
         assert_eq!(done.output.as_deref(), Some("alpha"));
-        assert_eq!(events[3], Event::Said("it says alpha".into()));
-        assert_eq!(turns[1].events, vec![Event::Said("welcome".into())]);
+        assert_eq!(events[4], Event::Started(omc_wire::Part::Text));
+        assert_eq!(events[5], Event::Said("it says alpha".into()));
+        assert_eq!(
+            turns[1].events,
+            vec![
+                Event::Started(omc_wire::Part::Text),
+                Event::Said("welcome".into())
+            ]
+        );
     }
 
     /// A turn the client marked comes back with its id, what the reader wrote and the files, instead of the composed text.

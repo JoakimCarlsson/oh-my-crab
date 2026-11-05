@@ -53,6 +53,8 @@ pub enum Event {
     Commands(Vec<Slash>),
     /// How full the conversation's context is now.
     Used(Usage),
+    /// A new block of the agent's reply starts, of the kind given; the `Said` or `Thought` chunks that follow belong to it until the next block starts.
+    Started(Part),
     /// The agent said this much more of its reply.
     Said(String),
     /// The agent thought this much more.
@@ -95,4 +97,13 @@ pub enum Event {
     Resumed(Conversation),
     /// The agent named the conversation, or named it again.
     Titled(String),
+}
+
+/// The kind of a block of the agent's reply.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum Part {
+    /// What the agent is thinking, sent as `Thought` chunks.
+    Thinking,
+    /// What the agent says, sent as `Said` chunks.
+    Text,
 }

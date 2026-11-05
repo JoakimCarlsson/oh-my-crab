@@ -6,14 +6,14 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-use crate::chat::parse_arguments;
+use crate::chat::{Blocks, parse_arguments};
 use crate::identity;
 use crate::models::{
     ClaudeModel, ThinkingMode, claude_efforts, claude_output_limit, claude_supports_display,
     claude_thinking_mode, parse_claude,
 };
 use crate::{
-    Effort, Message, ProviderError, Reply, Request, Sink, Tokens, ToolCall, ToolSpec, sse,
+    Effort, Message, Part, ProviderError, Reply, Request, Sink, Tokens, ToolCall, ToolSpec, sse,
 };
 
 /// Messages endpoint.
@@ -140,6 +140,8 @@ pub(crate) struct Accumulator {
     thinking: String,
     /// Open blocks by position.
     blocks: BTreeMap<usize, Open>,
+    /// The block chunks go to now.
+    streaming: Blocks,
     /// Usage reported so far.
     tokens: Tokens,
     /// Whether any usage was reported.
@@ -154,6 +156,7 @@ impl Accumulator {
             text: String::new(),
             thinking: String::new(),
             blocks: BTreeMap::new(),
+            streaming: Blocks::default(),
             tokens: Tokens::default(),
             counted: false,
         }
@@ -243,15 +246,18 @@ impl Accumulator {
 
     /// Applies a `content_block_delta` to the block at `index`.
     fn delta(&mut self, index: Option<usize>, delta: Delta, sink: &mut dyn Sink) {
-        if let Some(chunk) = delta.text {
-            sink.text(&chunk);
+        let position = index.unwrap_or(0);
+        if let Some(chunk) = delta.text
+            && self.streaming.send(sink, Part::Text, position, &chunk)
+        {
             self.text.push_str(&chunk);
         }
         let open = index.and_then(|i| self.blocks.get_mut(&i));
         match open {
             Some(Open::Thinking { text, signature }) => {
-                if let Some(chunk) = delta.thinking {
-                    sink.thinking(&chunk);
+                if let Some(chunk) = delta.thinking
+                    && self.streaming.send(sink, Part::Thinking, position, &chunk)
+                {
                     self.thinking.push_str(&chunk);
                     text.push_str(&chunk);
                 }
@@ -726,9 +732,16 @@ mod tests {
         text: Vec<String>,
         /// Thinking chunks received.
         thinking: Vec<String>,
+        /// The kinds of the blocks started, in order.
+        starts: Vec<Part>,
     }
 
     impl Sink for Recorder {
+        /// Records the start of a block.
+        fn start(&mut self, part: Part) {
+            self.starts.push(part);
+        }
+
         /// Records a text chunk.
         fn text(&mut self, chunk: &str) {
             self.text.push(chunk.to_string());
@@ -971,6 +984,7 @@ mod tests {
         let mut sink = Recorder::default();
         let reply = run(&events, true, &mut sink);
         assert_eq!(sink.thinking, ["let me ", "think"]);
+        assert_eq!(sink.starts, [Part::Thinking, Part::Text]);
         assert_eq!(sink.text, ["hello"]);
         assert_eq!(reply.thinking, "let me think");
         assert_eq!(reply.text, "hello");

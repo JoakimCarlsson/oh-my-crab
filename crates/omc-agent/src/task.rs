@@ -111,7 +111,10 @@ impl Run {
         let nested = move |event: AgentEvent| {
             if matches!(
                 event,
-                AgentEvent::Delta(_) | AgentEvent::Thought(_) | AgentEvent::Used(_)
+                AgentEvent::Started(_)
+                    | AgentEvent::Delta(_)
+                    | AgentEvent::Thought(_)
+                    | AgentEvent::Used(_)
             ) {
                 return;
             }
