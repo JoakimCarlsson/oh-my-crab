@@ -61,6 +61,15 @@ pub enum AgentEvent {
         /// What it did.
         event: Box<AgentEvent>,
     },
+    /// The subagent started by the `task` call `id`, or by the step `id` of one, works in a git worktree of its own at `path`; sent again with what became of its changes once it ended.
+    Worktree {
+        /// Id of the `task` call, or of the step within it.
+        id: String,
+        /// The folder the subagent works in.
+        path: std::path::PathBuf,
+        /// What became of its changes, once it ended.
+        merge: Option<crate::Merge>,
+    },
     /// A tool call finished, successfully or not.
     ToolDone {
         /// Id of the call.

@@ -4,12 +4,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use omc_agent::Journal;
+use omc_agent::{Isolation, Journal};
 use omc_auth::{AuthError, LoginPrompt};
 use omc_context::{Discovered, Locations, discover, expand_skill};
 use omc_providers::Message;
 use omc_providers::Provider;
-use omc_tools::{LanguageService, Registry, Sandbox, Skill, Spill, Tool, ToolError, ToolOutput};
+use omc_tools::{
+    LanguageService, Languages, Registry, Sandbox, Skill, Spill, Tool, ToolError, ToolOutput,
+};
 use omc_wire::{Command, Event, Opening, QueueState, Slash};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::AbortHandle;
@@ -35,6 +37,8 @@ struct Open {
     locations: Arc<Locations>,
     /// The instruction files, skills and agents the reader turned off.
     disabled: Vec<String>,
+    /// How subagents get git worktrees of their own, when they can.
+    isolation: Option<Arc<Isolation>>,
 }
 
 /// The state of one conversation.
@@ -198,6 +202,8 @@ impl Session {
         };
         self.shared.languages.set(None);
         let spill = spill_for(conversation.as_deref());
+        let own_languages = self.shared.given_languages.is_none() && !languages;
+        let isolation = isolation_for(&directory, &spill, conversation.as_deref(), own_languages);
         let sandbox = match Sandbox::new(&directory) {
             Ok(sandbox) => sandbox.with_spill(spill.clone()),
             Err(error) => return self.say(Event::Failed(error.to_string())),
@@ -259,6 +265,7 @@ impl Session {
             discovered: Arc::new(discovered),
             locations: Arc::new(locations),
             disabled,
+            isolation,
         });
         let mode = if yolo { Mode::Yolo } else { Mode::Asking };
         self.shared.open(provider, models, model, mode);
@@ -409,6 +416,7 @@ impl Session {
             shared: self.shared.clone(),
             history: self.history.clone(),
             scribe: self.journal.as_ref().map(Journal::scribe),
+            isolation: open.isolation.clone(),
         };
         let ended = self.ended.clone();
         let task = tokio::spawn(async move {
@@ -632,6 +640,38 @@ fn spill_for(id: Option<&str>) -> Spill {
         Some(id) => Spill::for_conversation(id),
         None => Spill::default(),
     }
+}
+
+/// How long the worktrees of other conversations are kept after they were made, before they are taken to be left behind by a run that stopped or crashed.
+const WORKTREE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How the subagents of the conversation `id`, working in `directory`, get git worktrees of their own: made in a folder named like its folder of saved output `spill` under the harness's cache folder, after clearing away the worktrees runs left behind, with the tools that touch files confined to the worktree and asking the harness's own language servers, started for the worktree, when `own_languages` says the conversation uses those; nothing when there is no cache folder.
+///
+/// The language services of a client or of a program embedding the harness are not asked about files in a worktree, since they work on the main working tree.
+fn isolation_for(
+    directory: &Path,
+    spill: &Spill,
+    id: Option<&str>,
+    own_languages: bool,
+) -> Option<Arc<Isolation>> {
+    let root = dirs::cache_dir()?.join("oh-my-crab").join("worktrees");
+    let name = spill.dir()?.file_name()?.to_owned();
+    omc_agent::prune_worktrees(&root, id, WORKTREE_AGE);
+    let saved = spill.clone();
+    Some(Arc::new(Isolation {
+        directory: directory.to_path_buf(),
+        store: root.join(name),
+        patches: spill.clone(),
+        tools: Arc::new(move |folder: &Path| {
+            let sandbox = Sandbox::new(folder)?.with_spill(saved.clone());
+            let languages = Languages::new(if own_languages {
+                crate::languages::own_servers(folder, false)
+            } else {
+                None
+            });
+            Ok(Registry::builtin_for(sandbox, None, languages))
+        }),
+    }))
 }
 
 /// The file the saved history of the conversation `id` is kept in, inside `folder` or a folder under the harness's own data folder.
@@ -931,6 +971,7 @@ mod tests {
                 discovered: Arc::new(discovered),
                 locations: Arc::new(locations),
                 disabled: Vec::new(),
+                isolation: None,
             }),
             running: None,
             turns: 0,
@@ -1179,6 +1220,7 @@ mod tests {
                 discovered: Arc::new(discover(&locations, &[])),
                 locations: Arc::new(locations),
                 disabled: Vec::new(),
+                isolation: None,
             }),
             running: None,
             turns: 1,

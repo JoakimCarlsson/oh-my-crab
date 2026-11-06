@@ -14,4 +14,5 @@ pub(super) static DEF: Def = Def {
     base_url: "http://localhost:11434/v1",
     base_url_env: Some("OMC_OLLAMA_URL"),
     headers: &[],
+    replay_reasoning: false,
 };

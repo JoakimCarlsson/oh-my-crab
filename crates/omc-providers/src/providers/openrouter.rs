@@ -16,4 +16,5 @@ pub(super) static DEF: Def = Def {
     base_url: "https://openrouter.ai/api/v1",
     base_url_env: Some("OMC_OPENROUTER_URL"),
     headers: &[],
+    replay_reasoning: false,
 };

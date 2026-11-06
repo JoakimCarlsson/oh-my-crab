@@ -1,7 +1,9 @@
 # Adding a provider
 
-Every provider is built into the `omc` binary. There are no plugins and no
-runtime registration. See [supported.md](supported.md) for what exists today.
+Every provider in this guide is built into the `omc` binary. A server that
+speaks Chat Completions can also be added without a change to crab, in
+`providers.json`; see "Custom endpoints" in the [README](../../README.md#custom-endpoints).
+See [supported.md](supported.md) for what exists today.
 
 A provider is two things kept apart:
 
@@ -38,6 +40,7 @@ This is the common case. Add one file and one line.
        base_url: "https://api.groq.com/openai/v1",
        base_url_env: None,
        headers: &[],
+       replay_reasoning: false,
    };
    ```
 
@@ -46,8 +49,8 @@ This is the common case. Add one file and one line.
    `Provider` variant and `Provider::ALL`; the order of the list is the order
    clients offer the providers in.
 
-The `id` is the name saved to disk and equals the variant name in lowercase, so
-pick it once and keep it; a test checks this. Then run `cargo test --workspace`
+The `id` is the name saved to disk, so pick it once and keep it; a test checks
+that every id is unique and finds its provider again. Then run `cargo test --workspace`
 and add a row to [supported.md](supported.md).
 
 Clients list providers with `crab providers` or `omc_session::providers()`, so
@@ -59,11 +62,12 @@ The fields of a definition:
 | --------------- | ----------------------------------------------------------------------------- |
 | `label`         | The name clients show for the provider, such as `GitHub Copilot`.             |
 | `wire`          | Which `Wire` the provider speaks.                                             |
-| `default_model` | `Some(id)` for a fixed default, `None` to take the first model the server lists. |
+| `default_model` | `Some(id)` for a fixed default, which leads the listed models, or `None` to take the first model the server lists. |
 | `auth`          | `Auth::OAuth(&SPEC)`, `Auth::DeviceCode(&DEVICE)`, `Auth::ApiKey { env: &[...] }` or `Auth::None`. |
 | `base_url`      | The API address, used by wires that serve many hosts.                         |
 | `base_url_env`  | Environment variable that overrides `base_url`, or `None`.                    |
 | `headers`       | Headers sent on every request, such as the client identity a host requires.   |
+| `replay_reasoning` | Whether earlier reasoning goes back as `reasoning_content`, which hosts of thinking models want around tool calls. |
 
 An API-key provider reads its key from the first of its `env` variables that is
 set, and signing in fails with the variable names when none is. A provider with

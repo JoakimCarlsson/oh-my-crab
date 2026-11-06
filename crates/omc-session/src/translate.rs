@@ -27,6 +27,25 @@ fn bare(id: String) -> Tool {
         output: None,
         parent: None,
         agent: None,
+        worktree: None,
+    }
+}
+
+/// The wire form of what became of an isolated subagent's changes.
+fn merge_of(merge: omc_agent::Merge) -> omc_wire::Merge {
+    use omc_agent::Merge as Agent;
+    let shown = |path: std::path::PathBuf| path.display().to_string();
+    match merge {
+        Agent::Applied(files) => omc_wire::Merge::Applied { files },
+        Agent::Unchanged => omc_wire::Merge::Unchanged,
+        Agent::Conflicted { patch, files } => omc_wire::Merge::Conflicted {
+            patch: shown(patch),
+            files,
+        },
+        Agent::Held { reason, patch } => omc_wire::Merge::Held {
+            reason,
+            patch: patch.map(shown),
+        },
     }
 }
 
@@ -263,6 +282,13 @@ pub(crate) fn translate(event: AgentEvent, window: u64) -> Option<Event> {
             agent: Some(agent),
             ..bare(id)
         }),
+        AgentEvent::Worktree { id, path, merge } => Event::Tool(Tool {
+            worktree: Some(Box::new(omc_wire::Worktree {
+                path: path.display().to_string(),
+                merge: merge.map(merge_of),
+            })),
+            ..bare(id)
+        }),
         AgentEvent::Nested {
             parent,
             agent,
@@ -380,6 +406,57 @@ mod tests {
                 1
             )
             .is_none()
+        );
+    }
+
+    /// The worktree of an isolated subagent is reported on its call, or on its step of a call, with what became of its changes once it ended.
+    #[test]
+    fn worktrees_are_reported_on_the_call_or_its_step() {
+        let Some(Event::Tool(alone)) = translate(
+            AgentEvent::Worktree {
+                id: "c1".into(),
+                path: "/cache/wt/repo".into(),
+                merge: None,
+            },
+            1,
+        ) else {
+            panic!()
+        };
+        assert_eq!(alone.id, "c1");
+        assert_eq!(
+            alone.worktree,
+            Some(Box::new(omc_wire::Worktree {
+                path: "/cache/wt/repo".into(),
+                merge: None
+            }))
+        );
+        let Some(Event::Tool(step)) = translate(
+            AgentEvent::Nested {
+                parent: "c1".into(),
+                agent: "task".into(),
+                event: Box::new(AgentEvent::Worktree {
+                    id: "2".into(),
+                    path: "/cache/wt/repo".into(),
+                    merge: Some(omc_agent::Merge::Conflicted {
+                        patch: "/cache/out/p.log".into(),
+                        files: vec!["a.txt".into()],
+                    }),
+                }),
+            },
+            1,
+        ) else {
+            panic!()
+        };
+        assert_eq!(
+            (step.id.as_str(), step.parent.as_deref()),
+            ("c1:2", Some("c1"))
+        );
+        assert_eq!(
+            step.worktree.and_then(|worktree| worktree.merge),
+            Some(omc_wire::Merge::Conflicted {
+                patch: "/cache/out/p.log".into(),
+                files: vec!["a.txt".into()],
+            })
         );
     }
 

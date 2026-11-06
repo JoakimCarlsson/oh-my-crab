@@ -71,6 +71,46 @@ pub struct Tool {
     /// The kind of subagent this call starts, when it starts one.
     #[serde(default)]
     pub agent: Option<String>,
+    /// The git worktree of its own the subagent this call starts works in, and what became of its changes, when it works apart from the main agent; boxed, since most tool events carry none.
+    #[serde(default)]
+    pub worktree: Option<Box<Worktree>>,
+}
+
+/// The git worktree of its own an isolated subagent works in, so that its edits stay apart from the main agent's until it ends.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Worktree {
+    /// The folder the subagent works in.
+    pub path: String,
+    /// What became of its changes once it ended; nothing while it works.
+    #[serde(default)]
+    pub merge: Option<Merge>,
+}
+
+/// What became of the changes an isolated subagent made in its worktree.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum Merge {
+    /// They were applied to the main agent's working tree, uncommitted.
+    Applied {
+        /// The files that changed, from the root of the repository.
+        files: Vec<String>,
+    },
+    /// It changed nothing.
+    Unchanged,
+    /// They did not apply cleanly to the main agent's working tree, so none of them were applied.
+    Conflicted {
+        /// The file the whole patch was saved in.
+        patch: String,
+        /// The files whose part of the patch does not apply, from the root of the repository.
+        files: Vec<String>,
+    },
+    /// They were not applied, for a reason other than a conflict, such as the subagent failing.
+    Held {
+        /// Why they were not applied.
+        reason: String,
+        /// The file the whole patch was saved in, when it could be saved.
+        #[serde(default)]
+        patch: Option<String>,
+    },
 }
 
 /// A command or task that goes on running beyond the call that started it.

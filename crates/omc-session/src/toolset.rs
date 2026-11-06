@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use omc_agent::{Approvals, EventSink, Task, TaskSettings};
+use omc_agent::{Approvals, EventSink, Isolation, Task, TaskSettings};
 use omc_context::{Discovered, Environment, PromptInput, build_subagent_prompt};
 use omc_providers::{ChatModel, Effort};
 use omc_tools::{
@@ -40,6 +40,8 @@ pub(crate) struct Inputs<'a> {
     pub(crate) unnamed: bool,
     /// The background runs of the conversation.
     pub(crate) jobs: Arc<Jobs>,
+    /// How subagents get git worktrees of their own, when they can.
+    pub(crate) isolation: Option<Arc<Isolation>>,
 }
 
 /// The tools of a turn in each mode.
@@ -100,10 +102,15 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
         events: inputs.events.clone(),
         agents: discovered.agents.clone(),
         effort: inputs.effort,
-        prompt: Arc::new(move |agent, tools| {
+        prompt: Arc::new(move |agent, tools, apart| {
+            let moved = apart.map(|directory| Environment {
+                directory: directory.to_path_buf(),
+                branch: None,
+                ..(*environment).clone()
+            });
             build_subagent_prompt(
                 PromptInput {
-                    environment: &environment,
+                    environment: moved.as_ref().unwrap_or(&environment),
                     discovered: &discovered,
                     tools,
                     plan: false,
@@ -114,6 +121,7 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
             )
         }),
         jobs: inputs.jobs.clone(),
+        isolation: inputs.isolation.clone(),
     }));
     for name in inputs.denied {
         registry.remove(name);
@@ -176,6 +184,7 @@ mod tests {
             checkpoint,
             jobs: shared.jobs.clone(),
             unnamed: true,
+            isolation: None,
         })
     }
 

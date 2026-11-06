@@ -54,6 +54,8 @@ pub(crate) struct Turn {
     pub(crate) history: Vec<Message>,
     /// Where the turn's messages are saved, when the conversation is saved.
     pub(crate) scribe: Option<Scribe>,
+    /// How subagents get git worktrees of their own, when they can.
+    pub(crate) isolation: Option<Arc<omc_agent::Isolation>>,
 }
 
 impl Turn {
@@ -134,6 +136,7 @@ impl Turn {
             checkpoint: checkpoint.clone(),
             jobs: self.shared.jobs.clone(),
             unnamed,
+            isolation: self.isolation.clone(),
         });
         let key = Key {
             provider: self.provider,
@@ -301,6 +304,7 @@ mod tests {
             shared: shared.clone(),
             history,
             scribe: None,
+            isolation: None,
         }
     }
 
@@ -752,6 +756,7 @@ mod tests {
             shared,
             history: history.clone(),
             scribe: None,
+            isolation: None,
         };
         let Ended::Done(compacted) = turn
             .run_with(Arc::new(Summarizer), Job::Compact(Some("names".into())))
@@ -855,6 +860,7 @@ mod tests {
             shared: shared.clone(),
             history: Vec::new(),
             scribe: Some(journal.scribe()),
+            isolation: None,
         };
         let model = Arc::new(Interrupted {
             shared: shared.clone(),
@@ -933,6 +939,7 @@ mod tests {
             shared,
             history: Vec::new(),
             scribe: None,
+            isolation: None,
         };
         let model = Arc::new(Editor {
             step: Mutex::new(0),

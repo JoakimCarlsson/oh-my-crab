@@ -24,10 +24,10 @@ fn key_env(auth: &Auth) -> &'static [&'static str] {
     }
 }
 
-/// Every provider a conversation can be opened with, in the order a client should offer them.
+/// Every provider a conversation can be opened with, in the order a client should offer them: the built-in ones, then those the user defined in `providers.json`.
 pub fn providers() -> Vec<ProviderInfo> {
-    Provider::ALL
-        .iter()
+    Provider::all()
+        .into_iter()
         .map(|provider| {
             let def = provider.def();
             ProviderInfo {
@@ -96,7 +96,18 @@ mod tests {
     fn lists_every_provider() {
         let listed = providers();
         let ids: Vec<&str> = listed.iter().map(|info| info.id.as_str()).collect();
-        assert_eq!(ids, ["claude", "codex", "ollama", "openrouter", "copilot"]);
+        let built_in: Vec<&str> = Provider::ALL.iter().map(|p| p.def().id).collect();
+        assert_eq!(ids[..built_in.len()], built_in);
+        assert_eq!(
+            ids[..5],
+            ["claude", "codex", "ollama", "openrouter", "copilot"]
+        );
+        let kimi = listed.iter().find(|info| info.id == "kimi-code").unwrap();
+        assert_eq!(kimi.name, "Kimi Code");
+        assert_eq!(kimi.sign_in, SignIn::ApiKey);
+        assert_eq!(kimi.key_env, ["KIMI_CODE_API_KEY", "KIMI_API_KEY"]);
+        let lmstudio = listed.iter().find(|info| info.id == "lmstudio").unwrap();
+        assert_eq!(lmstudio.sign_in, SignIn::None);
         let copilot = listed.iter().find(|info| info.id == "copilot").unwrap();
         assert_eq!(copilot.name, "GitHub Copilot");
         assert_eq!(copilot.sign_in, SignIn::DeviceCode);

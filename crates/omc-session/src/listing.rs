@@ -68,6 +68,7 @@ pub fn tools() -> Result<Vec<ToolInfo>, String> {
         checkpoint: None,
         jobs: shared.jobs.clone(),
         unnamed: true,
+        isolation: None,
     });
     let mut listed: Vec<ToolInfo> = Vec::new();
     for plan in [false, true] {

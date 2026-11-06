@@ -432,6 +432,7 @@ impl RemoteModel {
                     credentials: &self.credentials,
                     base_url: &base_url,
                     headers: self.provider.def().headers,
+                    replay_reasoning: self.provider.def().replay_reasoning,
                 };
                 chat_completions::complete(target, &self.model, request, sink).await
             }

@@ -14,6 +14,7 @@ pub(super) static DEF: Def = Def {
     base_url: "https://api.anthropic.com",
     base_url_env: None,
     headers: &[],
+    replay_reasoning: false,
 };
 
 /// OAuth endpoints and parameters for Claude.

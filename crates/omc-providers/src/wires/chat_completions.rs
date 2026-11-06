@@ -19,6 +19,8 @@ pub(crate) struct Target<'a> {
     pub base_url: &'a str,
     /// Headers sent on every request.
     pub headers: &'a [(&'a str, &'a str)],
+    /// Whether earlier reasoning goes back as `reasoning_content`, as [`crate::Def::replay_reasoning`] says.
+    pub replay_reasoning: bool,
 }
 
 /// Returns the API address for `provider`: the one assigned to the account when there is one, else the provider's own.
@@ -41,17 +43,50 @@ fn authorized(request: reqwest::RequestBuilder, target: &Target<'_>) -> reqwest:
     request.bearer_auth(&target.credentials.access)
 }
 
-/// Picks the model ids out of a model list response, dropping entries the server marks as not for chat.
+/// Words in a model id that mark a model which cannot hold a conversation, such as one for embeddings, speech or images.
+const NOT_FOR_CHAT: &[&str] = &[
+    "embed",
+    "whisper",
+    "tts",
+    "transcribe",
+    "moderation",
+    "rerank",
+    "dall-e",
+    "image",
+    "realtime",
+    "veo",
+];
+
+/// Kinds a model list entry may declare for a model that does not chat.
+const OTHER_KINDS: &[&str] = &[
+    "embedding",
+    "embeddings",
+    "image",
+    "audio",
+    "video",
+    "moderation",
+    "rerank",
+    "transcribe",
+];
+
+/// Picks the model ids out of a model list response, dropping entries the server marks as not for chat and ids that name a model of another kind.
+///
+/// The list is the `data` array of the usual response, or the response itself when
+/// a server sends a bare array; the `models/` prefix some servers put on ids is
+/// dropped, since they take the id without it.
 pub(crate) fn model_ids(list: &Value) -> Vec<String> {
     list.get("data")
-        .and_then(Value::as_array)
+        .unwrap_or(list)
+        .as_array()
         .into_iter()
         .flatten()
         .filter(|entry| {
-            let chat = entry
-                .pointer("/capabilities/type")
-                .and_then(Value::as_str)
-                .is_none_or(|kind| kind == "chat");
+            let chat = ["/capabilities/type", "/type"].iter().all(|pointer| {
+                entry
+                    .pointer(pointer)
+                    .and_then(Value::as_str)
+                    .is_none_or(|kind| !OTHER_KINDS.contains(&kind))
+            });
             let picked = entry
                 .get("model_picker_enabled")
                 .and_then(Value::as_bool)
@@ -59,6 +94,11 @@ pub(crate) fn model_ids(list: &Value) -> Vec<String> {
             chat && picked
         })
         .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+        .map(|id| id.strip_prefix("models/").unwrap_or(id))
+        .filter(|id| {
+            let lower = id.to_ascii_lowercase();
+            !NOT_FOR_CHAT.iter().any(|word| lower.contains(word))
+        })
         .map(str::to_string)
         .collect()
 }
@@ -77,10 +117,28 @@ pub(crate) async fn list_models(target: Target<'_>) -> Result<Vec<String>, Provi
     Ok(model_ids(&response.json().await?))
 }
 
+/// The provider data a tool call carried beside its id, name and arguments, such as
+/// Gemini's thought signature, kept in a reply's `opaque` blocks under the call's id.
+fn call_extra<'a>(reply: &'a Reply, call_id: &str) -> Option<&'a Value> {
+    reply
+        .opaque
+        .iter()
+        .find(|block| block.get("tool_call_id").and_then(Value::as_str) == Some(call_id))
+        .and_then(|block| block.get("extra_content"))
+}
+
 /// Converts the conversation into the `messages` array, system prompt first.
 ///
+/// When `replay_reasoning` is set, an assistant message carries the reasoning that
+/// came with it as `reasoning_content`. A tool call carries back the extra
+/// content the server gave it.
+///
 /// A compaction is left out: the agent gives the model its summary as a user message in its place. So is a pruning, which the agent applies to the tool results it gives.
-pub(crate) fn messages_json(system: &str, messages: &[Message]) -> Vec<Value> {
+pub(crate) fn messages_json(
+    system: &str,
+    messages: &[Message],
+    replay_reasoning: bool,
+) -> Vec<Value> {
     let mut out = vec![json!({"role": "system", "content": system})];
     for message in messages {
         match message {
@@ -94,11 +152,15 @@ pub(crate) fn messages_json(system: &str, messages: &[Message]) -> Vec<Value> {
                             Value::String(raw) => raw.clone(),
                             other => other.to_string(),
                         };
-                        json!({
+                        let mut entry = json!({
                             "id": call.id,
                             "type": "function",
                             "function": {"name": call.name, "arguments": arguments},
-                        })
+                        });
+                        if let Some(extra) = call_extra(reply, &call.id) {
+                            entry["extra_content"] = extra.clone();
+                        }
+                        entry
                     })
                     .collect();
                 let content = if reply.text.is_empty() {
@@ -109,6 +171,9 @@ pub(crate) fn messages_json(system: &str, messages: &[Message]) -> Vec<Value> {
                 let mut entry = json!({"role": "assistant", "content": content});
                 if !calls.is_empty() {
                     entry["tool_calls"] = Value::Array(calls);
+                }
+                if replay_reasoning && !reply.thinking.is_empty() {
+                    entry["reasoning_content"] = Value::String(reply.thinking.clone());
                 }
                 out.push(entry);
             }
@@ -168,13 +233,13 @@ pub(crate) fn tools_json(tools: &[ToolSpec]) -> Vec<Value> {
         .collect()
 }
 
-/// Builds the request body for `model`.
-pub(crate) fn build_body(model: &str, request: &Request<'_>) -> Value {
+/// Builds the request body for `model`, with earlier reasoning sent back when `replay_reasoning` is set.
+pub(crate) fn build_body(model: &str, request: &Request<'_>, replay_reasoning: bool) -> Value {
     let mut body = json!({
         "model": model,
         "stream": true,
         "stream_options": {"include_usage": true},
-        "messages": messages_json(request.system, request.messages),
+        "messages": messages_json(request.system, request.messages, replay_reasoning),
     });
     if !request.tools.is_empty() {
         body["tools"] = Value::Array(tools_json(request.tools));
@@ -212,6 +277,8 @@ struct PartialCall {
     name: String,
     /// The argument text so far.
     arguments: String,
+    /// Provider data sent beside the call, such as a thought signature, to be sent back with it.
+    extra: Option<Value>,
 }
 
 /// Collects the chunks of one streamed response.
@@ -279,10 +346,13 @@ impl Accumulator {
         {
             self.thinking.push_str(text);
         }
-        if let Some(text) = delta.get("content").and_then(Value::as_str)
-            && self.blocks.send(sink, Part::Text, 0, text)
-        {
-            self.text.push_str(text);
+        for (part, text) in content_pieces(delta.get("content")) {
+            if self.blocks.send(sink, part, 0, text) {
+                match part {
+                    Part::Thinking => self.thinking.push_str(text),
+                    Part::Text => self.text.push_str(text),
+                }
+            }
         }
         for fragment in delta
             .get("tool_calls")
@@ -314,6 +384,12 @@ impl Accumulator {
         {
             call.arguments.push_str(arguments);
         }
+        if let Some(extra) = fragment
+            .get("extra_content")
+            .filter(|extra| !extra.is_null())
+        {
+            call.extra = Some(extra.clone());
+        }
     }
 
     /// Ends the stream and returns the reply it described.
@@ -342,19 +418,26 @@ impl Accumulator {
             Some("length") => Stop::Length,
             _ => Stop::Finished,
         };
+        let mut opaque = Vec::new();
         let tool_calls = self
             .calls
             .into_iter()
             .filter(|call| !call.name.is_empty())
             .enumerate()
-            .map(|(position, call)| ToolCall {
-                id: if call.id.is_empty() {
+            .map(|(position, call)| {
+                let id = if call.id.is_empty() {
                     format!("call_{position}")
                 } else {
                     call.id
-                },
-                name: call.name,
-                arguments: parse_arguments(&call.arguments),
+                };
+                if let Some(extra) = call.extra {
+                    opaque.push(json!({"tool_call_id": id, "extra_content": extra}));
+                }
+                ToolCall {
+                    id,
+                    name: call.name,
+                    arguments: parse_arguments(&call.arguments),
+                }
             })
             .collect();
         Reply {
@@ -362,9 +445,41 @@ impl Accumulator {
             thinking: self.thinking,
             tool_calls,
             tokens: self.tokens,
-            opaque: Vec::new(),
+            opaque,
             stop,
         }
+    }
+}
+
+/// The pieces of a streamed `content` value, each with the block it belongs to.
+///
+/// Most servers send a string, which is answer text. Mistral's reasoning models send
+/// a list of chunks instead: `text` chunks of answer and `thinking` chunks whose
+/// own `thinking` list holds the reasoning text.
+fn content_pieces(content: Option<&Value>) -> Vec<(Part, &str)> {
+    match content {
+        Some(Value::String(text)) => vec![(Part::Text, text.as_str())],
+        Some(Value::Array(chunks)) => chunks
+            .iter()
+            .flat_map(|chunk| match chunk.get("type").and_then(Value::as_str) {
+                Some("text") => chunk
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(|text| (Part::Text, text))
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                Some("thinking") => chunk
+                    .get("thinking")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|inner| inner.get("text").and_then(Value::as_str))
+                    .map(|text| (Part::Thinking, text))
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -381,7 +496,7 @@ pub(crate) async fn complete(
     request: Request<'_>,
     sink: &mut dyn Sink,
 ) -> Result<Reply, ProviderError> {
-    let body = build_body(model, &request);
+    let body = build_body(model, &request, target.replay_reasoning);
     let response = authorized(
         reqwest::Client::new().post(format!("{}/chat/completions", target.base_url)),
         &target,
@@ -455,7 +570,7 @@ mod tests {
                 images: Vec::new(),
             }]),
         ];
-        let out = messages_json("sys", &messages);
+        let out = messages_json("sys", &messages, false);
         assert_eq!(out[0]["role"], "system");
         assert_eq!(out[2]["content"], Value::Null);
         assert_eq!(
@@ -485,7 +600,7 @@ mod tests {
     /// Images follow the tool messages in one user message, since tool messages take only text.
     #[test]
     fn sends_tool_result_images_in_a_user_message() {
-        let out = messages_json("sys", &[Message::ToolResults(vec![pictured()])]);
+        let out = messages_json("sys", &[Message::ToolResults(vec![pictured()])], false);
         assert_eq!(out[1]["role"], "tool");
         assert_eq!(out[1]["content"], "[image]");
         assert_eq!(out[2]["role"], "user");
@@ -495,7 +610,7 @@ mod tests {
             out[2]["content"][1]["image_url"]["url"],
             "data:image/png;base64,AAAA"
         );
-        let plain = messages_json("sys", &[Message::ToolResults(Vec::new())]);
+        let plain = messages_json("sys", &[Message::ToolResults(Vec::new())], false);
         assert_eq!(plain.len(), 1);
     }
 
@@ -665,6 +780,7 @@ mod tests {
             credentials: &credentials,
             base_url: &address,
             headers: &[("Copilot-Integration-Id", "copilot-chat")],
+            replay_reasoning: false,
         };
         let messages = [Message::User("hi".into())];
         let request = Request {
@@ -695,5 +811,92 @@ mod tests {
             {"id": "plain"},
         ]});
         assert_eq!(model_ids(&list), ["a", "plain"]);
+    }
+
+    /// A bare array is a model list too, entries typed as another kind are left out, and the `models/` prefix is dropped.
+    #[test]
+    fn model_list_reads_other_shapes() {
+        let bare = json!([
+            {"id": "MiniMaxAI/MiniMax-M3", "type": "chat"},
+            {"id": "flux", "type": "image"},
+            {"id": "coder", "type": "code"},
+            {"id": "plain"},
+        ]);
+        assert_eq!(model_ids(&bare), ["MiniMaxAI/MiniMax-M3", "coder", "plain"]);
+        let prefixed = json!({"data": [
+            {"id": "models/gemini-3.8-flash", "object": "model"},
+            {"id": "models/gemini-embedding-2", "object": "model"},
+            {"id": "whisper-large-v3"},
+        ]});
+        assert_eq!(model_ids(&prefixed), ["gemini-3.8-flash"]);
+    }
+
+    /// Reasoning goes back as `reasoning_content` only when the provider asks for it, and a tool call's extra content goes back with it.
+    #[test]
+    fn replays_reasoning_and_call_extras() {
+        let messages = [
+            Message::User("go".into()),
+            Message::Assistant(Reply {
+                thinking: "look first".into(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    arguments: json!({}),
+                }],
+                opaque: vec![json!({
+                    "tool_call_id": "c1",
+                    "extra_content": {"google": {"thought_signature": "sig"}}
+                })],
+                ..Reply::default()
+            }),
+        ];
+        let replayed = messages_json("sys", &messages, true);
+        assert_eq!(replayed[2]["reasoning_content"], "look first");
+        assert_eq!(
+            replayed[2]["tool_calls"][0]["extra_content"]["google"]["thought_signature"],
+            "sig"
+        );
+        let plain = messages_json("sys", &messages, false);
+        assert!(plain[2].get("reasoning_content").is_none());
+    }
+
+    /// A tool call's extra content is kept in the reply's opaque blocks under the call's id.
+    #[test]
+    fn keeps_call_extras() {
+        let mut accumulator = Accumulator::default();
+        let mut sink = Recorder::default();
+        let chunk = json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "id": "c1",
+            "function": {"name": "read", "arguments": "{}"},
+            "extra_content": {"google": {"thought_signature": "sig"}}
+        }]}, "finish_reason": "tool_calls"}]});
+        accumulator.feed(&chunk.to_string(), &mut sink).unwrap();
+        let reply = accumulator.finish().unwrap();
+        assert_eq!(reply.opaque[0]["tool_call_id"], "c1");
+        assert_eq!(
+            reply.opaque[0]["extra_content"]["google"]["thought_signature"],
+            "sig"
+        );
+    }
+
+    /// Content sent as a list of chunks gives its thinking and its text to the right blocks.
+    #[test]
+    fn reads_chunked_content() {
+        let mut accumulator = Accumulator::default();
+        let mut sink = Recorder::default();
+        let chunks = [
+            json!({"choices": [{"delta": {"content": [
+                {"type": "thinking", "thinking": [{"type": "text", "text": "hmm"}]}
+            ]}}]}),
+            json!({"choices": [{"delta": {"content": [{"type": "text", "text": "done"}]},
+                "finish_reason": "stop"}]}),
+        ];
+        for chunk in &chunks {
+            accumulator.feed(&chunk.to_string(), &mut sink).unwrap();
+        }
+        let reply = accumulator.finish().unwrap();
+        assert_eq!(reply.thinking, "hmm");
+        assert_eq!(reply.text, "done");
+        assert_eq!(sink.starts, [Part::Thinking, Part::Text]);
     }
 }

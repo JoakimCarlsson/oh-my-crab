@@ -14,6 +14,7 @@ mod submit;
 mod task;
 mod text_calls;
 mod todos;
+mod worktree;
 
 pub use agent::{
     AgentError, AgentEvent, Context, Live, compact, run_turn, run_turn_recorded, run_turn_steered,
@@ -24,6 +25,7 @@ pub use journal::{INTERRUPTED, Journal, JournalError, Lost, Mark, Marked, STOPPE
 pub use recall::{RECALL, spec as recall_spec};
 pub use steering::Steering;
 pub use task::{EventSink, MAX_CONCURRENT, MAX_TASKS, PromptBuilder, Task, TaskSettings};
+pub use worktree::{Isolation, LOCK_REASON, Merge, ToolsFor, prune as prune_worktrees};
 
 #[cfg(test)]
 mod compaction_tests;

@@ -23,6 +23,8 @@ pub struct AgentDefinition {
     pub prompt: String,
     /// The JSON Schema its result must match, when it hands back structured data instead of prose.
     pub output_schema: Option<serde_json::Value>,
+    /// Whether it works in a git worktree of its own unless a call says otherwise, its changes handed back to the main agent's working tree as a patch when it ends.
+    pub isolated: bool,
     /// Where the definition is, or nothing for a built-in one.
     pub path: Option<PathBuf>,
     /// Where the definition came from.
@@ -135,9 +137,16 @@ fn from_markdown(
         tools,
         prompt,
         output_schema: schema_of(parsed.get("output_schema")),
+        isolated: flag(parsed.get("isolated")),
         path,
         origin,
     })
+}
+
+/// Whether `text`, the value of a front matter key, says yes: `true`, `yes` or `on`, in any case; anything else, or no value, says no.
+fn flag(text: Option<&str>) -> bool {
+    text.map(|text| text.trim().trim_matches(['"', '\'']).to_ascii_lowercase())
+        .is_some_and(|text| matches!(text.as_str(), "true" | "yes" | "on"))
 }
 
 /// The JSON Schema `text` holds, when it holds a JSON object; anything else declares none.
@@ -169,6 +178,7 @@ fn from_toml(
         description: get("description").unwrap_or_default(),
         tools: None,
         output_schema: schema_of(get("output_schema").as_deref()),
+        isolated: flag(get("isolated").as_deref()),
         prompt,
         path: Some(path.to_path_buf()),
         origin,
@@ -279,5 +289,25 @@ mod tests {
                 .iter()
                 .all(|agent| agent.output_schema.is_none())
         );
+    }
+
+    /// A definition may ask to work in a worktree of its own; none does unless it says so.
+    #[test]
+    fn reads_whether_it_is_isolated() {
+        let isolated = |front: &str| {
+            from_markdown(
+                &format!("---\n{front}\n---\nWork."),
+                "a",
+                None,
+                Origin::User,
+            )
+            .unwrap()
+            .isolated
+        };
+        assert!(isolated("isolated: true"));
+        assert!(isolated("isolated: Yes"));
+        assert!(!isolated("isolated: false"));
+        assert!(!isolated("description: d"));
+        assert!(builtin_agents().iter().all(|agent| !agent.isolated));
     }
 }

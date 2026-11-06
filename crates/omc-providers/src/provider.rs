@@ -1,7 +1,9 @@
 //! What a provider is: a definition naming its wire and sign-in, and the calls that act on one.
 
 use omc_auth::{Auth, AuthError, Credentials, LoginPrompt};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::custom::Custom;
 pub use crate::providers::Provider;
 
 /// The wire protocol a provider speaks; one streaming implementation exists per protocol.
@@ -17,7 +19,7 @@ pub enum Wire {
 
 /// Everything that distinguishes one provider from another, kept in one place.
 pub struct Def {
-    /// Stable identifier used on the command line and in saved files; equals the variant name in lowercase.
+    /// Stable identifier used on the command line and in saved files, such as `claude` or `kimi-code`.
     pub id: &'static str,
     /// The name a client shows for the provider, such as `GitHub Copilot`.
     pub label: &'static str,
@@ -33,6 +35,10 @@ pub struct Def {
     pub base_url_env: Option<&'static str>,
     /// Headers sent on every request to the provider.
     pub headers: &'static [(&'static str, &'static str)],
+    /// Whether the model's reasoning goes back as `reasoning_content` on the assistant
+    /// messages of later requests, which hosts of thinking models such as Kimi and
+    /// DeepSeek require around tool calls; only the Chat Completions wire reads it.
+    pub replay_reasoning: bool,
 }
 
 impl Def {
@@ -48,9 +54,18 @@ impl Def {
 }
 
 impl Provider {
-    /// Returns the provider whose identifier is `id`, when there is one.
+    /// Every provider a conversation can be opened with: the built-in ones of [`Provider::ALL`] in their order, then the ones the user defined in configuration in the order they were written.
+    pub fn all() -> Vec<Provider> {
+        Self::ALL
+            .iter()
+            .copied()
+            .chain(Custom::all().map(Provider::Custom))
+            .collect()
+    }
+
+    /// Returns the provider whose identifier is `id`, built in or defined by the user, when there is one.
     pub fn from_id(id: &str) -> Option<Provider> {
-        Self::ALL.iter().copied().find(|p| p.def().id == id)
+        Self::all().into_iter().find(|p| p.def().id == id)
     }
 
     /// Returns the human-readable name shown in the UI.
@@ -61,6 +76,26 @@ impl Provider {
     /// Returns the wire protocol this provider speaks.
     pub fn wire(self) -> Wire {
         self.def().wire
+    }
+}
+
+impl Serialize for Provider {
+    /// Writes the provider as its id.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.def().id)
+    }
+}
+
+impl<'de> Deserialize<'de> for Provider {
+    /// Reads a provider from its id.
+    ///
+    /// # Errors
+    ///
+    /// Fails when no provider, built in or defined by the user, has the id read.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let id = String::deserialize(deserializer)?;
+        Provider::from_id(&id)
+            .ok_or_else(|| serde::de::Error::custom(format!("no provider is called {id}")))
     }
 }
 
@@ -112,5 +147,51 @@ mod tests {
             assert!(seen.insert(provider.def().id));
         }
         assert_eq!(Provider::from_id("nope"), None);
+        let read: Provider = serde_json::from_str("\"kimi-code\"").unwrap();
+        assert_eq!(read, Provider::KimiCode);
+        assert!(serde_json::from_str::<Provider>("\"nope\"").is_err());
+    }
+
+    /// The built-in providers come first in their own order, and the new hosts are among them with their keys and addresses.
+    #[test]
+    fn registers_the_built_in_providers() {
+        let all = Provider::all();
+        assert_eq!(&all[..Provider::ALL.len()], Provider::ALL);
+        let ids: Vec<&str> = Provider::ALL.iter().map(|p| p.def().id).collect();
+        for id in [
+            "claude",
+            "codex",
+            "ollama",
+            "openrouter",
+            "copilot",
+            "kimi-code",
+            "moonshot",
+            "zai-coding",
+            "zai",
+            "minimax",
+            "deepseek",
+            "xai",
+            "groq",
+            "cerebras",
+            "mistral",
+            "openai",
+            "gemini",
+            "together",
+            "fireworks",
+            "lmstudio",
+            "llamacpp",
+            "vllm",
+        ] {
+            assert!(ids.contains(&id), "{id} is not registered");
+        }
+        let kimi = Provider::from_id("kimi-code").unwrap().def();
+        assert_eq!(kimi.default_model, Some("kimi-for-coding"));
+        assert!(matches!(kimi.auth, Auth::ApiKey { env } if env.contains(&"KIMI_CODE_API_KEY")));
+        for provider in Provider::ALL {
+            let def = provider.def();
+            assert!(!def.label.is_empty());
+            assert!(def.base_url.starts_with("http"), "{}", def.id);
+            assert!(!def.base_url.ends_with('/'), "{}", def.id);
+        }
     }
 }

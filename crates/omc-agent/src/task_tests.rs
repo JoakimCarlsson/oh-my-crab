@@ -46,8 +46,9 @@ fn task_tool(
         events,
         agents,
         effort: None,
-        prompt: Arc::new(|agent, _| format!("SUB:{}", agent.name)),
+        prompt: Arc::new(|agent, _, _| format!("SUB:{}", agent.name)),
         jobs,
+        isolation: None,
     });
     (task, log, dir)
 }
@@ -333,6 +334,7 @@ async fn a_definition_can_declare_the_schema() {
         tools: Some(vec!["read".into()]),
         prompt: "Count.".into(),
         output_schema: Some(counting()),
+        isolated: false,
         path: None,
         origin: Origin::User,
     });

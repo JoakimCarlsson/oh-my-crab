@@ -5,6 +5,8 @@ const USAGE: &str = "usage: crab <serve|tools|providers|account|history|rename|i
 
 /// Runs the conversation the command line asks for.
 ///
+/// `serve` ends the process as soon as the conversation is over, on [`omc_wire::Command::Close`] as on the end of standard input, without waiting for the thread that reads standard input to see its end.
+///
 /// # Errors
 ///
 /// Fails when the streams cannot be read or written.
@@ -13,7 +15,7 @@ async fn main() -> anyhow::Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("serve") => {
             omc_session::serve(tokio::io::stdin(), tokio::io::stdout()).await?;
-            Ok(())
+            std::process::exit(0)
         }
         Some("tools") => {
             let tools = omc_session::tools().map_err(|reason| anyhow::anyhow!(reason))?;

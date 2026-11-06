@@ -20,6 +20,7 @@ pub(super) static DEF: Def = Def {
         ("Openai-Intent", "conversation-agent"),
         ("X-GitHub-Api-Version", "2026-08-01"),
     ],
+    replay_reasoning: false,
 };
 
 /// Device-code login for GitHub Copilot, using the minimal-grant OAuth app.

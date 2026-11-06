@@ -14,6 +14,7 @@ pub(super) static DEF: Def = Def {
     base_url: "https://chatgpt.com/backend-api/codex",
     base_url_env: None,
     headers: &[],
+    replay_reasoning: false,
 };
 
 /// OAuth endpoints and parameters for Codex.

@@ -30,6 +30,6 @@ pub use plan::{PlanStep, Progress};
 pub use provider::{KeySource, ProviderInfo, SignIn};
 pub use queue::{QueueState, Queued};
 pub use setting::{Pick, Setting, Slash};
-pub use tool::{Background, Diff, Kind, Tool, ToolInfo, ToolState};
+pub use tool::{Background, Diff, Kind, Merge, Tool, ToolInfo, ToolState, Worktree};
 pub use toolserver::{Reach, ToolServer};
 pub use usage::Usage;

@@ -30,8 +30,9 @@ pub struct Harness {
     errors: Arc<Mutex<String>>,
 }
 
-/// What listening to the harness for a moment came to.
+/// What listening to the harness for a moment came to; nearly always an event, so the event is kept unboxed.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Heard {
     /// The harness reported this.
     Event(Event),
