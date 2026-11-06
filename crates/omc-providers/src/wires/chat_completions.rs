@@ -82,6 +82,8 @@ pub(crate) async fn list_models(target: Target<'_>) -> Result<Vec<String>, Provi
 }
 
 /// Converts the conversation into the `messages` array, system prompt first.
+///
+/// A compaction is left out: the agent gives the model its summary as a user message in its place. So is a pruning, which the agent applies to the tool results it gives.
 pub(crate) fn messages_json(system: &str, messages: &[Message]) -> Vec<Value> {
     let mut out = vec![json!({"role": "system", "content": system})];
     for message in messages {
@@ -124,6 +126,7 @@ pub(crate) fn messages_json(system: &str, messages: &[Message]) -> Vec<Value> {
                 }
                 out.extend(result_images(results));
             }
+            Message::Compaction(_) | Message::Pruning(_) => {}
         }
     }
     out

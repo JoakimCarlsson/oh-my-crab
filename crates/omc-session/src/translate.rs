@@ -79,7 +79,7 @@ fn lost_turn(lost: &omc_agent::Lost) -> PastTurn {
 
 /// The turns a saved `history` tells, as the events a live conversation would have sent for them, with the context size measured against `window`.
 ///
-/// A turn starts at each message the reader wrote. The target of a call is taken from its tool in `registry` when it is still there. The files a call changed come back as its diff when they were saved with it.
+/// A turn starts at each message the reader wrote. The target of a call is taken from its tool in `registry` when it is still there. The files a call changed come back as its diff when they were saved with it. A compaction shows as a finished `compact` call whose output is its summary, followed by how full the context was after it, as it did live: in a turn of its own when the reader asked for it, which its mark says, and otherwise in the turn it happened in. A pruning shows only as how full the context was after it.
 pub(crate) fn replay(
     history: &[omc_providers::Message],
     marks: &[omc_agent::Marked],
@@ -92,18 +92,27 @@ pub(crate) fn replay(
     let mut turns: Vec<PastTurn> = Vec::new();
     let mut ended = 0;
     for (at, message) in history.iter().enumerate() {
-        if matches!(message, Message::User(_)) {
+        let mark = marks
+            .iter()
+            .find(|(position, _)| *position == at)
+            .map(|(_, mark)| mark);
+        let asked_for = matches!(message, Message::Compaction(_)) && mark.is_some();
+        if matches!(message, Message::User(_)) || asked_for {
             while ended < lost.len() && lost[ended].at <= at {
                 turns.push(lost_turn(&lost[ended]));
                 ended += 1;
             }
         }
+        if asked_for && let Some(mark) = mark {
+            turns.push(PastTurn {
+                id: Some(mark.id.clone()),
+                prompt: mark.text.clone(),
+                files: mark.files.clone(),
+                events: Vec::new(),
+            });
+        }
         match message {
             Message::User(text) => {
-                let mark = marks
-                    .iter()
-                    .find(|(position, _)| *position == at)
-                    .map(|(_, mark)| mark);
                 turns.push(PastTurn {
                     id: mark.map(|mark| mark.id.clone()),
                     prompt: mark.map_or_else(|| text.clone(), |mark| mark.text.clone()),
@@ -163,6 +172,28 @@ pub(crate) fn replay(
                         },
                         window.unwrap_or(0),
                     ));
+                }
+            }
+            Message::Compaction(compaction) => {
+                let Some(turn) = turns.last_mut() else {
+                    continue;
+                };
+                for event in omc_agent::replayed(at, compaction) {
+                    if let (AgentEvent::Used(_), None) = (&event, window) {
+                        continue;
+                    }
+                    turn.events
+                        .extend(translate_all(event, window.unwrap_or(0)));
+                }
+            }
+            Message::Pruning(pruning) => {
+                if let (Some(turn), Some(window)) = (turns.last_mut(), window)
+                    && pruning.tokens_after > 0
+                {
+                    turn.events.push(Event::Used(Usage {
+                        used: pruning.tokens_after,
+                        size: window,
+                    }));
                 }
             }
         }
@@ -569,6 +600,79 @@ mod tests {
         assert_eq!(turns[1].events, vec![Event::Halted, Event::Finished(None)]);
         assert_eq!(turns[2].events, vec![Event::Finished(Some("boom".into()))]);
         assert_eq!(turns[2].id.as_deref(), Some("b"));
+    }
+
+    /// Every turn from before a compaction still comes back, and the compaction shows in its turn as a finished `compact` call with the summary.
+    #[test]
+    fn replay_keeps_turns_before_a_compaction() {
+        let registry = omc_tools::Registry::new();
+        let mut history = saved();
+        history.insert(
+            4,
+            omc_providers::Message::Compaction(omc_providers::Compaction {
+                summary: "read a, said alpha".into(),
+                first_kept: 3,
+                tokens_before: 900,
+                ..Default::default()
+            }),
+        );
+        let turns = replay(&history, &[], &[], &Default::default(), &registry, None);
+        let prompts: Vec<&str> = turns.iter().map(|turn| turn.prompt.as_str()).collect();
+        assert_eq!(prompts, vec!["read a", "thanks"]);
+        let tools: Vec<&Tool> = turns[0]
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Tool(tool) if tool.id == "compact-4" => Some(tool),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].title.as_deref(), Some(omc_agent::COMPACT));
+        assert_eq!(tools[1].state, Some(ToolState::Done));
+        assert_eq!(tools[1].output.as_deref(), Some("read a, said alpha"));
+    }
+
+    /// A compaction the reader asked for comes back as a turn of its own under its mark, ending with how full the context was after it.
+    #[test]
+    fn replay_gives_an_asked_for_compaction_its_own_turn() {
+        let registry = omc_tools::Registry::new();
+        let mut history = saved();
+        history.push(omc_providers::Message::Compaction(
+            omc_providers::Compaction {
+                summary: "all said".into(),
+                first_kept: 4,
+                tokens_before: 900,
+                tokens_after: 120,
+                ..Default::default()
+            },
+        ));
+        let marks = vec![(
+            6,
+            omc_agent::Mark {
+                id: "c".into(),
+                text: "/compact".into(),
+                files: Vec::new(),
+            },
+        )];
+        let turns = replay(
+            &history,
+            &marks,
+            &[],
+            &Default::default(),
+            &registry,
+            Some(1_000),
+        );
+        let prompts: Vec<&str> = turns.iter().map(|turn| turn.prompt.as_str()).collect();
+        assert_eq!(prompts, vec!["read a", "thanks", "/compact"]);
+        assert_eq!(turns[2].id.as_deref(), Some("c"));
+        assert!(matches!(
+            turns[2].events.last(),
+            Some(Event::Used(Usage {
+                used: 120,
+                size: 1_000
+            }))
+        ));
     }
 
     /// A call whose changes were saved comes back with its diff, and one with several files gets an event for each.

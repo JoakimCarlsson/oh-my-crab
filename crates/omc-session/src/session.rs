@@ -16,7 +16,7 @@ use tokio::task::AbortHandle;
 use crate::prompt::compose;
 use crate::settings::{CHECKPOINTS, EFFORT, MODE, MODEL, Mode, OFF, ON};
 use crate::shared::Shared;
-use crate::turn::{Ended, Turn};
+use crate::turn::{Ended, Job, Turn};
 
 /// A conversation that has been opened.
 struct Open {
@@ -90,6 +90,19 @@ impl Session {
                 turn,
                 context,
             } => {
+                if let Some(focus) = compact_request(&text) {
+                    if !files.is_empty() {
+                        return self.say(Event::Failed(
+                            "/compact takes no files; send them with a prompt instead".to_owned(),
+                        ));
+                    }
+                    let mark = turn.map(|id| omc_agent::Mark {
+                        id,
+                        text: text.clone(),
+                        files: Vec::new(),
+                    });
+                    return self.start(Job::Compact(focus), mark);
+                }
                 let names = files
                     .iter()
                     .filter_map(|file| file.file_name())
@@ -101,7 +114,7 @@ impl Session {
                     files: names,
                 });
                 let told = format!("{}{}", context.unwrap_or_default(), compose(&text, &files));
-                self.prompt(told, mark);
+                self.start(Job::Prompt(told), mark);
             }
             Command::Choose { ticket, option } => {
                 self.shared.questions.answer(ticket, option.as_deref());
@@ -290,8 +303,8 @@ impl Session {
         }));
     }
 
-    /// Starts a turn with `prompt`, which the client described as `mark` when it did, unless one is running or nothing is open.
-    fn prompt(&mut self, prompt: String, mark: Option<omc_agent::Mark>) {
+    /// Starts a turn doing `job`, whose prompt the client described as `mark` when it did, unless one is running or nothing is open.
+    fn start(&mut self, job: Job, mark: Option<omc_agent::Mark>) {
         let (true, Some((_, model))) = (self.open.is_some(), self.shared.model()) else {
             return self.say(Event::Failed("the conversation is not open".to_owned()));
         };
@@ -312,7 +325,10 @@ impl Session {
         self.turns += 1;
         let number = self.turns;
         self.resets_at_start = self.shared.notebook.resets();
-        let prompt = expand_skill(&prompt, &open.discovered.skills);
+        let job = match job {
+            Job::Prompt(prompt) => Job::Prompt(expand_skill(&prompt, &open.discovered.skills)),
+            compact => compact,
+        };
         let turn = Turn {
             provider: open.provider,
             model,
@@ -326,7 +342,7 @@ impl Session {
         };
         let ended = self.ended.clone();
         let task = tokio::spawn(async move {
-            let how = turn.run(prompt).await;
+            let how = turn.run(job).await;
             let _ = ended.send((number, how));
         });
         self.running = Some((number, task.abort_handle()));
@@ -670,16 +686,29 @@ fn restored_settings(
 /// The name the skill tool is registered under.
 const SKILL_TOOL: &str = "skill";
 
-/// The commands the client offers behind a slash for what was `discovered`: one for each skill.
+/// The command that compacts the conversation.
+const COMPACT_COMMAND: &str = "compact";
+
+/// The commands the client offers behind a slash for what was `discovered`: compacting the conversation, then one for each skill.
 fn commands_of(discovered: &Discovered) -> Vec<Slash> {
-    discovered
-        .skills
-        .iter()
-        .map(|skill| Slash {
+    let compact = Slash {
+        name: COMPACT_COMMAND.to_owned(),
+        description: "Summarize the older part of the conversation to free up context; text after the command says what the summary should keep in particular".to_owned(),
+    };
+    std::iter::once(compact)
+        .chain(discovered.skills.iter().map(|skill| Slash {
             name: skill.name.clone(),
             description: skill.description.clone(),
-        })
+        }))
         .collect()
+}
+
+/// What to give particular attention to when `text` asks for the conversation to be compacted, as `/compact` followed by an optional focus; nothing when it asks for something else.
+fn compact_request(text: &str) -> Option<Option<String>> {
+    let rest = text.trim().strip_prefix('/')?;
+    let (name, focus) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    (name == COMPACT_COMMAND)
+        .then(|| Some(focus.trim().to_owned()).filter(|focus| !focus.is_empty()))
 }
 
 /// Tests for the conversation's re-reading of what is on disk.
@@ -739,8 +768,8 @@ mod tests {
         let Ok(Event::Commands(commands)) = events.try_recv() else {
             panic!("the new skill was not announced");
         };
-        assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].name, "fresh");
+        let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec![COMPACT_COMMAND, "fresh"]);
         let open = session.open.as_ref().unwrap();
         assert!(open.base.get("skill").is_some());
         session.rescan();
@@ -804,6 +833,20 @@ mod tests {
         jobs.spawn("forever".into(), None, std::future::pending());
         session.stop();
         assert!(jobs.wait().await.is_err());
+    }
+
+    /// `/compact` asks for a compaction, with what follows it as the focus; other text, and commands that only start the same way, do not.
+    #[test]
+    fn recognises_a_compact_request() {
+        assert_eq!(compact_request("/compact"), Some(None));
+        assert_eq!(compact_request("  /compact  \n"), Some(None));
+        assert_eq!(
+            compact_request("/compact keep the API notes"),
+            Some(Some("keep the API notes".to_owned()))
+        );
+        assert_eq!(compact_request("/compacting"), None);
+        assert_eq!(compact_request("please /compact"), None);
+        assert_eq!(compact_request("compact"), None);
     }
 
     /// A conversation id is a file name, so it may not climb out of the folder, and the history of an id is found again by the same id.

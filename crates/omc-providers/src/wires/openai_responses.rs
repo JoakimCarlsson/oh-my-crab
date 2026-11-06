@@ -150,7 +150,9 @@ fn is_reasoning(item: &Value) -> bool {
 ///
 /// Reasoning items kept in a reply's `opaque` go back, without their ids,
 /// ahead of the output they accompanied; items that are not Codex reasoning
-/// are dropped.
+/// are dropped. A compaction is left out: the agent gives the model its
+/// summary as a user message in its place. So is a pruning, which the agent
+/// applies to the tool results it gives.
 pub(crate) fn input_json(messages: &[Message]) -> Vec<Value> {
     let mut items = Vec::new();
     for message in messages {
@@ -199,6 +201,7 @@ pub(crate) fn input_json(messages: &[Message]) -> Vec<Value> {
                     }));
                 }
             }
+            Message::Compaction(_) | Message::Pruning(_) => {}
         }
     }
     items

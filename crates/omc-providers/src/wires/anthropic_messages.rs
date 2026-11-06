@@ -404,7 +404,9 @@ fn replays_thinking(parsed: &ClaudeModel, params: &ThinkingParams) -> bool {
 /// Signed thinking blocks kept in a reply's `opaque` go back first in the
 /// assistant message that carries them when `replay` is set; blocks that are
 /// not Claude thinking are dropped. Tool names get the wire prefix when
-/// `prefixed` is set.
+/// `prefixed` is set. A compaction is left out: the agent gives the model its
+/// summary as a user message in its place. So is a pruning, which the agent
+/// applies to the tool results it gives.
 pub(crate) fn messages_json(messages: &[Message], prefixed: bool, replay: bool) -> Vec<Value> {
     let wire_name = |name: &str| {
         if prefixed {
@@ -460,6 +462,7 @@ pub(crate) fn messages_json(messages: &[Message], prefixed: bool, replay: bool) 
                     .collect();
                 Some(json!({ "role": "user", "content": blocks }))
             }
+            Message::Compaction(_) | Message::Pruning(_) => None,
         })
         .collect()
 }

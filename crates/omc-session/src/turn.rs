@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use omc_agent::{Context, EventSink, Live, Scribe, run_turn_recorded};
+use omc_agent::{Context, EventSink, Live, Scribe, compact, run_turn_recorded};
 use omc_auth::AuthError;
 use omc_context::{Discovered, Environment, Locations};
 use omc_providers::Provider;
@@ -22,6 +22,14 @@ pub(crate) enum Ended {
     SignedOut(String),
     /// It failed for this reason.
     Failed(String),
+}
+
+/// What a turn is asked to do.
+pub(crate) enum Job {
+    /// Answer this prompt.
+    Prompt(String),
+    /// Summarize the older part of the conversation, giving particular attention to this when it is given.
+    Compact(Option<String>),
 }
 
 /// Everything one turn needs.
@@ -47,8 +55,8 @@ pub(crate) struct Turn {
 }
 
 impl Turn {
-    /// Runs the turn for `prompt` against the hosted model and says how it ended.
-    pub(crate) async fn run(self, prompt: String) -> Ended {
+    /// Does `job` with the hosted model and says how it ended.
+    pub(crate) async fn run(self, job: Job) -> Ended {
         let credentials = match self
             .shared
             .with_home(omc_providers::credentials_for(self.provider))
@@ -63,11 +71,11 @@ impl Turn {
             credentials,
             model: self.model.clone(),
         };
-        self.run_with(Arc::new(model), prompt).await
+        self.run_with(Arc::new(model), job).await
     }
 
-    /// Runs the turn for `prompt` against `model` and says how it ended.
-    pub(crate) async fn run_with(mut self, model: Arc<dyn ChatModel>, prompt: String) -> Ended {
+    /// Does `job` with `model` and says how it ended.
+    pub(crate) async fn run_with(mut self, model: Arc<dyn ChatModel>, job: Job) -> Ended {
         let window = omc_providers::context_window(self.provider, &self.model);
         let effort = self.shared.effort_now();
         let out = self.shared.out.clone();
@@ -112,14 +120,28 @@ impl Turn {
             window: Some(window),
             checkpoint: checkpoint.as_deref(),
         };
-        let result = run_turn_recorded(
-            &context,
-            &mut self.history,
-            prompt,
-            events.as_ref(),
-            self.scribe.as_ref(),
-        )
-        .await;
+        let result = match job {
+            Job::Prompt(prompt) => {
+                run_turn_recorded(
+                    &context,
+                    &mut self.history,
+                    prompt,
+                    events.as_ref(),
+                    self.scribe.as_ref(),
+                )
+                .await
+            }
+            Job::Compact(focus) => {
+                compact(
+                    &context,
+                    &mut self.history,
+                    focus.as_deref(),
+                    events.as_ref(),
+                    self.scribe.as_ref(),
+                )
+                .await
+            }
+        };
         match result {
             Ok(()) => Ended::Done(self.history),
             Err(error) => Ended::Failed(error.to_string()),
@@ -204,7 +226,7 @@ mod tests {
         let model = Arc::new(Planner {
             seen: Mutex::new(Vec::new()),
         });
-        let running = tokio::spawn(turn.run_with(model.clone(), "plan it".into()));
+        let running = tokio::spawn(turn.run_with(model.clone(), Job::Prompt("plan it".into())));
         let ticket = loop {
             match events.recv().await {
                 Some(Event::Ask(asked)) => {
@@ -323,6 +345,83 @@ mod tests {
         }
     }
 
+    /// A model that answers every request, summary requests included, with the same text.
+    struct Summarizer;
+
+    #[async_trait]
+    impl ChatModel for Summarizer {
+        /// Answers with a summary.
+        async fn complete(&self, _: Request<'_>, _: &mut dyn Sink) -> Result<Reply, ProviderError> {
+            Ok(Reply {
+                text: "what happened".into(),
+                ..Reply::default()
+            })
+        }
+    }
+
+    /// Compacting on request summarizes the older turns, keeps every message in the history, and shows the client a finished `compact` step with the summary and a smaller context.
+    #[tokio::test]
+    async fn compacting_on_request_shows_a_compact_step() {
+        let (out, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared::new(out);
+        shared.open(Provider::Claude, vec!["m".into()], "m".into(), Mode::Yolo);
+        let history = vec![
+            Message::User("a".repeat(100_000)),
+            Message::Assistant(Reply {
+                text: "first".into(),
+                ..Reply::default()
+            }),
+            Message::User("b".repeat(100_000)),
+            Message::Assistant(Reply {
+                text: "second".into(),
+                ..Reply::default()
+            }),
+        ];
+        let turn = Turn {
+            provider: Provider::Claude,
+            model: "m".into(),
+            base: Arc::new(Registry::new()),
+            denied: Arc::new(Vec::new()),
+            discovered: Arc::new(Discovered::default()),
+            locations: Arc::new(Locations {
+                directory: std::path::PathBuf::from("."),
+                root: None,
+                home: None,
+                claude: None,
+                codex: None,
+            }),
+            shared,
+            history: history.clone(),
+            scribe: None,
+        };
+        let Ended::Done(compacted) = turn
+            .run_with(Arc::new(Summarizer), Job::Compact(Some("names".into())))
+            .await
+        else {
+            panic!("compaction failed");
+        };
+        assert_eq!(compacted[..4], history[..]);
+        let Message::Compaction(compaction) = &compacted[4] else {
+            panic!("no compaction recorded");
+        };
+        assert_eq!(compaction.first_kept, 2);
+        let mut done = None;
+        let mut used = None;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                Event::Tool(tool) if tool.state == Some(omc_wire::ToolState::Done) => {
+                    done = Some(tool)
+                }
+                Event::Used(usage) => used = Some(usage.used),
+                _ => {}
+            }
+        }
+        let done = done.expect("no finished compact step");
+        assert_eq!(done.id, "compact-4");
+        assert_eq!(done.output.as_deref(), Some("what happened"));
+        assert!(used.is_some_and(|used| used < compaction.tokens_before));
+    }
+
     /// Reading then editing two lines changes the file and sends a diff; an edit with a stale tag is refused with a message to read again.
     #[tokio::test]
     async fn edits_report_a_diff_and_stale_tags_are_refused() {
@@ -354,7 +453,7 @@ mod tests {
         let model = Arc::new(Editor {
             step: Mutex::new(0),
         });
-        let Ended::Done(history) = turn.run_with(model, "edit".into()).await else {
+        let Ended::Done(history) = turn.run_with(model, Job::Prompt("edit".into())).await else {
             panic!("turn failed");
         };
         assert_eq!(

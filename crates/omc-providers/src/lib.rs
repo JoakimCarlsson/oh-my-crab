@@ -12,8 +12,8 @@ mod wires;
 mod xxh64;
 
 pub use chat::{
-    ChatModel, DeltaSink, Effort, Image, Message, Part, RemoteModel, Reply, Request, Sink, Tokens,
-    ToolCall, ToolResult, ToolSpec,
+    ChatModel, Compaction, DeltaSink, Effort, Elided, Elision, Image, Message, Part, Pruning,
+    RemoteModel, Reply, Request, Sink, Tokens, ToolCall, ToolResult, ToolSpec,
 };
 pub use error::ProviderError;
 pub use models::{context_window, efforts};

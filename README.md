@@ -38,6 +38,36 @@ sends with `Rename` always wins.
 The commands and events are defined in `crates/omc-wire`. `crates/omc-client`
 is a small blocking client for programs that start `crab` and talk to it.
 
+## Long conversations
+
+When a conversation's context nears the model's window, `crab` first leaves
+old tool outputs out of what the model is sent: every output of at least 50
+tokens outside the most recent 40,000 tokens of tool output, as long as that
+saves at least 20,000 tokens. Each is replaced with a short note. A read made
+again with the same arguments makes the earlier copy out of date, and that copy
+is left out as soon as doing so costs little of the provider's prompt cache.
+When leaving outputs out is not enough, `crab` compacts the conversation
+before the next request. It asks the model for a structured summary of the
+older messages, building on the previous summary when there is one, and keeps
+about 20,000 tokens of the most recent messages as they are. The threshold is
+the window less 15% of it; on a window over 65,536 tokens it is at least 16,384
+tokens below the window. When a provider still refuses a request as too long,
+`crab` compacts and sends the request again, once a turn. Sending `/compact`,
+optionally followed by what the summary should keep in particular, compacts on
+demand; it takes no files.
+
+A compaction deletes nothing. It is recorded at the point it happened, the
+summary goes to the model in place of the older messages, and the whole
+conversation stays saved and is still shown when it is opened again, with the
+compaction as a finished `compact` step holding the summary. A `/compact` the
+reader sent comes back as a turn of its own, and one that failed comes back
+with its reason.
+
+Nothing left out or summarized is lost to the model either. Once a
+conversation has been pruned or compacted, the model is offered a `recall` tool
+that reads the whole history again: the full output of one tool call, the
+lines that contain some text, or a range of messages by number.
+
 ## Providers
 
 `claude`, `codex`, `copilot`, `openrouter` and `ollama`. See

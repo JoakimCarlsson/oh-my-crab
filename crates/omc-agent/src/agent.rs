@@ -4,12 +4,15 @@ use std::sync::Arc;
 
 use futures_util::future::join_all;
 use omc_providers::{
-    ChatModel, Effort, Message, Part, ProviderError, Reply, Request, Sink, Tokens, ToolCall,
-    ToolResult, ToolSpec,
+    ChatModel, Effort, Message, Part, ProviderError, Pruning, Reply, Request, Sink, Tokens,
+    ToolCall, ToolResult, ToolSpec,
 };
 use omc_tools::{Checkpoint, FileChange, Notebook, Registry, sanitize};
 use thiserror::Error;
 
+use crate::compaction;
+use crate::pruning;
+use crate::recall::{self, RECALL};
 use crate::{ApprovalRequest, Approvals, Scribe};
 
 /// Something the UI should show while a turn runs.
@@ -74,6 +77,9 @@ pub enum AgentError {
     /// The model answered the prompt with nothing: no text and no tool calls.
     #[error("the model returned an empty answer; the provider may have filtered or dropped it")]
     Empty,
+    /// The history could not be compacted, for this reason.
+    #[error("compacting the conversation failed: {0}")]
+    Compaction(String),
 }
 
 /// The tools and system prompt to use for the next request, when they can change while a turn runs.
@@ -102,7 +108,7 @@ pub struct Context<'a> {
     pub notebook: Option<&'a Notebook>,
     /// The checkpoint whose rewind requests are carried out when a batch of tool calls has finished, by replacing the history since the checkpoint with the report. It is forgotten when the turn ends.
     pub checkpoint: Option<&'a Checkpoint>,
-    /// The size of the model's context window in tokens, when it is known; the agent is reminded to save its notes when a request fills most of it.
+    /// The size of the model's context window in tokens, when it is known; the agent is reminded to save its notes when a request fills most of it, and the older part of the history is summarized before a request that would fill nearly all of it.
     pub window: Option<u64>,
 }
 
@@ -306,6 +312,8 @@ fn is_empty(reply: &Reply) -> bool {
 /// When the provider refuses a request while the history holds images, the
 /// images are taken out, with a note left in their place, and the request is
 /// sent once more, since the usual cause is a model without image input.
+///
+/// When the window is known and the context has grown past the compaction threshold, the older part of the history is summarized before the next request; a summary that cannot be made is shown and not tried again this turn. When the provider says a request holds more than the window takes, the history is compacted and the request sent once more, once a turn.
 async fn drive(
     context: &Context<'_>,
     history: &mut Vec<Message>,
@@ -316,22 +324,54 @@ async fn drive(
     let mut reminded = false;
     let mut first = true;
     let mut stripped = false;
+    let mut overflowed = false;
+    let mut compaction_failed = false;
     loop {
         let live = context.refresh.map(|refresh| refresh());
         let registry = live
             .as_ref()
             .map_or(context.registry, |live| &*live.registry);
         let system = live.as_ref().map_or(context.system, |live| &*live.system);
-        let specs = tool_specs(registry);
+        if let Some(pruning) = pruning::stale(history) {
+            prune_history(history, pruning, system, events, scribe);
+        }
+        if !compaction_failed
+            && over_threshold(context, history, system)
+            && make_room(context, history, system, false, events, scribe)
+                .await
+                .is_err()
+        {
+            compaction_failed = true;
+        }
+        let mut specs = tool_specs(registry);
+        if recall::offered(history) && registry.get(RECALL).is_none() {
+            specs.push(recall::spec());
+        }
         let mut chunks = Chunks { events };
-        let request = Request {
-            system,
-            messages: history,
-            tools: &specs,
-            effort: context.effort,
+        let answered = {
+            let messages = compaction::context(history);
+            let request = Request {
+                system,
+                messages: &messages,
+                tools: &specs,
+                effort: context.effort,
+            };
+            context.model.complete(request, &mut chunks).await
         };
-        let reply = match context.model.complete(request, &mut chunks).await {
+        let reply = match answered {
             Ok(reply) => reply,
+            Err(error) if !overflowed && error.is_context_overflow() => {
+                overflowed = true;
+                match make_room(context, history, system, true, events, scribe).await {
+                    Ok(true) => continue,
+                    Ok(false) => return Err(error.into()),
+                    Err(reason) => {
+                        return Err(AgentError::Compaction(format!(
+                            "{reason}, after the provider refused the request as too long: {error}"
+                        )));
+                    }
+                }
+            }
             Err(error) if !stripped && refuses_request(&error) && strip_images(history) => {
                 stripped = true;
                 continue;
@@ -367,7 +407,7 @@ async fn drive(
             }
             events(event);
         };
-        let mut results = run_calls(registry, context.approvals, &calls, &capture).await;
+        let mut results = run_calls(registry, context.approvals, history, &calls, &capture).await;
         for (call, files) in changed
             .into_inner()
             .unwrap_or_else(|held| held.into_inner())
@@ -413,6 +453,141 @@ async fn drive(
     }
 }
 
+/// Compacts `history` now, as the reader asked: summarizes all but the most recent messages, giving particular attention to `focus` when there is one, and records the compaction with `scribe`, which is synced when it is done.
+///
+/// When the compaction fails, the journal records the turn that asked for it as lost for that reason, as it does for a failed turn, so a reopened conversation still shows it.
+///
+/// # Errors
+///
+/// Returns [`AgentError::Compaction`] when the history holds nothing old enough to summarize, or when the summary could not be made; the history is then left as it was.
+pub async fn compact(
+    context: &Context<'_>,
+    history: &mut Vec<Message>,
+    focus: Option<&str>,
+    events: &(dyn Fn(AgentEvent) + Send + Sync),
+    scribe: Option<&Scribe>,
+) -> Result<(), AgentError> {
+    let live = context.refresh.map(|refresh| refresh());
+    let system = live.as_ref().map_or(context.system, |live| &*live.system);
+    let result = match compact_history(context, history, system, focus, events, scribe).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(AgentError::Compaction(
+            "there is nothing to compact yet: the conversation is no longer than the recent messages a compaction keeps".to_owned(),
+        )),
+        Err(reason) => Err(AgentError::Compaction(reason)),
+    };
+    if let (Err(error), Some(scribe)) = (&result, scribe)
+        && let Err(error) = scribe.cut_losing(history.len(), &error.to_string())
+    {
+        eprintln!("history not saved: {error}");
+    }
+    if let Some(Err(error)) = scribe.map(Scribe::sync) {
+        eprintln!("history not saved: {error}");
+    }
+    result
+}
+
+/// Whether the window is known and the context of `history`, sent with the system prompt `system`, has grown past the compaction threshold.
+fn over_threshold(context: &Context<'_>, history: &[Message], system: &str) -> bool {
+    context.window.is_some_and(|window| {
+        compaction::context_tokens(history, system) > compaction::threshold(window)
+    })
+}
+
+/// Makes room in the context of `history`, sent with the system prompt `system`: leaves old tool outputs out first, and summarizes the older part of the history when that is not enough to bring the context under the compaction threshold, or always when `overflowed`, since the provider has refused a request as too long and the estimate cannot be trusted.
+///
+/// Returns whether anything was left out or summarized.
+///
+/// # Errors
+///
+/// Returns why, for the reader, when a summary was needed and could not be made; what was left out stays left out.
+async fn make_room(
+    context: &Context<'_>,
+    history: &mut Vec<Message>,
+    system: &str,
+    overflowed: bool,
+    events: &(dyn Fn(AgentEvent) + Send + Sync),
+    scribe: Option<&Scribe>,
+) -> Result<bool, String> {
+    let pruned = match pruning::prune(history) {
+        Some(pruning) => {
+            prune_history(history, pruning, system, events, scribe);
+            true
+        }
+        None => false,
+    };
+    if pruned && !overflowed && !over_threshold(context, history, system) {
+        return Ok(true);
+    }
+    Ok(compact_history(context, history, system, None, events, scribe).await? || pruned)
+}
+
+/// Appends `pruning` to `history` and to `scribe`'s journal, with how full the context of `history`, sent with the system prompt `system`, is after it, and shows that through `events`.
+fn prune_history(
+    history: &mut Vec<Message>,
+    pruning: Pruning,
+    system: &str,
+    events: &(dyn Fn(AgentEvent) + Send + Sync),
+    scribe: Option<&Scribe>,
+) {
+    history.push(Message::Pruning(pruning));
+    let tokens_after = compaction::estimated(history, system);
+    let at = history.len() - 1;
+    if let Message::Pruning(pruning) = &mut history[at] {
+        pruning.tokens_after = tokens_after;
+    }
+    record(scribe, &history[at]);
+    events(AgentEvent::Used(Tokens {
+        input: tokens_after,
+        ..Tokens::default()
+    }));
+}
+
+/// Summarizes the older part of `history`, whose context is sent with the system prompt `system`, and appends the compaction to it and to `scribe`'s journal; `focus` is what the summary should give particular attention to.
+///
+/// The compaction is shown through `events` as a call of the `compact` tool, followed by how full the context is after it. Returns whether the history was compacted: it is not when nothing is old enough to summarize.
+///
+/// # Errors
+///
+/// Returns why, for the reader, when the summary could not be made; the history is then left as it was.
+async fn compact_history(
+    context: &Context<'_>,
+    history: &mut Vec<Message>,
+    system: &str,
+    focus: Option<&str>,
+    events: &(dyn Fn(AgentEvent) + Send + Sync),
+    scribe: Option<&Scribe>,
+) -> Result<bool, String> {
+    let tokens = compaction::context_tokens(history, system);
+    let Some(plan) = compaction::plan(history, compaction::keep_recent(context.window), tokens)
+    else {
+        return Ok(false);
+    };
+    let at = history.len();
+    events(compaction::started(at, tokens));
+    match compaction::summarize(context.model, context.effort, history, &plan, focus).await {
+        Ok(done) => {
+            let summary = done.summary.clone();
+            history.push(Message::Compaction(done));
+            let tokens_after = compaction::estimated(history, system);
+            if let Message::Compaction(done) = &mut history[at] {
+                done.tokens_after = tokens_after;
+            }
+            record(scribe, &history[at]);
+            events(compaction::finished(at, summary, false));
+            events(AgentEvent::Used(Tokens {
+                input: tokens_after,
+                ..Tokens::default()
+            }));
+            Ok(true)
+        }
+        Err(reason) => {
+            events(compaction::finished(at, reason.clone(), true));
+            Err(reason)
+        }
+    }
+}
+
 /// Describes every registered tool in the provider-neutral form.
 fn tool_specs(registry: &Registry) -> Vec<ToolSpec> {
     registry
@@ -433,6 +608,7 @@ fn tool_specs(registry: &Registry) -> Vec<ToolSpec> {
 async fn run_calls(
     registry: &Registry,
     approvals: &Approvals,
+    history: &[Message],
     calls: &[ToolCall],
     events: &(dyn Fn(AgentEvent) + Send + Sync),
 ) -> Vec<ToolResult> {
@@ -441,16 +617,28 @@ async fn run_calls(
     let mut sequential = Vec::new();
     for (index, call) in calls.iter().enumerate() {
         let tool = registry.get(&call.name);
-        let summary = sanitize(&tool.map_or_else(
-            || call.arguments.to_string(),
-            |t| t.describe(&call.arguments),
-        ));
+        let recalls = tool.is_none() && call.name == RECALL && recall::offered(history);
+        let summary = sanitize(&match tool {
+            Some(tool) => tool.describe(&call.arguments),
+            None if recalls => recall::describe(&call.arguments),
+            None => call.arguments.to_string(),
+        });
         events(AgentEvent::ToolStart {
             id: call.id.clone(),
             name: call.name.clone(),
             summary: summary.clone(),
         });
         match tool {
+            None if recalls => {
+                slots[index] = Some(match recall::run(history, call.arguments.clone()) {
+                    Ok((text, images)) => {
+                        let mut result = finish(call, text, false, Vec::new(), events);
+                        result.images = images;
+                        result
+                    }
+                    Err(message) => finish(call, message, true, Vec::new(), events),
+                });
+            }
             None => {
                 let message = format!("unknown tool: {}", call.name);
                 slots[index] = Some(finish(call, message, true, Vec::new(), events));

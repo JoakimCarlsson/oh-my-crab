@@ -164,6 +164,63 @@ pub enum Message {
     Assistant(Reply),
     /// The results for the tool calls of the previous assistant message.
     ToolResults(Vec<ToolResult>),
+    /// The point where the older part of the history was summarized; it is never sent as it is, but stands for what the model is given from then on.
+    Compaction(Compaction),
+    /// The point where tool outputs earlier in the history were elided to save room; it is never sent, but from then on those outputs are given to the model as short notes.
+    Pruning(Pruning),
+}
+
+/// Tool outputs left out of what the model is given from the point this is recorded on, each replaced with a short note saying why and how to read it again.
+///
+/// The outputs themselves stay in the history, so the conversation can still be shown, and the outputs read again, whole.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Pruning {
+    /// The outputs left out.
+    pub elided: Vec<Elided>,
+    /// About how many tokens the context held right after the outputs were left out, system prompt included.
+    pub tokens_after: u64,
+}
+
+/// One tool output left out of what the model is given.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Elided {
+    /// The position in the history of the tool results the output is one of.
+    pub at: usize,
+    /// The id of the call the output answers.
+    pub call_id: String,
+    /// Why it was left out.
+    pub reason: Elision,
+}
+
+/// Why a tool output was left out of what the model is given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Elision {
+    /// It was old and large, and the context was nearly full.
+    Old,
+    /// The same read was made again later, so this copy is out of date.
+    Superseded,
+}
+
+/// A summary that stands in for the older part of a history, recorded at the point it was made.
+///
+/// The messages before it stay in the history, so the conversation can still be shown and read whole; what the model is given from this point on is the summary, then the messages from `first_kept` up to this point, then the messages after it.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Compaction {
+    /// The summary of the messages it replaces.
+    pub summary: String,
+    /// The position in the history of the first message kept as it is after the summary.
+    pub first_kept: usize,
+    /// About how many tokens the context held before it was compacted.
+    pub tokens_before: u64,
+    /// About how many tokens the context held right after it was compacted, system prompt included.
+    pub tokens_after: u64,
+    /// The files read in the summarized messages and in those summarized before them, without the ones also changed.
+    pub read_files: Vec<String>,
+    /// The files changed in the summarized messages and in those summarized before them.
+    pub modified_files: Vec<String>,
 }
 
 /// The kind of a block of a streamed reply.
