@@ -18,7 +18,7 @@ use tokio::task::AbortHandle;
 
 use crate::prompt::compose;
 use crate::settings::{
-    CACHE, CHECKPOINTS, EFFORT, MODE, MODEL, Mode, OFF, ON, WARMING, parse_retention,
+    CACHE, CHECKPOINTS, EFFORT, MEMORY, MODE, MODEL, Mode, OFF, ON, WARMING, parse_retention,
 };
 use crate::shared::Shared;
 use crate::turn::{Ended, Job, Turn};
@@ -268,6 +268,8 @@ impl Session {
             isolation,
         });
         let mode = if yolo { Mode::Yolo } else { Mode::Asking };
+        self.shared
+            .set_memories(memories_for(&directory, conversation.clone()));
         self.shared.open(provider, models, model, mode);
         let chosen = self
             .journal
@@ -595,6 +597,13 @@ impl Session {
                 }
                 _ => false,
             },
+            MEMORY => match value {
+                ON | OFF => {
+                    self.shared.set_memory(value == ON);
+                    true
+                }
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -640,6 +649,14 @@ fn spill_for(id: Option<&str>) -> Spill {
         Some(id) => Spill::for_conversation(id),
         None => Spill::default(),
     }
+}
+
+/// The memories of the project `directory` belongs to and of the user, for the conversation `id` when it has one; nothing when [`omc_memory::SWITCH_VARIABLE`] turns memory off or there is no folder to keep them in.
+fn memories_for(directory: &Path, id: Option<String>) -> Option<Arc<omc_memory::Memories>> {
+    if omc_memory::disabled_by_environment() {
+        return None;
+    }
+    omc_memory::Memories::open(directory, id).map(Arc::new)
 }
 
 /// How long the worktrees of other conversations are kept after they were made, before they are taken to be left behind by a run that stopped or crashed.

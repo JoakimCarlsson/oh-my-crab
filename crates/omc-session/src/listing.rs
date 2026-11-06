@@ -69,6 +69,10 @@ pub fn tools() -> Result<Vec<ToolInfo>, String> {
         jobs: shared.jobs.clone(),
         unnamed: true,
         isolation: None,
+        memories: (!omc_memory::disabled_by_environment())
+            .then(|| omc_memory::Memories::open(&directory, None))
+            .flatten()
+            .map(Arc::new),
     });
     let mut listed: Vec<ToolInfo> = Vec::new();
     for plan in [false, true] {
@@ -90,11 +94,18 @@ pub fn tools() -> Result<Vec<ToolInfo>, String> {
 mod tests {
     use super::*;
 
-    /// Every tool of either mode is listed once, with a short description.
+    /// Every tool of either mode is listed once, with a short description; the memory tools are among them unless memory is turned off for the process.
     #[test]
     fn lists_every_tool_once() {
         let listed = tools().unwrap();
-        let names: Vec<&str> = listed.iter().map(|tool| tool.name.as_str()).collect();
+        let mut names: Vec<&str> = listed.iter().map(|tool| tool.name.as_str()).collect();
+        let memory = ["memory_edit", "memory_search", "remember"];
+        if !omc_memory::disabled_by_environment() {
+            for name in memory {
+                assert!(names.contains(&name), "{name} missing");
+            }
+        }
+        names.retain(|name| !memory.contains(name));
         assert_eq!(
             names,
             [

@@ -33,6 +33,9 @@ pub(crate) const LONG: &str = "1h";
 /// The id of the setting that turns keeping the prompt cache warm on or off; it takes [`ON`] and [`OFF`].
 pub(crate) const WARMING: &str = "cache_warming";
 
+/// The id of the setting that turns the memory that outlives conversations on or off; it takes [`ON`] and [`OFF`].
+pub(crate) const MEMORY: &str = "memory";
+
 /// The value of the cache setting that stands for `retention`.
 pub(crate) fn retention_value(retention: Retention) -> &'static str {
     match retention {
@@ -98,6 +101,8 @@ pub(crate) struct Offer<'a> {
     pub(crate) retention: Option<Retention>,
     /// Whether the prompt cache is kept warm, when the provider can be warmed.
     pub(crate) warming: Option<bool>,
+    /// Whether the agent has its memory, when memory can be had at all.
+    pub(crate) memory: Option<bool>,
 }
 
 /// The effort a model thinks at when the reader has not picked one: medium when it offers it, otherwise its lightest.
@@ -108,7 +113,7 @@ pub(crate) fn default_effort(efforts: &[Effort]) -> Option<Effort> {
         .or_else(|| efforts.first().copied())
 }
 
-/// The settings for `offer`; the effort setting is left out when the model takes none, and the cache settings when the provider offers no choice.
+/// The settings for `offer`; the effort setting is left out when the model takes none, the cache settings when the provider offers no choice, and the memory setting when memory is turned off for the whole process or has no folder to live in.
 pub(crate) fn offered(offer: &Offer<'_>) -> Vec<Setting> {
     let mut names: Vec<&str> = offer.models.iter().map(String::as_str).collect();
     if !names.contains(&offer.model) {
@@ -196,6 +201,26 @@ pub(crate) fn offered(offer: &Offer<'_>) -> Vec<Setting> {
             ],
         });
     }
+    if let Some(memory) = offer.memory {
+        settings.push(Setting {
+            id: MEMORY.to_owned(),
+            category: MEMORY.to_owned(),
+            name: "Memory".to_owned(),
+            current: if memory { ON } else { OFF }.to_owned(),
+            picks: vec![
+                pick(
+                    ON,
+                    "On",
+                    "The agent starts with what earlier conversations in this project remembered, and can save, search, correct and forget memories",
+                ),
+                pick(
+                    OFF,
+                    "Off",
+                    "No memories are loaded, and the agent has no memory tools",
+                ),
+            ],
+        });
+    }
     settings.push(Setting {
         id: CHECKPOINTS.to_owned(),
         category: CHECKPOINTS.to_owned(),
@@ -247,22 +272,32 @@ mod tests {
             checkpoints: false,
             retention: None,
             warming: None,
+            memory: None,
         }
     }
 
-    /// The cache settings come before the checkpoints, only when the provider offers them, and their values round-trip.
+    /// The cache and memory settings come before the checkpoints, only when they can be had, and the cache values round-trip.
     #[test]
     fn cache_settings_follow_the_provider() {
         let models = [];
         let mut offer = offer(&models, &[], None);
         offer.retention = Some(Retention::Long);
         offer.warming = Some(true);
+        offer.memory = Some(false);
         let settings = offered(&offer);
         let ids: Vec<&str> = settings.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(
             ids,
-            ["model", "mode", "cache", "cache_warming", "checkpoints"]
+            [
+                "model",
+                "mode",
+                "cache",
+                "cache_warming",
+                "memory",
+                "checkpoints"
+            ]
         );
+        assert_eq!(settings[4].current, "off");
         assert_eq!(
             (settings[2].current.as_str(), settings[3].current.as_str()),
             ("1h", "on")

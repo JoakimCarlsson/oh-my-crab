@@ -1539,6 +1539,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "omc-memory"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "omc-context",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "omc-providers"
 version = "0.1.0"
 dependencies = [
@@ -1568,6 +1579,7 @@ dependencies = [
  "omc-context",
  "omc-lsp",
  "omc-mcp",
+ "omc-memory",
  "omc-providers",
  "omc-tools",
  "omc-wire",
@@ -1597,6 +1609,7 @@ dependencies = [
  "image",
  "libc",
  "omc-context",
+ "omc-memory",
  "omc-wire",
  "pdf-extract",
  "regex",

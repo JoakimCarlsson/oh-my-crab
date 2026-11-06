@@ -8,6 +8,7 @@
 mod bridge;
 mod languages;
 mod listing;
+mod memory;
 mod prefix;
 mod prompt;
 mod providers;
@@ -22,6 +23,7 @@ mod turn;
 mod warmer;
 
 pub use listing::tools;
+pub use memory::memory;
 pub use providers::{account, key_source, providers, save_key, signed_in};
 pub use serve::serve;
 pub use session::{Options, run, run_with};

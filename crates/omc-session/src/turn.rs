@@ -120,6 +120,7 @@ impl Turn {
             .then(|| self.shared.checkpoint.clone());
         let environment = Arc::new(self.environment());
         let unnamed = self.shared.title().is_none();
+        let memories = self.shared.memories_now();
         let tree = self.shared.tree(&self.locations.directory).await;
         let toolset = Toolset::build(&Inputs {
             base: &self.base,
@@ -137,11 +138,13 @@ impl Turn {
             jobs: self.shared.jobs.clone(),
             unnamed,
             isolation: self.isolation.clone(),
+            memories: memories.clone(),
         });
         let key = Key {
             provider: self.provider,
             model: self.model.clone(),
             checkpoints: checkpoint.is_some(),
+            memory: memories.is_some(),
         };
         let prefix = self.shared.prefix(&key, || {
             Prefix::freeze(
@@ -184,6 +187,10 @@ impl Turn {
                     planning(),
                     &toolset,
                 );
+                if let Some(memories) = memories.filter(|_| prefix.wants_memory(&self.history)) {
+                    let digest = digest(memories, prompt.clone()).await;
+                    told.push(prefix.memory_notice(&digest));
+                }
                 told.push(prompt);
                 run_turn_steered(
                     &context,
@@ -211,6 +218,19 @@ impl Turn {
             Err(error) => Ended::Failed(error.to_string()),
         }
     }
+}
+
+/// The digest of `memories` a conversation whose prompt is `prompt` starts with, read on a thread for blocking work; empty when there are none or they cannot be read, which the agent is then told as there being none.
+async fn digest(memories: Arc<omc_memory::Memories>, prompt: String) -> String {
+    tokio::task::spawn_blocking(move || match memories.all() {
+        Ok(all) => omc_memory::digest(all, &prompt),
+        Err(error) => {
+            eprintln!("memories not loaded: {error}");
+            String::new()
+        }
+    })
+    .await
+    .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -967,5 +987,165 @@ mod tests {
         assert_eq!(diffs[0].old.as_deref(), Some("a\nb\nc\n"));
         assert_eq!(diffs[0].new, "A\nb\nC\n");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A model that saves a memory on its first request and answers every other one, keeping what each request carried.
+    struct Rememberer {
+        /// What each request carried.
+        seen: Mutex<Vec<Sent>>,
+    }
+
+    #[async_trait]
+    impl ChatModel for Rememberer {
+        /// Calls `remember` the first time, then answers.
+        async fn complete(
+            &self,
+            request: Request<'_>,
+            _: &mut dyn Sink,
+        ) -> Result<Reply, ProviderError> {
+            let mut seen = self.seen.lock().unwrap();
+            seen.push(Sent::of(&request));
+            Ok(if seen.len() == 1 {
+                calling(
+                    "remember",
+                    json!({"text": "Release builds need the `ci` feature.", "tags": ["build"]}),
+                )
+            } else {
+                Reply {
+                    text: "ok".into(),
+                    ..Reply::default()
+                }
+            })
+        }
+    }
+
+    /// A fresh folder named `name` for a turn to work in, and memories kept in a store inside it, holding one memory about integration tests.
+    fn with_memories(name: &str) -> (std::path::PathBuf, Arc<omc_memory::Memories>) {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let memories = Arc::new(omc_memory::Memories::new(
+            &omc_memory::Store::new(dir.join("store")),
+            omc_memory::Project::of(&dir),
+            None,
+        ));
+        memories
+            .remember(
+                "Integration tests need Docker running.",
+                &[],
+                omc_memory::Scope::Project,
+            )
+            .unwrap();
+        (dir, memories)
+    }
+
+    /// The names of the tools `sent` offered.
+    fn tool_names(sent: &Sent) -> Vec<&str> {
+        sent.tools
+            .iter()
+            .map(|tool| tool[0].as_str().unwrap())
+            .collect()
+    }
+
+    /// The first prompt starts with the digest of the memories; a memory saved during the turn is kept on disk and never makes the system prompt, the tool list or the next prompt change.
+    #[tokio::test]
+    async fn the_memory_digest_comes_once_and_the_prefix_holds() {
+        let (dir, memories) = with_memories("turn-memory");
+        let (out, _events) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared::new(out);
+        shared.set_memories(Some(memories.clone()));
+        shared.open(Provider::Claude, vec!["m".into()], "m".into(), Mode::Yolo);
+        let model = Arc::new(Rememberer {
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut history = Vec::new();
+        for prompt in ["how do I run the integration tests", "next"] {
+            let turn = turn_in(&dir, &shared, history);
+            let Ended::Done(after) = turn
+                .run_with(model.clone(), Job::Prompt(prompt.into()))
+                .await
+            else {
+                panic!("turn failed");
+            };
+            history = after;
+        }
+        let seen = model.seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        for sent in seen.iter() {
+            assert_eq!(sent.system.as_bytes(), seen[0].system.as_bytes());
+            assert_eq!(
+                serde_json::to_vec(&sent.tools).unwrap(),
+                serde_json::to_vec(&seen[0].tools).unwrap()
+            );
+        }
+        let names = tool_names(&seen[0]);
+        for name in ["remember", "memory_search", "memory_edit"] {
+            assert!(names.contains(&name), "{name} missing");
+        }
+        assert!(seen[0].system.contains("# Memory"));
+        let first = seen[0].prompt.as_deref().unwrap();
+        assert!(
+            first.contains("<memory>") && first.contains("Integration tests need Docker running.")
+        );
+        assert!(first.ends_with("how do I run the integration tests"));
+        assert_eq!(seen[2].prompt.as_deref(), Some("next"));
+        let saved = memories.all().unwrap();
+        assert_eq!(saved.len(), 2);
+        assert_eq!(saved[1].text, "Release builds need the `ci` feature.");
+        assert_eq!(saved[1].tags, ["build"]);
+    }
+
+    /// With the setting off the agent has no memory tools and no digest; turned on again, the next prompt brings the digest, and a compaction that summarized it away brings it once more.
+    #[tokio::test]
+    async fn the_memory_setting_and_compaction() {
+        let (dir, memories) = with_memories("turn-memory-off");
+        let (out, _events) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared::new(out);
+        shared.set_memories(Some(memories));
+        shared.open(Provider::Claude, vec!["m".into()], "m".into(), Mode::Asking);
+        shared.set_memory(false);
+        let model = Arc::new(Recording {
+            seen: Mutex::new(Vec::new()),
+        });
+        let run = |history: Vec<Message>, prompt: &'static str| {
+            let turn = turn_in(&dir, &shared, history);
+            let model = model.clone();
+            async move {
+                match turn.run_with(model, Job::Prompt(prompt.into())).await {
+                    Ended::Done(after) => after,
+                    _ => panic!("turn failed"),
+                }
+            }
+        };
+        let mut history = run(Vec::new(), "one").await;
+        shared.set_memory(true);
+        history = run(history, "two").await;
+        history.push(Message::Compaction(omc_providers::Compaction {
+            summary: "s".into(),
+            first_kept: history.len(),
+            ..omc_providers::Compaction::default()
+        }));
+        run(history, "three").await;
+        let seen = model.seen.lock().unwrap();
+        let off = &seen[0];
+        assert!(
+            !tool_names(off)
+                .iter()
+                .any(|name| name.contains("memory") || *name == "remember")
+        );
+        assert!(!off.system.contains("# Memory"));
+        assert!(!off.prompt.as_deref().unwrap().contains("<memory>"));
+        let on = &seen[1];
+        assert!(tool_names(on).contains(&"remember"));
+        assert!(
+            on.prompt
+                .as_deref()
+                .unwrap()
+                .contains("Integration tests need Docker")
+        );
+        let after = seen[2].prompt.as_deref().unwrap();
+        assert!(after.contains("<memory>") && after.ends_with("three"));
     }
 }

@@ -81,8 +81,21 @@ pub fn build_subagent_prompt(input: PromptInput<'_>, role: &str) -> String {
 /// One `has_<tool>` flag for each tool the prompt knows how to talk about, set when `tools` names the tool.
 pub(crate) fn flags(tools: &[String]) -> Vec<(String, String)> {
     [
-        "read", "grep", "glob", "bash", "edit", "write", "todo", "ask", "task", "skill",
-        "ast_grep", "ast_edit",
+        "read",
+        "grep",
+        "glob",
+        "bash",
+        "edit",
+        "write",
+        "todo",
+        "ask",
+        "task",
+        "skill",
+        "ast_grep",
+        "ast_edit",
+        "remember",
+        "memory_search",
+        "memory_edit",
     ]
     .iter()
     .map(|tool| {

@@ -1,0 +1,5 @@
+Saves one durable fact or lesson to memory, which outlives this conversation: every later conversation in this project starts with a digest of the memories and can search them.
+
+Save what a later conversation would otherwise have to rediscover the hard way: a build, test or environment quirk, a non-obvious convention or design decision, a pitfall and its fix, a preference the user stated. Write `text` as one self-contained statement that makes sense without this conversation, with the concrete names, commands and paths, at most 2,000 bytes. NEVER save what the code, its docs or instruction files already say, progress on the current task, guesses, or secrets such as keys and passwords.
+
+`tags` are a few short words to file it under. `scope` is `project` (default), shared by every conversation and worktree of this repository, or `user`, kept for the user across every project: only for their own lasting preferences. Saving text that is already kept adds the tags to the existing memory. Returns the memory's id.

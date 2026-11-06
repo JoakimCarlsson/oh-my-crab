@@ -39,6 +39,10 @@ struct State {
     retention: Retention,
     /// Whether the prompt cache is kept warm while the agent waits.
     warming: bool,
+    /// Whether the agent has its memory, when the conversation has memories to reach.
+    memory: bool,
+    /// The memories of the conversation's project and of the user, when memory is not turned off for the process.
+    memories: Option<Arc<omc_memory::Memories>>,
 }
 
 /// What a conversation's commands, turns and tools share.
@@ -135,6 +139,8 @@ impl Shared {
                 checkpoints: false,
                 retention: Retention::Short,
                 warming: true,
+                memory: true,
+                memories: None,
             }),
             prefix: Mutex::new(None),
             tree: Mutex::new(None),
@@ -318,6 +324,7 @@ impl Shared {
                     .map(|_| state.retention),
                 warming: omc_providers::warmable(provider, &state.model, None)
                     .then_some(state.warming),
+                memory: state.memories.as_ref().map(|_| state.memory),
             }))
         });
         if let Some(settings) = settings {
@@ -411,6 +418,24 @@ impl Shared {
             self.warmer.stop();
         }
         self.checkpoint.clear();
+    }
+
+    /// Gives the conversation `memories`, the memories of its project and of the user, or none when memory is turned off for the process or has no folder.
+    pub(crate) fn set_memories(&self, memories: Option<Arc<omc_memory::Memories>>) {
+        self.state(|state| state.memories = memories);
+    }
+
+    /// The memories the turns that start now are given: nothing when the setting is off or there are none.
+    pub(crate) fn memories_now(&self) -> Option<Arc<omc_memory::Memories>> {
+        self.state(|state| state.memories.clone().filter(|_| state.memory))
+    }
+
+    /// Turns the agent's memory on or off for the turns that start from now on; turning it either way stops warming the last request, whose tool list the next turn no longer sends.
+    pub(crate) fn set_memory(&self, enabled: bool) {
+        let was = self.state(|state| std::mem::replace(&mut state.memory, enabled));
+        if was != enabled {
+            self.warmer.stop();
+        }
     }
 
     /// Changes the effort the reader picked and the checkpoint setting with `with`, without anything else that changing them does.
@@ -569,6 +594,37 @@ mod tests {
         let settings = announced(&mut events);
         let setting = settings.iter().find(|s| s.id == "checkpoints").unwrap();
         assert_eq!(setting.current, "on");
+    }
+
+    /// Memory is offered as a setting, on, only when the conversation has memories; turning it off withholds them and stops warming the last request.
+    #[tokio::test]
+    async fn memory_is_a_setting() {
+        let (shared, mut events) = opened();
+        shared.announce();
+        assert!(!announced(&mut events).iter().any(|s| s.id == "memory"));
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/shared-memory");
+        let memories = Arc::new(omc_memory::Memories::new(
+            &omc_memory::Store::new(root),
+            omc_memory::Project::of(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))),
+            None,
+        ));
+        shared.set_memories(Some(memories));
+        shared.announce();
+        let settings = announced(&mut events);
+        let setting = settings.iter().find(|s| s.id == "memory").unwrap();
+        assert_eq!(setting.current, "on");
+        assert!(shared.memories_now().is_some());
+        shared.warmer.arm();
+        shared.set_memory(false);
+        assert!(!shared.warmer.armed());
+        assert!(shared.memories_now().is_none());
+        shared.announce();
+        let settings = announced(&mut events);
+        assert_eq!(
+            settings.iter().find(|s| s.id == "memory").unwrap().current,
+            "off"
+        );
     }
 
     /// Another effort or turning the checkpoint tools on or off stops warming the last request; picking the same effort again does not.

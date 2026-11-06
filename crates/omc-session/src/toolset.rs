@@ -4,10 +4,11 @@ use std::sync::Arc;
 
 use omc_agent::{Approvals, EventSink, Isolation, Task, TaskSettings};
 use omc_context::{Discovered, Environment, PromptInput, build_subagent_prompt};
+use omc_memory::Memories;
 use omc_providers::{ChatModel, Effort};
 use omc_tools::{
-    Ask, Checkpoint, CheckpointTool, ContextNotes, ExitPlanMode, Host, Jobs, NewContext, Notebook,
-    Registry, Rewind, SetTitle, Todo, Wait,
+    Ask, Checkpoint, CheckpointTool, ContextNotes, ExitPlanMode, Host, Jobs, MemoryEdit,
+    MemorySearch, NewContext, Notebook, Registry, Remember, Rewind, SetTitle, Todo, Wait,
 };
 
 /// What the tools and prompts of a turn are built from.
@@ -42,6 +43,8 @@ pub(crate) struct Inputs<'a> {
     pub(crate) jobs: Arc<Jobs>,
     /// How subagents get git worktrees of their own, when they can.
     pub(crate) isolation: Option<Arc<Isolation>>,
+    /// The memories the agent reads and writes, when it has its memory.
+    pub(crate) memories: Option<Arc<Memories>>,
 }
 
 /// The tools of a turn in each mode.
@@ -68,14 +71,23 @@ impl Toolset {
 }
 
 /// The tools for plan mode when `plan` is set, and otherwise for the rest.
+///
+/// With memories, the agent can save, search and change them, while its subagents can only search them: what a subagent learns comes back in its result for the main agent to judge before anything is saved.
 fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
-    let base = if plan {
+    let mut base = if plan {
         inputs.base.read_only()
     } else {
         inputs.base.clone()
     };
+    if let Some(memories) = &inputs.memories {
+        base.register(MemorySearch::new(memories.clone()));
+    }
     let sub_base = Arc::new(base.foreground());
     let mut registry = base;
+    if let Some(memories) = &inputs.memories {
+        registry.register(Remember::new(memories.clone()));
+        registry.register(MemoryEdit::new(memories.clone()));
+    }
     registry.register(Todo::new(inputs.host.clone()));
     registry.register(Ask::new(inputs.host.clone()));
     registry.register(ContextNotes::new(inputs.notebook.clone()));
@@ -154,6 +166,15 @@ mod tests {
 
     /// Builds the toolset like [`toolset`], with `checkpoint` given to the agent when it is set.
     fn toolset_with(denied: &[String], checkpoint: Option<Arc<Checkpoint>>) -> Toolset {
+        toolset_full(denied, checkpoint, None)
+    }
+
+    /// Builds the toolset like [`toolset_with`], with `memories` given to the agent when they are set.
+    fn toolset_full(
+        denied: &[String],
+        checkpoint: Option<Arc<Checkpoint>>,
+        memories: Option<Arc<Memories>>,
+    ) -> Toolset {
         let (out, _events) = tokio::sync::mpsc::unbounded_channel();
         let shared = Shared::new(out);
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -185,7 +206,35 @@ mod tests {
             jobs: shared.jobs.clone(),
             unnamed: true,
             isolation: None,
+            memories,
         })
+    }
+
+    /// With memories, both modes have the three memory tools; without, neither has any.
+    #[test]
+    fn memory_tools_follow_the_memories() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/toolset-memory");
+        let memories = Arc::new(Memories::new(
+            &omc_memory::Store::new(root),
+            omc_memory::Project::of(std::path::Path::new(env!("CARGO_MANIFEST_DIR"))),
+            None,
+        ));
+        let tools = toolset_full(&[], None, Some(memories));
+        for plan in [false, true] {
+            let names = tools.tools(plan).names();
+            for name in ["remember", "memory_search", "memory_edit"] {
+                assert!(names.iter().any(|n| n == name), "{name} missing");
+            }
+        }
+        for plan in [false, true] {
+            let names = toolset(&[]).tools(plan).names();
+            assert!(
+                !names
+                    .iter()
+                    .any(|n| n.starts_with("memory") || n == "remember")
+            );
+        }
     }
 
     /// The checkpoint and rewind tools are there in both modes when they are given and in neither otherwise.

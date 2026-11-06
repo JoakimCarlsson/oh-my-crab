@@ -8,7 +8,16 @@ use crate::plugins::installed;
 use crate::{Locations, Origin, toml};
 
 /// The tools that only look and never change anything.
-pub const READ_ONLY_TOOLS: &[&str] = &["read", "grep", "glob", "ast_grep", "skill", "ask", "todo"];
+pub const READ_ONLY_TOOLS: &[&str] = &[
+    "read",
+    "grep",
+    "glob",
+    "ast_grep",
+    "skill",
+    "ask",
+    "todo",
+    "memory_search",
+];
 
 /// One kind of subagent.
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use omc_agent::RECALL;
 use omc_context::{
     Discovered, Environment, Notice, PromptInput, build_prompt, context_changes,
-    environment_reminder, plan_mode_notice,
+    environment_reminder, memory_notice, plan_mode_notice,
 };
 use omc_providers::{Message, Provider};
 use omc_tools::{Registry, Tool, ToolError, ToolOutput};
@@ -19,7 +19,7 @@ use crate::toolset::Toolset;
 /// Says whether plan mode is on now.
 pub(crate) type Planning = Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// What a prefix is made for. A new prefix is made when any of it changes: a new model has no cache to keep, and turning the checkpoint tools on or off is the reader's choice to change the tools.
+/// What a prefix is made for. A new prefix is made when any of it changes: a new model has no cache to keep, and turning the checkpoint tools or memory on or off is the reader's choice to change the tools.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Key {
     /// The provider that serves the model.
@@ -28,6 +28,8 @@ pub(crate) struct Key {
     pub(crate) model: String,
     /// Whether the agent has the checkpoint and rewind tools.
     pub(crate) checkpoints: bool,
+    /// Whether the agent has its memory.
+    pub(crate) memory: bool,
 }
 
 /// A tool as the model is told about it.
@@ -157,6 +159,19 @@ impl Prefix {
             told.push(wanted);
         }
         told
+    }
+
+    /// Whether the next prompt of a conversation whose history is `history` starts with the digest of the memories: the agent has its memory and no digest is left in what the model sees, as at the start of a conversation and after a compaction or a fresh context window dropped the earlier one.
+    ///
+    /// A memory saved later in the conversation therefore reaches the model through the tool that saved it rather than a new digest, and the system prompt never changes for it.
+    pub(crate) fn wants_memory(&self, history: &[Message]) -> bool {
+        self.key.memory && last_notice(&omc_agent::context(history), Notice::Memory).is_none()
+    }
+
+    /// The notice that hands the agent `digest`, pointing only at tools the prefix offers.
+    pub(crate) fn memory_notice(&self, digest: &str) -> String {
+        let offered: Vec<String> = self.specs.iter().map(|spec| spec.name.to_owned()).collect();
+        memory_notice(digest, &offered)
     }
 }
 

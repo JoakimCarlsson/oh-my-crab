@@ -1,7 +1,7 @@
 //! The `crab` binary: the harness, served to another program over standard input and output.
 
 /// Usage text printed for `--help` and after a bad argument.
-const USAGE: &str = "usage: crab <serve|tools|providers|account|history|rename|import>\n\n  serve                    hold a conversation: read commands from standard input, write events to standard output\n  tools                    print the tools the agent can have, as a JSON list of name and description\n  providers                print the providers a conversation can be opened with, as a JSON list of id, name and sign-in\n  account <provider> [folder]  print who <provider> is signed in as with the logins in [folder], or in crab's own folder, or nothing\n  history <id> [folder]    print the saved conversation <id> as JSON: its title, saved settings and turns, which works while it is open elsewhere\n  rename <id> <folder> <title>  name the saved conversation <id>, which fails while it is open elsewhere\n  import <id> <folder>          save the conversation a client kept, read as JSON from standard input, as the conversation <id>";
+const USAGE: &str = "usage: crab <serve|tools|providers|account|history|rename|import|memory>\n\n  serve                    hold a conversation: read commands from standard input, write events to standard output\n  tools                    print the tools the agent can have, as a JSON list of name and description\n  providers                print the providers a conversation can be opened with, as a JSON list of id, name and sign-in\n  account <provider> [folder]  print who <provider> is signed in as with the logins in [folder], or in crab's own folder, or nothing\n  history <id> [folder]    print the saved conversation <id> as JSON: its title, saved settings and turns, which works while it is open elsewhere\n  rename <id> <folder> <title>  name the saved conversation <id>, which fails while it is open elsewhere\n  import <id> <folder>          save the conversation a client kept, read as JSON from standard input, as the conversation <id>\n  memory [folder]          print the memories a conversation in [folder], or in the current folder, starts with, as JSON: its project's, which every worktree of the repository shares, and the user's";
 
 /// Runs the conversation the command line asks for.
 ///
@@ -70,6 +70,12 @@ async fn main() -> anyhow::Result<()> {
             let imported: omc_wire::Imported = serde_json::from_reader(std::io::stdin().lock())?;
             omc_session::import(&id, Some(std::path::PathBuf::from(folder)), &imported)
                 .map_err(|reason| anyhow::anyhow!(reason))
+        }
+        Some("memory") => {
+            let folder = std::env::args().nth(2).map(std::path::PathBuf::from);
+            let listed = omc_session::memory(folder).map_err(|reason| anyhow::anyhow!(reason))?;
+            println!("{}", serde_json::to_string(&listed)?);
+            Ok(())
         }
         Some("-h" | "--help") => {
             println!("{USAGE}");

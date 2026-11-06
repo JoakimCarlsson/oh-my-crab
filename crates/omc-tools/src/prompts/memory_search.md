@@ -1,0 +1,3 @@
+Searches the memories earlier conversations saved, for this project and for the user across projects. Matches the words of `query` against each memory's text and tags, forgiving typos and word endings, best match first; leave `query` out to list the most recent. `tags` keeps only memories carrying every tag given, `scope` (`project`, `user` or `all`, the default) keeps one scope, and `limit` (default 10, at most 50) caps the results.
+
+Each result gives the memory's id, scope, when it was saved or last changed, its tags and its text. Memories may have gone stale: check one against the code before relying on it.

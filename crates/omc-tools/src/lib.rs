@@ -31,5 +31,6 @@ pub use spill::Spill;
 pub use tool::{FileChange, Image, Tool, ToolOutput, marked_lines, parse_args, sanitize};
 pub use tools::{
     Ask, AstEdit, AstGrep, Bash, CheckpointTool, ContextNotes, Edit, ExitPlanMode, Glob, Grep,
-    NewContext, Read, Rewind, SetTitle, Skill, Todo, Wait, Write, snapshot_tag,
+    MemoryEdit, MemorySearch, NewContext, Read, Remember, Rewind, SetTitle, Skill, Todo, Wait,
+    Write, snapshot_tag,
 };

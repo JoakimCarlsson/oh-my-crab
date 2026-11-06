@@ -12,6 +12,7 @@ omc-context = { version = "0.1.0", path = "../omc-context" }
 omc-auth = { version = "0.1.0", path = "../omc-auth" }
 omc-lsp = { version = "0.1.0", path = "../omc-lsp", optional = true }
 omc-mcp = { version = "0.1.0", path = "../omc-mcp" }
+omc-memory = { version = "0.1.0", path = "../omc-memory" }
 omc-providers = { version = "0.1.0", path = "../omc-providers" }
 omc-tools = { version = "0.1.0", path = "../omc-tools" }
 omc-wire = { version = "0.1.0", path = "../omc-wire" }

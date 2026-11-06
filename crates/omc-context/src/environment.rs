@@ -54,6 +54,18 @@ fn date(seconds: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// The moment `seconds` after the Unix epoch, as `YYYY-MM-DDTHH:MM:SSZ` in UTC, which sorts in time order as text.
+pub fn timestamp(seconds: u64) -> String {
+    let within = seconds % 86_400;
+    format!(
+        "{}T{:02}:{:02}:{:02}Z",
+        date(seconds),
+        within / 3600,
+        within / 60 % 60,
+        within % 60
+    )
+}
+
 /// The branch the repository at `root` is on, or a short commit id when its head is detached.
 fn branch(root: &Path) -> Option<String> {
     let dot_git = root.join(".git");
@@ -89,6 +101,13 @@ mod tests {
         assert_eq!(date(0), "1970-01-01");
         assert_eq!(date(951_782_400), "2000-02-29");
         assert_eq!(date(1_793_664_000), "2026-11-03");
+    }
+
+    /// Timestamps carry the time of day after the date.
+    #[test]
+    fn timestamps() {
+        assert_eq!(timestamp(0), "1970-01-01T00:00:00Z");
+        assert_eq!(timestamp(1_793_664_000 + 3_723), "2026-11-03T01:02:03Z");
     }
 
     /// The branch is read from the head, attached or not.

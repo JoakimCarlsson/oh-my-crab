@@ -23,13 +23,13 @@ mod testutil;
 
 pub use agents::{AgentDefinition, READ_ONLY_TOOLS, builtin_agents};
 pub use discovery::{Discovered, discover};
-pub use environment::Environment;
+pub use environment::{Environment, timestamp};
 pub use frontmatter::{Parsed, parse as parse_frontmatter};
 pub use instructions::Instruction;
 pub use invoke::{
     expand_skill, plan_approved, plan_rejected, skill_invocation, subagent_assignment,
 };
-pub use notices::{Notice, context_changes, environment_reminder, plan_mode_notice};
+pub use notices::{Notice, context_changes, environment_reminder, memory_notice, plan_mode_notice};
 pub use origin::Origin;
 pub use place::{agent_places, instruction_places, skill_places};
 pub use scope::Locations;

@@ -1,4 +1,4 @@
-//! What the agent is told in a message, rather than in the system prompt, so that the system prompt stays the same for the whole conversation and the provider's prompt cache keeps it: the date and branch, plan mode turning on and off, and what changed on disk.
+//! What the agent is told in a message, rather than in the system prompt, so that the system prompt stays the same for the whole conversation and the provider's prompt cache keeps it: the date and branch, plan mode turning on and off, what changed on disk, and what earlier conversations remembered.
 
 use crate::Discovered;
 use crate::Environment;
@@ -17,6 +17,9 @@ const PLAN_OFF: &str = include_str!("prompts/plan_mode_off.md");
 /// What the agent is told when what was found on disk changed.
 const CHANGES: &str = include_str!("prompts/context_changes.md");
 
+/// The memories of earlier conversations the agent is told.
+const MEMORY: &str = include_str!("prompts/memory.md");
+
 /// The kinds of notice, each a block of its own tag that a later one of the same kind replaces.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Notice {
@@ -26,6 +29,8 @@ pub enum Notice {
     PlanMode,
     /// Skills, agents and instruction files that changed on disk.
     ContextChanges,
+    /// What earlier conversations remembered about the project and the user.
+    Memory,
 }
 
 impl Notice {
@@ -35,6 +40,7 @@ impl Notice {
             Notice::Environment => "environment",
             Notice::PlanMode => "plan-mode",
             Notice::ContextChanges => "context-changes",
+            Notice::Memory => "memory",
         }
     }
 
@@ -57,6 +63,16 @@ pub fn environment_reminder(environment: &Environment) -> String {
             ("branch", environment.branch.as_deref().unwrap_or_default()),
         ],
     )
+}
+
+/// The notice that hands the agent `memories`, the digest of what earlier conversations saved with one memory to a line, or says that nothing is saved yet when it is empty; it points at `memory_edit` only when `tools` names it.
+pub fn memory_notice(memories: &str, tools: &[String]) -> String {
+    let edit = if tools.iter().any(|tool| tool == "memory_edit") {
+        "1"
+    } else {
+        ""
+    };
+    render(MEMORY, &[("memories", memories), ("has_memory_edit", edit)])
 }
 
 /// The notice that plan mode is now `on`, giving the rules and `tools`, the tools it allows, when it is, and saying every tool may be used again when it is not.
@@ -181,6 +197,24 @@ mod tests {
         );
         assert_eq!(Notice::PlanMode.find_last(&text), None);
         assert_eq!(Notice::PlanMode.find_last("<plan-mode> cut"), None);
+    }
+
+    /// The memory notice lists the memories it is given, points at `memory_edit` only when it is offered, says so when there are none, and is found again as a notice of its kind.
+    #[test]
+    fn memory_notices() {
+        let tools: Vec<String> = vec!["memory_edit".into()];
+        let listed = memory_notice("- [a1] Use tabs.", &tools);
+        assert!(listed.starts_with("<memory>") && listed.ends_with("</memory>"));
+        assert!(listed.contains("- [a1] Use tabs.") && listed.contains("`memory_edit`"));
+        assert!(!memory_notice("- [a1] Use tabs.", &[]).contains("memory_edit"));
+        assert!(listed.contains("`memory_edit`.\n- [a1] Use tabs.\n</memory>"));
+        let empty = memory_notice("", &tools);
+        assert_eq!(
+            empty,
+            "<memory>\nNo memories are saved for this project yet.\n</memory>"
+        );
+        let text = format!("{empty}\n\nhello");
+        assert_eq!(Notice::Memory.find_last(&text), Some(empty.as_str()));
     }
 
     /// Turning plan mode on lists the tools it allows and its rules; turning it off says so.

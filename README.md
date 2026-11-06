@@ -27,6 +27,7 @@ crab account <p> [folder]       print who provider <p> is signed in as, or nothi
 crab history <id> [folder]      print a saved conversation: title, settings and turns
 crab rename <id> <folder> <t>   name a saved conversation nobody has open
 crab import <id> <folder>        save a conversation a client kept itself, read as JSON
+crab memory [folder]            print the memories a conversation in the folder starts with, as JSON
 ```
 
 A conversation opened with an id is saved by `crab`: its messages, its turns,
@@ -212,6 +213,59 @@ contain some text, or a range of messages by number. `recall` is on the tool
 list from the first turn, so the list does not change and cost the prompt
 cache when it becomes useful; called before anything was left out, it says
 there is nothing to read yet.
+
+## Memory
+
+The agent keeps a memory that outlives conversations. With `remember` it saves
+one durable fact or lesson at a time, such as a build quirk, a convention the
+code does not spell out or a preference the user stated, with a few tags if it
+likes; `memory_search` finds memories by the words of their text and tags,
+forgiving typos and word endings, best match first; and `memory_edit` corrects
+a memory or forgets it by its id. Each memory records when it was saved and
+the conversation that saved it, and when and by which conversation it was last
+changed. Saving text that is already kept, whatever its case and spacing, adds
+the new tags to the memory that is there instead of keeping it twice.
+
+Memories belong to a project by default. In a git repository the project is
+the repository: the main checkout and every linked worktree of it, such as the
+one an editor gives each agent session, share one memory, while a submodule
+and an unrelated repository with the same folder name each have their own.
+Outside a repository the project is the folder. A memory saved with
+`scope: "user"` is kept for the user across every project instead.
+
+The first prompt of a conversation starts with a digest of the memories in a
+`<memory>` notice, those that share the most words with the prompt first and
+the most recently changed among equals, at most 4,000 bytes with each memory
+cut to 300; a last line counts the ones left out, which `memory_search` still
+finds. With nothing saved yet, the notice says so. The digest is told once:
+memories saved later in the conversation reach the model through the tool
+call that saved them, and the system prompt and the tool list never change
+for them, so the prompt cache holds. After a compaction or a fresh context
+window has dropped the digest, the next prompt carries a new one.
+
+Subagents can search the memory but not change it: `memory_search` is among
+the tools they get, so what one of them learns comes back in its result for
+the main agent to judge before anything is saved.
+
+Memories are kept as JSON lines, one memory to a line, under
+`oh-my-crab/memory` in the user's data folder, or in the folder
+`OMC_MEMORY_DIR` names: a project's in `projects/<name>-<hash>/memories.jsonl`,
+beside a `project.json` saying which project it is for, and the user's in
+`user/memories.jsonl`. They can be read and edited by hand; a line that is not
+a memory is left as it is. Every change holds a lock on `memories.lock` beside
+the file, reads it again and replaces it whole through a temporary file, so
+conversations writing at once never lose each other's memories and a reader
+never sees half a file. On Unix the folders and files are made readable by
+the user alone.
+
+The `memory` setting (`on` by default, or `off`) is offered in each
+conversation; off, nothing is loaded and the agent has none of the three
+tools. Turning it either way changes the tool list from the next turn on.
+Set `OMC_MEMORY=0` to turn memory off for every conversation of the process;
+the setting is then not offered. `crab memory [folder]` prints the memories a
+conversation in the folder, or in the current one, would start with, as JSON:
+the project's name and folder, where its memories and the user's are kept,
+whether memory is on, and every memory with its scope.
 
 ## When things go wrong
 
@@ -428,9 +482,9 @@ Providers cache the start of a request, tools then system prompt then
 messages, only while it stays byte for byte the same. `crab` therefore makes
 the system prompt and the tool list once per conversation, when its first
 turn starts, and sends them unchanged after that; they are made again only
-when the model changes or the checkpoint tools are turned on or off. What
-changes later reaches the agent as a short notice at the start of the next
-prompt instead:
+when the model changes or the checkpoint tools or memory are turned on or
+off. What changes later reaches the agent as a short notice at the start of
+the next prompt instead:
 
 - today's date and the git branch, on the first prompt, again when either
   changes, and again after a compaction or a fresh context window has dropped
@@ -439,7 +493,9 @@ prompt instead:
   off;
 - skills, subagent kinds and instruction files that were added, changed or
   removed on disk since the system prompt was written; the notice only points
-  at tools the agent is offered.
+  at tools the agent is offered;
+- the digest of the memories earlier conversations saved, on the first prompt
+  and again after a compaction or a fresh context window has dropped it.
 
 The `skill` tool is on the list even when no skill exists yet, so that a skill
 added later can be loaded without changing the list; until then a call to it
