@@ -95,6 +95,11 @@ impl Tool for Grep {
         }
     }
 
+    /// The matches as a list, and whether the limit cut it.
+    fn data_shape(&self) -> Option<&'static str> {
+        Some("{ matches: { path: string; line: number; text: string }[]; truncated: boolean }")
+    }
+
     /// Runs the search on a blocking thread.
     async fn call(&self, args: Value) -> Result<ToolOutput, ToolError> {
         let args: Args = parse_args(args)?;
@@ -107,10 +112,33 @@ impl Tool for Grep {
         }
         let limit = args.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let sandbox = self.sandbox.clone();
-        let text = tokio::task::spawn_blocking(move || search(&sandbox, &target, &args, limit))
-            .await
-            .map_err(|e| ToolError::Failed(e.to_string()))??;
-        Ok(ToolOutput::new(text))
+        let (text, data) =
+            tokio::task::spawn_blocking(move || search(&sandbox, &target, &args, limit))
+                .await
+                .map_err(|e| ToolError::Failed(e.to_string()))??;
+        Ok(ToolOutput::new(text).with_data(data))
+    }
+}
+
+/// One matching line.
+struct Match {
+    /// Display path of the file.
+    path: String,
+    /// The line number, counted from one.
+    line: u64,
+    /// The line, cut to [`MAX_LINE_CHARS`] characters.
+    text: String,
+}
+
+impl Match {
+    /// The match as `path:line:text`.
+    fn shown(&self) -> String {
+        format!("{}:{}:{}", self.path, self.line, self.text)
+    }
+
+    /// The match as a JSON object with `path`, `line` and `text`.
+    fn value(&self) -> Value {
+        json!({ "path": self.path, "line": self.line, "text": self.text })
     }
 }
 
@@ -119,7 +147,7 @@ struct Collector<'a> {
     /// Display path of the file being searched.
     path: String,
     /// Matches gathered so far, across files.
-    found: &'a mut Vec<String>,
+    found: &'a mut Vec<Match>,
     /// Most matches to gather.
     limit: usize,
 }
@@ -127,12 +155,14 @@ struct Collector<'a> {
 impl Sink for Collector<'_> {
     type Error = io::Error;
 
-    /// Records the match as `path:line:text` and asks to stop once full.
+    /// Records the match and asks to stop once full.
     fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, io::Error> {
-        let number = mat.line_number().unwrap_or(0);
         let text = String::from_utf8_lossy(mat.bytes());
-        let text = clip(text.trim_end_matches(['\n', '\r']));
-        self.found.push(format!("{}:{number}:{text}", self.path));
+        self.found.push(Match {
+            path: self.path.clone(),
+            line: mat.line_number().unwrap_or(0),
+            text: clip(text.trim_end_matches(['\n', '\r'])),
+        });
         Ok(self.found.len() < self.limit)
     }
 }
@@ -145,7 +175,7 @@ fn clip(line: &str) -> String {
     }
 }
 
-/// Walks `target` and searches every file, returning the formatted result.
+/// Walks `target` and searches every file, returning the formatted result and the matches as data.
 ///
 /// # Errors
 ///
@@ -155,7 +185,7 @@ fn search(
     target: &Path,
     args: &Args,
     limit: usize,
-) -> Result<String, ToolError> {
+) -> Result<(String, Value), ToolError> {
     let matcher = RegexMatcherBuilder::new()
         .case_insensitive(args.case_insensitive.unwrap_or(false))
         .build(&args.pattern)
@@ -195,11 +225,20 @@ fn search(
             break;
         }
     }
+    let truncated = found.len() >= limit;
+    let data = json!({
+        "matches": found.iter().map(Match::value).collect::<Vec<_>>(),
+        "truncated": truncated,
+    });
     if found.is_empty() {
-        return Ok("No matches found".to_string());
+        return Ok(("No matches found".to_string(), data));
     }
-    let mut text = found.join("\n");
-    if found.len() >= limit {
+    let mut text = found
+        .iter()
+        .map(Match::shown)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if truncated {
         text.push_str(&format!(
             "\n[results truncated at {limit} matches; narrow the pattern, path or glob]"
         ));
@@ -208,7 +247,7 @@ fn search(
     for (path, tag) in tags {
         text.push_str(&format!("\n{path}: {tag}"));
     }
-    Ok(text)
+    Ok((text, data))
 }
 
 #[cfg(test)]

@@ -27,6 +27,7 @@ Matching skill → MUST load it with the `skill` tool first, or by reading its `
 # General
 SHOULD resolve prerequisites, parallelize independent calls. Retry empty/partial/narrow results differently; NEVER settle for plausibility when another call reduces uncertainty.
 {{#if has_task}}- User says `parallel` or `parallelize` → MUST use `task` subagents; parallel tool calls insufficient.{{/if}}
+{{#if has_script}}- Many calls feeding one small answer (scan, filter, count or rank across files; read only the matching ranges) → one `script` instead of a call per item; only what it prints and returns enters context.{{/if}}
 
 # Tool I/O
 - Prefer relative `path`-like fields.

@@ -11,6 +11,7 @@ license = "MIT"
 omc-agent = { path = "crates/omc-agent" }
 omc-auth = { path = "crates/omc-auth" }
 omc-providers = { path = "crates/omc-providers" }
+omc-script = { path = "crates/omc-script" }
 omc-tools = { path = "crates/omc-tools" }
 omc-wire = { path = "crates/omc-wire" }
 omc-mcp = { path = "crates/omc-mcp" }

@@ -90,6 +90,7 @@ pub(crate) fn flags(tools: &[String]) -> Vec<(String, String)> {
         "todo",
         "ask",
         "task",
+        "script",
         "skill",
         "ast_grep",
         "ast_edit",

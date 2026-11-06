@@ -28,7 +28,9 @@ pub use notebook::{NOTEBOOK_LIMIT, Notebook};
 pub use registry::Registry;
 pub use sandbox::Sandbox;
 pub use spill::Spill;
-pub use tool::{FileChange, Image, Tool, ToolOutput, marked_lines, parse_args, sanitize};
+pub use tool::{
+    Caller, FileChange, Image, NoCaller, Tool, ToolOutput, marked_lines, parse_args, sanitize,
+};
 pub use tools::{
     Ask, AstEdit, AstGrep, Bash, CheckpointTool, ContextNotes, Edit, ExitPlanMode, Glob, Grep,
     MemoryEdit, MemorySearch, NewContext, Read, Remember, Rewind, SetTitle, Skill, Todo, Wait,

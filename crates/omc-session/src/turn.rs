@@ -448,6 +448,94 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A model that runs one script, then answers, and keeps the results it was given.
+    struct Scripting {
+        /// The script it runs.
+        code: &'static str,
+        /// The results of each request that carried some.
+        results: Mutex<Vec<omc_providers::ToolResult>>,
+    }
+
+    #[async_trait]
+    impl ChatModel for Scripting {
+        /// Runs the script first, then says it is done.
+        async fn complete(
+            &self,
+            request: Request<'_>,
+            _: &mut dyn Sink,
+        ) -> Result<Reply, ProviderError> {
+            if let Some(Message::ToolResults(results)) = request.messages.last() {
+                self.results.lock().unwrap().extend(results.iter().cloned());
+                return Ok(Reply {
+                    text: "done".into(),
+                    ..Reply::default()
+                });
+            }
+            Ok(calling("script", json!({ "code": self.code })))
+        }
+    }
+
+    /// In plan mode a script can only call the tools that look, through the conversation's own tool list; its calls reach the client as children of the script call.
+    #[tokio::test]
+    async fn scripts_in_plan_mode_only_look() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/turn-script-plan");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "alpha\n").unwrap();
+        let (out, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared::new(out);
+        shared.open(Provider::Claude, vec!["m".into()], "m".into(), Mode::Yolo);
+        shared.set_mode(Mode::Plan);
+        let mut turn = turn_in(&dir, &shared, Vec::new());
+        let mut base = Registry::builtin(&dir).unwrap();
+        base.register(omc_script::Script::new(omc_tools::Spill::disabled()));
+        turn.base = Arc::new(base);
+        let model = Arc::new(Scripting {
+            code: "const text = await tools.read({ path: 'a.txt' });
+                   let refused;
+                   try { await tools.write({ path: 'made.txt', content: 'x' }); } catch (error) { refused = error.message; }
+                   return { read: text.includes('alpha'), refused };",
+            results: Mutex::new(Vec::new()),
+        });
+        let Ended::Done(_) = turn
+            .run_with(model.clone(), Job::Prompt("look".into()))
+            .await
+        else {
+            panic!("turn failed");
+        };
+        let results = model.results.lock().unwrap();
+        assert!(!results[0].is_error, "{}", results[0].text);
+        assert!(
+            results[0].text.contains("\"read\": true"),
+            "{}",
+            results[0].text
+        );
+        assert!(
+            results[0]
+                .text
+                .contains("there is no tool called write in scripts"),
+            "{}",
+            results[0].text
+        );
+        assert!(!dir.join("made.txt").exists());
+        let mut children = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let Event::Tool(tool) = event
+                && tool.parent.as_deref() == Some("script")
+            {
+                children.push(tool);
+            }
+        }
+        assert!(
+            children.iter().any(|tool| tool.id == "script:1"
+                && tool.title.as_deref() == Some("read")
+                && tool.agent.as_deref() == Some("script")),
+            "{children:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A model that answers every request at once and keeps what each carried.
     struct Recording {
         /// What each request carried.

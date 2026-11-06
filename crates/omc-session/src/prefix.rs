@@ -11,7 +11,7 @@ use omc_context::{
     environment_reminder, memory_notice, plan_mode_notice,
 };
 use omc_providers::{Message, Provider};
-use omc_tools::{Registry, Tool, ToolError, ToolOutput};
+use omc_tools::{Caller, Registry, Tool, ToolError, ToolOutput};
 use serde_json::Value;
 
 use crate::toolset::Toolset;
@@ -351,6 +351,31 @@ impl Tool for Gated {
             .map_err(ToolError::Failed)?
             .call_as(id, args)
             .await
+    }
+
+    /// Runs the tool of the mode on now for the call `id` with `args`, reaching other tools through `caller` when it runs any.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Gated::call`].
+    async fn call_through(
+        &self,
+        id: &str,
+        args: Value,
+        caller: &dyn Caller,
+    ) -> Result<ToolOutput, ToolError> {
+        self.current()
+            .map_err(ToolError::Failed)?
+            .call_through(id, args, caller)
+            .await
+    }
+
+    /// The shape of the data the tool gives, whichever mode has it.
+    fn data_shape(&self) -> Option<&'static str> {
+        self.full
+            .as_ref()
+            .or(self.plan.as_ref())
+            .and_then(|tool| tool.data_shape())
     }
 }
 

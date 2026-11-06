@@ -112,6 +112,17 @@ impl Registry {
         }
     }
 
+    /// The same registry with every tool that depends on what else the agent has replaced by its copy made for the tools here.
+    pub fn fitted(&self) -> Self {
+        Self {
+            tools: self
+                .tools
+                .iter()
+                .map(|(name, tool)| (*name, tool.fitted(self).unwrap_or_else(|| tool.clone())))
+                .collect(),
+        }
+    }
+
     /// A registry with only the tools that never change anything.
     pub fn read_only(&self) -> Self {
         self.filtered(|tool| tool.read_only())

@@ -551,15 +551,18 @@ impl Task {
         }
     }
 
-    /// The tools `agent` gets: those of the registry the tool was given, less what is withheld, and only those the definition lists when it lists any.
+    /// The tools `agent` gets: those of the registry the tool was given, less what is withheld, and only those the definition lists when it lists any; a tool that depends on what else the agent has, such as `script`, is fitted to them.
     fn tools_for(&self, agent: &AgentDefinition) -> Registry {
-        self.settings.registry.filtered(|tool| {
-            !WITHHELD.contains(&tool.name())
-                && agent
-                    .tools
-                    .as_ref()
-                    .is_none_or(|listed| listed.iter().any(|name| name == tool.name()))
-        })
+        self.settings
+            .registry
+            .filtered(|tool| {
+                !WITHHELD.contains(&tool.name())
+                    && agent
+                        .tools
+                        .as_ref()
+                        .is_none_or(|listed| listed.iter().any(|name| name == tool.name()))
+            })
+            .fitted()
     }
 
     /// The definition of the subagent kind `kind`.

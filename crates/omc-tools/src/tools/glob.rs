@@ -82,6 +82,11 @@ impl Tool for Glob {
         }
     }
 
+    /// The paths as a list, and whether the limit cut it.
+    fn data_shape(&self) -> Option<&'static str> {
+        Some("{ paths: string[]; truncated: boolean }")
+    }
+
     /// Runs the walk on a blocking thread.
     async fn call(&self, args: Value) -> Result<ToolOutput, ToolError> {
         let args: Args = parse_args(args)?;
@@ -94,15 +99,15 @@ impl Tool for Glob {
         }
         let limit = args.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let sandbox = self.sandbox.clone();
-        let text =
+        let (text, data) =
             tokio::task::spawn_blocking(move || find(&sandbox, &target, &args.pattern, limit))
                 .await
                 .map_err(|e| ToolError::Failed(e.to_string()))??;
-        Ok(ToolOutput::new(text))
+        Ok(ToolOutput::new(text).with_data(data))
     }
 }
 
-/// Walks `target` and lists files matching `pattern`, newest first.
+/// Walks `target` and lists files matching `pattern`, newest first, as text and as data.
 ///
 /// # Errors
 ///
@@ -112,7 +117,7 @@ fn find(
     target: &Path,
     pattern: &str,
     limit: usize,
-) -> Result<String, ToolError> {
+) -> Result<(String, Value), ToolError> {
     let pattern = if pattern.contains('/') {
         pattern.trim_start_matches("./").to_string()
     } else {
@@ -146,22 +151,20 @@ fn find(
         })
         .collect();
     if hits.is_empty() {
-        return Ok("No files found matching pattern".to_string());
+        let data = json!({ "paths": [], "truncated": false });
+        return Ok(("No files found matching pattern".to_string(), data));
     }
     hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     let total = hits.len();
-    let mut text = hits
-        .into_iter()
-        .take(limit)
-        .map(|(_, path)| path)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let paths: Vec<String> = hits.into_iter().take(limit).map(|(_, path)| path).collect();
+    let data = json!({ "paths": paths, "truncated": total > limit });
+    let mut text = paths.join("\n");
     if total > limit {
         text.push_str(&format!(
             "\n[showing {limit} of {total} matches; narrow the pattern or path]"
         ));
     }
-    Ok(text)
+    Ok((text, data))
 }
 
 #[cfg(test)]

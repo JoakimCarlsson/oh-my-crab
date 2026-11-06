@@ -2,13 +2,18 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use futures_util::future::join_all;
 use omc_providers::{
     ChatModel, Effort, Message, Part, ProviderError, Pruning, Reply, Request, Sink, Stop, Tokens,
     ToolCall, ToolResult, ToolSpec,
 };
-use omc_tools::{Checkpoint, FileChange, Notebook, Registry, Tool, sanitize};
+use omc_tools::{
+    Caller, Checkpoint, FileChange, NoCaller, Notebook, Registry, Tool, ToolOutput, sanitize,
+};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -883,6 +888,8 @@ fn tool_specs(registry: &Registry) -> Vec<ToolSpec> {
 /// race, while calls that need no approval run concurrently. The hooks see each
 /// call that succeeded once more, after it ran, and what they say is added to
 /// its result.
+///
+/// A tool that runs other tools, such as `script`, runs them through a [`Nested`] caller, so that each of its calls goes through the same steps and is reported under it.
 async fn run_calls(
     registry: &Registry,
     approvals: &Approvals,
@@ -895,98 +902,60 @@ async fn run_calls(
     let mut concurrent = Vec::new();
     let mut sequential = Vec::new();
     for (index, call) in calls.iter().enumerate() {
-        let recalls = call.name == RECALL && recall::offered(history);
-        let mut prepared = registry
-            .get(&call.name)
-            .filter(|_| !recalls)
-            .map(|tool| (tool, prepare(registry, call)));
-        let mut screened = Screening::default();
-        if let (Some(hooks), Some((_, Ok(arguments)))) = (hooks, &mut prepared) {
-            let verdict = hooks.before_tool(call, arguments).await;
-            if let Some(rewritten) = verdict.arguments {
-                match registry.prepared(&call.name, rewritten) {
-                    Ok((_, rewritten)) => *arguments = rewritten,
-                    Err(error) => {
-                        screened.denied =
-                            Some(format!("a hook rewrote the arguments wrongly: {error}"));
-                    }
+        if call.name == RECALL && recall::offered(history) {
+            events(AgentEvent::ToolStart {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                summary: sanitize(&recall::describe(&call.arguments)),
+            });
+            slots[index] = Some(match recall::run(history, call.arguments.clone()) {
+                Ok((text, images)) => {
+                    let mut result = finish(call, text, false, Vec::new(), events);
+                    result.images = images;
+                    result
                 }
-            }
-            match verdict.gate {
-                Gate::Pass => {}
-                Gate::Allow => screened.allowed = true,
-                Gate::Deny(reason) => screened.denied = Some(reason),
-            }
-            screened.note = verdict.note;
-        }
-        let summary = sanitize(&match &prepared {
-            Some((tool, Ok(arguments))) => tool.describe(arguments),
-            Some((tool, Err(_))) => tool.describe(&call.arguments),
-            None if recalls => recall::describe(&call.arguments),
-            None => call.arguments.to_string(),
-        });
-        events(AgentEvent::ToolStart {
-            id: call.id.clone(),
-            name: call.name.clone(),
-            summary: summary.clone(),
-        });
-        if let Some(reason) = screened.denied.take() {
-            let message = format!("a hook blocked this tool call: {}", reason.trim());
-            slots[index] = Some(finish(call, message, true, Vec::new(), events));
+                Err(message) => finish(call, message, true, Vec::new(), events),
+            });
             continue;
         }
-        match prepared {
-            None if recalls => {
-                slots[index] = Some(match recall::run(history, call.arguments.clone()) {
-                    Ok((text, images)) => {
-                        let mut result = finish(call, text, false, Vec::new(), events);
-                        result.images = images;
-                        result
-                    }
-                    Err(message) => finish(call, message, true, Vec::new(), events),
-                });
+        let ready = match admit(registry, hooks, call, events).await {
+            Admitted::Ended(result) => {
+                slots[index] = Some(result);
+                continue;
             }
-            None => {
-                let message = format!("unknown tool: {}", call.name);
-                slots[index] = Some(finish(call, message, true, Vec::new(), events));
-            }
-            Some((_, Err(message))) => {
-                slots[index] = Some(finish(call, message, true, Vec::new(), events));
-            }
-            Some((tool, Ok(arguments))) => {
-                let note = screened.note.take();
-                let Some(scope) = tool.approval_scope(&arguments) else {
-                    concurrent.push((index, tool, arguments, note));
-                    continue;
-                };
-                let request = ApprovalRequest {
-                    tool: call.name.clone(),
-                    scope,
-                    summary,
-                };
-                if screened.allowed || approvals.allows(&request).await {
-                    sequential.push((index, tool, arguments, note));
-                } else {
-                    let message = "the user denied this tool call".to_string();
-                    slots[index] = Some(finish(call, message, true, Vec::new(), events));
-                }
-            }
+            Admitted::Ready(ready) => ready,
+        };
+        let Some(request) = &ready.request else {
+            concurrent.push((index, ready));
+            continue;
+        };
+        if ready.allowed || approvals.allows(request).await {
+            sequential.push((index, ready));
+        } else {
+            let message = "the user denied this tool call".to_string();
+            slots[index] = Some(finish(call, message, true, Vec::new(), events));
         }
     }
+    let gate = tokio::sync::Mutex::new(());
+    let batch = Batch {
+        registry,
+        approvals,
+        hooks,
+        events,
+        gate: &gate,
+    };
     let indices: Vec<usize> = concurrent.iter().map(|(index, ..)| *index).collect();
     let done = join_all(
         concurrent
             .into_iter()
-            .map(|(index, tool, arguments, note)| {
-                run_call(tool, &calls[index], arguments, hooks, note, events)
-            }),
+            .map(|(index, ready)| batch.run_call(&calls[index], ready)),
     )
     .await;
     for (index, result) in indices.into_iter().zip(done) {
         slots[index] = Some(result);
     }
-    for (index, tool, arguments, note) in sequential {
-        slots[index] = Some(run_call(tool, &calls[index], arguments, hooks, note, events).await);
+    for (index, ready) in sequential {
+        slots[index] = Some(batch.run_call(&calls[index], ready).await);
     }
     slots.into_iter().flatten().collect()
 }
@@ -1002,6 +971,95 @@ struct Screening {
     note: Option<String>,
 }
 
+/// Where one call stands once it was read, shown to the hooks and announced.
+enum Admitted<'r> {
+    /// It ended without running, with this result.
+    Ended(ToolResult),
+    /// It may run, once it is approved when it needs to be.
+    Ready(Ready<'r>),
+}
+
+/// A call that may run, once it is approved when it needs to be.
+struct Ready<'r> {
+    /// The tool it calls.
+    tool: &'r Arc<dyn Tool>,
+    /// Its arguments, put right against the tool's schema and as the hooks left them.
+    arguments: Value,
+    /// A note from the hooks for the model, added to the result.
+    note: Option<String>,
+    /// What the reader is asked to approve, when the call needs approval.
+    request: Option<ApprovalRequest>,
+    /// Whether a hook allowed it without asking the reader.
+    allowed: bool,
+}
+
+/// Reads the arguments of `call`, a call of a tool in `registry`, puts them right against the tool's schema and shows them to `hooks`, which may deny the call, allow it without asking or rewrite its arguments; then announces the call through `events` and says whether it may run.
+///
+/// A call of an unknown tool, with arguments that cannot be read or put right, or that a hook denied, ends here with its result reported.
+async fn admit<'r>(
+    registry: &'r Registry,
+    hooks: Option<&dyn Hooks>,
+    call: &ToolCall,
+    events: &(dyn Fn(AgentEvent) + Send + Sync),
+) -> Admitted<'r> {
+    let mut prepared = registry
+        .get(&call.name)
+        .map(|tool| (tool, prepare(registry, call)));
+    let mut screened = Screening::default();
+    if let (Some(hooks), Some((_, Ok(arguments)))) = (hooks, &mut prepared) {
+        let verdict = hooks.before_tool(call, arguments).await;
+        if let Some(rewritten) = verdict.arguments {
+            match registry.prepared(&call.name, rewritten) {
+                Ok((_, rewritten)) => *arguments = rewritten,
+                Err(error) => {
+                    screened.denied =
+                        Some(format!("a hook rewrote the arguments wrongly: {error}"));
+                }
+            }
+        }
+        match verdict.gate {
+            Gate::Pass => {}
+            Gate::Allow => screened.allowed = true,
+            Gate::Deny(reason) => screened.denied = Some(reason),
+        }
+        screened.note = verdict.note;
+    }
+    let summary = sanitize(&match &prepared {
+        Some((tool, Ok(arguments))) => tool.describe(arguments),
+        Some((tool, Err(_))) => tool.describe(&call.arguments),
+        None => call.arguments.to_string(),
+    });
+    events(AgentEvent::ToolStart {
+        id: call.id.clone(),
+        name: call.name.clone(),
+        summary: summary.clone(),
+    });
+    if let Some(reason) = screened.denied.take() {
+        let message = format!("a hook blocked this tool call: {}", reason.trim());
+        return Admitted::Ended(finish(call, message, true, Vec::new(), events));
+    }
+    match prepared {
+        None => {
+            let message = format!("unknown tool: {}", call.name);
+            Admitted::Ended(finish(call, message, true, Vec::new(), events))
+        }
+        Some((_, Err(message))) => Admitted::Ended(finish(call, message, true, Vec::new(), events)),
+        Some((tool, Ok(arguments))) => Admitted::Ready(Ready {
+            request: tool
+                .approval_scope(&arguments)
+                .map(|scope| ApprovalRequest {
+                    tool: call.name.clone(),
+                    scope,
+                    summary,
+                }),
+            tool,
+            arguments,
+            note: screened.note,
+            allowed: screened.allowed,
+        }),
+    }
+}
+
 /// The arguments of `call`, a call of a tool in `registry`, read as a JSON object and put right against the tool's schema, as they are described, approved and run.
 ///
 /// # Errors
@@ -1015,38 +1073,203 @@ fn prepare(registry: &Registry, call: &ToolCall) -> Result<Value, String> {
         .map_err(|error| error.to_string())
 }
 
-/// Runs one approved call of `tool` with `arguments`, already put right against its schema, and reports its outcome, with `note` from the hooks that screened it and what `hooks` say after a call that succeeded added to its text.
-///
-/// A failing tool yields a result with `is_error` set.
-async fn run_call(
-    tool: &Arc<dyn Tool>,
+/// What one batch of calls runs with, shared with the [`Nested`] callers of the tools in it that run other tools.
+#[derive(Clone, Copy)]
+struct Batch<'a> {
+    /// The tools.
+    registry: &'a Registry,
+    /// What is allowed without asking.
+    approvals: &'a Approvals,
+    /// The checks around each call.
+    hooks: Option<&'a dyn Hooks>,
+    /// Where the calls are reported.
+    events: &'a (dyn Fn(AgentEvent) + Send + Sync),
+    /// Held while a call made by another tool is asked about and run when it needs approval, so that such calls run one at a time across the batch, as approved calls of the model do.
+    gate: &'a tokio::sync::Mutex<()>,
+}
+
+impl Batch<'_> {
+    /// Runs `call`, admitted as `ready`, and reports its outcome, with the note from the hooks that screened it and what the hooks say after it succeeded added to its text; the tools it runs, when it runs any, are run through a [`Nested`] caller under it.
+    ///
+    /// A failing tool yields a result with `is_error` set.
+    async fn run_call(&self, call: &ToolCall, ready: Ready<'_>) -> ToolResult {
+        let caller = Nested::new(*self, call);
+        let done = perform(call, ready, self.hooks, &caller).await;
+        let mut result = finish(call, done.text, done.is_error, done.changes, self.events);
+        result.images = done.images.into_iter().map(image).collect();
+        result
+    }
+}
+
+/// How one call that ran ended.
+struct Performed {
+    /// The result text, with the hooks' notes, or the error.
+    text: String,
+    /// Whether it failed.
+    is_error: bool,
+    /// The files it changed.
+    changes: Vec<FileChange>,
+    /// The images it returned.
+    images: Vec<omc_tools::Image>,
+    /// What its text says as a value, when the tool gives one and no hook added a note to the text.
+    data: Option<Value>,
+}
+
+/// Runs `call`, admitted as `ready`, with `caller` for the tools it runs, and adds the note from the hooks that screened it and what `hooks` say after a call that succeeded to its text.
+async fn perform(
     call: &ToolCall,
-    arguments: Value,
+    ready: Ready<'_>,
     hooks: Option<&dyn Hooks>,
-    note: Option<String>,
-    events: &(dyn Fn(AgentEvent) + Send + Sync),
-) -> ToolResult {
+    caller: &dyn Caller,
+) -> Performed {
+    let Ready {
+        tool,
+        arguments,
+        note,
+        ..
+    } = ready;
     let shown = hooks.map(|_| arguments.clone());
-    let (mut text, is_error, changes, images) = match tool.call_as(&call.id, arguments).await {
-        Ok(output) => (
-            output.text,
-            false,
-            output.changes,
-            output.images.into_iter().map(image).collect(),
-        ),
-        Err(error) => (error.to_string(), true, Vec::new(), Vec::new()),
+    let mut done = match tool.call_through(&call.id, arguments, caller).await {
+        Ok(output) => Performed {
+            text: output.text,
+            is_error: false,
+            changes: output.changes,
+            images: output.images,
+            data: output.data,
+        },
+        Err(error) => Performed {
+            text: error.to_string(),
+            is_error: true,
+            changes: Vec::new(),
+            images: Vec::new(),
+            data: None,
+        },
     };
     if let Some(note) = note {
-        text = with_note(text, &note);
+        done.text = with_note(done.text, &note);
+        done.data = None;
     }
-    if let (Some(hooks), Some(arguments), false) = (hooks, &shown, is_error)
-        && let Some(note) = hooks.after_tool(call, arguments, &text).await
+    if let (Some(hooks), Some(arguments), false) = (hooks, &shown, done.is_error)
+        && let Some(note) = hooks.after_tool(call, arguments, &done.text).await
     {
-        text = with_note(text, &note);
+        done.text = with_note(done.text, &note);
+        done.data = None;
     }
-    let mut result = finish(call, text, is_error, changes, events);
-    result.images = images;
-    result
+    done
+}
+
+/// What the calls a tool makes of other tools wait for and report under.
+struct Nested<'a> {
+    /// What the batch of the calling tool runs with.
+    batch: Batch<'a>,
+    /// The id of the call that runs the tools.
+    parent: &'a str,
+    /// The name of the tool that runs them, which the reports are filed under.
+    agent: &'a str,
+    /// How many calls it made.
+    made: AtomicUsize,
+    /// How long the calls waited for the reader, and since when the one being asked about now has.
+    waiting: std::sync::Mutex<(Duration, Option<Instant>)>,
+}
+
+impl<'a> Nested<'a> {
+    /// The caller for the tools `call` runs, as the batch `batch` runs it.
+    fn new(batch: Batch<'a>, call: &'a ToolCall) -> Self {
+        Self {
+            batch,
+            parent: &call.id,
+            agent: &call.name,
+            made: AtomicUsize::new(0),
+            waiting: std::sync::Mutex::new((Duration::ZERO, None)),
+        }
+    }
+
+    /// `event` filed under the calling tool's call.
+    fn file(&self, event: AgentEvent) -> AgentEvent {
+        AgentEvent::Nested {
+            parent: self.parent.to_owned(),
+            agent: self.agent.to_owned(),
+            event: Box::new(event),
+        }
+    }
+
+    /// Asks the reader about `request`, timing how long the answer takes, and says whether the call may run.
+    async fn ask(&self, request: &ApprovalRequest) -> bool {
+        self.lock_waiting().1 = Some(Instant::now());
+        let allowed = self.batch.approvals.allows(request).await;
+        let mut waiting = self.lock_waiting();
+        if let Some(since) = waiting.1.take() {
+            waiting.0 += since.elapsed();
+        }
+        allowed
+    }
+
+    /// The time waited for the reader, held.
+    fn lock_waiting(&self) -> std::sync::MutexGuard<'_, (Duration, Option<Instant>)> {
+        self.waiting.lock().unwrap_or_else(|held| held.into_inner())
+    }
+}
+
+#[async_trait]
+impl Caller for Nested<'_> {
+    /// Whether the agent has a tool called `name`.
+    fn has(&self, name: &str) -> bool {
+        self.batch.registry.get(name).is_some()
+    }
+
+    /// Runs the tool `name` with `args` the way a call of the model runs: its arguments put right against the schema and shown to the hooks, the reader asked when it needs approval, the hooks shown its result; reported under the calling tool's call, numbered from one in the order they were made.
+    ///
+    /// Calls that need approval are asked about and run one at a time; the reader is told which tool made them.
+    async fn call(&self, name: &str, args: Value) -> Result<ToolOutput, String> {
+        let number = self.made.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        let call = ToolCall {
+            id: number.to_string(),
+            name: name.to_owned(),
+            arguments: args,
+        };
+        let filed = |event: AgentEvent| (self.batch.events)(self.file(event));
+        let ready = match admit(self.batch.registry, self.batch.hooks, &call, &filed).await {
+            Admitted::Ended(result) => return Err(result.text),
+            Admitted::Ready(ready) => ready,
+        };
+        let _turn = match &ready.request {
+            Some(_) => Some(self.batch.gate.lock().await),
+            None => None,
+        };
+        if let Some(request) = ready.request.as_ref().filter(|_| !ready.allowed) {
+            let request = ApprovalRequest {
+                summary: format!("{} (called by {})", request.summary, self.agent),
+                ..request.clone()
+            };
+            if !self.ask(&request).await {
+                let message = "the user denied this tool call".to_owned();
+                finish(&call, message.clone(), true, Vec::new(), &filed);
+                return Err(message);
+            }
+        }
+        let done = perform(&call, ready, self.batch.hooks, &NoCaller).await;
+        finish(
+            &call,
+            done.text.clone(),
+            done.is_error,
+            done.changes,
+            &filed,
+        );
+        if done.is_error {
+            return Err(done.text);
+        }
+        let output = ToolOutput::new(done.text);
+        Ok(match done.data {
+            Some(data) => output.with_data(data),
+            None => output,
+        })
+    }
+
+    /// How long the calls made so far waited for the reader's answer, the open question included.
+    fn waited(&self) -> Duration {
+        let waiting = self.lock_waiting();
+        waiting.0 + waiting.1.map_or(Duration::ZERO, |since| since.elapsed())
+    }
 }
 
 /// Converts an image a tool returned into the form sent to the model.

@@ -11,6 +11,7 @@ use omc_dap::DebugTool;
 use omc_hooks::{Assessment, Engine, Setting, Standing, TrustStore, assess};
 use omc_providers::Message;
 use omc_providers::Provider;
+use omc_script::Script;
 use omc_tools::{
     LanguageService, Languages, Registry, Sandbox, Skill, Spill, Tool, ToolError, ToolOutput,
 };
@@ -277,6 +278,7 @@ impl Session {
             self.shared.languages.clone(),
         );
         registry.register(DebugTool::new(sandbox, self.shared.debuggers.clone()));
+        registry.register(Script::new(spill.clone()));
         let (tools, unreachable) = omc_mcp::tools(&servers, &spill).await;
         for tool in tools {
             registry.register_shared(tool);

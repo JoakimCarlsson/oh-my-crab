@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use omc_context::{Discovered, Environment, Locations};
 use omc_dap::DebugTool;
 use omc_providers::{ChatModel, ProviderError, Reply, Request, Sink};
-use omc_tools::{Languages, Registry, Sandbox, Skill};
+use omc_script::Script;
+use omc_tools::{Languages, Registry, Sandbox, Skill, Spill};
 use omc_wire::ToolInfo;
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -53,6 +54,7 @@ pub fn tools() -> Result<Vec<ToolInfo>, String> {
     let (out, _unheard) = unbounded_channel();
     let shared = Shared::new(out);
     base.register(DebugTool::new(sandbox, shared.debuggers.clone()));
+    base.register(Script::new(Spill::disabled()));
     let locations = Locations::detect(&directory);
     let toolset = Toolset::build(&Inputs {
         base: &base,
@@ -125,6 +127,7 @@ mod tests {
                 "grep",
                 "new_context",
                 "read",
+                "script",
                 "set_title",
                 "skill",
                 "task",

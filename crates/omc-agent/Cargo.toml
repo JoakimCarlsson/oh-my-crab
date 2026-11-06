@@ -17,4 +17,5 @@ tokio = { version = "1.54.1", features = ["rt", "macros", "sync", "time", "proce
 
 [dev-dependencies]
 omc-wire = { version = "0.1.0", path = "../omc-wire" }
+omc-script = { version = "0.1.0", path = "../omc-script" }
 tokio = { version = "1.54.1", features = ["test-util"] }

@@ -76,7 +76,7 @@ impl Toolset {
 ///
 /// With memories, the agent can save, search and change them, while its subagents can only search them: what a subagent learns comes back in its result for the main agent to judge before anything is saved.
 ///
-/// Subagents get the tools [`subagent_tools`] leaves them.
+/// Subagents get the tools [`subagent_tools`] leaves them. The tools that depend on what else the agent has, such as `script`, are fitted to the tools of the mode, so that a script in plan mode can only call the tools that only look.
 fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
     let mut base = if plan {
         inputs.base.read_only()
@@ -143,7 +143,7 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
     for name in inputs.denied {
         registry.remove(name);
     }
-    registry
+    registry.fitted()
 }
 
 /// The tools subagents get from `base`: the same, with copies that cannot start background runs, and without `debug`.
@@ -194,7 +194,8 @@ mod tests {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../build/tests/omc-session/toolset");
         std::fs::create_dir_all(&dir).unwrap();
-        let base = Registry::builtin(&dir).unwrap();
+        let mut base = Registry::builtin(&dir).unwrap();
+        base.register(omc_script::Script::new(omc_tools::Spill::disabled()));
         let locations = omc_context::Locations {
             directory: dir.clone(),
             root: None,
@@ -283,6 +284,7 @@ mod tests {
                 "grep",
                 "new_context",
                 "read",
+                "script",
                 "set_title",
                 "task",
                 "todo",
@@ -303,6 +305,7 @@ mod tests {
                 "grep",
                 "new_context",
                 "read",
+                "script",
                 "set_title",
                 "task",
                 "todo",
@@ -310,6 +313,40 @@ mod tests {
                 "web_search",
                 "write"
             ]
+        );
+    }
+
+    /// The script tool of each mode can call that mode's tools, less the ones scripts never get: in plan mode only those that look; a denied tool is not offered to scripts, and a denied script is gone.
+    #[test]
+    fn scripts_call_the_tools_of_their_mode() {
+        let tools = toolset(&["bash".to_owned()]);
+        let offered = |plan: bool| {
+            let script = tools.tools(plan).get("script").cloned().unwrap();
+            let description = script.description().to_owned();
+            (script.read_only(), description)
+        };
+        let (looks, plan) = offered(true);
+        assert!(looks);
+        assert!(plan.contains("tools.read(") && plan.contains("tools.grep("));
+        for absent in [
+            "tools.write(",
+            "tools.edit(",
+            "tools.bash(",
+            "tools.task(",
+            "tools.ask(",
+            "tools.exit_plan_mode(",
+        ] {
+            assert!(!plan.contains(absent), "{absent} offered in plan mode");
+        }
+        let (looks, full) = offered(false);
+        assert!(!looks);
+        assert!(full.contains("tools.write(") && full.contains("tools.edit("));
+        assert!(!full.contains("tools.bash(") && !full.contains("tools.todo("));
+        assert!(
+            toolset(&["script".to_owned()])
+                .tools(false)
+                .get("script")
+                .is_none()
         );
     }
 

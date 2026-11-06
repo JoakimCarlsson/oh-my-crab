@@ -16,6 +16,7 @@ omc-lsp = { version = "0.1.0", path = "../omc-lsp", optional = true }
 omc-mcp = { version = "0.1.0", path = "../omc-mcp" }
 omc-memory = { version = "0.1.0", path = "../omc-memory" }
 omc-providers = { version = "0.1.0", path = "../omc-providers" }
+omc-script = { version = "0.1.0", path = "../omc-script" }
 omc-tools = { version = "0.1.0", path = "../omc-tools" }
 omc-wire = { version = "0.1.0", path = "../omc-wire" }
 serde_json = "1.0.154"

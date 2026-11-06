@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::ToolError;
+use crate::{Registry, ToolError};
 
 /// How one file changed in a tool call.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -28,7 +28,7 @@ pub struct Image {
 }
 
 /// What a successful tool call returns to the model.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolOutput {
     /// The text the model reads as the tool result.
     pub text: String,
@@ -36,6 +36,8 @@ pub struct ToolOutput {
     pub changes: Vec<FileChange>,
     /// Images the model sees after the text; empty for most tools.
     pub images: Vec<Image>,
+    /// What the text says, as a value a program can work with, for the tools whose output has a shape of its own; the model reads the text, and a script gets this instead.
+    pub data: Option<Value>,
 }
 
 impl ToolOutput {
@@ -45,7 +47,14 @@ impl ToolOutput {
             text: text.into(),
             changes: Vec::new(),
             images: Vec::new(),
+            data: None,
         }
+    }
+
+    /// Attaches `data`, what the text says as a value a program can work with.
+    pub fn with_data(mut self, data: Value) -> Self {
+        self.data = Some(data);
+        self
     }
 
     /// Attaches `images` for the model to look at.
@@ -125,6 +134,65 @@ pub trait Tool: Send + Sync {
     /// Same as [`Tool::call`].
     async fn call_as(&self, _id: &str, args: Value) -> Result<ToolOutput, ToolError> {
         self.call(args).await
+    }
+
+    /// Runs the tool for the model's call numbered `id`, for tools that run other tools, which they reach through `caller` so that those calls are checked, asked about and reported like the model's own; every other tool ignores `caller`.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Tool::call`].
+    async fn call_through(
+        &self,
+        id: &str,
+        args: Value,
+        _caller: &dyn Caller,
+    ) -> Result<ToolOutput, ToolError> {
+        self.call_as(id, args).await
+    }
+
+    /// A copy of the tool made for an agent whose tools are `tools`, for a tool that depends on what else the agent has; nothing for the rest.
+    fn fitted(&self, _tools: &Registry) -> Option<std::sync::Arc<dyn Tool>> {
+        None
+    }
+
+    /// The shape of [`ToolOutput::data`], written as a TypeScript type, for a tool whose successful calls carry it; nothing for a tool whose output is only text.
+    fn data_shape(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+/// How a tool that runs other tools reaches them: the way the agent runs the model's own calls, with the same argument checks, hooks, questions to the reader and reports.
+#[async_trait]
+pub trait Caller: Send + Sync {
+    /// Whether there is a tool called `name` to call.
+    fn has(&self, name: &str) -> bool;
+
+    /// Runs the tool called `name` with `args`, as a call nested under the one this caller was made for.
+    ///
+    /// # Errors
+    ///
+    /// Returns the text the model would read for a call that did not succeed: unknown, with arguments that cannot be put right, blocked by a hook, denied by the reader, or failed.
+    async fn call(&self, name: &str, args: Value) -> Result<ToolOutput, String>;
+
+    /// How long the calls made so far have waited for the reader to answer whether they may run, a question still open included; a tool with a time limit leaves that time out of it.
+    fn waited(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+}
+
+/// A [`Caller`] that has no tools, for running a tool outside the agent loop.
+pub struct NoCaller;
+
+#[async_trait]
+impl Caller for NoCaller {
+    /// Has no tool.
+    fn has(&self, _name: &str) -> bool {
+        false
+    }
+
+    /// Fails, since there is no tool to call.
+    async fn call(&self, name: &str, _args: Value) -> Result<ToolOutput, String> {
+        Err(format!("unknown tool: {name}"))
     }
 }
 

@@ -36,6 +36,8 @@ mod hooks_tests;
 #[cfg(test)]
 mod recovery_tests;
 #[cfg(test)]
+mod script_tests;
+#[cfg(test)]
 mod steering_tests;
 #[cfg(test)]
 mod task_tests;
