@@ -6,16 +6,28 @@ use omc_wire::{Diff, Event, Kind, PastTurn, Tool, ToolState, Usage};
 
 /// What kind of tool use a call of the tool called `name` is, its target
 /// shown as `target`: a `read` whose target is a web address, as a URL or a
-/// GitHub path shows, fetches rather than reads.
+/// GitHub path shows, fetches rather than reads, and a `debug` call runs a
+/// command when it starts or runs the program, and is something else when it
+/// only looks at it or sets breakpoints.
 fn kind_of(name: &str, target: &str) -> Kind {
     match name {
         "read" if is_web(target) => Kind::Fetch,
+        "debug" if runs_program(target) => Kind::Execute,
         "read" | "skill" => Kind::Read,
         "edit" | "write" | "ast_edit" => Kind::Edit,
         "grep" | "glob" | "ast_grep" | "web_search" => Kind::Search,
         "bash" => Kind::Execute,
         _ => Kind::Other,
     }
+}
+
+/// Whether the `debug` call shown as `target` starts or runs the program: a launch, an attach, a continue or a step.
+fn runs_program(target: &str) -> bool {
+    let action = target.split_whitespace().next().unwrap_or_default();
+    matches!(
+        action,
+        "launch" | "attach" | "continue" | "step_over" | "step_in" | "step_out"
+    )
 }
 
 /// Whether `target` is an `http://` or `https://` address.
@@ -323,7 +335,8 @@ mod tests {
     use super::*;
 
     /// A read of a web address or GitHub path fetches, a web search searches,
-    /// and a read of a file reads.
+    /// a read of a file reads, and a debug call executes only when it runs the
+    /// program.
     #[test]
     fn kinds_follow_the_target() {
         assert_eq!(
@@ -334,6 +347,10 @@ mod tests {
         assert_eq!(kind_of("read", "src/http.rs"), Kind::Read);
         assert_eq!(kind_of("web_search", "rust async"), Kind::Search);
         assert_eq!(kind_of("bash", "https://x"), Kind::Execute);
+        assert_eq!(kind_of("debug", "launch build/app -v"), Kind::Execute);
+        assert_eq!(kind_of("debug", "continue [dbg-1]"), Kind::Execute);
+        assert_eq!(kind_of("debug", "variables frame 0"), Kind::Other);
+        assert_eq!(kind_of("debug", "break a.c:3"), Kind::Other);
     }
 
     /// A started tool carries its kind and target, and a failed one its state.

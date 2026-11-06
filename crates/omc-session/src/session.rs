@@ -7,6 +7,7 @@ use std::time::Duration;
 use omc_agent::{Isolation, Journal};
 use omc_auth::{AuthError, LoginPrompt};
 use omc_context::{Discovered, Locations, discover, expand_skill};
+use omc_dap::DebugTool;
 use omc_hooks::{Assessment, Engine, Setting, Standing, TrustStore, assess};
 use omc_providers::Message;
 use omc_providers::Provider;
@@ -130,6 +131,8 @@ pub async fn run(commands: UnboundedReceiver<Command>, out: UnboundedSender<Even
 }
 
 /// Runs a conversation like [`run`], with what `options` gives it.
+///
+/// When the conversation ends, its debugging sessions are disconnected cleanly first, and then everything still running is stopped.
 pub async fn run_with(
     mut commands: UnboundedReceiver<Command>,
     out: UnboundedSender<Event>,
@@ -156,6 +159,7 @@ pub async fn run_with(
             Some((number, how)) = finished.recv() => session.finish(number, how),
         }
     }
+    session.shared.debuggers.close().await;
     session.stop();
 }
 
@@ -225,7 +229,7 @@ impl Session {
 
     /// Opens the conversation: finds the provider, the tools, the skills and the agents, and says what can be set.
     ///
-    /// A turn of the conversation open before is cancelled first, and the prompts queued for it are dropped, so that nothing of it reaches the conversation opened now.
+    /// A turn of the conversation open before is cancelled first, and the prompts queued for it are dropped, so that nothing of it reaches the conversation opened now; its background runs are stopped and its debugging sessions disconnected.
     async fn open(&mut self, opening: Opening) {
         let Opening {
             directory,
@@ -251,6 +255,7 @@ impl Session {
         self.cancel();
         self.journal = None;
         self.shared.jobs.stop_all();
+        self.shared.debuggers.close().await;
         let saved = match &conversation {
             Some(id) => match load_history(id, history, keep, before.as_deref()) {
                 Ok(saved) => Some(saved),
@@ -267,10 +272,11 @@ impl Session {
             Err(error) => return self.say(Event::Failed(error.to_string())),
         };
         let mut registry = Registry::builtin_for(
-            sandbox,
+            sandbox.clone(),
             Some(self.shared.jobs.clone()),
             self.shared.languages.clone(),
         );
+        registry.register(DebugTool::new(sandbox, self.shared.debuggers.clone()));
         let (tools, unreachable) = omc_mcp::tools(&servers, &spill).await;
         for tool in tools {
             registry.register_shared(tool);
@@ -671,10 +677,11 @@ impl Session {
         self.drop_queue();
     }
 
-    /// Ends whatever is running, for good, background runs included.
+    /// Ends whatever is running, for good, background runs and debugging sessions included.
     fn stop(&mut self) {
         self.shared.questions.decline_all();
         self.shared.jobs.stop_all();
+        self.shared.debuggers.stop_all();
         if let Some((_, task)) = self.running.take() {
             task.abort();
             self.forget_turn();

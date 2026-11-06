@@ -9,6 +9,7 @@ async-trait = "0.1.92"
 dirs = "7.0.0"
 omc-agent = { version = "0.1.0", path = "../omc-agent" }
 omc-context = { version = "0.1.0", path = "../omc-context" }
+omc-dap = { version = "0.1.0", path = "../omc-dap" }
 omc-hooks = { version = "0.1.0", path = "../omc-hooks" }
 omc-auth = { version = "0.1.0", path = "../omc-auth" }
 omc-lsp = { version = "0.1.0", path = "../omc-lsp", optional = true }

@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use omc_context::{Discovered, Environment, Locations};
+use omc_dap::DebugTool;
 use omc_providers::{ChatModel, ProviderError, Reply, Request, Sink};
-use omc_tools::{Registry, Skill};
+use omc_tools::{Languages, Registry, Sandbox, Skill};
 use omc_wire::ToolInfo;
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -46,10 +47,12 @@ fn sentence(description: &str) -> String {
 /// Fails with the reason when the working folder cannot be used to build the tools.
 pub fn tools() -> Result<Vec<ToolInfo>, String> {
     let directory = std::env::current_dir().map_err(|error| error.to_string())?;
-    let mut base = Registry::builtin(&directory).map_err(|error| error.to_string())?;
+    let sandbox = Sandbox::new(&directory).map_err(|error| error.to_string())?;
+    let mut base = Registry::builtin_for(sandbox.clone(), None, Languages::default());
     base.register(Skill::new(Vec::new()));
     let (out, _unheard) = unbounded_channel();
     let shared = Shared::new(out);
+    base.register(DebugTool::new(sandbox, shared.debuggers.clone()));
     let locations = Locations::detect(&directory);
     let toolset = Toolset::build(&Inputs {
         base: &base,
@@ -115,6 +118,7 @@ mod tests {
                 "ast_grep",
                 "bash",
                 "context_notes",
+                "debug",
                 "edit",
                 "exit_plan_mode",
                 "glob",

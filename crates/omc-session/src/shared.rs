@@ -59,6 +59,8 @@ pub(crate) struct Shared {
     pub(crate) checkpoint: Arc<Checkpoint>,
     /// The commands and subagents running in the background.
     pub(crate) jobs: Arc<Jobs>,
+    /// The debugging sessions the `debug` tool keeps across calls.
+    pub(crate) debuggers: Arc<omc_dap::Sessions>,
     /// The language services `edit` and `write` ask, chosen when the conversation is opened.
     pub(crate) languages: Languages,
     /// The language services of the client, which are used when it says it offers them.
@@ -126,6 +128,7 @@ impl Shared {
             jobs: Arc::new(Jobs::new(move |run| {
                 let _ = announce.send(Event::Background(run));
             })),
+            debuggers: Arc::new(omc_dap::Sessions::new()),
             naming: Mutex::new(Naming::default()),
             login: Mutex::new(Login::default()),
             state: Mutex::new(State {

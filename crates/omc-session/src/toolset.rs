@@ -75,6 +75,8 @@ impl Toolset {
 /// The tools for plan mode when `plan` is set, and otherwise for the rest.
 ///
 /// With memories, the agent can save, search and change them, while its subagents can only search them: what a subagent learns comes back in its result for the main agent to judge before anything is saved.
+///
+/// Subagents get the tools [`subagent_tools`] leaves them.
 fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
     let mut base = if plan {
         inputs.base.read_only()
@@ -84,7 +86,7 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
     if let Some(memories) = &inputs.memories {
         base.register(MemorySearch::new(memories.clone()));
     }
-    let sub_base = Arc::new(base.foreground());
+    let sub_base = Arc::new(subagent_tools(&base));
     let mut registry = base;
     if let Some(memories) = &inputs.memories {
         registry.register(Remember::new(memories.clone()));
@@ -142,6 +144,15 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
         registry.remove(name);
     }
     registry
+}
+
+/// The tools subagents get from `base`: the same, with copies that cannot start background runs, and without `debug`.
+///
+/// Subagents never get `debug`: its sessions belong to the conversation and outlive the calls that use them, so subagents running at once would steer the same program over each other, and a session one started would outlive it.
+fn subagent_tools(base: &Registry) -> Registry {
+    let mut tools = base.foreground();
+    tools.remove("debug");
+    tools
 }
 
 #[cfg(test)]
@@ -300,6 +311,25 @@ mod tests {
                 "write"
             ]
         );
+    }
+
+    /// The agent has `debug` outside plan mode only, and subagents never have it.
+    #[test]
+    fn debug_is_the_main_agents_alone() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/toolset-debug");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sandbox = omc_tools::Sandbox::new(&dir).unwrap();
+        let mut base = Registry::builtin_for(sandbox.clone(), None, Default::default());
+        base.register(omc_dap::DebugTool::new(
+            sandbox,
+            Arc::new(omc_dap::Sessions::new()),
+        ));
+        assert!(base.get("debug").is_some());
+        assert!(base.read_only().get("debug").is_none());
+        let sub = subagent_tools(&base);
+        assert!(sub.get("debug").is_none());
+        assert!(sub.get("bash").is_some());
     }
 
     /// Denied tools are left out of both modes.
