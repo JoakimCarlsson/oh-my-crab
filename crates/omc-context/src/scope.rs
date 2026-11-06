@@ -15,10 +15,12 @@ pub struct Locations {
     pub claude: Option<PathBuf>,
     /// Codex's own config folder, when known.
     pub codex: Option<PathBuf>,
+    /// Whether the project's own folders are read: off while the project is not trusted, which leaves out its instruction files, skills and agent definitions, and the plugins its settings switch on or off.
+    pub project: bool,
 }
 
 impl Locations {
-    /// The locations for work in `directory`, with the user folders taken from the environment.
+    /// The locations for work in `directory`, with the user folders taken from the environment and the project's own folders read.
     ///
     /// `CLAUDE_CONFIG_DIR` and `CODEX_HOME` move the products' own folders; otherwise they are `~/.claude` and `~/.codex`.
     pub fn detect(directory: &Path) -> Self {
@@ -34,6 +36,7 @@ impl Locations {
             claude: own("CLAUDE_CONFIG_DIR", ".claude"),
             codex: own("CODEX_HOME", ".codex"),
             home,
+            project: true,
         }
     }
 
@@ -95,6 +98,7 @@ mod tests {
             home: None,
             claude: None,
             codex: None,
+            project: true,
         };
         assert_eq!(locations.ancestors(), vec![base]);
     }

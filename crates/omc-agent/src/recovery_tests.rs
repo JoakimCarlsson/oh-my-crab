@@ -108,6 +108,7 @@ fn context<'a>(
         notebook: None,
         window: None,
         checkpoint: None,
+        hooks: None,
     }
 }
 

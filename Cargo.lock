@@ -1514,6 +1514,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "omc-hooks"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "dirs",
+ "futures-util",
+ "globset",
+ "libc",
+ "omc-agent",
+ "omc-context",
+ "omc-memory",
+ "omc-providers",
+ "omc-wire",
+ "regex",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "omc-lsp"
 version = "0.1.0"
 dependencies = [
@@ -1577,6 +1597,7 @@ dependencies = [
  "omc-agent",
  "omc-auth",
  "omc-context",
+ "omc-hooks",
  "omc-lsp",
  "omc-mcp",
  "omc-memory",

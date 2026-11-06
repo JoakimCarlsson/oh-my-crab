@@ -246,6 +246,7 @@ mod tests {
             home: None,
             claude: None,
             codex: None,
+            project: true,
         };
         let before = discover(&locations, &[]);
         let tools: Vec<String> = vec!["skill".into(), "task".into()];
@@ -284,6 +285,7 @@ mod tests {
             home: None,
             claude: None,
             codex: None,
+            project: true,
         };
         let before = discover(&locations, &[]);
         put(

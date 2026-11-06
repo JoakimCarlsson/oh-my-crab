@@ -3,6 +3,7 @@
 mod agent;
 mod approval;
 mod compaction;
+mod hooks;
 mod journal;
 mod loop_guard;
 mod pruning;
@@ -21,6 +22,7 @@ pub use agent::{
 };
 pub use approval::{ApprovalRequest, Approvals, Decision, Prompter};
 pub use compaction::{COMPACT, context, replayed};
+pub use hooks::{Gate, Hooks, MAX_STOP_IN_A_ROW, MAX_STOP_PER_TURN, Screened};
 pub use journal::{INTERRUPTED, Journal, JournalError, Lost, Mark, Marked, STOPPED, Saved, Scribe};
 pub use recall::{RECALL, spec as recall_spec};
 pub use steering::Steering;
@@ -29,6 +31,8 @@ pub use worktree::{Isolation, LOCK_REASON, Merge, ToolsFor, prune as prune_workt
 
 #[cfg(test)]
 mod compaction_tests;
+#[cfg(test)]
+mod hooks_tests;
 #[cfg(test)]
 mod recovery_tests;
 #[cfg(test)]

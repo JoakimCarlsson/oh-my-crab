@@ -7,6 +7,7 @@ use crate::plan::PlanStep;
 use crate::queue::Queued;
 use crate::setting::{Setting, Slash};
 use crate::tool::{Background, Tool};
+use crate::trust::TrustRequest;
 use crate::usage::Usage;
 
 /// One turn of a saved conversation: what the reader prompted and what the agent did, as the events it would have sent live.
@@ -103,6 +104,8 @@ pub enum Event {
     Titled(String),
     /// A prompt sent while a turn was running waits, was put into that turn, started a turn of its own or was dropped; the steered or started prompt is the reader's from then on, as one sent between turns is.
     Queued(Queued),
+    /// The harness left out what the project folder brings, its hooks, instruction files, skills and agent definitions, or some of them, until the reader trusts it, and waits for a [`crate::Command::Trust`] answer; sent when the conversation opens and again when what was left out changes.
+    Trust(TrustRequest),
 }
 
 /// The kind of a block of the agent's reply.

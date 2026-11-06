@@ -47,6 +47,7 @@ fn task_tool(
         agents,
         effort: None,
         prompt: Arc::new(|agent, _, _| format!("SUB:{}", agent.name)),
+        hooks: None,
         jobs,
         isolation: None,
     });
@@ -529,6 +530,7 @@ async fn aborting_a_turn_aborts_a_whole_batch() {
                 notebook: None,
                 window: None,
                 checkpoint: None,
+                hooks: None,
             },
             &mut history,
             "go".into(),

@@ -7,6 +7,7 @@ use std::time::Duration;
 use omc_agent::{Isolation, Journal};
 use omc_auth::{AuthError, LoginPrompt};
 use omc_context::{Discovered, Locations, discover, expand_skill};
+use omc_hooks::{Assessment, Engine, Setting, Standing, TrustStore, assess};
 use omc_providers::Message;
 use omc_providers::Provider;
 use omc_tools::{
@@ -39,6 +40,59 @@ struct Open {
     disabled: Vec<String>,
     /// How subagents get git worktrees of their own, when they can.
     isolation: Option<Arc<Isolation>>,
+    /// The hooks that run, when there are any.
+    hooks: Option<Arc<Engine>>,
+    /// Whether the project may be used, and what it brings that is left out.
+    trust: Trust,
+}
+
+/// Where a conversation's project stands on trust, and what the client was told about it.
+struct Trust {
+    /// The latest assessment of the project.
+    assessment: Arc<Assessment>,
+    /// Whether the reader trusted the project for this conversation only.
+    vouched: bool,
+    /// The trust request the client was sent last and has not answered, by its ticket.
+    ticket: Option<u64>,
+    /// The standing and what was left out, as the client was told them last, so they are told again only when they change.
+    told: Option<(Standing, Vec<omc_wire::Skipped>)>,
+    /// What the hooks of the conversation are run with.
+    setting: Arc<dyn Fn() -> Setting + Send + Sync>,
+    /// The reader's own hooks file for crab, when there is one.
+    own: Option<PathBuf>,
+    /// Where trust is recorded, when it can be.
+    store: Option<TrustStore>,
+}
+
+impl Trust {
+    /// The trust of a conversation whose project is assessed as `assessment`, whose hooks run with `setting`, reading the reader's own hooks from `own` and recording trust in `store`.
+    fn new(
+        assessment: Assessment,
+        setting: Arc<dyn Fn() -> Setting + Send + Sync>,
+        own: Option<PathBuf>,
+        store: Option<TrustStore>,
+    ) -> Self {
+        Self {
+            assessment: Arc::new(assessment),
+            vouched: false,
+            ticket: None,
+            told: None,
+            setting,
+            own,
+            store,
+        }
+    }
+
+    /// What a conversation for `locations` may use now, leaving out what `disabled` names; what cannot be read is reported on standard error.
+    fn assess(&self, locations: &Locations, disabled: &[String]) -> Assessment {
+        assessed(
+            locations,
+            self.own.as_deref(),
+            self.store.as_ref(),
+            self.vouched,
+            disabled,
+        )
+    }
 }
 
 /// The state of one conversation.
@@ -59,6 +113,8 @@ struct Session {
     resets_at_start: u64,
     /// Where finished turns report.
     ended: UnboundedSender<(u64, Ended)>,
+    /// The number the last trust request was sent under.
+    trust_tickets: u64,
 }
 
 /// What a conversation is run with besides its commands.
@@ -89,6 +145,7 @@ pub async fn run_with(
         turns: 0,
         resets_at_start: 0,
         ended,
+        trust_tickets: 0,
     };
     loop {
         tokio::select! {
@@ -156,6 +213,7 @@ impl Session {
             Command::Language { ticket, answer } => {
                 self.shared.client_languages.answer(ticket, answer);
             }
+            Command::Trust { ticket, verdict } => self.trust(ticket, verdict),
             Command::Close => {}
         }
     }
@@ -220,7 +278,17 @@ impl Session {
         for reason in unreachable {
             eprintln!("tool server unavailable: {reason}");
         }
-        let locations = Locations::detect(&directory);
+        let setting = hook_setting(&self.shared, &directory, conversation.clone());
+        let (own, store) = (omc_hooks::own_file(), TrustStore::locate());
+        let assessment = assessed(
+            &Locations::detect(&directory),
+            own.as_deref(),
+            store.as_ref(),
+            false,
+            &disabled,
+        );
+        let locations = assessment.locations.clone();
+        let hooks = engine_for(&assessment, setting());
         let discovered = discover(&locations, &disabled);
         register_skills(&mut registry, &discovered.skills);
         let credentials = match self
@@ -266,6 +334,8 @@ impl Session {
             locations: Arc::new(locations),
             disabled,
             isolation,
+            hooks,
+            trust: Trust::new(assessment, setting, own, store),
         });
         let mode = if yolo { Mode::Yolo } else { Mode::Asking };
         self.shared
@@ -282,7 +352,11 @@ impl Session {
                 self.apply(id, value);
             }
         }
-        let trusted = self.shared.mode() == Mode::Yolo;
+        let trusted = self.shared.mode() == Mode::Yolo
+            && self
+                .open
+                .as_ref()
+                .is_some_and(|open| open.trust.assessment.standing.reads_project());
         self.shared
             .languages
             .set(self.languages_for(&directory, languages, trusted));
@@ -295,6 +369,74 @@ impl Session {
             }
             self.say_history();
         }
+        self.tell_trust();
+    }
+
+    /// Answers the trust request under `ticket` with the reader's `verdict`: trusts the project for good, recording it for every worktree of its repository, for this conversation only, or records that it is not trusted; then reads what the project brings again, so the next turn uses it. A ticket that is not the one waiting is ignored.
+    fn trust(&mut self, ticket: u64, verdict: omc_wire::Verdict) {
+        let Some(open) = &mut self.open else {
+            return;
+        };
+        if open.trust.ticket != Some(ticket) {
+            return;
+        }
+        open.trust.ticket = None;
+        let assessment = open.trust.assessment.clone();
+        let recorded = match verdict {
+            omc_wire::Verdict::Allow => {
+                open.trust.vouched = true;
+                Ok(())
+            }
+            omc_wire::Verdict::Always => open.trust.store.as_ref().map_or(Ok(()), |store| {
+                store.set(&assessment.project, true, assessment.project_hooks.clone())
+            }),
+            omc_wire::Verdict::Reject => open.trust.store.as_ref().map_or(Ok(()), |store| {
+                store.set(&assessment.project, false, Vec::new())
+            }),
+        };
+        if let Err(error) = recorded {
+            self.say(Event::Failed(format!(
+                "cannot record the project's trust: {error}"
+            )));
+        }
+        self.reread();
+        if verdict == omc_wire::Verdict::Reject
+            && let Some(open) = &mut self.open
+        {
+            let assessment = &open.trust.assessment;
+            open.trust.told = Some((assessment.standing, assessment.skipped.clone()));
+        }
+        self.tell_trust();
+    }
+
+    /// Tells the client what the project brings that is left out until it is trusted, under a new ticket, when something is and it differs from what the client was told last.
+    fn tell_trust(&mut self) {
+        let Some(open) = &mut self.open else {
+            return;
+        };
+        let assessment = &open.trust.assessment;
+        let now = (assessment.standing, assessment.skipped.clone());
+        if open.trust.told.as_ref() == Some(&now) {
+            return;
+        }
+        open.trust.told = Some(now);
+        let Some(standing) = assessment
+            .standing
+            .wire()
+            .filter(|_| !assessment.skipped.is_empty())
+        else {
+            open.trust.ticket = None;
+            return;
+        };
+        self.trust_tickets += 1;
+        open.trust.ticket = Some(self.trust_tickets);
+        let request = omc_wire::TrustRequest {
+            ticket: self.trust_tickets,
+            root: assessment.project.root.clone(),
+            standing,
+            skipped: assessment.skipped.clone(),
+        };
+        self.shared.say(Event::Trust(request));
     }
 
     /// The language services for a conversation in `directory`: the ones the program running it gave it, the client's when `client_offers` them, or the harness's own servers, started early when the agent is `trusted` with everything.
@@ -419,6 +561,7 @@ impl Session {
             history: self.history.clone(),
             scribe: self.journal.as_ref().map(Journal::scribe),
             isolation: open.isolation.clone(),
+            hooks: open.hooks.clone(),
         };
         let ended = self.ended.clone();
         let task = tokio::spawn(async move {
@@ -430,11 +573,21 @@ impl Session {
 
     /// Reads what is on disk again, so that a skill added or removed since the last turn is known to this one; the client is told the commands again when the skills changed.
     ///
-    /// The skill tool is rebuilt from the new list only when the list differs, which keeps the common turn to one scan of a few folders.
+    /// The project's trust is assessed again first, so hooks added or changed since are found, and those of a project whose hooks changed since it was trusted wait for trust again; the client is told when what is left out changed. The skill tool is rebuilt from the new list only when the list differs, which keeps the common turn to a scan of a few folders.
     fn rescan(&mut self) {
+        self.reread();
+        self.tell_trust();
+    }
+
+    /// Does what [`Self::rescan`] does, without telling the client what is left out.
+    fn reread(&mut self) {
         let Some(open) = &mut self.open else {
             return;
         };
+        let assessment = open.trust.assess(&open.locations, &open.disabled);
+        open.hooks = engine_for(&assessment, (open.trust.setting)());
+        open.locations = Arc::new(assessment.locations.clone());
+        open.trust.assessment = Arc::new(assessment);
         let found = discover(&open.locations, &open.disabled);
         let changed = found.skills != open.discovered.skills;
         if changed {
@@ -631,6 +784,48 @@ impl Session {
             });
         });
     }
+}
+
+/// What a conversation for `locations` may use as its project's trust stands, with the reader's own hooks file `own` and the trust recorded in `store`, `vouched` when the reader trusted it for the conversation, leaving out what `disabled` names; what cannot be read is reported on standard error.
+fn assessed(
+    locations: &Locations,
+    own: Option<&Path>,
+    store: Option<&TrustStore>,
+    vouched: bool,
+    disabled: &[String],
+) -> Assessment {
+    let assessment = assess(locations, own, store, vouched, disabled);
+    for problem in &assessment.problems {
+        eprintln!("hooks: {problem}");
+    }
+    assessment
+}
+
+/// The engine running the hooks `assessment` lets run, with `setting`; nothing when there are none.
+fn engine_for(assessment: &Assessment, setting: Setting) -> Option<Arc<Engine>> {
+    (!assessment.hooks.is_empty()).then(|| Arc::new(Engine::new(assessment.hooks.clone(), setting)))
+}
+
+/// What the hooks of the conversation `id` in `directory` are run with, as a maker of it: the conversation's id, its folder and the mode `shared` is in when a hook runs, in Claude Code's words.
+fn hook_setting(
+    shared: &Arc<Shared>,
+    directory: &Path,
+    id: Option<String>,
+) -> Arc<dyn Fn() -> Setting + Send + Sync> {
+    let shared = Arc::downgrade(shared);
+    let folder = directory.to_path_buf();
+    Arc::new(move || {
+        let shared = shared.clone();
+        Setting {
+            session: id.clone(),
+            folder: folder.clone(),
+            mode: Arc::new(move || match shared.upgrade().map(|shared| shared.mode()) {
+                Some(Mode::Plan) => "plan",
+                Some(Mode::Yolo) => "bypassPermissions",
+                _ => "default",
+            }),
+        }
+    })
 }
 
 /// The names Windows keeps for devices, which cannot be file names there whatever the extension.
@@ -949,6 +1144,28 @@ fn compact_request(text: &str) -> Option<Option<String>> {
 mod tests {
     use super::*;
 
+    /// The trust of a conversation in `directory`, recorded in `store` when there is one, reading no hooks of the user's, vouched for when `vouched` is set.
+    fn test_trust(directory: &Path, store: Option<TrustStore>, vouched: bool) -> Trust {
+        let locations = Locations {
+            directory: directory.to_path_buf(),
+            root: Some(directory.to_path_buf()),
+            home: None,
+            claude: None,
+            codex: None,
+            project: true,
+        };
+        let assessment = assess(&locations, None, store.as_ref(), vouched, &[]);
+        let folder = directory.to_path_buf();
+        let setting: Arc<dyn Fn() -> Setting + Send + Sync> = Arc::new(move || Setting {
+            session: None,
+            folder: folder.clone(),
+            mode: Arc::new(|| "default"),
+        });
+        let mut trust = Trust::new(assessment, setting, None, store);
+        trust.vouched = vouched;
+        trust
+    }
+
     /// Writes a skill called `name` under `directory/.claude/skills`.
     fn add_skill(directory: &std::path::Path, name: &str) {
         let folder = directory.join(".claude/skills").join(name);
@@ -973,6 +1190,7 @@ mod tests {
             home: None,
             claude: None,
             codex: None,
+            project: true,
         };
         let (out, mut events) = unbounded_channel();
         let (ended, _finished) = unbounded_channel();
@@ -989,11 +1207,14 @@ mod tests {
                 locations: Arc::new(locations),
                 disabled: Vec::new(),
                 isolation: None,
+                hooks: None,
+                trust: test_trust(&directory, None, true),
             }),
             running: None,
             turns: 0,
             resets_at_start: 0,
             ended,
+            trust_tickets: 0,
         };
         session.rescan();
         assert!(events.try_recv().is_err());
@@ -1030,6 +1251,7 @@ mod tests {
             turns: 0,
             resets_at_start: 0,
             ended,
+            trust_tickets: 0,
         };
         session
             .shared
@@ -1125,6 +1347,7 @@ mod tests {
             turns: 0,
             resets_at_start: 0,
             ended,
+            trust_tickets: 0,
         };
         let chosen = session.languages_for(Path::new("/w"), true, false).unwrap();
         assert!(Arc::ptr_eq(&chosen, &given));
@@ -1139,6 +1362,7 @@ mod tests {
             turns: 0,
             resets_at_start: 0,
             ended,
+            trust_tickets: 0,
         };
         let client: Arc<dyn LanguageService> = session.shared.client_languages.clone();
         let chosen = session.languages_for(Path::new("/w"), true, false).unwrap();
@@ -1147,6 +1371,165 @@ mod tests {
             .languages_for(Path::new("/w"), false, false)
             .unwrap();
         assert!(!Arc::ptr_eq(&own, &client));
+    }
+
+    /// Makes `directory` a fresh git repository of its own, so it is a project apart from the one the tests run in.
+    fn repository(directory: &Path) {
+        std::fs::create_dir_all(directory).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(directory)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    /// An untrusted project's hook and instruction file are left out and the client is asked about them over the wire, once; a stale ticket is ignored, and trusting it for good records it, runs the hook and reads the file from then on.
+    #[tokio::test]
+    async fn trust_is_asked_over_the_wire_and_granted() {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/trust-wire");
+        let _ = std::fs::remove_dir_all(&base);
+        let directory = base.join("repo");
+        repository(&directory);
+        let directory = directory.canonicalize().unwrap();
+        std::fs::create_dir_all(directory.join(".claude")).unwrap();
+        std::fs::write(
+            directory.join(".claude/settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"./no-rm.sh"}]}]}}"#,
+        )
+        .unwrap();
+        std::fs::write(directory.join("AGENTS.md"), "Project rules.").unwrap();
+        let store = TrustStore::new(base.join("data/trust.json"));
+        let mut session = bare_session();
+        let (out, mut events) = unbounded_channel();
+        session.shared = Shared::new(out);
+        let trust = test_trust(&directory, Some(store.clone()), false);
+        let locations = trust.assessment.locations.clone();
+        session.open = Some(Open {
+            provider: Provider::Claude,
+            base: Arc::new(Registry::builtin(&directory).unwrap()),
+            denied: Arc::new(Vec::new()),
+            discovered: Arc::new(discover(&locations, &[])),
+            locations: Arc::new(locations),
+            disabled: Vec::new(),
+            isolation: None,
+            hooks: None,
+            trust,
+        });
+        session.tell_trust();
+        session.rescan();
+        let told: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        let asked: Vec<&omc_wire::TrustRequest> = told
+            .iter()
+            .filter_map(|event| match event {
+                Event::Trust(request) => Some(request),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asked.len(), 1, "{told:?}");
+        let request = asked[0].clone();
+        let line = omc_wire::encode(&Event::Trust(request.clone())).unwrap();
+        assert!(line.starts_with(r#"{"Trust":"#));
+        assert_eq!(request.standing, omc_wire::Standing::Unknown);
+        assert_eq!(request.root, directory);
+        let kinds: Vec<omc_wire::Input> = request.skipped.iter().map(|s| s.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![omc_wire::Input::Hook, omc_wire::Input::Instruction]
+        );
+        let open = session.open.as_ref().unwrap();
+        assert!(open.hooks.is_none() && open.discovered.instructions.is_empty());
+        let answer = |ticket| {
+            omc_wire::decode::<Command>(&format!(
+                r#"{{"Trust":{{"ticket":{ticket},"verdict":"Always"}}}}"#
+            ))
+            .unwrap()
+        };
+        session.handle(answer(request.ticket + 1)).await;
+        assert!(store.get(&omc_memory::Project::of(&directory)).is_none());
+        session.handle(answer(request.ticket)).await;
+        let record = store.get(&omc_memory::Project::of(&directory)).unwrap();
+        assert!(record.trusted);
+        assert_eq!(
+            record.hooks,
+            vec!["PreToolUse\tBash\t./no-rm.sh".to_owned()]
+        );
+        let open = session.open.as_ref().unwrap();
+        assert_eq!(open.trust.assessment.standing, Standing::Trusted);
+        assert!(
+            open.hooks
+                .as_ref()
+                .is_some_and(|hooks| hooks.has(omc_hooks::HookEvent::PreToolUse))
+        );
+        assert_eq!(open.discovered.instructions.len(), 1);
+        assert!(
+            !std::iter::from_fn(|| events.try_recv().ok())
+                .any(|event| matches!(event, Event::Trust(_)))
+        );
+    }
+
+    /// Declining trust is recorded and not asked about again in the same conversation; trusting for the conversation only records nothing.
+    #[tokio::test]
+    async fn trust_can_be_declined_or_given_once() {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/trust-decline");
+        let _ = std::fs::remove_dir_all(&base);
+        let directory = base.join("repo");
+        repository(&directory);
+        std::fs::write(directory.join("AGENTS.md"), "Project rules.").unwrap();
+        let store = TrustStore::new(base.join("data/trust.json"));
+        for (verdict, recorded) in [("Reject", Some(false)), ("Allow", None)] {
+            let _ = std::fs::remove_file(store.path());
+            let mut session = bare_session();
+            let (out, mut events) = unbounded_channel();
+            session.shared = Shared::new(out);
+            let trust = test_trust(&directory, Some(store.clone()), false);
+            let locations = trust.assessment.locations.clone();
+            session.open = Some(Open {
+                provider: Provider::Claude,
+                base: Arc::new(Registry::builtin(&directory).unwrap()),
+                denied: Arc::new(Vec::new()),
+                discovered: Arc::new(discover(&locations, &[])),
+                locations: Arc::new(locations),
+                disabled: Vec::new(),
+                isolation: None,
+                hooks: None,
+                trust,
+            });
+            session.tell_trust();
+            let Ok(Event::Trust(request)) = events.try_recv() else {
+                panic!("no trust request");
+            };
+            session
+                .handle(
+                    omc_wire::decode(&format!(
+                        r#"{{"Trust":{{"ticket":{},"verdict":"{verdict}"}}}}"#,
+                        request.ticket
+                    ))
+                    .unwrap(),
+                )
+                .await;
+            session.rescan();
+            assert!(
+                !std::iter::from_fn(|| events.try_recv().ok())
+                    .any(|event| matches!(event, Event::Trust(_))),
+                "{verdict} asked again"
+            );
+            let project = omc_memory::Project::of(&directory);
+            assert_eq!(store.get(&project).map(|record| record.trusted), recorded);
+            let read = !session
+                .open
+                .as_ref()
+                .unwrap()
+                .discovered
+                .instructions
+                .is_empty();
+            assert_eq!(read, verdict == "Allow");
+        }
     }
 
     /// Cancelling a running turn leaves no active checkpoint behind.
@@ -1163,6 +1546,7 @@ mod tests {
             turns: 0,
             resets_at_start: 0,
             ended,
+            trust_tickets: 0,
         };
         let task = tokio::spawn(std::future::pending::<()>());
         session.running = Some((1, task.abort_handle()));
@@ -1186,6 +1570,7 @@ mod tests {
             turns: 0,
             resets_at_start: 0,
             ended,
+            trust_tickets: 0,
         }
     }
 
@@ -1220,6 +1605,7 @@ mod tests {
             home: None,
             claude: None,
             codex: None,
+            project: true,
         };
         let (out, events) = unbounded_channel();
         let (ended, _finished) = unbounded_channel();
@@ -1238,11 +1624,14 @@ mod tests {
                 locations: Arc::new(locations),
                 disabled: Vec::new(),
                 isolation: None,
+                hooks: None,
+                trust: test_trust(&directory, None, true),
             }),
             running: None,
             turns: 1,
             resets_at_start: 0,
             ended,
+            trust_tickets: 0,
         };
         let task = tokio::spawn(std::future::pending::<()>());
         session.running = Some((1, task.abort_handle()));

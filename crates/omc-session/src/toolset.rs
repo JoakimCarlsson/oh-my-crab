@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use omc_agent::{Approvals, EventSink, Isolation, Task, TaskSettings};
+use omc_agent::{Approvals, EventSink, Hooks, Isolation, Task, TaskSettings};
 use omc_context::{Discovered, Environment, PromptInput, build_subagent_prompt};
 use omc_memory::Memories;
 use omc_providers::{ChatModel, Effort};
@@ -45,6 +45,8 @@ pub(crate) struct Inputs<'a> {
     pub(crate) isolation: Option<Arc<Isolation>>,
     /// The memories the agent reads and writes, when it has its memory.
     pub(crate) memories: Option<Arc<Memories>>,
+    /// The hooks subagents run, when there are any.
+    pub(crate) hooks: Option<Arc<dyn Hooks>>,
 }
 
 /// The tools of a turn in each mode.
@@ -134,6 +136,7 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
         }),
         jobs: inputs.jobs.clone(),
         isolation: inputs.isolation.clone(),
+        hooks: inputs.hooks.clone(),
     }));
     for name in inputs.denied {
         registry.remove(name);
@@ -187,6 +190,7 @@ mod tests {
             home: None,
             claude: None,
             codex: None,
+            project: true,
         };
         Toolset::build(&Inputs {
             base: &base,
@@ -207,6 +211,7 @@ mod tests {
             unnamed: true,
             isolation: None,
             memories,
+            hooks: None,
         })
     }
 

@@ -144,6 +144,7 @@ fn context_on<'a>(
         notebook: None,
         window,
         checkpoint: None,
+        hooks: None,
     }
 }
 

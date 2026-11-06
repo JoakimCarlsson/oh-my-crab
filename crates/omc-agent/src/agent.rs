@@ -13,6 +13,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::compaction;
+use crate::hooks::{Gate, Hooks, StopBound, with_note};
 use crate::loop_guard::LoopGuard;
 use crate::pruning;
 use crate::recall::{self, RECALL};
@@ -132,6 +133,8 @@ pub struct Context<'a> {
     pub checkpoint: Option<&'a Checkpoint>,
     /// The size of the model's context window in tokens, when it is known; the agent is reminded to save its notes when a request fills most of it, and the older part of the history is summarized before a request that would fill nearly all of it.
     pub window: Option<u64>,
+    /// The checks the user set up around tool calls and the end of the turn, when there are any.
+    pub hooks: Option<&'a dyn Hooks>,
 }
 
 /// Passes the chunks of a reply on as events.
@@ -488,6 +491,7 @@ async fn drive(
     let mut cut: Option<Reply> = None;
     let mut guard = LoopGuard::default();
     let mut todos = TodoTracker::new(history);
+    let mut stops = StopBound::default();
     loop {
         let live = context.refresh.map(|refresh| refresh());
         let registry = live
@@ -588,8 +592,13 @@ async fn drive(
             return Err(AgentError::OutputLimit);
         }
         let follow_up = if calls.is_empty() {
-            follow_up(&reply, registry, &mut written_noticed, &mut todos)
+            match follow_up(&reply, registry, &mut written_noticed, &mut todos) {
+                Some(notice) => Some(notice),
+                None if reply.stop != Stop::Length => stops.next(context.hooks, &said).await,
+                None => None,
+            }
         } else {
+            stops.tools_called();
             None
         };
         history.push(Message::Assistant(reply));
@@ -624,7 +633,15 @@ async fn drive(
             }
             events(event);
         };
-        let mut results = run_calls(registry, context.approvals, history, &calls, &capture).await;
+        let mut results = run_calls(
+            registry,
+            context.approvals,
+            context.hooks,
+            history,
+            &calls,
+            &capture,
+        )
+        .await;
         let changed = changed
             .into_inner()
             .unwrap_or_else(|held| held.into_inner());
@@ -856,15 +873,20 @@ fn tool_specs(registry: &Registry) -> Vec<ToolSpec> {
 /// Runs the calls of one model reply and returns their results in call order.
 ///
 /// Every call is announced first. The arguments of a call of a registered tool
-/// are read and put right against its schema once, before the call is
-/// described, asked about or run, so the user approves exactly what runs; a
-/// call whose arguments cannot be read or put right fails without being asked
-/// about. Calls that need approval are asked about one at a time, in order.
-/// Approved calls then run one after another so edits cannot race, while calls
-/// that need no approval run concurrently.
+/// are read and put right against its schema once, then shown to `hooks`, which
+/// may deny the call, let it run without asking or rewrite its arguments, which
+/// are put right against the schema again; only then is the call described,
+/// asked about or run, so the user approves exactly what runs. A call whose
+/// arguments cannot be read or put right fails without being asked about.
+/// Calls that need approval are asked about one at a time, in order, unless a
+/// hook allowed them. Approved calls then run one after another so edits cannot
+/// race, while calls that need no approval run concurrently. The hooks see each
+/// call that succeeded once more, after it ran, and what they say is added to
+/// its result.
 async fn run_calls(
     registry: &Registry,
     approvals: &Approvals,
+    hooks: Option<&dyn Hooks>,
     history: &[Message],
     calls: &[ToolCall],
     events: &(dyn Fn(AgentEvent) + Send + Sync),
@@ -874,10 +896,29 @@ async fn run_calls(
     let mut sequential = Vec::new();
     for (index, call) in calls.iter().enumerate() {
         let recalls = call.name == RECALL && recall::offered(history);
-        let prepared = registry
+        let mut prepared = registry
             .get(&call.name)
             .filter(|_| !recalls)
             .map(|tool| (tool, prepare(registry, call)));
+        let mut screened = Screening::default();
+        if let (Some(hooks), Some((_, Ok(arguments)))) = (hooks, &mut prepared) {
+            let verdict = hooks.before_tool(call, arguments).await;
+            if let Some(rewritten) = verdict.arguments {
+                match registry.prepared(&call.name, rewritten) {
+                    Ok((_, rewritten)) => *arguments = rewritten,
+                    Err(error) => {
+                        screened.denied =
+                            Some(format!("a hook rewrote the arguments wrongly: {error}"));
+                    }
+                }
+            }
+            match verdict.gate {
+                Gate::Pass => {}
+                Gate::Allow => screened.allowed = true,
+                Gate::Deny(reason) => screened.denied = Some(reason),
+            }
+            screened.note = verdict.note;
+        }
         let summary = sanitize(&match &prepared {
             Some((tool, Ok(arguments))) => tool.describe(arguments),
             Some((tool, Err(_))) => tool.describe(&call.arguments),
@@ -889,6 +930,11 @@ async fn run_calls(
             name: call.name.clone(),
             summary: summary.clone(),
         });
+        if let Some(reason) = screened.denied.take() {
+            let message = format!("a hook blocked this tool call: {}", reason.trim());
+            slots[index] = Some(finish(call, message, true, Vec::new(), events));
+            continue;
+        }
         match prepared {
             None if recalls => {
                 slots[index] = Some(match recall::run(history, call.arguments.clone()) {
@@ -908,8 +954,9 @@ async fn run_calls(
                 slots[index] = Some(finish(call, message, true, Vec::new(), events));
             }
             Some((tool, Ok(arguments))) => {
+                let note = screened.note.take();
                 let Some(scope) = tool.approval_scope(&arguments) else {
-                    concurrent.push((index, tool, arguments));
+                    concurrent.push((index, tool, arguments, note));
                     continue;
                 };
                 let request = ApprovalRequest {
@@ -917,8 +964,8 @@ async fn run_calls(
                     scope,
                     summary,
                 };
-                if approvals.allows(&request).await {
-                    sequential.push((index, tool, arguments));
+                if screened.allowed || approvals.allows(&request).await {
+                    sequential.push((index, tool, arguments, note));
                 } else {
                     let message = "the user denied this tool call".to_string();
                     slots[index] = Some(finish(call, message, true, Vec::new(), events));
@@ -930,16 +977,29 @@ async fn run_calls(
     let done = join_all(
         concurrent
             .into_iter()
-            .map(|(index, tool, arguments)| run_call(tool, &calls[index], arguments, events)),
+            .map(|(index, tool, arguments, note)| {
+                run_call(tool, &calls[index], arguments, hooks, note, events)
+            }),
     )
     .await;
     for (index, result) in indices.into_iter().zip(done) {
         slots[index] = Some(result);
     }
-    for (index, tool, arguments) in sequential {
-        slots[index] = Some(run_call(tool, &calls[index], arguments, events).await);
+    for (index, tool, arguments, note) in sequential {
+        slots[index] = Some(run_call(tool, &calls[index], arguments, hooks, note, events).await);
     }
     slots.into_iter().flatten().collect()
+}
+
+/// What the hooks said about one call before it ran.
+#[derive(Default)]
+struct Screening {
+    /// Why the call is not run, when it is not.
+    denied: Option<String>,
+    /// Whether it runs without the reader being asked.
+    allowed: bool,
+    /// A note for the model, added to the result.
+    note: Option<String>,
 }
 
 /// The arguments of `call`, a call of a tool in `registry`, read as a JSON object and put right against the tool's schema, as they are described, approved and run.
@@ -955,24 +1015,38 @@ fn prepare(registry: &Registry, call: &ToolCall) -> Result<Value, String> {
         .map_err(|error| error.to_string())
 }
 
-/// Runs one approved call of `tool` with `arguments`, already put right against its schema, and reports its outcome.
+/// Runs one approved call of `tool` with `arguments`, already put right against its schema, and reports its outcome, with `note` from the hooks that screened it and what `hooks` say after a call that succeeded added to its text.
 ///
 /// A failing tool yields a result with `is_error` set.
 async fn run_call(
     tool: &Arc<dyn Tool>,
     call: &ToolCall,
     arguments: Value,
+    hooks: Option<&dyn Hooks>,
+    note: Option<String>,
     events: &(dyn Fn(AgentEvent) + Send + Sync),
 ) -> ToolResult {
-    match tool.call_as(&call.id, arguments).await {
-        Ok(output) => {
-            let images = output.images.into_iter().map(image).collect();
-            let mut result = finish(call, output.text, false, output.changes, events);
-            result.images = images;
-            result
-        }
-        Err(error) => finish(call, error.to_string(), true, Vec::new(), events),
+    let shown = hooks.map(|_| arguments.clone());
+    let (mut text, is_error, changes, images) = match tool.call_as(&call.id, arguments).await {
+        Ok(output) => (
+            output.text,
+            false,
+            output.changes,
+            output.images.into_iter().map(image).collect(),
+        ),
+        Err(error) => (error.to_string(), true, Vec::new(), Vec::new()),
+    };
+    if let Some(note) = note {
+        text = with_note(text, &note);
     }
+    if let (Some(hooks), Some(arguments), false) = (hooks, &shown, is_error)
+        && let Some(note) = hooks.after_tool(call, arguments, &text).await
+    {
+        text = with_note(text, &note);
+    }
+    let mut result = finish(call, text, is_error, changes, events);
+    result.images = images;
+    result
 }
 
 /// Converts an image a tool returned into the form sent to the model.
@@ -1144,6 +1218,7 @@ mod tests {
                 notebook: None,
                 window: None,
                 checkpoint: None,
+                hooks: None,
             },
             &mut history,
             "read it".into(),
@@ -1188,6 +1263,7 @@ mod tests {
                 notebook: None,
                 window: None,
                 checkpoint: None,
+                hooks: None,
             },
             history,
             "go".into(),
@@ -1266,6 +1342,7 @@ mod tests {
                 notebook: None,
                 window: None,
                 checkpoint: None,
+                hooks: None,
             },
             &mut history,
             "look".into(),
@@ -1332,6 +1409,7 @@ mod tests {
                 notebook: None,
                 window: None,
                 checkpoint: None,
+                hooks: None,
             },
             &mut history,
             "read it".into(),
@@ -1404,6 +1482,7 @@ mod tests {
                 notebook: None,
                 window: None,
                 checkpoint: None,
+                hooks: None,
             },
             &mut history,
             "go".into(),
@@ -1445,6 +1524,7 @@ mod tests {
                 notebook: None,
                 window: None,
                 checkpoint: None,
+                hooks: None,
             },
             &mut history,
             "go".into(),
@@ -1475,6 +1555,7 @@ mod tests {
                 notebook: None,
                 window: None,
                 checkpoint: None,
+                hooks: None,
             },
             &mut history,
             "edit".into(),
@@ -1514,6 +1595,7 @@ mod tests {
                 notebook: None,
                 window: None,
                 checkpoint: None,
+                hooks: None,
             },
             &mut history,
             "edit".into(),
@@ -1557,6 +1639,7 @@ mod tests {
                 notebook: None,
                 window: None,
                 checkpoint: None,
+                hooks: None,
             },
             history,
             prompt.into(),

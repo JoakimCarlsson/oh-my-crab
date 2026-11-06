@@ -72,6 +72,7 @@ async fn turn_on(model: &Replies, dir: &Path, history: &mut Vec<Message>, prompt
             notebook: None,
             window: None,
             checkpoint: None,
+            hooks: None,
         },
         history,
         prompt.into(),

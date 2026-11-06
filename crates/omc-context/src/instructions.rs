@@ -118,6 +118,7 @@ mod tests {
             home: Some(base.join("home")),
             claude: Some(base.join("home/.claude")),
             codex: Some(base.join("home/.codex")),
+            project: true,
         }
     }
 

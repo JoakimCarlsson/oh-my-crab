@@ -118,10 +118,11 @@ fn described(places: &[Place]) -> Vec<String> {
 }
 
 impl crate::Locations {
-    /// The folders `root` stands for, nearest first.
+    /// The folders `root` stands for, nearest first; none for the project while its own folders are not read.
     pub(crate) fn folders(&self, root: Root) -> Vec<std::path::PathBuf> {
         match root {
-            Root::Project => self.ancestors(),
+            Root::Project if self.project => self.ancestors(),
+            Root::Project => Vec::new(),
             Root::Claude => self.claude.iter().cloned().collect(),
             Root::Codex => self.codex.iter().cloned().collect(),
             Root::Home => self.home.iter().cloned().collect(),

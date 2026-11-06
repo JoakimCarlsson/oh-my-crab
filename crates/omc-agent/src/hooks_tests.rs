@@ -1,0 +1,319 @@
+//! Tests of the checks the user sets up around tool calls and the end of a turn, driven through the agent loop.
+
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use omc_context::builtin_agents;
+use omc_providers::{Message, ToolCall};
+use omc_tools::{Jobs, Registry, Tool};
+use serde_json::{Value, json};
+
+use crate::testkit::{Router, call, deny_all, read_args, say, scratch};
+use crate::{
+    AgentEvent, Context, EventSink, Gate, Hooks, MAX_STOP_IN_A_ROW, Screened, Task, TaskSettings,
+    run_turn,
+};
+
+/// What scripted checks were shown, as who saw it, the event and the tool or answer.
+type Seen = Arc<Mutex<Vec<(Option<String>, &'static str, String)>>>;
+
+/// Checks that answer as a test scripts them and keep what they were shown.
+#[derive(Default)]
+struct Scripted {
+    /// What every call is screened with, by tool name; a tool not listed passes.
+    before: Vec<(&'static str, Screened)>,
+    /// The note added after every successful call, when there is one.
+    after: Option<&'static str>,
+    /// Why the turn should go on, when it should every time.
+    stop: Option<&'static str>,
+    /// Who the checks are for: nothing for the main agent, the subagent's id and kind otherwise.
+    agent: Option<(String, String)>,
+    /// What the checks were shown, as who saw it, the event and the tool or answer.
+    seen: Seen,
+}
+
+impl Scripted {
+    /// Records that `event` was checked for `what`.
+    fn saw(&self, event: &'static str, what: &str) {
+        let agent = self.agent.as_ref().map(|(id, kind)| format!("{kind}#{id}"));
+        self.seen
+            .lock()
+            .unwrap()
+            .push((agent, event, what.to_owned()));
+    }
+}
+
+#[async_trait]
+impl Hooks for Scripted {
+    /// Screens the call as scripted for its tool.
+    async fn before_tool(&self, call: &ToolCall, _arguments: &Value) -> Screened {
+        self.saw("before", &call.name);
+        self.before
+            .iter()
+            .find(|(name, _)| *name == call.name)
+            .map(|(_, screened)| screened.clone())
+            .unwrap_or_default()
+    }
+
+    /// Adds the scripted note.
+    async fn after_tool(
+        &self,
+        call: &ToolCall,
+        _arguments: &Value,
+        _output: &str,
+    ) -> Option<String> {
+        self.saw("after", &call.name);
+        self.after.map(str::to_owned)
+    }
+
+    /// Asks to go on with the scripted reason, whenever there is one.
+    async fn stop(&self, answer: &str, again: bool) -> Option<String> {
+        self.saw(if again { "stop-again" } else { "stop" }, answer);
+        self.stop.map(str::to_owned)
+    }
+
+    /// The same script, recording under the subagent's name.
+    fn for_subagent(&self, id: &str, kind: &str) -> Arc<dyn Hooks> {
+        Arc::new(Scripted {
+            before: self.before.clone(),
+            after: self.after,
+            stop: self.stop,
+            agent: Some((id.to_owned(), kind.to_owned())),
+            seen: self.seen.clone(),
+        })
+    }
+}
+
+/// Runs one turn of `go` with the built-in tools of `dir` against `model`, checked by `hooks`, with every approval denied; the history.
+async fn drive(model: &Router, dir: &std::path::Path, hooks: &Scripted) -> Vec<Message> {
+    let registry = Registry::builtin(dir).unwrap();
+    let mut history = Vec::new();
+    run_turn(
+        &Context {
+            model,
+            registry: &registry,
+            approvals: &deny_all(),
+            system: "",
+            effort: None,
+            refresh: None,
+            notebook: None,
+            window: None,
+            checkpoint: None,
+            hooks: Some(hooks),
+        },
+        &mut history,
+        "go".into(),
+        &|_: AgentEvent| {},
+    )
+    .await
+    .unwrap();
+    history
+}
+
+/// The text and failure of the first result of the tool results at `index` of `history`.
+fn result(history: &[Message], index: usize) -> (String, bool) {
+    let Message::ToolResults(results) = &history[index] else {
+        panic!("no results at {index}");
+    };
+    (results[0].text.clone(), results[0].is_error)
+}
+
+/// A model that calls `write` with `arguments` once, then answers.
+fn writer(arguments: Value) -> Arc<Router> {
+    Router::new(move |seen| match seen.messages {
+        1 => call("w", "write", arguments.clone()),
+        _ => say("done"),
+    })
+}
+
+/// A denied call never runs, and the model reads the hook's reason as the call's failure.
+#[tokio::test]
+async fn a_denied_call_does_not_run() {
+    let dir = scratch("hooks-deny");
+    let hooks = Scripted {
+        before: vec![(
+            "write",
+            Screened {
+                gate: Gate::Deny("no writes here".into()),
+                ..Screened::default()
+            },
+        )],
+        ..Scripted::default()
+    };
+    let history = drive(
+        &writer(json!({"path": "a.txt", "content": "x"})),
+        &dir,
+        &hooks,
+    )
+    .await;
+    let (text, failed) = result(&history, 2);
+    assert!(failed && text.contains("a hook blocked this tool call: no writes here"));
+    assert!(!dir.join("a.txt").exists());
+}
+
+/// A hook that rewrites the arguments and allows the call has it run as rewritten, without the reader being asked, and its note reaches the model.
+#[tokio::test]
+async fn a_rewritten_call_runs_as_rewritten() {
+    let dir = scratch("hooks-rewrite");
+    let hooks = Scripted {
+        before: vec![(
+            "write",
+            Screened {
+                gate: Gate::Allow,
+                arguments: Some(json!({"path": "safe.txt", "content": "x"})),
+                note: Some("moved to safe.txt".into()),
+            },
+        )],
+        ..Scripted::default()
+    };
+    let history = drive(
+        &writer(json!({"path": "a.txt", "content": "x"})),
+        &dir,
+        &hooks,
+    )
+    .await;
+    let (text, failed) = result(&history, 2);
+    assert!(!failed, "{text}");
+    assert!(
+        text.ends_with("<hook-note>\nmoved to safe.txt\n</hook-note>"),
+        "{text}"
+    );
+    assert!(dir.join("safe.txt").exists() && !dir.join("a.txt").exists());
+}
+
+/// Without a hook's allowance a call that needs approval is still asked about, and the reader's refusal stands.
+#[tokio::test]
+async fn passing_leaves_the_approval_to_the_reader() {
+    let dir = scratch("hooks-pass");
+    let history = drive(
+        &writer(json!({"path": "a.txt", "content": "x"})),
+        &dir,
+        &Scripted::default(),
+    )
+    .await;
+    let (text, failed) = result(&history, 2);
+    assert!(failed && text.contains("the user denied"));
+}
+
+/// Rewritten arguments that break the tool's schema fail the call instead of running it.
+#[tokio::test]
+async fn a_wrong_rewrite_fails_the_call() {
+    let dir = scratch("hooks-bad-rewrite");
+    let hooks = Scripted {
+        before: vec![(
+            "write",
+            Screened {
+                gate: Gate::Allow,
+                arguments: Some(json!({"nothing": true})),
+                note: None,
+            },
+        )],
+        ..Scripted::default()
+    };
+    let history = drive(
+        &writer(json!({"path": "a.txt", "content": "x"})),
+        &dir,
+        &hooks,
+    )
+    .await;
+    let (text, failed) = result(&history, 2);
+    assert!(
+        failed && text.contains("rewrote the arguments wrongly"),
+        "{text}"
+    );
+    assert!(!dir.join("a.txt").exists());
+}
+
+/// A note the hooks give after a call that succeeded is added to its result, which the model reads.
+#[tokio::test]
+async fn a_note_after_the_call_reaches_the_model() {
+    let dir = scratch("hooks-after");
+    std::fs::write(dir.join("a.txt"), "alpha\n").unwrap();
+    let hooks = Scripted {
+        after: Some("remember to run the tests"),
+        ..Scripted::default()
+    };
+    let model = Router::new(|seen| match seen.messages {
+        1 => call("r", "read", read_args("a.txt")),
+        _ => say("done"),
+    });
+    let history = drive(&model, &dir, &hooks).await;
+    let (text, failed) = result(&history, 2);
+    assert!(!failed && text.contains("alpha"));
+    assert!(text.ends_with("<hook-note>\nremember to run the tests\n</hook-note>"));
+}
+
+/// A stop hook that never lets go makes the turn go on only so many times in a row, and says so to the model each time.
+#[tokio::test]
+async fn a_stop_hook_is_bounded() {
+    let dir = scratch("hooks-stop");
+    let hooks = Scripted {
+        stop: Some("the tests are not run yet"),
+        ..Scripted::default()
+    };
+    let model = Router::new(|_| say("done"));
+    let history = drive(&model, &dir, &hooks).await;
+    let seen = model.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1 + MAX_STOP_IN_A_ROW);
+    assert!(
+        seen[1]
+            .last_user
+            .as_deref()
+            .unwrap()
+            .contains("the tests are not run yet")
+    );
+    let asked: Vec<&'static str> = hooks
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, event, _)| *event)
+        .collect();
+    assert_eq!(asked.len(), MAX_STOP_IN_A_ROW);
+    assert_eq!(asked[0], "stop");
+    assert!(asked[1..].iter().all(|event| *event == "stop-again"));
+    assert!(matches!(history.last(), Some(Message::Assistant(_))));
+}
+
+/// A subagent runs the same tool hooks, under its own id and kind.
+#[tokio::test]
+async fn subagents_run_the_hooks_as_themselves() {
+    let dir = scratch("hooks-subagent");
+    std::fs::write(dir.join("a.txt"), "alpha\n").unwrap();
+    let hooks = Arc::new(Scripted::default());
+    let model = Router::new(|seen| match (seen.system.as_str(), seen.messages) {
+        ("SUB:scout", 1) => call("s1", "read", read_args("a.txt")),
+        _ => say("found alpha"),
+    });
+    let events: Arc<EventSink> = Arc::new(|_| {});
+    let task = Task::new(TaskSettings {
+        model,
+        registry: Arc::new(Registry::builtin(&dir).unwrap()),
+        approvals: deny_all(),
+        events,
+        agents: builtin_agents(),
+        effort: None,
+        prompt: Arc::new(|agent, _, _| format!("SUB:{}", agent.name)),
+        jobs: Arc::new(Jobs::new(|_| {})),
+        isolation: None,
+        hooks: Some(hooks.clone()),
+    });
+    let out = task
+        .call_as("t1", json!({"agent": "scout", "task": "find alpha"}))
+        .await
+        .unwrap();
+    assert!(out.text.contains("found alpha"));
+    let seen = hooks.seen.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        vec![
+            (Some("scout#t1".to_owned()), "before", "read".to_owned()),
+            (Some("scout#t1".to_owned()), "after", "read".to_owned()),
+            (
+                Some("scout#t1".to_owned()),
+                "stop",
+                "found alpha".to_owned()
+            ),
+        ]
+    );
+}

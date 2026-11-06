@@ -32,6 +32,7 @@ pub use invoke::{
 pub use notices::{Notice, context_changes, environment_reminder, memory_notice, plan_mode_notice};
 pub use origin::Origin;
 pub use place::{agent_places, instruction_places, skill_places};
+pub use plugins::plugin_folders;
 pub use scope::Locations;
 pub use skills::Skill;
 pub use system::{PromptInput, build_prompt, build_subagent_prompt};

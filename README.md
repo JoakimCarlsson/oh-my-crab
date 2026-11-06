@@ -28,6 +28,8 @@ crab history <id> [folder]      print a saved conversation: title, settings and 
 crab rename <id> <folder> <t>   name a saved conversation nobody has open
 crab import <id> <folder>        save a conversation a client kept itself, read as JSON
 crab memory [folder]            print the memories a conversation in the folder starts with, as JSON
+crab hooks [folder]             print the hooks a conversation in the folder would find and its project's trust, as JSON
+crab trust <folder> [on|off]    print whether the folder's project is trusted, or record that it is or is not
 ```
 
 A conversation opened with an id is saved by `crab`: its messages, its turns,
@@ -169,6 +171,136 @@ conversations' worktrees made more than a day before are removed then too.
 Isolation needs `git` and a git working tree; a call asking for it anywhere
 else is refused with the reason and starts nothing, rather than running the
 subagents unisolated.
+
+## Hooks
+
+Hooks are commands the user sets up to run at four points of a conversation:
+before a tool call, after a tool call that succeeded, when a prompt is about to
+start a turn, and when the agent is about to end its turn. A hook is a shell
+command line, run with `bash -c` (`cmd /C` on Windows) in the conversation's
+folder, that reads a JSON payload on standard input and answers on standard
+output and with its exit code. The format is Claude Code's, as its hooks
+reference at <https://code.claude.com/docs/en/hooks> describes it, so hooks a
+user already has keep working:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [{ "type": "command", "command": "~/bin/no-rm.sh", "timeout": 10 }]
+      }
+    ]
+  }
+}
+```
+
+They are read from crab's own `hooks.json` in `~/.config/oh-my-crab/`, or the
+file `OMC_HOOKS_FILE` names; from Claude Code's `settings.json` in `~/.claude`
+(or `CLAUDE_CONFIG_DIR`); from `hooks/hooks.json` of each installed Claude Code
+plugin, run with `CLAUDE_PLUGIN_ROOT` set to the plugin's folder; and, once the
+project is trusted, from `.oh-my-crab/hooks.json`, `.claude/settings.json` and
+`.claude/settings.local.json` in the folders from the working folder up to the
+repository root. Hooks from every file run; a file that sets
+`disableAllHooks` turns them all off. The events are `PreToolUse`,
+`PostToolUse`, `UserPromptSubmit`, `Stop` and `SubagentStop`; other events and
+other hook types than `command` are skipped, so one file can serve both
+programs. A hook may run for `timeout` seconds, 60 by default and 30 for
+`UserPromptSubmit`; past that it is killed with everything it started. Hooks
+of one event that match run at once, and the same command listed twice runs
+once.
+
+A matcher names the tools a hook runs for. Empty or `*` is every tool; names
+made of letters, digits, `_` and `-` are exact, several split by `|` or `,`;
+a pattern whose only other characters are `*` and `?` is a glob over the whole
+name, such as `mcp__*`; anything else is a regular expression that may match
+anywhere in the name, such as `Edit.*` or `^mcp__github__`. A tool matches by
+crab's name (`bash`, `edit`) and by Claude Code's name for the same tool
+(`Bash`, `Edit` or `MultiEdit`). `SubagentStop` matches the kind of subagent,
+and the other two events take no matcher.
+
+Every payload holds `session_id` (the conversation's id, or empty), `cwd`,
+`hook_event_name` and `permission_mode` (`default`, `plan` or
+`bypassPermissions` in yolo mode), and `agent_id` and `agent_type` when a
+subagent runs the hook: subagents run the same hooks as the main agent, under
+the id of the `task` call that started them, followed by `/` and their place
+when the call started several. A tool call adds `tool_name`, `tool_input` (the
+arguments, already put right against the tool's schema) and `tool_use_id`, and
+after the call `tool_response` with the `output` the model will read. A hook
+from one of Claude Code's files is told Claude Code's name for the tool, and
+`tool_input.file_path` holds the `path` of the call made absolute. A prompt
+adds `prompt`, and the end of a turn `stop_hook_active` and
+`last_assistant_message`. The project folder is in `CLAUDE_PROJECT_DIR`.
+
+A hook answers with exit code 0 and, when it has something to say, a JSON
+object on standard output, or with exit code 2 and a reason on standard error:
+
+- Before a tool call, exit code 2, `"permissionDecision": "deny"` in
+  `hookSpecificOutput` or the older `"decision": "block"` refuses the call, and
+  the model reads the reason as the call's failure. `"allow"` (or `"approve"`)
+  runs it without asking the reader. `updatedInput` replaces the arguments,
+  which are put right against the schema again and fail the call when they
+  do not fit, and `additionalContext` is added to the result. Every denial
+  wins over every allowance, and the last rewrite wins.
+- After a tool call, `additionalContext`, the `reason` of `"decision":
+  "block"` and what exit code 2 writes to standard error are added to the
+  result as a `<hook-note>`, which the model reads and the client shows.
+- When a prompt is submitted, exit code 2, `"decision": "block"` or
+  `"continue": false` keeps it from the model; the turn ends with the reason as
+  its failure and is saved as one that failed. Plain text on standard output
+  and `additionalContext` are told to the model before the prompt. While a
+  hook runs on prompts, a prompt sent during a turn waits for the turn to end
+  and starts a turn of its own, so it is checked too.
+- When the agent is about to end its turn, exit code 2, `"decision": "block"`
+  or `additionalContext` has it go on with the reason as a notice; at most 8
+  times in a row before the model calls a tool again and 24 times a turn, and
+  `"continue": false` always lets the turn end.
+
+A hook that fails with another exit code is ignored, with a line on standard
+error, and what it guarded goes on. A hook that times out or cannot be started
+gave no answer: before a tool call that refuses the call, since its check never
+ran, and the model is told so; at the other three points the conversation goes
+on as if it had not been there. A turn never waits on a hook longer than its
+timeout, and stopping the turn kills the hooks it runs.
+
+## Project trust
+
+A freshly cloned repository can steer the agent, so what a project folder
+brings is not used until the reader trusts the project: its hooks, its
+instruction files (`AGENTS.md`, `CLAUDE.md`, `.claude/rules` and the like),
+its skills and agent definitions, and the Claude Code plugins its settings
+switch on or off. The user's own folders (`~/.claude`, `~/.codex`,
+`~/.agents/skills` and crab's config folder) and the plugins the user
+installed are always used, and a project that is the user's home folder is the
+user's own. Crab reads no tool-server configuration from a project; the tool
+servers are the ones the client passes when it opens the conversation. In
+yolo mode the language servers of an untrusted project start on the first
+write instead of when the conversation opens.
+
+Trust is recorded per repository: the main checkout and every linked worktree
+of it share one decision, while another repository with the same folder name
+does not. Outside a repository the project is the folder. Decisions are kept
+in `trust.json` under `oh-my-crab` in the user's data folder, or in the file
+`OMC_TRUST_FILE` names, with the project's hook commands as they were when it
+was trusted. When a trusted project later has a hook that is not among them,
+added or changed, its hooks are left out until it is trusted again, while its
+instruction files, skills and agent definitions stay in use; a hook that is
+removed changes nothing.
+
+When something is left out, crab tells the client with a `Trust` event: the
+folder trust is recorded for, the standing (`Unknown`, `Changed` or
+`Declined`), and each input left out with its kind, name and file. The client
+answers with a `Trust` command under the event's ticket: `Always` trusts the
+project for good, `Allow` for this conversation only, and `Reject` records
+that it is not trusted, which is not asked about again in that conversation.
+What a trusted project brings is used from the next turn on. The event is sent
+when the conversation opens and again when what is left out changes, since the
+files are read again before every prompt. `crab trust <folder> on` and `off`
+record the same decisions from a shell, and `crab hooks [folder]` prints every
+hook found, whether it runs, and what is left out. Set `OMC_TRUST_ALL=1` to
+trust every project for the conversations of the process without recording
+anything, for automation that vouches for what it runs in.
 
 ## Long conversations
 

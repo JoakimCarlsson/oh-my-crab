@@ -74,7 +74,7 @@ pub(crate) fn installed(locations: &Locations) -> Vec<Plugin> {
     let Some(plugins) = record["plugins"].as_object() else {
         return Vec::new();
     };
-    let switched = switched(claude, &locations.directory);
+    let switched = switched(claude, &locations.directory, locations.project);
     let here = locations.directory.canonicalize().ok();
     let mut bound = Vec::new();
     let mut shared = Vec::new();
@@ -112,6 +112,14 @@ pub(crate) fn installed(locations: &Locations) -> Vec<Plugin> {
     bound
 }
 
+/// The installed Claude Code plugins that apply to the working folder of `locations`, as their names and the folders they are installed in, those bound to a project first.
+pub fn plugin_folders(locations: &Locations) -> Vec<(String, PathBuf)> {
+    installed(locations)
+        .into_iter()
+        .map(|plugin| (plugin.name, plugin.folder))
+        .collect()
+}
+
 /// Whether `install`, bound to a project, was installed for `here`, the working folder.
 fn installed_here(install: &Value, here: Option<&Path>) -> bool {
     let project = install["projectPath"]
@@ -120,13 +128,13 @@ fn installed_here(install: &Value, here: Option<&Path>) -> bool {
     here.is_some() && project.as_deref() == here
 }
 
-/// The plugins switched on or off by `enabledPlugins` in Claude's `settings.json` under `claude`, then the working folder's `.claude/settings.json` and `.claude/settings.local.json`, a later file winning.
-fn switched(claude: &Path, directory: &Path) -> HashMap<String, bool> {
-    let files = [
-        claude.join("settings.json"),
-        directory.join(".claude/settings.json"),
-        directory.join(".claude/settings.local.json"),
-    ];
+/// The plugins switched on or off by `enabledPlugins` in Claude's `settings.json` under `claude`, then, when the `project`'s own files are read, the working folder's `.claude/settings.json` and `.claude/settings.local.json`, a later file winning.
+fn switched(claude: &Path, directory: &Path, project: bool) -> HashMap<String, bool> {
+    let mut files = vec![claude.join("settings.json")];
+    if project {
+        files.push(directory.join(".claude/settings.json"));
+        files.push(directory.join(".claude/settings.local.json"));
+    }
     let mut switched = HashMap::new();
     for settings in files.iter().filter_map(|file| json(file)) {
         let Some(enabled) = settings["enabledPlugins"].as_object() else {
@@ -190,6 +198,7 @@ mod tests {
             home: Some(base.join("home")),
             claude: Some(base.join("home/.claude")),
             codex: None,
+            project: true,
         }
     }
 
@@ -277,6 +286,38 @@ mod tests {
                 ("kit".to_owned(), "kit-user".to_owned()),
             ]
         );
+    }
+
+    /// While the project's own folders are not read, its settings neither switch a plugin on nor off; the user's still do.
+    #[test]
+    fn an_untrusted_project_switches_nothing() {
+        let base = scratch("plugins-untrusted");
+        std::fs::create_dir_all(base.join("repo")).unwrap();
+        std::fs::create_dir_all(base.join("elsewhere")).unwrap();
+        record(
+            &base,
+            r#"{
+                "kit@market":[{"scope":"user","installPath":"{base}/kit"}],
+                "forced@market":[{"scope":"project","projectPath":"{base}/elsewhere","installPath":"{base}/forced"}]
+            }"#,
+        );
+        put(
+            &base,
+            "repo/.claude/settings.json",
+            r#"{"enabledPlugins":{"forced@market":true,"kit@market":false}}"#,
+        );
+        let mut untrusted = locations(&base);
+        untrusted.project = false;
+        let names: Vec<String> = plugin_folders(&untrusted)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, vec!["kit".to_owned()]);
+        let names: Vec<String> = plugin_folders(&locations(&base))
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, vec!["forced".to_owned()]);
     }
 
     /// The manifest can name more skill folders, one or a list, and those outside the plugin are ignored.

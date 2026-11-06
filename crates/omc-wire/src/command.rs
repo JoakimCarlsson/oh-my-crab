@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use crate::inquiry::Reply;
 use crate::language::LanguageAnswer;
+use crate::permission::Verdict;
 use crate::toolserver::ToolServer;
 
 /// How a conversation is opened.
@@ -111,6 +112,13 @@ pub enum Command {
         /// The answer.
         answer: LanguageAnswer,
     },
+    /// Answers the trust request under `ticket`: [`Verdict::Always`] trusts the project for good, recording it for every worktree of the repository, [`Verdict::Allow`] trusts it for this conversation only, and [`Verdict::Reject`] records that it is not trusted. What a trusted project brings is used from the next turn on; a ticket the harness no longer waits on is ignored.
+    Trust {
+        /// The request being answered.
+        ticket: u64,
+        /// The reader's decision.
+        verdict: Verdict,
+    },
     /// Ends the conversation and the harness.
     Close,
 }
@@ -130,5 +138,36 @@ mod tests {
         assert_eq!(opening.conversation, None);
         assert_eq!(opening.history, None);
         assert_eq!(opening.keep, None);
+    }
+
+    /// A trust answer and a trust request each survive a trip through a line, in the shape a client writes and reads.
+    #[test]
+    fn trust_round_trips() {
+        let answer: Command =
+            crate::decode(r#"{"Trust":{"ticket":3,"verdict":"Always"}}"#).unwrap();
+        assert_eq!(
+            answer,
+            Command::Trust {
+                ticket: 3,
+                verdict: Verdict::Always
+            }
+        );
+        assert_eq!(
+            crate::decode::<Command>(&crate::encode(&answer).unwrap()).unwrap(),
+            answer
+        );
+        let request = crate::Event::Trust(crate::TrustRequest {
+            ticket: 3,
+            root: PathBuf::from("/w"),
+            standing: crate::Standing::Unknown,
+            skipped: vec![crate::Skipped {
+                kind: crate::Input::Hook,
+                name: "PreToolUse bash: ./guard.sh".to_owned(),
+                path: PathBuf::from("/w/.claude/settings.json"),
+            }],
+        });
+        let line = crate::encode(&request).unwrap();
+        assert!(line.starts_with(r#"{"Trust":{"ticket":3,"root":"/w","standing":"Unknown","#));
+        assert_eq!(crate::decode::<crate::Event>(&line).unwrap(), request);
     }
 }

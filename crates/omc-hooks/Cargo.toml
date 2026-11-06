@@ -1,0 +1,26 @@
+[package]
+name = "omc-hooks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = "0.1.92"
+dirs = "7.0.0"
+futures-util = "0.3.34"
+globset = "0.4.21"
+omc-agent = { version = "0.1.0", path = "../omc-agent" }
+omc-context = { version = "0.1.0", path = "../omc-context" }
+omc-memory = { version = "0.1.0", path = "../omc-memory" }
+omc-providers = { version = "0.1.0", path = "../omc-providers" }
+omc-wire = { version = "0.1.0", path = "../omc-wire" }
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["rt", "macros", "process", "time", "io-util"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["test-util", "rt-multi-thread"] }

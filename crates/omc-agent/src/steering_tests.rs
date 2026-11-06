@@ -57,6 +57,7 @@ async fn steered_turn(
             notebook: None,
             window: None,
             checkpoint: None,
+            hooks: None,
         },
         history,
         "go".into(),

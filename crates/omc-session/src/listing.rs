@@ -73,6 +73,7 @@ pub fn tools() -> Result<Vec<ToolInfo>, String> {
             .then(|| omc_memory::Memories::open(&directory, None))
             .flatten()
             .map(Arc::new),
+        hooks: None,
     });
     let mut listed: Vec<ToolInfo> = Vec::new();
     for plan in [false, true] {

@@ -6,6 +6,7 @@
 //! so another program can hold the conversation.
 
 mod bridge;
+mod hooks;
 mod languages;
 mod listing;
 mod memory;
@@ -22,6 +23,7 @@ mod translate;
 mod turn;
 mod warmer;
 
+pub use hooks::{hooks, trust};
 pub use listing::tools;
 pub use memory::memory;
 pub use providers::{account, key_source, providers, save_key, signed_in};

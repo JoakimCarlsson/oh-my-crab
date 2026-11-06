@@ -21,3 +21,61 @@ pub fn discover(locations: &Locations, disabled: &[String]) -> Discovered {
         agents: agents::find(locations, disabled),
     }
 }
+
+#[cfg(test)]
+/// Tests for what an untrusted project gives.
+mod tests {
+    use super::*;
+    use crate::testutil::{put, scratch};
+
+    /// With the project's own folders not read, its instruction files, skills and agent definitions are left out and the user's are still found.
+    #[test]
+    fn an_untrusted_project_gives_nothing_of_its_own() {
+        let base = scratch("discovery-untrusted");
+        std::fs::create_dir_all(base.join("repo/.git")).unwrap();
+        put(&base, "repo/AGENTS.md", "Run the setup script first.");
+        put(
+            &base,
+            "repo/.claude/skills/setup/SKILL.md",
+            "---\nname: setup\ndescription: Sets up\n---\nRun it.",
+        );
+        put(
+            &base,
+            "repo/.claude/agents/helper.md",
+            "---\nname: helper\ndescription: Helps\n---\nHelp.",
+        );
+        put(&base, "home/.claude/CLAUDE.md", "Be brief.");
+        put(
+            &base,
+            "home/.claude/skills/mine/SKILL.md",
+            "---\nname: mine\ndescription: Mine\n---\nDo it.",
+        );
+        let mut locations = Locations {
+            directory: base.join("repo"),
+            root: Some(base.join("repo")),
+            home: Some(base.join("home")),
+            claude: Some(base.join("home/.claude")),
+            codex: None,
+            project: true,
+        };
+        let trusted = discover(&locations, &[]);
+        assert_eq!(trusted.instructions.len(), 2);
+        assert!(trusted.skills.iter().any(|skill| skill.name == "setup"));
+        assert!(trusted.agents.iter().any(|agent| agent.name == "helper"));
+        locations.project = false;
+        let untrusted = discover(&locations, &[]);
+        let paths: Vec<_> = untrusted
+            .instructions
+            .iter()
+            .map(|file| file.path.clone())
+            .collect();
+        assert_eq!(paths, vec![base.join("home/.claude/CLAUDE.md")]);
+        let skills: Vec<&str> = untrusted
+            .skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect();
+        assert_eq!(skills, vec!["mine"]);
+        assert!(!untrusted.agents.iter().any(|agent| agent.name == "helper"));
+    }
+}

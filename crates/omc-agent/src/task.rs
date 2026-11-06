@@ -17,7 +17,7 @@ use tokio::sync::Semaphore;
 
 use crate::submit::{Slot, SubmitResult};
 use crate::worktree::{self, Handback, Isolation, Lease, Merge};
-use crate::{AgentError, AgentEvent, Approvals, Context, run_turn};
+use crate::{AgentError, AgentEvent, Approvals, Context, Hooks, run_turn};
 
 /// The tools a subagent never gets: starting subagents of its own, and the ones that talk to the reader about the main agent's work.
 const WITHHELD: &[&str] = &[
@@ -76,6 +76,8 @@ pub struct TaskSettings {
     pub jobs: Arc<Jobs>,
     /// How subagents are given worktrees of their own, or nothing when they cannot be, which refuses every call asking for one.
     pub isolation: Option<Arc<Isolation>>,
+    /// The checks the user set up around tool calls and the end of a turn, which subagents run as the main agent does, each under its own id and kind.
+    pub hooks: Option<Arc<dyn Hooks>>,
 }
 
 /// Arguments of a `task` call.
@@ -317,6 +319,8 @@ struct Run {
     isolated: bool,
     /// The worktree it works in, once it was given one.
     lease: Option<Lease>,
+    /// The checks the user set up, as they apply to this subagent.
+    hooks: Option<Arc<dyn Hooks>>,
 }
 
 impl Run {
@@ -373,6 +377,7 @@ impl Run {
             effort,
             assignment,
             structured,
+            hooks,
             ..
         } = self;
         let kind = lane.kind.clone();
@@ -398,6 +403,7 @@ impl Run {
             notebook: None,
             window: None,
             checkpoint: None,
+            hooks: hooks.as_deref(),
         };
         let mut history = Vec::new();
         let opening = match &structured {
@@ -602,6 +608,15 @@ impl Task {
             Structured { schema, slot }
         });
         let system = (self.settings.prompt)(agent, &registry.names(), None);
+        let id = match place {
+            Some(place) => format!("{call}/{place}"),
+            None => call.to_owned(),
+        };
+        let hooks = self
+            .settings
+            .hooks
+            .as_ref()
+            .map(|hooks| hooks.for_subagent(&id, &agent.name));
         Ok(Run {
             model: self.settings.model.clone(),
             registry,
@@ -620,6 +635,7 @@ impl Task {
             isolated: item.isolated.unwrap_or(agent.isolated),
             definition: agent.clone(),
             lease: None,
+            hooks,
         })
     }
 
@@ -909,6 +925,7 @@ mod tests {
             agents: builtin_agents(),
             effort: None,
             prompt: Arc::new(|agent, _, _| format!("SUB:{}", agent.name)),
+            hooks: None,
             isolation: None,
             jobs: Arc::new(Jobs::new(|_| {})),
         }));
@@ -935,6 +952,7 @@ mod tests {
                 notebook: None,
                 window: None,
                 checkpoint: None,
+                hooks: None,
             },
             &mut history,
             prompt.into(),
@@ -1134,6 +1152,7 @@ mod tests {
             agents: builtin_agents(),
             effort: None,
             prompt: Arc::new(|agent, _, _| format!("SUB:{}", agent.name)),
+            hooks: None,
             isolation: None,
             jobs: jobs.clone(),
         });
@@ -1218,6 +1237,7 @@ mod tests {
             agents: builtin_agents(),
             effort: None,
             prompt: Arc::new(|agent, _, _| format!("SUB:{}", agent.name)),
+            hooks: None,
             isolation: None,
             jobs: Arc::new(Jobs::new(|_| {})),
         }));
@@ -1237,6 +1257,7 @@ mod tests {
                         notebook: None,
                         window: None,
                         checkpoint: None,
+                        hooks: None,
                     },
                     &mut mine,
                     "go".into(),

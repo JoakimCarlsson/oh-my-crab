@@ -1,7 +1,7 @@
 //! The `crab` binary: the harness, served to another program over standard input and output.
 
 /// Usage text printed for `--help` and after a bad argument.
-const USAGE: &str = "usage: crab <serve|tools|providers|account|history|rename|import|memory>\n\n  serve                    hold a conversation: read commands from standard input, write events to standard output\n  tools                    print the tools the agent can have, as a JSON list of name and description\n  providers                print the providers a conversation can be opened with, as a JSON list of id, name and sign-in\n  account <provider> [folder]  print who <provider> is signed in as with the logins in [folder], or in crab's own folder, or nothing\n  history <id> [folder]    print the saved conversation <id> as JSON: its title, saved settings and turns, which works while it is open elsewhere\n  rename <id> <folder> <title>  name the saved conversation <id>, which fails while it is open elsewhere\n  import <id> <folder>          save the conversation a client kept, read as JSON from standard input, as the conversation <id>\n  memory [folder]          print the memories a conversation in [folder], or in the current folder, starts with, as JSON: its project's, which every worktree of the repository shares, and the user's";
+const USAGE: &str = "usage: crab <serve|tools|providers|account|history|rename|import|memory|hooks|trust>\n\n  serve                    hold a conversation: read commands from standard input, write events to standard output\n  tools                    print the tools the agent can have, as a JSON list of name and description\n  providers                print the providers a conversation can be opened with, as a JSON list of id, name and sign-in\n  account <provider> [folder]  print who <provider> is signed in as with the logins in [folder], or in crab's own folder, or nothing\n  history <id> [folder]    print the saved conversation <id> as JSON: its title, saved settings and turns, which works while it is open elsewhere\n  rename <id> <folder> <title>  name the saved conversation <id>, which fails while it is open elsewhere\n  import <id> <folder>          save the conversation a client kept, read as JSON from standard input, as the conversation <id>\n  memory [folder]          print the memories a conversation in [folder], or in the current folder, starts with, as JSON: its project's, which every worktree of the repository shares, and the user's\n  hooks [folder]           print the hooks a conversation in [folder], or in the current folder, would find, whether each runs, and its project's trust, as JSON\n  trust <folder> [on|off]  print whether the project <folder> belongs to is trusted, as JSON, or record that it is (on) or is not (off), for every worktree of its repository";
 
 /// Runs the conversation the command line asks for.
 ///
@@ -75,6 +75,31 @@ async fn main() -> anyhow::Result<()> {
             let folder = std::env::args().nth(2).map(std::path::PathBuf::from);
             let listed = omc_session::memory(folder).map_err(|reason| anyhow::anyhow!(reason))?;
             println!("{}", serde_json::to_string(&listed)?);
+            Ok(())
+        }
+        Some("hooks") => {
+            let folder = std::env::args().nth(2).map(std::path::PathBuf::from);
+            let listed = omc_session::hooks(folder).map_err(|reason| anyhow::anyhow!(reason))?;
+            println!("{}", serde_json::to_string(&listed)?);
+            Ok(())
+        }
+        Some("trust") => {
+            let mut arguments = std::env::args().skip(2);
+            let folder = arguments
+                .next()
+                .map(std::path::PathBuf::from)
+                .ok_or_else(|| anyhow::anyhow!("trust needs a folder"))?;
+            let trusted = match arguments.next().as_deref() {
+                None => None,
+                Some("on") => Some(true),
+                Some("off") => Some(false),
+                Some(other) => {
+                    return Err(anyhow::anyhow!("trust takes on or off, not {other}"));
+                }
+            };
+            let standing = omc_session::trust(Some(folder), trusted)
+                .map_err(|reason| anyhow::anyhow!(reason))?;
+            println!("{}", serde_json::to_string(&standing)?);
             Ok(())
         }
         Some("-h" | "--help") => {

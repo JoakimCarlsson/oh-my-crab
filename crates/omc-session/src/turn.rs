@@ -2,9 +2,10 @@
 
 use std::sync::Arc;
 
-use omc_agent::{Context, EventSink, Scribe, compact, run_turn_steered};
+use omc_agent::{Context, EventSink, Hooks, Scribe, compact, run_turn_steered};
 use omc_auth::AuthError;
 use omc_context::{Discovered, Environment, Locations};
+use omc_hooks::{Engine, HookEvent, Submitted};
 use omc_providers::Provider;
 use omc_providers::{ChatModel, Message, RemoteModel};
 use omc_tools::{Host, Registry};
@@ -56,6 +57,8 @@ pub(crate) struct Turn {
     pub(crate) scribe: Option<Scribe>,
     /// How subagents get git worktrees of their own, when they can.
     pub(crate) isolation: Option<Arc<omc_agent::Isolation>>,
+    /// The hooks that run, when there are any.
+    pub(crate) hooks: Option<Arc<Engine>>,
 }
 
 impl Turn {
@@ -139,6 +142,7 @@ impl Turn {
             unnamed,
             isolation: self.isolation.clone(),
             memories: memories.clone(),
+            hooks: self.hooks.clone().map(|hooks| -> Arc<dyn Hooks> { hooks }),
         });
         let key = Key {
             provider: self.provider,
@@ -177,9 +181,14 @@ impl Turn {
             notebook: Some(&self.shared.notebook),
             window: Some(window),
             checkpoint: checkpoint.as_deref(),
+            hooks: self.hooks.as_deref().map(|hooks| hooks as &dyn Hooks),
         };
         let result = match job {
             Job::Prompt(prompt) => {
+                let added = match self.submitted(&prompt).await {
+                    Ok(added) => added,
+                    Err(blocked) => return blocked,
+                };
                 let mut told = prefix.notices(
                     &self.history,
                     &environment,
@@ -191,14 +200,24 @@ impl Turn {
                     let digest = digest(memories, prompt.clone()).await;
                     told.push(prefix.memory_notice(&digest));
                 }
+                told.extend(added);
                 told.push(prompt);
+                let steering: Option<&dyn omc_agent::Steering> = if self
+                    .hooks
+                    .as_ref()
+                    .is_some_and(|hooks| hooks.has(HookEvent::UserPromptSubmit))
+                {
+                    None
+                } else {
+                    Some(self.shared.as_ref())
+                };
                 run_turn_steered(
                     &context,
                     &mut self.history,
                     told.join("\n\n"),
                     events.as_ref(),
                     self.scribe.as_ref(),
-                    Some(self.shared.as_ref()),
+                    steering,
                 )
                 .await
             }
@@ -216,6 +235,33 @@ impl Turn {
         match result {
             Ok(()) => Ended::Done(self.history),
             Err(error) => Ended::Failed(error.to_string()),
+        }
+    }
+}
+
+impl Turn {
+    /// Runs the hooks of the prompt `prompt` and returns the context they add before it; when they block it, the turn that ends for that reason, recorded in the saved history as lost so the reader still sees the prompt.
+    async fn submitted(&self, prompt: &str) -> Result<Option<String>, Ended> {
+        let Some(hooks) = &self.hooks else {
+            return Ok(None);
+        };
+        match hooks.prompt(prompt).await {
+            Submitted::Go => Ok(None),
+            Submitted::WithContext(context) => Ok(Some(format!(
+                "<user-prompt-submit-hook>\n{}\n</user-prompt-submit-hook>",
+                context.trim()
+            ))),
+            Submitted::Blocked(reason) => {
+                let reason = format!("a hook blocked the prompt: {}", reason.trim());
+                if let Some(Err(error)) = self
+                    .scribe
+                    .as_ref()
+                    .map(|scribe| scribe.cut_losing(self.history.len(), &reason))
+                {
+                    eprintln!("history not saved: {error}");
+                }
+                Err(Ended::Failed(reason))
+            }
         }
     }
 }
@@ -320,11 +366,13 @@ mod tests {
                 home: None,
                 claude: None,
                 codex: None,
+                project: true,
             }),
             shared: shared.clone(),
             history,
             scribe: None,
             isolation: None,
+            hooks: None,
         }
     }
 
@@ -650,6 +698,178 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A model that deletes `f.txt` with `bash` on its first request, then answers, keeping the results it was given.
+    struct Deleter {
+        /// The results each request carried.
+        results: Mutex<Vec<Vec<omc_providers::ToolResult>>>,
+    }
+
+    #[async_trait]
+    impl ChatModel for Deleter {
+        /// Calls `bash` with `rm f.txt`, then answers.
+        async fn complete(
+            &self,
+            request: Request<'_>,
+            _: &mut dyn Sink,
+        ) -> Result<Reply, ProviderError> {
+            let mut results = self.results.lock().unwrap();
+            if let Some(Message::ToolResults(given)) = request.messages.last() {
+                results.push(given.clone());
+                return Ok(Reply {
+                    text: "done".into(),
+                    ..Reply::default()
+                });
+            }
+            Ok(calling("bash", json!({"command": "rm f.txt"})))
+        }
+    }
+
+    /// A project's hook that refuses `rm` in `bash` is skipped while the project is untrusted, so the file is deleted, and enforced once it is trusted, so the model is told why and the file stays; the user's note after each call reaches the model either way.
+    #[tokio::test]
+    async fn a_project_hook_runs_only_once_trusted() {
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/turn-hooks");
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("repo");
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let dir = dir.canonicalize().unwrap();
+        std::fs::write(
+            dir.join(".claude/settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"grep -q '\"command\":\"rm ' && { echo 'deleting files is not allowed here' >&2; exit 2; }; exit 0"}]}]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("user-hooks.json"),
+            r#"{"hooks":{"PostToolUse":[{"matcher":"bash","hooks":[{"type":"command","command":"echo '{\"hookSpecificOutput\":{\"additionalContext\":\"checked by the user hook\"}}'"}]}]}}"#,
+        )
+        .unwrap();
+        let store = omc_hooks::TrustStore::new(base.join("trust.json"));
+        let locations = Locations {
+            directory: dir.clone(),
+            root: Some(dir.clone()),
+            home: None,
+            claude: None,
+            codex: None,
+            project: true,
+        };
+        let own = base.join("user-hooks.json");
+        let untrusted = omc_hooks::assess(&locations, Some(&own), Some(&store), false, &[]);
+        assert_eq!(untrusted.skipped.len(), 1);
+        store
+            .set(&untrusted.project, true, untrusted.project_hooks.clone())
+            .unwrap();
+        let trusted = omc_hooks::assess(&locations, Some(&own), Some(&store), false, &[]);
+        assert!(trusted.skipped.is_empty());
+        let mut seen = Vec::new();
+        for assessment in [untrusted, trusted] {
+            std::fs::write(dir.join("f.txt"), "keep me").unwrap();
+            let (out, _events) = tokio::sync::mpsc::unbounded_channel();
+            let shared = Shared::new(out);
+            shared.open(Provider::Claude, vec!["m".into()], "m".into(), Mode::Yolo);
+            let mut turn = turn_in(&dir, &shared, Vec::new());
+            turn.hooks = Some(Arc::new(Engine::new(
+                assessment.hooks.clone(),
+                omc_hooks::Setting {
+                    session: None,
+                    folder: dir.clone(),
+                    mode: Arc::new(|| "bypassPermissions"),
+                },
+            )));
+            let model = Arc::new(Deleter {
+                results: Mutex::new(Vec::new()),
+            });
+            let Ended::Done(_) = turn
+                .run_with(model.clone(), Job::Prompt("delete f.txt".into()))
+                .await
+            else {
+                panic!("turn failed");
+            };
+            let result = model.results.lock().unwrap()[0][0].clone();
+            seen.push((dir.join("f.txt").exists(), result));
+        }
+        let (kept, result) = &seen[0];
+        assert!(!*kept && !result.is_error, "{}", result.text);
+        assert!(result.text.contains("checked by the user hook"));
+        let (kept, result) = &seen[1];
+        assert!(*kept && result.is_error);
+        assert!(
+            result.text.contains("deleting files is not allowed here"),
+            "{}",
+            result.text
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A prompt hook that blocks ends the turn before the model is asked, with its reason; one that adds context has it told before the prompt.
+    #[tokio::test]
+    async fn prompt_hooks_block_or_add_context() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/turn-prompt-hooks");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (out, _events) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared::new(out);
+        shared.open(Provider::Claude, vec!["m".into()], "m".into(), Mode::Asking);
+        let hook = |command: &str| omc_hooks::Hook {
+            event: HookEvent::UserPromptSubmit,
+            matcher: String::new(),
+            command: command.to_owned(),
+            timeout: None,
+            file: dir.join("hooks.json"),
+            origin: omc_hooks::HookOrigin::User,
+            claude: false,
+            plugin: None,
+        };
+        let engine = |command: &str| {
+            Arc::new(Engine::new(
+                vec![hook(command)],
+                omc_hooks::Setting {
+                    session: None,
+                    folder: dir.clone(),
+                    mode: Arc::new(|| "default"),
+                },
+            ))
+        };
+        let model = Arc::new(Recording {
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut turn = turn_in(&dir, &shared, Vec::new());
+        turn.hooks = Some(engine(
+            "grep -q secret && { echo 'no secrets in prompts' >&2; exit 2; }; exit 0",
+        ));
+        let Ended::Failed(reason) = turn
+            .run_with(model.clone(), Job::Prompt("my secret is 42".into()))
+            .await
+        else {
+            panic!("the prompt was not blocked");
+        };
+        assert_eq!(reason, "a hook blocked the prompt: no secrets in prompts");
+        assert!(model.seen.lock().unwrap().is_empty());
+        let mut turn = turn_in(&dir, &shared, Vec::new());
+        turn.hooks = Some(engine("echo 'the build is red'"));
+        let Ended::Done(_) = turn
+            .run_with(model.clone(), Job::Prompt("hello".into()))
+            .await
+        else {
+            panic!("turn failed");
+        };
+        let prompt = model.seen.lock().unwrap()[0].prompt.clone().unwrap();
+        assert!(
+            prompt.contains(
+                "<user-prompt-submit-hook>\nthe build is red\n</user-prompt-submit-hook>\n\nhello"
+            ),
+            "{prompt}"
+        );
+    }
+
     /// Rejecting the plan keeps plan mode on.
     #[tokio::test]
     async fn rejecting_a_plan_keeps_plan_mode() {
@@ -772,11 +992,13 @@ mod tests {
                 home: None,
                 claude: None,
                 codex: None,
+                project: true,
             }),
             shared,
             history: history.clone(),
             scribe: None,
             isolation: None,
+            hooks: None,
         };
         let Ended::Done(compacted) = turn
             .run_with(Arc::new(Summarizer), Job::Compact(Some("names".into())))
@@ -876,11 +1098,13 @@ mod tests {
                 home: None,
                 claude: None,
                 codex: None,
+                project: true,
             }),
             shared: shared.clone(),
             history: Vec::new(),
             scribe: Some(journal.scribe()),
             isolation: None,
+            hooks: None,
         };
         let model = Arc::new(Interrupted {
             shared: shared.clone(),
@@ -955,11 +1179,13 @@ mod tests {
                 home: None,
                 claude: None,
                 codex: None,
+                project: true,
             }),
             shared,
             history: Vec::new(),
             scribe: None,
             isolation: None,
+            hooks: None,
         };
         let model = Arc::new(Editor {
             step: Mutex::new(0),

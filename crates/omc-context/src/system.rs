@@ -194,6 +194,7 @@ mod tests {
             home: Some(base.join("home")),
             claude: Some(base.join("home/.claude")),
             codex: Some(base.join("home/.codex")),
+            project: true,
         };
         let discovered = discover(&locations, &[]);
         let environment = Environment::detect(&locations, "model-x");
@@ -233,6 +234,7 @@ mod tests {
             home: None,
             claude: None,
             codex: None,
+            project: true,
         };
         let discovered = Discovered::default();
         let environment = Environment::detect(&locations, "");
@@ -263,6 +265,7 @@ mod tests {
             home: None,
             claude: None,
             codex: None,
+            project: true,
         };
         let discovered = Discovered::default();
         let environment = Environment::detect(&locations, "m");
@@ -295,6 +298,7 @@ mod tests {
             home: None,
             claude: None,
             codex: None,
+            project: true,
         };
         let tree = crate::workspace_tree(&base);
         assert_eq!(tree, "src/\n  main.rs\nCargo.toml");
@@ -325,6 +329,7 @@ mod tests {
             home: None,
             claude: None,
             codex: None,
+            project: true,
         };
         let discovered = Discovered::default();
         let environment = Environment::detect(&locations, "");

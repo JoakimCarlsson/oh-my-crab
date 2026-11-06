@@ -131,6 +131,7 @@ fn task_tool(
         }),
         jobs: Arc::new(Jobs::new(|_| {})),
         isolation,
+        hooks: None,
     });
     (task, log)
 }
@@ -150,6 +151,7 @@ fn task_tool_with(
         agents: builtin_agents(),
         effort: None,
         prompt: Arc::new(|agent, _, _| format!("SUB:{}", agent.name)),
+        hooks: None,
         jobs,
         isolation: Some(isolation),
     })
