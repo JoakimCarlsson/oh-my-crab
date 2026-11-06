@@ -1,12 +1,19 @@
 //! The `read` tool: numbered lines of a text file or an outline of a large
-//! code file, a directory listing, an image, the text of a PDF, or a web page.
+//! code file, a directory listing, an image, the text of a PDF, a web page,
+//! the tables of a SQLite database, the members of an archive, or a jq query
+//! on a JSON file.
 
+mod archive;
+mod container;
 mod guard;
+mod json;
 mod lines;
 mod listing;
 mod media;
 mod outline;
 mod selector;
+mod shrink;
+mod sqlite;
 mod web;
 
 use std::io::{BufReader, Read as _};
@@ -17,6 +24,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::snapshot::tag_file;
+use super::{conflict, lookalike};
 use crate::tool::parse_args;
 use crate::{Sandbox, Tool, ToolError, ToolOutput};
 use media::Media;
@@ -111,7 +119,7 @@ impl Tool for Read {
 
     /// Describes the tool to the model.
     fn description(&self) -> &'static str {
-        "Read a file, directory, image, PDF or web page.\n\
+        "Read a file, directory, image, PDF, SQLite database, archive or web page.\n\
          - Text files: lines prefixed with line numbers, under a header with the file's snapshot \
          tag; pass that tag and those line numbers to edit.\n\
          - Pick lines with a suffix on the path: file:50 or file:50- (from line 50), \
@@ -125,9 +133,29 @@ impl Tool for Read {
          the folded ranges. Never guess what a fold holds: read it, e.g. file:120-149, before \
          editing inside it; an edit with the outline's tag that touches a folded line is \
          refused. file:1- reads the file as it is.\n\
+         - Merge conflicts: when lines with conflict markers are shown, a note lists every \
+         conflict of the file by number with its lines and side labels; file:conflicts shows \
+         only the conflicts. Resolve one with edit's resolve operation and the read's tag.\n\
+         - A path that does not exist but is the end of exactly one file's path (or matches it \
+         ignoring case) reads that file, and the result says so; several candidates are \
+         listed in the error.\n\
          - Directories: entries, directories first and ending in /, honoring .gitignore.\n\
-         - Images (PNG, JPEG, GIF, WebP): returned for you to look at.\n\
+         - Images (PNG, JPEG, GIF, WebP): returned for you to look at. One over 3.75 MB or \
+         2000 px on a side is shrunk first; the header then gives the original size and \
+         the factor to multiply coordinates by to map them back to it.\n\
          - PDFs: extracted text, a [page N] line before each page; line suffixes work.\n\
+         - SQLite databases: db.sqlite lists tables with row counts and schemas; \
+         db.sqlite:users shows rows (50 at a time; db.sqlite:users:51-100 or :-20 for \
+         others); db.sqlite:SELECT ... runs a read-only query (SELECT, WITH or PRAGMA \
+         table_info only), paged the same way.\n\
+         - Archives (.zip, .tar, .tar.gz, .tgz): a.zip lists members with sizes; \
+         a.zip:dir/file.txt reads a member as numbered text, with line suffixes such as \
+         a.zip:dir/file.txt:10-40; a.zip:dir lists a directory. Members have no tag and \
+         cannot be edited.\n\
+         - JSON: data.json:<jq filter> such as data.json:.items[0].name, \
+         data.json:.items[] | .id, data.json:keys or data.json:.items | length gives the \
+         result pretty-printed and numbered; add a line suffix to page it \
+         (data.json:.items:100-200). data.json:50-80 reads lines as text.\n\
          - http:// and https:// URLs: the page as Markdown with numbered lines; url:raw for \
          the original HTML. The user approves fetches per site. Redirects to another site \
          are not followed: read the URL the error names. A host name that resolves to a \
@@ -142,7 +170,7 @@ impl Tool for Read {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "File or directory path relative to the working directory, or an http(s) URL, optionally with a selector suffix: src/main.rs:120-180, log.txt:-50, https://example.com/docs:raw."
+                    "description": "File or directory path relative to the working directory, or an http(s) URL, optionally with a selector suffix: src/main.rs:120-180, log.txt:-50, src/lib.rs:conflicts, https://example.com/docs:raw, app.db:users, src.zip:lib/a.rs, data.json:.items[0]."
                 }
             },
             "required": ["path"]
@@ -158,7 +186,9 @@ impl Tool for Read {
         }
     }
 
-    /// Fetches a URL, or reads a path on a blocking thread.
+    /// Fetches a URL, or reads a path on a blocking thread: inside a
+    /// database, archive or JSON file when the path names one, as a file or
+    /// directory otherwise.
     async fn call(&self, args: Value) -> Result<ToolOutput, ToolError> {
         let args: Args = parse_args(args)?;
         if web::is_url(&args.path) {
@@ -166,12 +196,20 @@ impl Tool for Read {
             let selector = selector.windowed(args.offset, args.limit)?;
             return web::read(url.as_str(), selector).await;
         }
+        if let Some(target) = container::locate(&self.sandbox, &args.path) {
+            return container::read_bounded(target, args.offset, args.limit).await;
+        }
         let (path, label, selector) = self.locate(&args.path)?;
         let selector = selector.windowed(args.offset, args.limit)?;
         let outline = self.outline;
-        tokio::task::spawn_blocking(move || read_path(&path, &label, &selector, outline))
-            .await
-            .map_err(|e| ToolError::Failed(e.to_string()))?
+        let sandbox = self.sandbox.clone();
+        tokio::task::spawn_blocking(move || {
+            let (path, label, note) = lookalike::redirect(&sandbox, path, label)?;
+            read_path(&path, &label, &selector, outline)
+                .map(|output| lookalike::noted(output, note))
+        })
+        .await
+        .map_err(|e| ToolError::Failed(e.to_string()))?
     }
 }
 
@@ -220,6 +258,11 @@ fn read_path(
             media::image(&std::fs::read(path)?, media_type, label)
         }
         Some(Media::Pdf) => {
+            if selector.conflicts {
+                return Err(ToolError::InvalidArguments(format!(
+                    "{label} is a PDF; the conflicts selector applies to text files"
+                )));
+            }
             media::check_pdf_size(file_size(path)?, label)?;
             let (text, pages) = media::pdf_text(&std::fs::read(path)?, label)?;
             let numbered = lines::number(
@@ -234,18 +277,29 @@ fn read_path(
         }
         None if head.contains(&0) => Err(lines::not_text(label)),
         None => {
+            let (conflicts, text) = conflict::scan_file(path);
+            if selector.conflicts {
+                let header = format!("[tag {}]\n", tag_file(path)?);
+                return Ok(ToolOutput::new(conflict::listing(
+                    &header, label, &text, &conflicts,
+                )));
+            }
             if outline
+                && conflicts.is_empty()
                 && !selector.picks_lines()
                 && let Some(text) = outline::read(path, label)?
             {
                 return Ok(ToolOutput::new(text));
             }
             let header = format!("[tag {}]\n", tag_file(path)?);
-            let numbered = lines::number(
+            let mut numbered = lines::number(
                 || std::fs::File::open(path).map(BufReader::new),
                 selector,
                 label,
             )?;
+            if !conflicts.is_empty() && conflict::shows_markers(&numbered) {
+                numbered.push_str(&conflict::note(label, &conflicts));
+            }
             Ok(ToolOutput::new(header + &numbered))
         }
     }
@@ -350,6 +404,81 @@ mod tests {
         let missing = tool.call(json!({ "path": "gone.txt:5" })).await;
         assert!(
             matches!(missing, Err(ToolError::Failed(m)) if m.contains("gone.txt does not exist"))
+        );
+    }
+
+    /// Lines showing conflict markers get a note listing every conflict of the
+    /// file; lines without them do not; `:conflicts` shows only the blocks.
+    #[tokio::test]
+    async fn notes_and_lists_merge_conflicts() {
+        use super::super::conflict::tests::TWO;
+        let (tool, dir) = tool("read-conflicts");
+        std::fs::write(dir.join("f.txt"), TWO).unwrap();
+        let whole = text(&tool, "f.txt").await;
+        assert!(whole.contains("[2 merge conflicts in f.txt:\n#1 lines 2-7: ours \"HEAD\" (line 3), theirs \"feature\" (lines 5-6)\n#2 lines 9-14:"), "{whole}");
+        assert!(whole.contains("\"op\": \"resolve\""), "{whole}");
+        assert!(!text(&tool, "f.txt:1-1").await.contains("merge conflict"));
+        let listed = text(&tool, "f.txt:conflicts").await;
+        assert!(
+            listed.starts_with(&format!(
+                "[tag {}]\n[2 merge conflicts in f.txt]\n\n#1 lines 2-7",
+                tag(TWO.as_bytes())
+            )),
+            "{listed}"
+        );
+        assert!(listed.contains("     2\t<<<<<<< HEAD\n"), "{listed}");
+        assert!(
+            !listed.contains("\ttop\n") && !listed.contains("\tmiddle\n"),
+            "{listed}"
+        );
+        std::fs::write(dir.join("clean.txt"), "a\n").unwrap();
+        assert!(
+            text(&tool, "clean.txt:conflicts")
+                .await
+                .ends_with("[no merge conflicts in clean.txt]\n")
+        );
+        let windowed = tool
+            .call(json!({ "path": "f.txt:conflicts", "offset": 2 }))
+            .await;
+        assert!(matches!(windowed, Err(ToolError::InvalidArguments(_))));
+    }
+
+    /// A large code file with conflicts is read as text, not as an outline.
+    #[tokio::test]
+    async fn reads_conflicted_code_as_text() {
+        let (tool, dir) = tool("read-conflicts-outline");
+        let code = outline::tests::rust_source(20, 10);
+        let conflicted = format!("<<<<<<< HEAD\n// a\n=======\n// b\n>>>>>>> other\n{code}");
+        std::fs::write(dir.join("a.rs"), &conflicted).unwrap();
+        let out = text(&tool, "a.rs").await;
+        assert!(!out.contains("[outline"), "{out}");
+        assert!(out.contains("[1 merge conflict in a.rs:"), "{out}");
+    }
+
+    /// A missing path that ends exactly one file's path reads that file and
+    /// says so; several candidates are listed in the error.
+    #[tokio::test]
+    async fn reads_the_one_file_a_mistyped_path_means() {
+        let (tool, dir) = tool("read-lookalike");
+        std::fs::create_dir_all(dir.join("crates/a/src")).unwrap();
+        std::fs::create_dir_all(dir.join("crates/b/src")).unwrap();
+        std::fs::write(dir.join("crates/a/src/lib.rs"), "a\nb\n").unwrap();
+        std::fs::write(dir.join("crates/b/src/lib.rs"), "c\n").unwrap();
+        let out = text(&tool, "a/src/lib.rs:2").await;
+        assert!(
+            out.starts_with("[a/src/lib.rs does not exist; showing crates/a/src/lib.rs, the only file whose path ends with it]\n[tag "),
+            "{out}"
+        );
+        assert!(out.ends_with("     2\tb\n"), "{out}");
+        assert!(
+            text(&tool, "CRATES/B/SRC/LIB.RS")
+                .await
+                .contains("crates/b/src/lib.rs")
+        );
+        let several = tool.call(json!({ "path": "src/lib.rs" })).await;
+        assert!(
+            matches!(&several, Err(ToolError::Failed(m)) if m.contains("crates/a/src/lib.rs, crates/b/src/lib.rs")),
+            "{several:?}"
         );
     }
 

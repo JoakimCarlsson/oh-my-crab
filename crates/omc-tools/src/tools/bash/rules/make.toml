@@ -1,0 +1,44 @@
+# Condensing rules for make and ninja: directory changes, include chains and step counters.
+
+[[filter]]
+name = "make"
+programs = ["make", "gmake", "ninja"]
+drop = [
+  '^g?make(\[\d+\])?: (Entering|Leaving) directory ',
+  '^In file included from ',
+  '^\s+from \S+:\d+[:,]$',
+]
+collapse = [
+  { pattern = '^\[\d+/\d+\] (Building|Linking|Generating|Running|Copying|Install)', label = "build step" },
+]
+
+[[test]]
+command = "make -j8 all"
+input = """
+make[1]: Entering directory '/work/lib'
+cc -O2 -c util.c -o util.o
+In file included from util.c:1:
+                 from util.h:3,
+util.h:9:6: warning: unused parameter 'n' [-Wunused-parameter]
+make[1]: Leaving directory '/work/lib'
+make[1]: Entering directory '/work/app'
+cc -O2 -c main.c -o main.o
+make[1]: Leaving directory '/work/app'
+"""
+expected = """
+cc -O2 -c util.c -o util.o
+util.h:9:6: warning: unused parameter 'n' [-Wunused-parameter]
+cc -O2 -c main.c -o main.o
+"""
+
+[[test]]
+command = "ninja -C build"
+input = """
+[1/4] Building CXX object src/CMakeFiles/app.dir/a.cpp.o
+[2/4] Building CXX object src/CMakeFiles/app.dir/b.cpp.o
+[3/4] Building CXX object src/CMakeFiles/app.dir/c.cpp.o
+[4/4] Linking CXX executable app
+"""
+expected = """
+… 4 build step lines
+"""

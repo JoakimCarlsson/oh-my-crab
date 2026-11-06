@@ -118,6 +118,7 @@ impl Turn {
             .then(|| self.shared.checkpoint.clone());
         let environment = Arc::new(self.environment());
         let unnamed = self.shared.title().is_none();
+        let tree = self.shared.tree(&self.locations.directory);
         let toolset = Toolset::build(&Inputs {
             base: &self.base,
             denied: &self.denied,
@@ -128,6 +129,7 @@ impl Turn {
             effort,
             discovered: self.discovered.clone(),
             environment: environment.clone(),
+            tree: tree.clone(),
             notebook: self.shared.notebook.clone(),
             checkpoint: checkpoint.clone(),
             jobs: self.shared.jobs.clone(),
@@ -143,6 +145,7 @@ impl Turn {
                 key.clone(),
                 &toolset,
                 &environment,
+                &tree,
                 self.discovered.clone(),
                 unnamed,
             )
@@ -394,12 +397,14 @@ mod tests {
         }
     }
 
-    /// The system prompt and tool list sent stay byte for byte the same across plan mode turning on and off and the date changing; each change is told once, at the start of the next prompt.
+    /// The system prompt and tool list sent stay byte for byte the same across plan mode turning on and off, the date changing and files appearing; each change of mode or date is told once, at the start of the next prompt, and the workspace outline stays as the first turn saw it.
     #[tokio::test]
     async fn the_prefix_survives_plan_mode_and_a_new_day() {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../build/tests/omc-session/turn-prefix");
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("early.txt"), "").unwrap();
         let (out, _events) = tokio::sync::mpsc::unbounded_channel();
         let shared = Shared::new(out);
         shared.open(Provider::Claude, vec!["m".into()], "m".into(), Mode::Asking);
@@ -424,9 +429,13 @@ mod tests {
                 panic!("turn failed");
             };
             history = after;
+            std::fs::write(dir.join("later.txt"), "").unwrap();
         }
         let seen = model.seen.lock().unwrap();
         assert_eq!(seen.len(), 4);
+        assert!(seen[0].system.contains("<workspace-tree>"));
+        assert!(seen[0].system.contains("\nearly.txt\n"));
+        assert!(!seen[0].system.contains("later.txt"));
         for sent in seen.iter() {
             assert_eq!(sent.system.as_bytes(), seen[0].system.as_bytes());
             assert_eq!(

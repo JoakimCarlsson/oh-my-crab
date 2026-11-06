@@ -1,0 +1,26 @@
+# Condensing rules for C and C++ compilers: include chains go, diagnostics stay.
+
+[[filter]]
+name = "cc"
+programs = ["gcc", "g++", "cc", "c++", "clang", "clang++"]
+drop = [
+  '^In file included from ',
+  '^\s+from \S+:\d+[:,]$',
+]
+
+[[test]]
+command = "gcc -Wall -c main.c"
+input = """
+In file included from /usr/include/stdio.h:42,
+                 from main.c:1:
+main.c:10:5: error: implicit declaration of function 'foo'
+   10 |     foo();
+      |     ^~~
+main.c:15:9: warning: unused variable 'x' [-Wunused-variable]
+"""
+expected = """
+main.c:10:5: error: implicit declaration of function 'foo'
+   10 |     foo();
+      |     ^~~
+main.c:15:9: warning: unused variable 'x' [-Wunused-variable]
+"""

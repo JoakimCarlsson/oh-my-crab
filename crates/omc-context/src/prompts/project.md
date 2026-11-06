@@ -5,6 +5,13 @@
 {{#if model}}- Model: {{model}}{{/if}}
 </workstation>
 
+{{#if tree}}
+<workspace-tree>
+Working directory layout, snapshot from the start of this conversation; NOT updated as files change. Folders end in `/`; depth ≤ 3; ignored, hidden, build and vendored folders omitted; long folders and deep levels cut. Use it to skip listing folders; read or search before relying on a path.
+{{tree}}
+</workspace-tree>
+{{/if}}
+
 {{#if rules}}
 <repo-rules>
 MUST follow these context files for all tasks; nearer files override farther ones:

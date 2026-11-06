@@ -201,8 +201,22 @@ pub enum Message {
 pub struct Pruning {
     /// The outputs left out.
     pub elided: Vec<Elided>,
+    /// The large fenced blocks cut out of earlier prompts and replies, each replaced with a short note.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub excised: Vec<Excised>,
     /// About how many tokens the context held right after the outputs were left out, system prompt included.
     pub tokens_after: u64,
+}
+
+/// One fenced block cut out of the text of a prompt or a reply in what the model is given.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Excised {
+    /// The position in the history of the prompt or reply the block is in.
+    pub at: usize,
+    /// The byte offset in its text where the block starts, at the start of its opening fence line.
+    pub start: usize,
+    /// The byte offset in its text where the block ends, at the end of its closing fence line.
+    pub end: usize,
 }
 
 /// One tool output left out of what the model is given.
@@ -224,6 +238,8 @@ pub enum Elision {
     Old,
     /// The same read was made again later, so this copy is out of date.
     Superseded,
+    /// It was heavy and older than the recent messages, and the context was shaken to make room without a summary.
+    Shaken,
 }
 
 /// A summary that stands in for the older part of a history, recorded at the point it was made.

@@ -16,7 +16,10 @@ use crate::loop_guard::LoopGuard;
 use crate::pruning;
 use crate::recall::{self, RECALL};
 use crate::recovery::{self, MAX_RECOVERIES, Retry};
+use crate::shake;
 use crate::steering::{self, Steering};
+use crate::text_calls::{self, TextCalls};
+use crate::todos::TodoTracker;
 use crate::{ApprovalRequest, Approvals, Scribe};
 
 /// Something the UI should show while a turn runs.
@@ -209,7 +212,9 @@ fn rewind(history: &mut Vec<Message>, length: usize, report: &str, scribe: Optio
 /// calls whose arguments cannot be read; the model is told why in their
 /// results. When the model keeps making the same calls, or keeps making edits
 /// that change nothing, a notice telling it to change course is added to the
-/// results.
+/// results; when it works on for long without updating a todo list with open
+/// items, a reminder is. A call the model wrote out as text instead of making
+/// it is made, or the model is told to make it.
 ///
 /// # Errors
 ///
@@ -389,6 +394,14 @@ fn refuse(
         .collect()
 }
 
+/// `reply`, a whole reply that is to be carried on by the next one after a notice, with a paragraph break after its text so the two read as one.
+fn carried_on(mut reply: Reply) -> Reply {
+    if !reply.text.trim().is_empty() {
+        reply.text.push_str("\n\n");
+    }
+    reply
+}
+
 /// Adds `notice` to the end of the last of `results`, where the model reads it with them.
 fn append_notice(results: &mut [ToolResult], notice: &str) {
     if let Some(last) = results.last_mut() {
@@ -410,11 +423,15 @@ fn append_notice(results: &mut [ToolResult], notice: &str) {
 ///
 /// The batches of calls are watched for circles: the same calls made again and again, or edits that change nothing, earn a notice to the model at the end of the batch's results.
 ///
+/// The model's todo list is watched too: when it still has open items after [`crate::todos::CHANGES`] file-changing calls since it last changed, a reminder listing them is added to the batch's results, at most [`crate::todos::MAX_REMINDERS`] times between changes; and a turn that changed files and is about to end with open items is carried on once with a notice to finish them or update the list. Neither happens when the model's reply ends by asking the user a question.
+///
+/// A reply without tool calls whose text holds calls written out as text is either given those calls, when they are marked as calls or are fenced calls with little else said, or carried on with a notice telling the model to make the call instead; either counts against [`MAX_RECOVERIES`].
+///
 /// When the provider refuses a request while the history holds images, the
 /// images are taken out, with a note left in their place, and the request is
 /// sent once more, since the usual cause is a model without image input.
 ///
-/// When the window is known and the context has grown past the compaction threshold, the older part of the history is summarized before the next request; a summary that cannot be made is shown and not tried again this turn. When the provider says a request holds more than the window takes, the history is compacted and the request sent once more, once a turn.
+/// When the window is known and the context has grown past the compaction threshold, old tool outputs are left out and the heavy content of all but the recent messages is shaken out, and when that is not enough the older part of the history is summarized before the next request; a summary that cannot be made is shown and not tried again this turn. When the provider says a request holds more than the window takes, the history is compacted and the request sent once more, once a turn.
 async fn drive(
     context: &Context<'_>,
     history: &mut Vec<Message>,
@@ -431,9 +448,10 @@ async fn drive(
     let mut retries = 0;
     let mut waits = 0;
     let mut recoveries = 0;
-    let mut notice: Option<&'static str> = None;
+    let mut notice: Option<Cow<'static, str>> = None;
     let mut cut: Option<Reply> = None;
     let mut guard = LoopGuard::default();
+    let mut todos = TodoTracker::new(history);
     loop {
         let live = context.refresh.map(|refresh| refresh());
         let registry = live
@@ -460,7 +478,7 @@ async fn drive(
         }
         let mut chunks = Chunks { events };
         let answered = {
-            let messages = request_messages(history, cut.as_ref(), notice);
+            let messages = request_messages(history, cut.as_ref(), notice.as_deref());
             let request = Request {
                 system,
                 messages: &messages,
@@ -507,6 +525,7 @@ async fn drive(
         if let Some(tokens) = reply.tokens {
             events(AgentEvent::Used(tokens));
         }
+        let carried = cut.is_some();
         let reply = match cut.take() {
             Some(earlier) => recovery::joined(earlier, reply),
             None => reply,
@@ -516,7 +535,7 @@ async fn drive(
             && let Some(next) = stopped_short(&reply)
         {
             recoveries += 1;
-            notice = Some(next);
+            notice = Some(Cow::Borrowed(next));
             if !is_empty(&reply) {
                 cut = Some(reply);
             }
@@ -526,11 +545,38 @@ async fn drive(
             return Err(AgentError::Empty);
         }
         first = false;
+        let written = if carried {
+            None
+        } else {
+            text_calls::recover(&reply, &|name| registry.get(name).is_some(), history.len())
+        };
+        let reply = match written {
+            Some(TextCalls::Made(made)) if recoveries < MAX_RECOVERIES => {
+                recoveries += 1;
+                made
+            }
+            Some(TextCalls::Unclear(asked)) if recoveries < MAX_RECOVERIES => {
+                recoveries += 1;
+                notice = Some(Cow::Owned(asked));
+                cut = Some(carried_on(reply));
+                continue;
+            }
+            _ => reply,
+        };
+        if reply.tool_calls.is_empty()
+            && reply.stop == Stop::Finished
+            && let Some(finish) = todos.finishing(&reply)
+        {
+            notice = Some(Cow::Owned(finish));
+            cut = Some(carried_on(reply));
+            continue;
+        }
         let nearly_full = reply
             .tokens
             .zip(context.window)
             .is_some_and(|(tokens, window)| tokens.context() >= window / 100 * REMINDER_PERCENT);
         let calls = reply.tool_calls.clone();
+        let said = reply.text.clone();
         let truncated = reply.stop == Stop::Length;
         history.push(Message::Assistant(reply));
         record(scribe, &history[history.len() - 1]);
@@ -572,6 +618,9 @@ async fn drive(
         }
         if let Some(redirect) = guard.observe(&calls, &results, &changed) {
             append_notice(&mut results, &redirect);
+        }
+        if let Some(reminder) = todos.observe(&calls, &results, &said) {
+            append_notice(&mut results, &reminder);
         }
         if nearly_full && !reminded && context.notebook.is_some() {
             reminded = true;
@@ -651,7 +700,7 @@ fn over_threshold(context: &Context<'_>, history: &[Message], system: &str) -> b
     })
 }
 
-/// Makes room in the context of `history`, sent with the system prompt `system`: leaves old tool outputs out first, and summarizes the older part of the history when that is not enough to bring the context under the compaction threshold, or always when `overflowed`, since the provider has refused a request as too long and the estimate cannot be trusted.
+/// Makes room in the context of `history`, sent with the system prompt `system`: leaves old tool outputs out first; then, when that is not enough to bring the context under the compaction threshold, shakes the heavy outputs and fenced blocks out of all but the recent messages; and summarizes the older part of the history when that is still not enough, or always when `overflowed`, since the provider has refused a request as too long and the estimate cannot be trusted.
 ///
 /// Returns whether anything was left out or summarized.
 ///
@@ -676,7 +725,17 @@ async fn make_room(
     if pruned && !overflowed && !over_threshold(context, history, system) {
         return Ok(true);
     }
-    Ok(compact_history(context, history, system, None, events, scribe).await? || pruned)
+    let shaken = match shake::shake(history, compaction::keep_recent(context.window)) {
+        Some(shaking) => {
+            prune_history(history, shaking, system, events, scribe);
+            true
+        }
+        None => false,
+    };
+    if shaken && !overflowed && !over_threshold(context, history, system) {
+        return Ok(true);
+    }
+    Ok(compact_history(context, history, system, None, events, scribe).await? || pruned || shaken)
 }
 
 /// Appends `pruning` to `history` and to `scribe`'s journal, with how full the context of `history`, sent with the system prompt `system`, is after it, and shows that through `events`.

@@ -1,0 +1,1 @@
+Run a shell command in the working directory, with bash (cmd on Windows). Returns the exit code, stdout and stderr. The command is killed after the timeout. Long output shows its start and end only, and the result names a file holding the whole of it, to read in parts with `read` instead of running the command again. The user is asked to approve each command.

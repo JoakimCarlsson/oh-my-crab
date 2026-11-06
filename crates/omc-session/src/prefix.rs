@@ -53,11 +53,12 @@ pub(crate) struct Prefix {
 }
 
 impl Prefix {
-    /// Makes the prefix for `key` from `toolset`: every tool of either mode, described as it is now, and a system prompt for that tool list outside plan mode, describing `environment` and `discovered`, which asks the agent to name the conversation when it is `unnamed`.
+    /// Makes the prefix for `key` from `toolset`: every tool of either mode, described as it is now, and a system prompt for that tool list outside plan mode, describing `environment`, the working directory outline `tree` and `discovered`, which asks the agent to name the conversation when it is `unnamed`.
     pub(crate) fn freeze(
         key: Key,
         toolset: &Toolset,
         environment: &Environment,
+        tree: &str,
         discovered: Arc<Discovered>,
         unnamed: bool,
     ) -> Self {
@@ -83,6 +84,7 @@ impl Prefix {
             tools: &names,
             plan: false,
             unnamed,
+            tree,
         });
         Self {
             key,

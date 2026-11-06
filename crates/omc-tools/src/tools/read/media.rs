@@ -3,11 +3,15 @@
 
 use base64::Engine as _;
 
+use super::shrink;
 use crate::{Image, ToolError, ToolOutput};
 
 /// Largest image handed to the model, in bytes; base64 makes it a third larger,
-/// which keeps it under the 5 MB providers accept.
+/// which keeps it under the 5 MB providers accept. Larger images are shrunk.
 pub(super) const MAX_IMAGE_BYTES: usize = 3_750_000;
+
+/// Largest image file `read` decodes to shrink it, in bytes.
+pub(super) const MAX_IMAGE_FILE_BYTES: usize = 64 << 20;
 
 /// Largest PDF whose text is extracted, in bytes.
 pub(super) const MAX_PDF_BYTES: usize = 64 << 20;
@@ -43,13 +47,30 @@ pub(super) fn sniff(head: &[u8]) -> Option<Media> {
 /// Hands the image `bytes` of type `media_type`, called `label`, to the model,
 /// under a line saying what it is.
 ///
+/// An image over [`MAX_IMAGE_BYTES`] or with a side over
+/// [`shrink::MAX_SIDE`] pixels is shrunk first, and the line then says how
+/// coordinates in it map back to the original; any other image is handed on
+/// unchanged.
+///
 /// # Errors
 ///
 /// Returns [`ToolError::Failed`] when the image is larger than
-/// [`MAX_IMAGE_BYTES`].
+/// [`MAX_IMAGE_FILE_BYTES`], or must shrink but cannot be decoded or made
+/// small enough.
 pub(super) fn image(bytes: &[u8], media_type: &str, label: &str) -> Result<ToolOutput, ToolError> {
     check_image_size(bytes.len(), label)?;
-    let text = format!("[image {label}, {media_type}, {}]", size(bytes.len()));
+    let shrunk = shrink::shrink(bytes, MAX_IMAGE_BYTES).map_err(|error| {
+        ToolError::Failed(format!("could not shrink the image {label}: {error}"))
+    })?;
+    let (bytes, media_type, note) = match &shrunk {
+        Some(shrunk) => (
+            &shrunk.bytes[..],
+            shrunk.media_type,
+            format!("; {}", shrunk.note()),
+        ),
+        None => (bytes, media_type, String::new()),
+    };
+    let text = format!("[image {label}, {media_type}, {}{note}]", size(bytes.len()));
     Ok(ToolOutput::new(text).with_images(vec![Image {
         media_type: media_type.to_string(),
         data: base64::engine::general_purpose::STANDARD.encode(bytes),
@@ -57,19 +78,21 @@ pub(super) fn image(bytes: &[u8], media_type: &str, label: &str) -> Result<ToolO
 }
 
 /// Checks that an image of `len` bytes, called `label`, is small enough to
-/// hand to the model.
+/// decode and, if need be, shrink for the model.
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::Failed`] when it is larger than [`MAX_IMAGE_BYTES`].
+/// Returns [`ToolError::Failed`] when it is larger than
+/// [`MAX_IMAGE_FILE_BYTES`].
 pub(super) fn check_image_size(len: usize, label: &str) -> Result<(), ToolError> {
-    if len <= MAX_IMAGE_BYTES {
+    if len <= MAX_IMAGE_FILE_BYTES {
         return Ok(());
     }
     Err(ToolError::Failed(format!(
-        "{label} is a {} image, larger than the {} the model accepts; make a smaller copy first",
+        "{label} is a {} image, larger than the {} read shrinks for the model; make a smaller \
+         copy first",
         size(len),
-        size(MAX_IMAGE_BYTES)
+        size(MAX_IMAGE_FILE_BYTES)
     )))
 }
 
@@ -248,8 +271,31 @@ pub(super) mod tests {
         assert_eq!(output.text, "[image p.png, image/png, 8 B]");
         assert_eq!(output.images[0].media_type, "image/png");
         assert_eq!(output.images[0].data, "iVBORw0KGgo=");
-        let big = vec![0u8; MAX_IMAGE_BYTES + 1];
-        assert!(image(&big, "image/png", "big.png").is_err());
+        let broken = vec![0u8; MAX_IMAGE_BYTES + 1];
+        assert!(image(&broken, "image/png", "big.png").is_err());
+        let huge = vec![0u8; MAX_IMAGE_FILE_BYTES + 1];
+        let refused = image(&huge, "image/png", "huge.png")
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("make a smaller copy"), "{refused}");
+    }
+
+    /// An image too wide for the model comes back smaller, with the factor
+    /// that maps its coordinates back to the original.
+    #[test]
+    fn shrinks_large_images() {
+        let output = image(&shrink::tests::noisy_png(2400, 60), "image/png", "w.png").unwrap();
+        assert!(
+            output.text.starts_with("[image w.png, image/jpeg, "),
+            "{}",
+            output.text
+        );
+        assert!(
+            output.text.contains("shrunk from 2400x60 to 2000x50"),
+            "{}",
+            output.text
+        );
+        assert_eq!(output.images[0].media_type, "image/jpeg");
     }
 
     /// The text of a PDF comes out page by page.

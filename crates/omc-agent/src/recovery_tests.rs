@@ -378,3 +378,47 @@ async fn edits_that_change_nothing_are_redirected() {
     assert!(!last.is_error, "{}", last.text);
     assert!(last.text.contains("changed nothing"), "{}", last.text);
 }
+
+/// An edit written out as a fenced JSON block, with little else said, is made as a real call and runs; the block leaves the saved reply.
+#[tokio::test]
+async fn an_edit_written_as_text_is_made() {
+    let dir = scratch("text-edit");
+    std::fs::write(dir.join("f.txt"), "before\n").unwrap();
+    let edit = json!({ "files": [{ "path": "f.txt", "tag": omc_tools::snapshot_tag(b"before\n"), "ops": [{ "op": "replace", "line": 1, "text": "after" }] }] });
+    let model = Outcomes::new(vec![Ok(say(&format!("Fixing it:\n```json\n{edit}\n```")))]);
+    let (ended, history, _) = turn(&model, &dir).await;
+    ended.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+        "after\n"
+    );
+    let Message::Assistant(made) = &history[1] else {
+        panic!("expected the reply, got {:?}", history[1]);
+    };
+    assert_eq!(made.text, "Fixing it:");
+    assert_eq!(made.tool_calls[0].name, "edit");
+    assert!(!results(&history, 2)[0].is_error);
+    assert_eq!(history.len(), 4);
+}
+
+/// A call written out amid a long answer is not run; the model is asked, with a notice the history does not keep, and its next reply carries the first on.
+#[tokio::test]
+async fn a_call_written_amid_prose_is_asked_about() {
+    let dir = scratch("text-unclear");
+    let text = format!(
+        "{}\n```json\n{}\n```",
+        "The write tool takes a path and the content. ".repeat(10),
+        json!({ "name": "write", "arguments": { "path": "x.txt", "content": "x" } })
+    );
+    let model = Outcomes::new(vec![Ok(say(&text)), Ok(say("That was only an example."))]);
+    let (ended, history, _) = turn(&model, &dir).await;
+    ended.unwrap();
+    assert!(!dir.join("x.txt").exists());
+    let asked = last_text(&model.requests()[1]);
+    assert!(asked.contains("`write`"), "{asked}");
+    assert_eq!(history.len(), 2);
+    let Message::Assistant(answer) = &history[1] else {
+        panic!("expected the answer, got {:?}", history[1]);
+    };
+    assert_eq!(answer.text, format!("{text}\n\nThat was only an example."));
+}

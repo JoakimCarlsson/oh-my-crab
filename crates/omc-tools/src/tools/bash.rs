@@ -1,4 +1,10 @@
 //! The `bash` tool: run a shell command with a timeout.
+//!
+//! Before a command runs, a plain use of the shell for something a dedicated tool does better is turned away in favour of that tool ([`intercept`]). While it runs, the output of known noisy commands is condensed for the model, the raw output staying saved whole ([`condense`]). Both can be switched off.
+
+mod condense;
+mod intercept;
+mod shell;
 
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
@@ -13,6 +19,9 @@ use tokio::process::Command;
 use super::capture::Capture;
 use crate::tool::parse_args;
 use crate::{Jobs, Sandbox, Tool, ToolError, ToolOutput};
+pub(super) use condense::Condenser;
+use condense::{Rules, rules_for};
+use intercept::Verdict;
 
 /// Timeout in seconds when the caller gives none.
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -24,14 +33,22 @@ const MAX_TIMEOUT_SECS: u64 = 600;
 const DRAIN_GRACE: Duration = Duration::from_secs(1);
 
 /// What the model is told about the tool.
-const DESCRIPTION: &str = "Run a shell command in the working directory, with bash (cmd on Windows). Returns the exit code, stdout \
-     and stderr. The command is killed after the timeout. Long output shows its start and end only, \
-     and the result names a file holding the whole of it, to read in parts with `read` instead of running the command again. \
-     The user is asked to approve each command.";
+const DESCRIPTION: &str = include_str!("../prompts/bash.md");
+
+/// What the model is told about commands being turned away in favour of dedicated tools, when they are.
+const INTERCEPT_NOTE: &str = include_str!("../prompts/bash_intercept.md");
+
+/// What the model is told about condensed output, when output is condensed.
+const CONDENSE_NOTE: &str = include_str!("../prompts/bash_condense.md");
 
 /// What the model is told about the `background` flag, when the tool has it.
-const BACKGROUND_NOTE: &str = " Pass `background: true` to start a long-running command (a dev server, a long build) and get a handle \
-     back at once; it has no timeout unless you give one, and `wait` returns its exit code and output, long output cut the same way, when it ends.";
+const BACKGROUND_NOTE: &str = include_str!("../prompts/bash_background.md");
+
+/// The environment variable that, set to `0`, `false`, `off` or `no`, stops output being condensed by default.
+const CONDENSE_ENV: &str = "OMC_BASH_CONDENSE";
+
+/// The environment variable that, set to `0`, `false`, `off` or `no`, stops commands being turned away in favour of dedicated tools by default.
+const INTERCEPT_ENV: &str = "OMC_BASH_INTERCEPT";
 
 /// Runs shell commands in the working directory.
 pub struct Bash {
@@ -39,28 +56,97 @@ pub struct Bash {
     sandbox: Sandbox,
     /// Where background commands run, when the tool may start them.
     jobs: Option<Arc<Jobs>>,
+    /// Whether the output of known noisy commands is condensed for the model.
+    condense: bool,
+    /// Whether plain shell uses that a dedicated tool does better are turned away.
+    intercept: bool,
     /// What the model is told it does.
     description: String,
 }
 
 impl Bash {
     /// Creates the tool running commands in the root of `sandbox`, in the foreground only.
+    ///
+    /// Output is condensed and plain shell uses of dedicated tools are turned away, unless the environment variable `OMC_BASH_CONDENSE` or `OMC_BASH_INTERCEPT` is set to `0`, `false`, `off` or `no`.
     pub fn new(sandbox: Sandbox) -> Self {
         Self {
             sandbox,
             jobs: None,
-            description: DESCRIPTION.to_owned(),
+            condense: switched_on(CONDENSE_ENV),
+            intercept: switched_on(INTERCEPT_ENV),
+            description: String::new(),
+        }
+        .described()
+    }
+
+    /// Creates the tool running commands in the root of `sandbox`, which can also start them as background runs in `jobs`, with the same defaults as [`Bash::new`].
+    pub fn with_jobs(sandbox: Sandbox, jobs: Arc<Jobs>) -> Self {
+        Self {
+            jobs: Some(jobs),
+            ..Self::new(sandbox)
+        }
+        .described()
+    }
+
+    /// The tool condensing the output of known noisy commands for the model when `on`, and showing all output as it is otherwise.
+    pub fn condensing(mut self, on: bool) -> Self {
+        self.condense = on;
+        self.described()
+    }
+
+    /// The tool turning away plain shell uses that a dedicated tool does better when `on`, and running every command otherwise.
+    pub fn intercepting(mut self, on: bool) -> Self {
+        self.intercept = on;
+        self.described()
+    }
+
+    /// The tool with its description matching what it does.
+    fn described(mut self) -> Self {
+        let notes = [
+            (true, DESCRIPTION),
+            (self.intercept, INTERCEPT_NOTE),
+            (self.condense, CONDENSE_NOTE),
+            (self.jobs.is_some(), BACKGROUND_NOTE),
+        ];
+        let parts: Vec<&str> = notes
+            .iter()
+            .filter(|(shown, _)| *shown)
+            .map(|(_, note)| note.trim())
+            .collect();
+        self.description = parts.join("\n\n");
+        self
+    }
+
+    /// Decides whether `command` may run, returning any tip to add to its result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Failed`], naming the tool and arguments to use instead, when the command is turned away.
+    fn screen(&self, command: &str) -> Result<Option<String>, ToolError> {
+        if !self.intercept {
+            return Ok(None);
+        }
+        match intercept::check(command, &self.sandbox) {
+            Verdict::Run => Ok(None),
+            Verdict::Hint(tip) => Ok(Some(tip)),
+            Verdict::Refuse(message) => Err(ToolError::Failed(message)),
         }
     }
 
-    /// Creates the tool running commands in the root of `sandbox`, which can also start them as background runs in `jobs`.
-    pub fn with_jobs(sandbox: Sandbox, jobs: Arc<Jobs>) -> Self {
-        Self {
-            sandbox,
-            jobs: Some(jobs),
-            description: format!("{DESCRIPTION}{BACKGROUND_NOTE}"),
-        }
+    /// The rules condensing the output of `command`, when output is condensed and a filter applies to it.
+    fn rules(&self, command: &str) -> Option<Rules> {
+        self.condense.then(|| rules_for(command)).flatten()
     }
+}
+
+/// Whether the switch in the environment variable `name` is on: it is unless set to `0`, `false`, `off` or `no`.
+fn switched_on(name: &str) -> bool {
+    std::env::var(name).map_or(true, |value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
 }
 
 /// Arguments of a `bash` call.
@@ -118,9 +204,13 @@ impl Tool for Bash {
 
     /// A copy that runs commands in the foreground only, when this one can start background runs.
     fn foreground(&self) -> Option<Arc<dyn Tool>> {
-        self.jobs
-            .as_ref()
-            .map(|_| Arc::new(Bash::new(self.sandbox.clone())) as Arc<dyn Tool>)
+        self.jobs.as_ref().map(|_| {
+            Arc::new(
+                Bash::new(self.sandbox.clone())
+                    .condensing(self.condense)
+                    .intercepting(self.intercept),
+            ) as Arc<dyn Tool>
+        })
     }
 
     /// Runs the call without an id, which only loses the link from a background run to the call that started it.
@@ -128,20 +218,27 @@ impl Tool for Bash {
         self.call_as("", args).await
     }
 
-    /// Runs the command, killing its whole process group on timeout, or starts it in the background under the call `id`.
+    /// Runs the command, killing its whole process group on timeout, or starts it in the background under the call `id`; turns it away first when a dedicated tool does the job.
     async fn call_as(&self, id: &str, args: Value) -> Result<ToolOutput, ToolError> {
         let args: Args = parse_args(args)?;
+        let tip = self.screen(&args.command)?;
+        let rules = self.rules(&args.command);
         if !args.background {
             let seconds = args
                 .timeout
                 .unwrap_or(DEFAULT_TIMEOUT_SECS)
                 .clamp(1, MAX_TIMEOUT_SECS);
-            return run(
+            let mut output = run(
                 &self.sandbox,
                 &args.command,
                 Some(Duration::from_secs(seconds)),
+                rules,
             )
-            .await;
+            .await?;
+            if let Some(tip) = tip {
+                output.text = format!("{}\n{tip}", output.text);
+            }
+            return Ok(output);
         }
         let jobs = self.jobs.as_ref().ok_or_else(|| {
             ToolError::Failed("this agent cannot start background runs".to_owned())
@@ -161,7 +258,7 @@ impl Tool for Bash {
         let work = {
             let command = command.clone();
             async move {
-                run(&sandbox, &command, timeout)
+                run(&sandbox, &command, timeout, rules)
                     .await
                     .map(|output| output.text)
                     .map_err(|error| error.to_string())
@@ -193,9 +290,9 @@ impl Drop for GroupGuard {
     }
 }
 
-/// Runs `command` in the root of `sandbox`, waiting at most `limit` when there is one.
+/// Runs `command` in the root of `sandbox`, waiting at most `limit` when there is one, and condensing its output with `rules` when there are any.
 ///
-/// An output stream too long to show is saved whole in the sandbox's spill folder, and only its start and end are reported, with the file's path. The command is killed, with its process group, when the returned future is dropped.
+/// An output stream too long to show, or one condensing left something out of, is saved whole in the sandbox's spill folder, and the report names the file. The command is killed, with its process group, when the returned future is dropped.
 ///
 /// # Errors
 ///
@@ -205,6 +302,7 @@ async fn run(
     sandbox: &Sandbox,
     command: &str,
     limit: Option<Duration>,
+    rules: Option<Rules>,
 ) -> Result<ToolOutput, ToolError> {
     let mut child = shell(command)
         .current_dir(sandbox.root())
@@ -215,7 +313,14 @@ async fn run(
         .spawn()?;
     let pid = child.id();
     let mut guard = GroupGuard(pid);
-    let fresh = |label| Arc::new(Mutex::new(Capture::new(label, sandbox.spill().clone())));
+    let fresh = |label| {
+        let capture = Capture::new(label, sandbox.spill().clone());
+        let capture = match &rules {
+            Some(rules) => capture.condensed_by(Condenser::new(rules.clone())),
+            None => capture,
+        };
+        Arc::new(Mutex::new(capture))
+    };
     let stdout = fresh("stdout");
     let stderr = fresh("stderr");
     let readers = [
@@ -309,7 +414,8 @@ fn format_output(
         None => "no exit code".to_string(),
     };
     for capture in [stdout, stderr] {
-        if let Some(stream) = capture.lock().unwrap().render() {
+        let rendered = capture.lock().unwrap().render();
+        if let Some(stream) = rendered {
             text.push('\n');
             text.push_str(&stream);
         }
@@ -479,6 +585,75 @@ mod tests {
         jobs.stop_all();
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(!marker.exists());
+    }
+
+    /// Writes an executable `cargo` into `dir` that prints build progress to stderr and a result to stdout, as the real one does.
+    fn fake_cargo(dir: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("cargo");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nfor c in a b c; do echo \"   Compiling $c v1.0.0\" >&2; done\necho 'warning: unused import' >&2\necho built\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Output of a known noisy command is condensed, says so, and is saved raw even though it is short; switched off, it is shown as it is.
+    #[tokio::test]
+    async fn condenses_noisy_output_and_saves_it_raw() {
+        let (sandbox, dir) = sandbox("bash-condense");
+        fake_cargo(&dir);
+        let command = json!({ "command": "PATH=\"$PWD:$PATH\" cargo build" });
+        let out = Bash::new(sandbox.clone())
+            .call(command.clone())
+            .await
+            .unwrap();
+        assert!(out.text.contains("--- stdout ---\nbuilt\n"));
+        assert!(out.text.contains(
+            "--- stderr ---\n… 3 Compiling lines\nwarning: unused import\n[stderr condensed: 4 lines → 2; the whole output is in "
+        ));
+        let raw = std::fs::read_to_string(saved_path(&out.text)).unwrap();
+        assert_eq!(raw.lines().count(), 4);
+        assert!(raw.starts_with("   Compiling a v1.0.0\n"));
+        let plain = Bash::new(sandbox)
+            .condensing(false)
+            .call(command)
+            .await
+            .unwrap();
+        assert!(plain.text.contains("   Compiling b v1.0.0"));
+        assert!(!plain.text.contains("condensed"));
+    }
+
+    /// A plain `cat` of a file is turned away naming `read`, runs when interception is off, and inside a pipeline runs with a tip.
+    #[tokio::test]
+    async fn steers_plain_file_reads_to_read() {
+        let (sandbox, dir) = sandbox("bash-intercept");
+        std::fs::write(dir.join("notes.txt"), "one\ntwo\n").unwrap();
+        let tool = Bash::new(sandbox.clone());
+        assert!(tool.description().contains("`read` to show a file"));
+        let Err(ToolError::Failed(message)) =
+            tool.call(json!({ "command": "cat notes.txt" })).await
+        else {
+            panic!("expected the command to be turned away");
+        };
+        assert!(message.contains(r#"Call `read` with {"path":"notes.txt"}"#));
+        let piped = tool
+            .call(json!({ "command": "cat notes.txt | wc -l" }))
+            .await
+            .unwrap();
+        assert!(
+            piped
+                .text
+                .contains("2\n[tip: the `read` tool does what `cat` did here")
+        );
+        let open = Bash::new(sandbox).intercepting(false);
+        assert!(!open.description().contains("`read` to show a file"));
+        let out = open
+            .call(json!({ "command": "cat notes.txt" }))
+            .await
+            .unwrap();
+        assert!(out.text.contains("one\ntwo"));
     }
 
     /// A command that leaves a background process holding the pipes still returns.

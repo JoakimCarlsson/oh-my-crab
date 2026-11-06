@@ -30,6 +30,8 @@ pub(crate) struct Inputs<'a> {
     pub(crate) discovered: Arc<Discovered>,
     /// The workstation.
     pub(crate) environment: Arc<Environment>,
+    /// The outline of the working directory, made when the conversation started; empty for none.
+    pub(crate) tree: Arc<str>,
     /// The notes the agent keeps.
     pub(crate) notebook: Arc<Notebook>,
     /// The checkpoint the agent marks, when it has the checkpoint and rewind tools.
@@ -90,6 +92,7 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
     }
     let discovered = inputs.discovered.clone();
     let environment = inputs.environment.clone();
+    let tree = inputs.tree.clone();
     registry.register(Task::new(TaskSettings {
         model: inputs.model.clone(),
         registry: sub_base,
@@ -105,6 +108,7 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
                     tools,
                     plan: false,
                     unnamed: false,
+                    tree: &tree,
                 },
                 &agent.prompt,
             )
@@ -167,6 +171,7 @@ mod tests {
             effort: None,
             discovered: Arc::new(Discovered::default()),
             environment: Arc::new(Environment::detect(&locations, "m")),
+            tree: Arc::from(""),
             notebook: shared.notebook.clone(),
             checkpoint,
             jobs: shared.jobs.clone(),

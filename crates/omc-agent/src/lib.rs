@@ -8,9 +8,12 @@ mod loop_guard;
 mod pruning;
 mod recall;
 mod recovery;
+mod shake;
 mod steering;
 mod submit;
 mod task;
+mod text_calls;
+mod todos;
 
 pub use agent::{
     AgentError, AgentEvent, Context, Live, compact, run_turn, run_turn_recorded, run_turn_steered,
@@ -32,5 +35,7 @@ mod steering_tests;
 mod task_tests;
 #[cfg(test)]
 mod testkit;
+#[cfg(test)]
+mod todo_tests;
 #[cfg(test)]
 mod tool_tests;

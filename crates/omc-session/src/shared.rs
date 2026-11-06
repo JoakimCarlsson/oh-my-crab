@@ -71,6 +71,8 @@ pub(crate) struct Shared {
     state: Mutex<State>,
     /// The system prompt and tool list of the conversation, once a turn made them.
     prefix: Mutex<Option<Arc<Prefix>>>,
+    /// The outline of the working directory the system prompts carry, once a turn made it.
+    tree: Mutex<Option<Arc<str>>>,
     /// What keeps the prompt cache warm.
     pub(crate) warmer: Arc<Warmer>,
     /// The date turns tell the agent instead of today's, in tests.
@@ -135,6 +137,7 @@ impl Shared {
                 warming: true,
             }),
             prefix: Mutex::new(None),
+            tree: Mutex::new(None),
             warmer: Arc::new(Warmer::default()),
             #[cfg(test)]
             today: Mutex::new(None),
@@ -150,6 +153,15 @@ impl Shared {
         let made = Arc::new(freeze());
         *held = Some(made.clone());
         made
+    }
+
+    /// The outline of `directory` the system prompts of the conversation carry, made the first time it is asked for after the conversation was opened and kept unchanged after that, so that a system prompt made again for another model stays the same and the agent's subagents see the same outline.
+    pub(crate) fn tree(&self, directory: &std::path::Path) -> Arc<str> {
+        self.tree
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .get_or_insert_with(|| Arc::from(omc_context::workspace_tree(directory)))
+            .clone()
     }
 
     /// Runs `with` on the state.
@@ -257,9 +269,10 @@ impl Shared {
         let _ = self.out.send(event);
     }
 
-    /// Records that the conversation is open with `provider`, `models` and `model`, in the mode `mode`; the system prompt and tools of a conversation opened before are forgotten and its cache is no longer kept warm.
+    /// Records that the conversation is open with `provider`, `models` and `model`, in the mode `mode`; the system prompt, tools and workspace outline of a conversation opened before are forgotten and its cache is no longer kept warm.
     pub(crate) fn open(&self, provider: Provider, models: Vec<String>, model: String, mode: Mode) {
         *self.prefix.lock().unwrap_or_else(|held| held.into_inner()) = None;
+        *self.tree.lock().unwrap_or_else(|held| held.into_inner()) = None;
         self.warmer.stop();
         self.state(|state| {
             state.opened = true;

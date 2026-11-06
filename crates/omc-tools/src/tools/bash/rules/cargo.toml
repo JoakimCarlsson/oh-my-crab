@@ -1,0 +1,119 @@
+# Condensing rules for cargo: build progress and passing tests are counted, diagnostics are kept whole.
+
+[[filter]]
+name = "cargo"
+programs = ["cargo", "cross"]
+subcommands = ["build", "b", "check", "c", "test", "t", "run", "r", "clippy", "install", "doc", "d", "bench", "fetch", "update", "nextest", "fix", "add", "remove", "tree"]
+value_options = ["-Z", "-C", "--config", "--color", "--manifest-path"]
+drop = [
+  '^\s+Updating (crates\.io|`[^`]+`) index$',
+  '^\s+Blocking waiting for file lock on ',
+  '^\s+Building \[[ =>]*\] \d+/\d+',
+]
+collapse = [
+  { pattern = '^\s+Compiling \S+ v\S+', label = "Compiling" },
+  { pattern = '^\s+Checking \S+ v\S+', label = "Checking" },
+  { pattern = '^\s+Documenting \S+ v\S+', label = "Documenting" },
+  { pattern = '^\s+Fresh \S+ v\S+', label = "Fresh" },
+  { pattern = '^\s+Download(ing|ed) ', label = "Downloading" },
+  { pattern = '^\s+(Locking|Adding|Updating|Removing|Unchanged) \S+ v\S+', label = "lock file" },
+  { pattern = '^test \S+( - .*)? \.\.\. ok$', label = "passing test" },
+  { pattern = '^test \S+( - .*)? \.\.\. ignored(, .*)?$', label = "ignored test" },
+  { pattern = '^\s+PASS \[\s*[\d.]+s\] ', label = "passing test" },
+]
+
+[[test]]
+command = "cargo build"
+input = """
+    Updating crates.io index
+  Downloaded serde v1.0.200
+  Downloaded libc v0.2.150
+  Downloaded 2 crates (1.2 MB) in 0.40s
+   Compiling libc v0.2.150
+   Compiling proc-macro2 v1.0.80
+   Compiling serde v1.0.200
+   Compiling app v0.1.0 (/work/app)
+warning: unused variable: `x`
+ --> src/main.rs:2:9
+  |
+2 |     let x = 1;
+  |         ^ help: if this is intentional, prefix it with an underscore: `_x`
+
+warning: `app` (bin "app") generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.20s
+"""
+expected = """
+… 7 lines: 3 Downloading, 4 Compiling
+warning: unused variable: `x`
+ --> src/main.rs:2:9
+  |
+2 |     let x = 1;
+  |         ^ help: if this is intentional, prefix it with an underscore: `_x`
+
+warning: `app` (bin "app") generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.20s
+"""
+
+[[test]]
+command = "cargo clippy --workspace"
+input = """
+    Checking memchr v2.7.0
+   Compiling serde v1.0.200
+    Checking regex v1.10.0
+    Checking app v0.1.0 (/work/app)
+error: this `if` has identical blocks
+ --> src/lib.rs:4:5
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.00s
+"""
+expected = """
+… 4 lines: 3 Checking, 1 Compiling
+error: this `if` has identical blocks
+ --> src/lib.rs:4:5
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.00s
+"""
+
+[[test]]
+command = "cargo test"
+input = """
+   Compiling app v0.1.0 (/work/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.00s
+     Running unittests src/lib.rs (target/debug/deps/app-1234)
+
+running 5 tests
+test parse::reads_numbers ... ok
+test parse::reads_words ... ok
+test parse::skips_spaces ... ok
+test slow::big_input ... ignored, takes a minute
+test parse::rejects_garbage ... FAILED
+
+failures:
+
+---- parse::rejects_garbage stdout ----
+thread 'parse::rejects_garbage' panicked at src/parse.rs:10:5:
+assertion failed: result.is_err()
+
+failures:
+    parse::rejects_garbage
+
+test result: FAILED. 3 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+"""
+expected = """
+   Compiling app v0.1.0 (/work/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.00s
+     Running unittests src/lib.rs (target/debug/deps/app-1234)
+
+running 5 tests
+… 4 lines: 3 passing test, 1 ignored test
+test parse::rejects_garbage ... FAILED
+
+failures:
+
+---- parse::rejects_garbage stdout ----
+thread 'parse::rejects_garbage' panicked at src/parse.rs:10:5:
+assertion failed: result.is_err()
+
+failures:
+    parse::rejects_garbage
+
+test result: FAILED. 3 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+"""

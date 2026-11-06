@@ -486,3 +486,88 @@ async fn old_outputs_are_pruned_before_a_summary() {
             .any(|message| matches!(message, Message::Pruning(p) if p.elided.len() == 2 && p.tokens_after < 170_000))
     );
 }
+
+/// Past the threshold, when leaving out old outputs is not enough, a large code block in an older reply is shaken out instead of asking for a summary; the shake is saved, so a reopened conversation gives the model the same, and `recall` still reads the block whole.
+#[tokio::test]
+async fn an_old_code_block_is_shaken_out_before_a_summary() {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../build/tests/omc-agent/journal/shake.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let (journal, mut history) = crate::Journal::open(&path, None).unwrap();
+    let scribe = journal.scribe();
+    let code = format!(
+        "Here it is:\n```rust\n{}```",
+        "let value = compute(input, 0123456789);\n".repeat(10_000)
+    );
+    for message in [
+        Message::User("write it".into()),
+        Message::Assistant(Reply {
+            text: code.clone(),
+            ..Reply::default()
+        }),
+        Message::User("now run it".into()),
+        calling("c", "bash", serde_json::json!({"command": "run"})),
+        bash_output("c", 'c', 30_000),
+        Message::Assistant(Reply {
+            text: "ran".into(),
+            tokens: Some(Tokens {
+                input: 175_000,
+                ..Tokens::default()
+            }),
+            ..Reply::default()
+        }),
+    ] {
+        scribe.append(&message).unwrap();
+        history.push(message);
+    }
+    let model = Script::new(
+        vec![
+            Ok(Reply {
+                tool_calls: vec![omc_providers::ToolCall {
+                    id: "r".into(),
+                    name: crate::RECALL.into(),
+                    arguments: serde_json::json!({"messages": "1"}),
+                }],
+                ..Reply::default()
+            }),
+            say("answered"),
+        ],
+        Vec::new(),
+    );
+    let registry = Registry::new();
+    let approvals = deny_all();
+    run_turn_recorded(
+        &context_on(&model, &registry, &approvals, Some(200_000)),
+        &mut history,
+        "next".into(),
+        &|_| {},
+        Some(&scribe),
+    )
+    .await
+    .unwrap();
+    assert_eq!(model.summary_requests(), 0);
+    let requests = model.turn_requests();
+    let Message::Assistant(shaken) = &requests[0][1] else {
+        panic!("not a reply");
+    };
+    assert_eq!(
+        shaken.text,
+        "Here it is:\n[10000 lines of rust block removed to save room. Call recall with messages \"1\" to read them again.]"
+    );
+    assert_eq!(requests[0][4], history[4], "the recent output is kept");
+    let Some(Message::ToolResults(recalled)) = requests[1].last() else {
+        panic!("no recall result");
+    };
+    assert!(recalled[0].text.contains("let value = compute"));
+    assert!(
+        history
+            .iter()
+            .any(|message| matches!(message, Message::Pruning(p) if p.excised.len() == 1 && p.tokens_after < 170_000))
+    );
+    drop(scribe);
+    drop(journal);
+    let (_, reopened) = crate::Journal::open(&path, None).unwrap();
+    assert_eq!(reopened, history);
+    assert_eq!(context(&reopened), context(&history));
+}

@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use omc_providers::{Elided, Elision, Message, Pruning, ToolResult};
 
-use crate::compaction::{elision_note, elisions, estimate, live, result_tokens, shown};
+use crate::compaction::{elision_note, elisions, estimate, hidden, live, result_tokens, shown};
 
 /// About how many tokens of the most recent tool outputs are never left out as old.
 const PROTECT_TOKENS: u64 = 40_000;
@@ -24,7 +24,7 @@ const MIN_OUTPUT_TOKENS: u64 = 50;
 const STALE_SUFFIX_TOKENS: u64 = 8_000;
 
 /// The tools whose outputs are never left out as old: instructions and notes the model works from.
-const KEPT_TOOLS: [&str; 2] = ["skill", "context_notes"];
+pub(crate) const KEPT_TOOLS: [&str; 3] = ["skill", "context_notes", "todo"];
 
 /// One tool output in the history that may be left out.
 struct Candidate<'h> {
@@ -68,7 +68,7 @@ fn outputs(history: &[Message]) -> Vec<Candidate<'_>> {
 }
 
 /// Whether the model has seen the message at `at` in `history`: a reply came after it.
-fn seen(history: &[Message], at: usize) -> bool {
+pub(crate) fn seen(history: &[Message], at: usize) -> bool {
     history[at + 1..]
         .iter()
         .any(|message| matches!(message, Message::Assistant(_)))
@@ -121,10 +121,10 @@ fn superseded<'c, 'h>(
 /// The pruning that leaves out the superseded reads of `history` that cost little of the prompt cache to leave out now: those the messages after which take at most [`STALE_SUFFIX_TOKENS`], and that are longer than their note. Nothing when there are none.
 pub(crate) fn stale(history: &[Message]) -> Option<Pruning> {
     let candidates = outputs(history);
-    let elided = elisions(history);
+    let hidden = hidden(history);
     let after = |at: usize| -> u64 {
         (at + 1..history.len())
-            .map(|position| estimate(&shown(history, position, &elided)))
+            .map(|position| estimate(&shown(history, position, &hidden)))
             .sum()
     };
     let elided: Vec<Elided> = superseded(history, &candidates)
@@ -135,7 +135,7 @@ pub(crate) fn stale(history: &[Message]) -> Option<Pruning> {
         .collect();
     (!elided.is_empty()).then_some(Pruning {
         elided,
-        tokens_after: 0,
+        ..Pruning::default()
     })
 }
 
@@ -174,7 +174,7 @@ pub(crate) fn prune(history: &[Message]) -> Option<Pruning> {
     elided.reverse();
     (saved >= MIN_SAVINGS).then_some(Pruning {
         elided,
-        tokens_after: 0,
+        ..Pruning::default()
     })
 }
 

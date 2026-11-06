@@ -1,0 +1,119 @@
+# Condensing rules for git: status hints, blank lines in logs, and transfer progress.
+
+[[filter]]
+name = "git status"
+programs = ["git"]
+subcommands = ["status"]
+value_options = ["-C", "-c", "--git-dir", "--work-tree", "--namespace"]
+drop = [
+  '^\s+\(use "git .*\)$',
+  '^\s+\(commit or discard the untracked or modified content in submodules\)$',
+]
+
+[[filter]]
+name = "git log"
+programs = ["git"]
+subcommands = ["log"]
+value_options = ["-C", "-c", "--git-dir", "--work-tree", "--namespace"]
+drop = ['^$']
+dedupe = false
+
+[[filter]]
+name = "git transfer"
+programs = ["git"]
+subcommands = ["push", "pull", "fetch", "clone"]
+value_options = ["-C", "-c", "--git-dir", "--work-tree", "--namespace"]
+drop = [
+  '^(remote: )?(Enumerating objects|Counting objects|Compressing objects|Receiving objects|Resolving deltas|Writing objects|Unpacking objects|Updating files|Checking out files|Filtering content): ',
+  '^(remote: )?Total \d+ \(delta \d+\)',
+  '^Delta compression using up to \d+ threads',
+  '^remote: ?$',
+]
+
+[[test]]
+command = "git status"
+input = """
+On branch main
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   src/lib.rs
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	notes.txt
+
+no changes added to commit (use "git add" and/or "git commit -a")
+"""
+expected = """
+On branch main
+Changes not staged for commit:
+	modified:   src/lib.rs
+
+Untracked files:
+	notes.txt
+
+no changes added to commit (use "git add" and/or "git commit -a")
+"""
+
+[[test]]
+command = "git log -n 2"
+input = """
+commit 1111111111111111111111111111111111111111
+Author: A <a@example.com>
+Date:   Mon Jan 1 10:00:00 2024 +0000
+
+    Fix the parser
+
+commit 2222222222222222222222222222222222222222
+Author: B <b@example.com>
+Date:   Sun Dec 31 10:00:00 2023 +0000
+
+    Add the parser
+"""
+expected = """
+commit 1111111111111111111111111111111111111111
+Author: A <a@example.com>
+Date:   Mon Jan 1 10:00:00 2024 +0000
+    Fix the parser
+commit 2222222222222222222222222222222222222222
+Author: B <b@example.com>
+Date:   Sun Dec 31 10:00:00 2023 +0000
+    Add the parser
+"""
+
+[[test]]
+command = "git push origin main"
+input = """
+Enumerating objects: 5, done.
+Counting objects: 100% (5/5), done.
+Delta compression using up to 8 threads
+Compressing objects: 100% (3/3), done.
+Writing objects:  50% (1/2)\rWriting objects: 100% (3/3), 310 bytes | 310.00 KiB/s, done.
+Total 3 (delta 2), reused 0 (delta 0), pack-reused 0
+remote: Resolving deltas: 100% (2/2), completed with 2 local objects.
+To github.com:example/repo.git
+   1111111..2222222  main -> main
+"""
+expected = """
+To github.com:example/repo.git
+   1111111..2222222  main -> main
+"""
+
+[[test]]
+command = "git pull"
+input = """
+remote: Enumerating objects: 7, done.
+remote: Total 7 (delta 3), reused 7 (delta 3), pack-reused 0
+Unpacking objects: 100% (7/7), 1.2 KiB | 300.00 KiB/s, done.
+From github.com:example/repo
+   2222222..3333333  main       -> origin/main
+error: Your local changes to the following files would be overwritten by merge:
+	src/lib.rs
+"""
+expected = """
+From github.com:example/repo
+   2222222..3333333  main       -> origin/main
+error: Your local changes to the following files would be overwritten by merge:
+	src/lib.rs
+"""

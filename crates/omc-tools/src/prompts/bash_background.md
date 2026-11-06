@@ -1,0 +1,1 @@
+Pass `background: true` to start a long-running command (a dev server, a long build) and get a handle back at once; it has no timeout unless you give one, and `wait` returns its exit code and output, long output cut the same way, when it ends.

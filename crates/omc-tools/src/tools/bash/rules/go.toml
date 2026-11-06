@@ -1,0 +1,45 @@
+# Condensing rules for the go tool: module downloads, test run markers and passing tests.
+
+[[filter]]
+name = "go"
+programs = ["go"]
+subcommands = ["build", "test", "vet", "install", "get", "run", "mod", "generate"]
+value_options = ["-C"]
+drop = [
+  '^=== (RUN|PAUSE|CONT|NAME)\s',
+]
+collapse = [
+  { pattern = '^go: (downloading|finding|extracting) ', label = "module download" },
+  { pattern = '^\s*--- PASS: ', label = "passing test" },
+  { pattern = '^\s*--- SKIP: ', label = "skipped test" },
+  { pattern = '^ok\s+\S+\s+(\(cached\)|[\d.]+s)', label = "passing package" },
+  { pattern = '^\?\s+\S+\s+\[no test files\]$', label = "no test files" },
+]
+
+[[test]]
+command = "go test -v ./..."
+input = """
+go: downloading example.com/testify v1.9.0
+go: downloading example.com/go-spew v1.1.1
+?   \texample.com/app/cmd\t[no test files]
+=== RUN   TestParse
+--- PASS: TestParse (0.00s)
+=== RUN   TestFormat
+    format_test.go:12: got "a", want "b"
+--- FAIL: TestFormat (0.00s)
+=== RUN   TestRound
+--- PASS: TestRound (0.00s)
+FAIL
+FAIL\texample.com/app/fmt\t0.01s
+ok  \texample.com/app/parse\t0.02s
+ok  \texample.com/app/util\t(cached)
+"""
+expected = """
+… 4 lines: 2 module download, 1 no test files, 1 passing test
+    format_test.go:12: got "a", want "b"
+--- FAIL: TestFormat (0.00s)
+--- PASS: TestRound (0.00s)
+FAIL
+FAIL\texample.com/app/fmt\t0.01s
+… 2 passing package lines
+"""

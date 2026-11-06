@@ -16,6 +16,7 @@ mod skills;
 mod system;
 mod template;
 mod toml;
+mod tree;
 
 #[cfg(test)]
 mod testutil;
@@ -35,3 +36,4 @@ pub use scope::Locations;
 pub use skills::Skill;
 pub use system::{PromptInput, build_prompt, build_subagent_prompt};
 pub use template::render;
+pub use tree::workspace_tree;

@@ -6,11 +6,12 @@ use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 
 use omc_providers::{
-    ChatModel, Compaction, Effort, Elision, Message, Part, Request, Sink, ToolResult,
+    ChatModel, Compaction, Effort, Elision, Message, Part, Reply, Request, Sink, ToolResult,
 };
 
 use crate::AgentEvent;
 use crate::recall::RECALL;
+use crate::todos;
 
 /// The fewest tokens kept free below the context window for the next request and its reply, on a window large enough to spare them.
 const RESERVE_TOKENS: u64 = 16_384;
@@ -60,19 +61,26 @@ pub(crate) struct Plan {
 
 /// The messages the model is given for `history`: the history itself when it was never compacted or pruned; otherwise the latest summary as a user message, when there is one, followed by the messages kept with it and the messages after it, with every elided tool output replaced by its note.
 pub fn context(history: &[Message]) -> Cow<'_, [Message]> {
-    let elided = elisions(history);
+    let hidden = hidden(history);
     let compacted = latest(history);
-    if compacted.is_none() && elided.is_empty() {
+    if compacted.is_none() && hidden.is_empty() {
         return Cow::Borrowed(history);
     }
     let mut messages: Vec<Message> = compacted
-        .map(|(_, compaction)| Message::User(summary_message(compaction)))
+        .map(|(at, compaction)| {
+            let mut text = summary_message(compaction);
+            if let Some(todos) = todos::restated(history, at, compaction.first_kept) {
+                text.push_str("\n\n");
+                text.push_str(&todos);
+            }
+            Message::User(text)
+        })
         .into_iter()
         .collect();
     messages.extend(
         live(history)
             .into_iter()
-            .map(|at| shown(history, at, &elided).into_owned()),
+            .map(|at| shown(history, at, &hidden).into_owned()),
     );
     Cow::Owned(messages)
 }
@@ -102,47 +110,131 @@ pub(crate) fn live(history: &[Message]) -> Vec<usize> {
         .collect()
 }
 
-/// Every tool output the prunings in `history` left out, keyed by the position of its tool results and the id of its call.
-pub(crate) fn elisions(history: &[Message]) -> HashMap<(usize, &str), Elision> {
-    history
-        .iter()
-        .filter_map(|message| match message {
-            Message::Pruning(pruning) => Some(pruning),
-            _ => None,
-        })
-        .flat_map(|pruning| &pruning.elided)
-        .map(|elided| ((elided.at, elided.call_id.as_str()), elided.reason))
-        .collect()
+/// What the prunings of a history keep from the model: tool outputs left out and fenced blocks cut out of prompts and replies.
+#[derive(Debug, Default)]
+pub(crate) struct Hidden<'h> {
+    /// Every tool output left out, keyed by the position of its tool results and the id of its call.
+    pub(crate) elided: HashMap<(usize, &'h str), Elision>,
+    /// The byte ranges cut out of the text of each prompt or reply, keyed by its position, in no particular order.
+    pub(crate) excised: HashMap<usize, Vec<(usize, usize)>>,
 }
 
-/// The message at `at` in `history` as the model is given it: the message itself, or, when it holds tool outputs that `elided` lists, a copy with each of those replaced by its note and its images dropped.
-pub(crate) fn shown<'h>(
-    history: &'h [Message],
-    at: usize,
-    elided: &HashMap<(usize, &str), Elision>,
-) -> Cow<'h, Message> {
-    let message = &history[at];
-    let Message::ToolResults(results) = message else {
-        return Cow::Borrowed(message);
-    };
-    if !results
-        .iter()
-        .any(|result| elided.contains_key(&(at, result.call_id.as_str())))
-    {
-        return Cow::Borrowed(message);
+impl Hidden<'_> {
+    /// Whether nothing is kept from the model.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.elided.is_empty() && self.excised.is_empty()
     }
-    let results = results
+}
+
+/// What the prunings in `history` keep from the model.
+pub(crate) fn hidden(history: &[Message]) -> Hidden<'_> {
+    let mut hidden = Hidden::default();
+    for message in history {
+        let Message::Pruning(pruning) = message else {
+            continue;
+        };
+        for elided in &pruning.elided {
+            hidden
+                .elided
+                .insert((elided.at, elided.call_id.as_str()), elided.reason);
+        }
+        for block in &pruning.excised {
+            hidden
+                .excised
+                .entry(block.at)
+                .or_default()
+                .push((block.start, block.end));
+        }
+    }
+    hidden
+}
+
+/// Every tool output the prunings in `history` left out, keyed by the position of its tool results and the id of its call.
+pub(crate) fn elisions(history: &[Message]) -> HashMap<(usize, &str), Elision> {
+    hidden(history).elided
+}
+
+/// The message at `at` in `history` as the model is given it: the message itself, or a copy with each tool output `hidden` lists replaced by its note and its images dropped, and each block `hidden` cuts out of its text replaced by its note.
+pub(crate) fn shown<'h>(history: &'h [Message], at: usize, hidden: &Hidden) -> Cow<'h, Message> {
+    let message = &history[at];
+    match message {
+        Message::ToolResults(results)
+            if results
+                .iter()
+                .any(|result| hidden.elided.contains_key(&(at, result.call_id.as_str()))) =>
+        {
+            let results = results
+                .iter()
+                .map(
+                    |result| match hidden.elided.get(&(at, result.call_id.as_str())) {
+                        Some(&reason) => ToolResult {
+                            text: elision_note(result, reason),
+                            images: Vec::new(),
+                            ..result.clone()
+                        },
+                        None => result.clone(),
+                    },
+                )
+                .collect();
+            Cow::Owned(Message::ToolResults(results))
+        }
+        Message::User(text) if let Some(ranges) = hidden.excised.get(&at) => {
+            Cow::Owned(Message::User(excise(text, at, ranges)))
+        }
+        Message::Assistant(reply) if let Some(ranges) = hidden.excised.get(&at) => {
+            Cow::Owned(Message::Assistant(Reply {
+                text: excise(&reply.text, at, ranges),
+                ..reply.clone()
+            }))
+        }
+        _ => Cow::Borrowed(message),
+    }
+}
+
+/// `text`, the text of the message at `at`, with each of `ranges` that is a whole fenced block of it replaced by its note; a range that no longer fits the text is left alone.
+fn excise(text: &str, at: usize, ranges: &[(usize, usize)]) -> String {
+    let mut ranges: Vec<(usize, usize)> = ranges
         .iter()
-        .map(|result| match elided.get(&(at, result.call_id.as_str())) {
-            Some(&reason) => ToolResult {
-                text: elision_note(result, reason),
-                images: Vec::new(),
-                ..result.clone()
-            },
-            None => result.clone(),
+        .copied()
+        .filter(|&(start, end)| {
+            start < end
+                && end <= text.len()
+                && text.is_char_boundary(start)
+                && text.is_char_boundary(end)
         })
         .collect();
-    Cow::Owned(Message::ToolResults(results))
+    ranges.sort_unstable();
+    ranges.dedup();
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for (start, end) in ranges {
+        if start < cursor {
+            continue;
+        }
+        out.push_str(&text[cursor..start]);
+        out.push_str(&excision_note(&text[start..end], at));
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+/// The note that stands in for `block`, a fenced block cut out of the message at `at`, which tells the model how to read it again.
+pub(crate) fn excision_note(block: &str, at: usize) -> String {
+    let lines = block.lines().count().saturating_sub(2);
+    let language = block
+        .lines()
+        .next()
+        .map(|fence| fence.trim().trim_start_matches(['`', '~']).trim())
+        .and_then(|info| info.split_whitespace().next())
+        .filter(|language| !language.is_empty());
+    let kind = match language {
+        Some(language) => format!("{language} block"),
+        None => "fenced block".to_owned(),
+    };
+    format!(
+        "[{lines} lines of {kind} removed to save room. Call {RECALL} with messages \"{at}\" to read them again.]"
+    )
 }
 
 /// The note that stands in for `result` when it is left out for `reason`, which tells the model how to read it again.
@@ -155,6 +247,11 @@ pub(crate) fn elision_note(result: &ToolResult, reason: Elision) -> String {
         ),
         Elision::Superseded => format!(
             "[Output elided: the same read was made again later in the conversation, so this copy is out of date. Call {RECALL} with call_id \"{id}\" to read it anyway.]"
+        ),
+        Elision::Shaken => format!(
+            "[{} lines of {} output removed to save room. Call {RECALL} with call_id \"{id}\" to read it again.]",
+            result.text.lines().count(),
+            result.name
         ),
     }
 }
@@ -252,7 +349,7 @@ pub(crate) fn keep_recent(window: Option<u64>) -> u64 {
 /// The cut point is a user message or a model reply, never tool results, so every kept result keeps its call. When it falls on a reply in the middle of a turn, the beginning of that turn is summarized on its own, so the rest of the turn still makes sense after the summary.
 pub(crate) fn plan(history: &[Message], keep: u64, tokens_before: u64) -> Option<Plan> {
     let live = live(history);
-    let elided = elisions(history);
+    let hidden = hidden(history);
     let starts_here = |index: usize| matches!(history[live[index]], Message::User(_));
     let cuts: Vec<usize> = (0..live.len())
         .filter(|&index| {
@@ -266,7 +363,7 @@ pub(crate) fn plan(history: &[Message], keep: u64, tokens_before: u64) -> Option
     let mut cut = cuts[0];
     let mut held = 0;
     for index in (0..live.len()).rev() {
-        held += estimate(&shown(history, live[index], &elided));
+        held += estimate(&shown(history, live[index], &hidden));
         if held >= keep {
             cut = cuts
                 .iter()
@@ -639,6 +736,49 @@ mod tests {
         assert!(first.contains("<read-files>\na.rs\n</read-files>"));
         assert_eq!(context[1], history[2]);
         assert_eq!(context[3], history[5]);
+    }
+
+    /// A compaction that hides the latest todo list restates its open items after the summary.
+    #[test]
+    fn the_summary_restates_open_todos() {
+        let mut history = vec![
+            user(1),
+            Message::Assistant(Reply {
+                tool_calls: vec![ToolCall {
+                    id: "t".into(),
+                    name: "todo".into(),
+                    arguments: json!({"todos": [
+                        {"content": "done", "status": "completed"},
+                        {"content": "left", "status": "pending"}
+                    ]}),
+                }],
+                ..Reply::default()
+            }),
+            Message::ToolResults(vec![ToolResult {
+                call_id: "t".into(),
+                name: "todo".into(),
+                text: "ok".into(),
+                is_error: false,
+                images: Vec::new(),
+            }]),
+            answer(1),
+            user(1),
+            answer(1),
+        ];
+        history.push(Message::Compaction(Compaction {
+            summary: "s".into(),
+            first_kept: 4,
+            ..Compaction::default()
+        }));
+        let given = context(&history);
+        let Message::User(first) = &given[0] else {
+            panic!("no summary first");
+        };
+        assert!(
+            first.contains("<open-todos>") && first.contains("- [pending] left"),
+            "{first}"
+        );
+        assert!(!first.contains("done"), "{first}");
     }
 
     /// A second compaction only considers what the model is given now, and can keep messages from before the first one.

@@ -24,15 +24,23 @@ pub(super) struct Selector {
     pub(super) spans: Vec<Span>,
     /// Whether the original HTML of a web page is wanted instead of its text.
     pub(super) raw: bool,
+    /// Whether only the merge conflicts of a file are wanted.
+    pub(super) conflicts: bool,
 }
 
 impl Selector {
     /// Parses a selector such as `50`, `50-`, `50-200`, `50+150`, `-60`, `raw`,
-    /// or a comma-separated list of them.
+    /// or a comma-separated list of them, or `conflicts` alone.
     ///
     /// Returns `None` when `text` is not a selector, so that the caller can
     /// treat it as part of a file name instead.
     pub(super) fn parse(text: &str) -> Option<Self> {
+        if text.trim() == "conflicts" {
+            return Some(Self {
+                conflicts: true,
+                ..Self::default()
+            });
+        }
         let mut selector = Self::default();
         for part in text.split(',').map(str::trim) {
             if part == "raw" {
@@ -49,7 +57,7 @@ impl Selector {
     /// # Errors
     ///
     /// Returns [`ToolError::InvalidArguments`] when the selector already names
-    /// lines and `offset` or `limit` is given as well.
+    /// lines or conflicts and `offset` or `limit` is given as well.
     pub(super) fn windowed(
         mut self,
         offset: Option<usize>,
@@ -58,7 +66,7 @@ impl Selector {
         if offset.is_none() && limit.is_none() {
             return Ok(self);
         }
-        if !self.spans.is_empty() {
+        if self.picks_lines() {
             return Err(ToolError::InvalidArguments(
                 "give lines either as a path suffix such as file:50-200 or with offset and \
                  limit, not both"
@@ -73,9 +81,10 @@ impl Selector {
         Ok(self)
     }
 
-    /// Whether the selector names any lines rather than the whole text.
+    /// Whether the selector names any lines, or the conflicts, rather than the
+    /// whole text.
     pub(super) fn picks_lines(&self) -> bool {
-        !self.spans.is_empty()
+        !self.spans.is_empty() || self.conflicts
     }
 
     /// Whether the ranges depend on the text's length, which then has to be
@@ -159,15 +168,16 @@ pub(super) fn split(raw: &str) -> Option<(&str, Selector)> {
 /// Splits a URL into the address and its selector.
 ///
 /// A `:` only starts a selector after the path has begun, so the port in
-/// `http://host:8080` is never taken for one.
+/// `http://host:8080` is never taken for one, and `conflicts`, which only
+/// applies to files, stays part of the address.
 pub(super) fn split_url(raw: &str) -> (&str, Selector) {
     let path_start = raw
         .find("://")
         .and_then(|scheme| raw[scheme + 3..].find('/').map(|slash| scheme + 3 + slash));
     match (path_start, raw.rfind(':')) {
         (Some(start), Some(colon)) if colon > start => match split(raw) {
-            Some(split) => split,
-            None => (raw, Selector::default()),
+            Some(split) if !split.1.conflicts => split,
+            _ => (raw, Selector::default()),
         },
         _ => (raw, Selector::default()),
     }
@@ -204,6 +214,9 @@ mod tests {
         );
         let raw = Selector::parse("raw").unwrap();
         assert!(raw.raw && raw.spans.is_empty());
+        let conflicts = Selector::parse("conflicts").unwrap();
+        assert!(conflicts.conflicts && conflicts.picks_lines());
+        assert_eq!(Selector::parse("conflicts,1-2"), None);
     }
 
     /// Text that is not a selector is refused rather than misread.

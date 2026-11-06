@@ -28,6 +28,8 @@ pub struct PromptInput<'a> {
     pub plan: bool,
     /// Whether the conversation has no name yet, which the prompt then asks the agent to give it.
     pub unnamed: bool,
+    /// The outline of the working directory from [`crate::workspace_tree`], made once when the conversation started; empty for none.
+    pub tree: &'a str,
 }
 
 /// The system prompt of the main agent for `input`.
@@ -123,7 +125,7 @@ fn skills(discovered: &Discovered) -> String {
         .join("\n")
 }
 
-/// The workstation and instruction files, as the project part of a prompt.
+/// The workstation, the outline of the working directory and the instruction files, as the project part of a prompt.
 fn project(input: &PromptInput<'_>) -> String {
     let environment = input.environment;
     let directory = environment.directory.display().to_string();
@@ -147,6 +149,7 @@ fn project(input: &PromptInput<'_>) -> String {
             ("os", environment.os.as_str()),
             ("model", environment.model.as_deref().unwrap_or_default()),
             ("rules", rules.as_str()),
+            ("tree", input.tree),
         ],
     )
 }
@@ -187,7 +190,9 @@ mod tests {
             tools: &tools,
             plan: false,
             unnamed: false,
+            tree: "",
         });
+        assert!(!prompt.contains("<workspace-tree>"));
         assert!(prompt.contains("- pdf: Reads PDFs"));
         assert!(prompt.contains("Use tabs. {{not_a_tag}}"));
         assert!(prompt.contains("Be brief."));
@@ -226,6 +231,7 @@ mod tests {
             tools: &tools,
             plan: true,
             unnamed: false,
+            tree: "",
         });
         assert!(prompt.contains("Plan mode active"));
         assert!(!prompt.contains("`set_title`"));
@@ -253,12 +259,47 @@ mod tests {
                 tools: &[],
                 plan: false,
                 unnamed: false,
+                tree: "src/\n  lib.rs",
             },
             "Be a scout.",
         );
         assert!(prompt.starts_with("§ Role\nBe a scout."));
         assert!(prompt.contains("<project-context>"));
         assert!(prompt.contains(&environment_reminder(&environment)));
+        assert!(prompt.contains("src/\n  lib.rs\n</workspace-tree>"));
+    }
+
+    /// The outline of the working directory goes into the project part, said to be a snapshot.
+    #[test]
+    fn prompt_carries_the_tree() {
+        let base = scratch("system-tree");
+        put(&base, "src/main.rs", "");
+        put(&base, "Cargo.toml", "");
+        let locations = Locations {
+            directory: base.clone(),
+            root: None,
+            home: None,
+            claude: None,
+            codex: None,
+        };
+        let tree = crate::workspace_tree(&base);
+        assert_eq!(tree, "src/\n  main.rs\nCargo.toml");
+        let discovered = Discovered::default();
+        let environment = Environment::detect(&locations, "");
+        let prompt = build_prompt(PromptInput {
+            environment: &environment,
+            discovered: &discovered,
+            tools: &[],
+            plan: false,
+            unnamed: false,
+            tree: &tree,
+        });
+        let start = prompt.find("<workspace-tree>").unwrap();
+        let end = prompt.find("</workspace-tree>").unwrap();
+        let block = &prompt[start..end];
+        assert!(block.contains("snapshot from the start of this conversation"));
+        assert!(block.ends_with("src/\n  main.rs\nCargo.toml\n"));
+        assert!(end < prompt.find("</project-context>").unwrap());
     }
 
     /// An unnamed conversation is asked to name itself, and a named one is not.
@@ -280,6 +321,7 @@ mod tests {
             tools: &tools,
             plan: false,
             unnamed,
+            tree: "",
         };
         assert!(build_prompt(input(true)).contains("call `set_title` once"));
         assert!(!build_prompt(input(false)).contains("call `set_title` once"));

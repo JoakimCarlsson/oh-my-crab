@@ -1,0 +1,76 @@
+# Condensing rules for docker and podman: build bookkeeping and layer transfer progress.
+
+[[filter]]
+name = "docker"
+programs = ["docker", "podman"]
+subcommands = ["build", "buildx", "builder", "image", "pull", "push", "compose"]
+value_options = ["-H", "--host", "-c", "--context", "--config", "-l", "--log-level", "-f", "--file", "-p", "--project-name"]
+drop = [
+  '^#\d+ (DONE|CACHED)( [\d.]+s)?$',
+  '^#\d+ \[internal\] ',
+  '^#\d+ (sha256:[0-9a-f]+ )?[\d.]+[kMG]?B / [\d.]+[kMG]?B( [\d.]+s)?( done)?$',
+  '^#\d+ (resolve|extracting|transferring|exporting|writing image|naming to|unpacking|preparing|sending tarball|loading layer|load metadata|load build definition|load \.dockerignore)',
+  '^ ---> (Running in [0-9a-f]+|Using cache|[0-9a-f]{12})$',
+  '^Removing intermediate container ',
+  '^Sending build context to Docker daemon',
+  '^\[\+\] (Building|Running|Pulling) [\d.]+s',
+]
+collapse = [
+  { pattern = '^[0-9a-f]{12}: (Pulling fs layer|Waiting|Downloading|Verifying Checksum|Download complete|Extracting|Pull complete|Already exists|Preparing|Pushing|Pushed|Layer already exists|Mounted from )', label = "layer progress" },
+]
+
+[[test]]
+command = "docker build -t app ."
+input = """
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 312B done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/rust:1.80
+#2 DONE 0.8s
+
+#3 [1/3] FROM docker.io/library/rust:1.80@sha256:abcdef
+#3 resolve docker.io/library/rust:1.80@sha256:abcdef 0.0s done
+#3 sha256:0123456789ab 10.5MB / 49.6MB 0.4s
+#3 CACHED
+
+#4 [2/3] COPY . /app
+#4 DONE 0.1s
+
+#5 [3/3] RUN cargo build --release
+#5 0.512 error: could not find `Cargo.toml` in `/app` or any parent directory
+#5 ERROR: process "/bin/sh -c cargo build --release" did not complete successfully: exit code: 101
+"""
+expected = """
+#0 building with "default" instance using docker driver
+
+#3 [1/3] FROM docker.io/library/rust:1.80@sha256:abcdef
+
+#4 [2/3] COPY . /app
+
+#5 [3/3] RUN cargo build --release
+#5 0.512 error: could not find `Cargo.toml` in `/app` or any parent directory
+#5 ERROR: process "/bin/sh -c cargo build --release" did not complete successfully: exit code: 101
+"""
+
+[[test]]
+command = "docker pull postgres:16"
+input = """
+16: Pulling from library/postgres
+a1b2c3d4e5f6: Pulling fs layer
+b1b2c3d4e5f6: Pulling fs layer
+a1b2c3d4e5f6: Verifying Checksum
+a1b2c3d4e5f6: Download complete
+a1b2c3d4e5f6: Pull complete
+b1b2c3d4e5f6: Pull complete
+Digest: sha256:0123
+Status: Downloaded newer image for postgres:16
+"""
+expected = """
+16: Pulling from library/postgres
+… 6 layer progress lines
+Digest: sha256:0123
+Status: Downloaded newer image for postgres:16
+"""

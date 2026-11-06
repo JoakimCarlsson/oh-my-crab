@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 
 use super::atomic::write_atomic;
 use super::snapshot::tag;
+use super::{generated, lookalike};
 use crate::language::{Languages, Written, settle};
 use crate::tool::{marked_lines, parse_args};
 use crate::{Sandbox, Tool, ToolError, ToolOutput};
@@ -37,6 +38,12 @@ struct Args {
     path: String,
     /// The complete new content.
     content: String,
+    /// Whether the user explicitly asked for this file to be overwritten although it is generated.
+    #[serde(default)]
+    generated: bool,
+    /// Whether to create the file even though its directory is missing and files with a path ending like it exist.
+    #[serde(default)]
+    create: bool,
 }
 
 #[async_trait]
@@ -50,7 +57,13 @@ impl Tool for Write {
     fn description(&self) -> &'static str {
         "Create a file, or overwrite it completely, with the given content. Missing parent \
          directories are created. Prefer edit for changing part of an existing file. The user \
-         is asked to approve each write."
+         is asked to approve each write.\n\
+         Overwriting a generated file (a generator's banner near the top, generated names like \
+         *.pb.go, or a lockfile) is refused: change its source or generator instead, and set \
+         generated: true only when the user explicitly asked to change that file itself.\n\
+         When the parent directory does not exist but files whose path ends with the given \
+         path do, the write is refused and names them, since the path is likely mistyped; set \
+         create: true to create the new file anyway."
     }
 
     /// Returns the argument schema.
@@ -59,7 +72,9 @@ impl Tool for Write {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "File to write, relative to the working directory." },
-                "content": { "type": "string", "description": "The complete file content." }
+                "content": { "type": "string", "description": "The complete file content." },
+                "generated": { "type": "boolean", "description": "Allow overwriting a generated file or lockfile. Only when the user explicitly asked to change this file itself." },
+                "create": { "type": "boolean", "description": "Create the file even though files whose path ends with this path exist elsewhere." }
             },
             "required": ["path", "content"]
         })
@@ -92,9 +107,13 @@ impl Tool for Write {
             text: args.content.clone(),
             formatted: false,
         };
-        let mut text = tokio::task::spawn_blocking(move || write(&path, &args))
-            .await
-            .map_err(|e| ToolError::Failed(e.to_string()))??;
+        let sandbox = self.sandbox.clone();
+        let mut text = tokio::task::spawn_blocking(move || {
+            check(&sandbox, &path, &args)?;
+            write(&path, &args)
+        })
+        .await
+        .map_err(|e| ToolError::Failed(e.to_string()))??;
         let diagnostics = settle(&self.languages, std::slice::from_mut(&mut file)).await;
         if file.formatted {
             text.push_str(&format!(
@@ -109,6 +128,31 @@ impl Tool for Write {
         }
         Ok(ToolOutput::new(text))
     }
+}
+
+/// Refuses a write of `args` to `path` that would overwrite a generated file,
+/// or create a file in a missing directory when files whose path ends like
+/// it exist, unless the arguments say to go ahead.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Failed`] naming the generated file's evidence, or the
+/// existing files the path probably meant.
+fn check(sandbox: &Sandbox, path: &std::path::Path, args: &Args) -> Result<(), ToolError> {
+    generated::refuse_existing(path, &args.path, args.generated, "\"generated\": true")?;
+    if args.create || path.exists() || path.parent().is_none_or(std::path::Path::exists) {
+        return Ok(());
+    }
+    let candidates = lookalike::lookalikes(sandbox, &args.path);
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    Err(ToolError::Failed(format!(
+        "{} Nothing was written. To create a new file at {} anyway, call write again with \
+         \"create\": true.",
+        lookalike::missing(&args.path, &candidates),
+        args.path
+    )))
 }
 
 /// Writes `args.content` to `path`, creating missing parent directories.
@@ -234,6 +278,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.text, "Overwrote m.rs (10 bytes)");
+    }
+
+    /// Overwriting a generated file is refused unless allowed; creating a file
+    /// with a lockfile's name is not overwriting one.
+    #[tokio::test]
+    async fn refuses_to_overwrite_generated_files() {
+        let (tool, dir) = tool("write-generated");
+        std::fs::write(dir.join("Cargo.lock"), "# lock\n").unwrap();
+        let refused = tool
+            .call(json!({ "path": "Cargo.lock", "content": "x" }))
+            .await;
+        assert!(
+            matches!(&refused, Err(ToolError::Failed(m)) if m.contains("Cargo.lock is a generated file") && m.contains("lockfile")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("Cargo.lock")).unwrap(),
+            "# lock\n"
+        );
+        tool.call(json!({ "path": "Cargo.lock", "content": "x", "generated": true }))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("Cargo.lock")).unwrap(),
+            "x"
+        );
+        tool.call(json!({ "path": "sub/go.sum", "content": "y" }))
+            .await
+            .unwrap();
+    }
+
+    /// A new file in a missing directory is refused when its path is the end
+    /// of an existing file's path, unless create is set; in an existing
+    /// directory it is created.
+    #[tokio::test]
+    async fn refuses_likely_mistyped_new_paths() {
+        let (tool, dir) = tool("write-lookalike");
+        std::fs::create_dir_all(dir.join("crates/a/src")).unwrap();
+        std::fs::write(dir.join("crates/a/src/lib.rs"), "old\n").unwrap();
+        let refused = tool
+            .call(json!({ "path": "a/src/lib.rs", "content": "new\n" }))
+            .await;
+        assert!(
+            matches!(&refused, Err(ToolError::Failed(m)) if m.contains("crates/a/src/lib.rs") && m.contains("\"create\": true")),
+            "{refused:?}"
+        );
+        assert!(!dir.join("a").exists());
+        tool.call(json!({ "path": "a/src/lib.rs", "content": "new\n", "create": true }))
+            .await
+            .unwrap();
+        assert!(dir.join("a/src/lib.rs").exists());
+        std::fs::remove_file(dir.join("a/src/lib.rs")).unwrap();
+        tool.call(json!({ "path": "a/src/lib.rs", "content": "new\n" }))
+            .await
+            .unwrap();
     }
 
     /// A `write` tool rooted at `dir` with no language service.

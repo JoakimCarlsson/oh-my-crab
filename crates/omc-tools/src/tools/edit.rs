@@ -8,8 +8,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::atomic::write_atomic;
+use super::conflict::{self, Take};
 use super::read::{Fold, folds};
 use super::snapshot::{outline_tag, tag};
+use super::{generated, lookalike};
 use crate::language::{Languages, Written, settle};
 use crate::tool::{marked_lines, parse_args};
 use crate::{FileChange, Sandbox, Tool, ToolError, ToolOutput};
@@ -56,9 +58,12 @@ struct Section {
     tag: String,
     /// Operations, all anchored to line numbers of that snapshot.
     ops: Vec<Op>,
+    /// Whether the user explicitly asked for this file to be changed although it is generated.
+    #[serde(default)]
+    generated: bool,
 }
 
-/// What one operation does to the lines it names.
+/// What one operation does, as the model names it.
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum Kind {
@@ -70,18 +75,49 @@ enum Kind {
     InsertAfter,
     /// Remove the line or range.
     Delete,
+    /// Replace a merge conflict block with one of its sides or the text.
+    Resolve,
 }
 
-/// One operation of a section.
+/// One operation of a section, as the model sends it.
 #[derive(Deserialize)]
 struct Op {
     /// What to do.
     op: Kind,
-    /// The line to act on, or the first line of the range; 1-indexed.
-    line: usize,
+    /// The line to act on, or the first line of the range; 1-indexed. Required except for `resolve`.
+    line: Option<usize>,
     /// The last line of the range, for `replace` and `delete`.
     end: Option<usize>,
-    /// The new lines, for `replace`, `insert_before` and `insert_after`.
+    /// The new lines, for `replace`, `insert_before` and `insert_after`, or what a `resolve` puts in place of the block.
+    text: Option<String>,
+    /// The number of the merge conflict a `resolve` replaces.
+    conflict: Option<usize>,
+    /// The side of the conflict a `resolve` keeps.
+    take: Option<Take>,
+}
+
+/// What an operation does to lines, once a `resolve` has been turned into the lines it replaces.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Action {
+    /// Replace the line or range with the text.
+    Replace,
+    /// Put the text before the line.
+    InsertBefore,
+    /// Put the text after the line.
+    InsertAfter,
+    /// Remove the line or range.
+    Delete,
+}
+
+/// An operation anchored to concrete lines of the snapshot.
+struct Placed {
+    /// What to do.
+    action: Action,
+    /// The line to act on, or the first line of the range; 1-indexed.
+    line: usize,
+    /// The last line of the range, for replace and delete.
+    end: Option<usize>,
+    /// The new lines, for replace and the inserts.
     text: Option<String>,
 }
 
@@ -116,7 +152,17 @@ impl Tool for Edit {
          read a folded range first. If the file changed since the tag was issued the call is rejected and \
          nothing is written; read the file again. A call either applies to every file or to \
          none. A successful edit returns the new tag and a preview of the changed lines, so you \
-         can edit again without reading. The user is asked to approve each edit."
+         can edit again without reading. The user is asked to approve each edit.\n\
+         Merge conflicts: {\"op\": \"resolve\", \"conflict\": N, \"take\": \"ours\"} replaces \
+         the whole block of conflict N, markers included, with one side (ours, theirs, base or \
+         both, ours first); give text instead of take to put your own lines there (an empty \
+         text removes the block). N is the number read lists the conflicts by; no line is \
+         needed.\n\
+         Generated files (a generator's banner such as Code generated … DO NOT EDIT near the \
+         top, generated names like *.pb.go, and lockfiles) are refused: change their source or \
+         generator instead. Set generated: true in a file's section only when the user \
+         explicitly asked to change that file itself.\n\
+         A path that does not exist is an error naming the files whose path ends with it."
     }
 
     /// Returns the argument schema.
@@ -140,14 +186,17 @@ impl Tool for Edit {
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "op": { "type": "string", "enum": ["replace", "insert_before", "insert_after", "delete"] },
-                                        "line": { "type": "integer", "minimum": 1, "description": "The line to act on; the first line of a range. insert_after accepts 0 to insert at the top." },
+                                        "op": { "type": "string", "enum": ["replace", "insert_before", "insert_after", "delete", "resolve"] },
+                                        "line": { "type": "integer", "minimum": 1, "description": "The line to act on; the first line of a range. Required except for resolve. insert_after accepts 0 to insert at the top." },
                                         "end": { "type": "integer", "minimum": 1, "description": "Last line of the range, for replace and delete. Defaults to line." },
-                                        "text": { "type": "string", "description": "The new lines, separated by newlines, without line numbers. Required except for delete; an empty string is one blank line, so use delete to remove lines." }
+                                        "text": { "type": "string", "description": "The new lines, separated by newlines, without line numbers. Required for replace and the inserts; an empty string is one blank line, so use delete to remove lines. For resolve, the lines that replace the conflict block, instead of take." },
+                                        "conflict": { "type": "integer", "minimum": 1, "description": "For resolve: the number of the merge conflict, as read lists them." },
+                                        "take": { "type": "string", "enum": ["ours", "theirs", "base", "both"], "description": "For resolve: the side of the conflict to keep; both is ours then theirs." }
                                     },
-                                    "required": ["op", "line"]
+                                    "required": ["op"]
                                 }
-                            }
+                            },
+                            "generated": { "type": "boolean", "description": "Allow changing a generated file or lockfile. Only when the user explicitly asked to change this file itself." }
                         },
                         "required": ["path", "tag", "ops"]
                     }
@@ -202,37 +251,53 @@ impl Edit {
     /// Describes one section: the path, then each operation with the old lines it removes and the new lines it adds.
     fn describe_section(&self, section: &Section) -> String {
         let shown = self.sandbox.describe(&section.path);
-        let old = self
+        let text = self
             .sandbox
             .resolve(&section.path)
             .ok()
             .and_then(|path| std::fs::read_to_string(path).ok())
-            .map(|text| text.lines().map(str::to_string).collect::<Vec<_>>())
             .unwrap_or_default();
+        let old: Vec<&str> = text.lines().collect();
         let mut out = vec![shown];
-        for op in &section.ops {
-            let end = op.end.unwrap_or(op.line).max(op.line);
-            let count = (end - op.line).saturating_add(1);
-            let verb = match op.op {
-                Kind::Replace => format!("replace lines {}-{end}", op.line),
-                Kind::Delete => format!("delete lines {}-{end}", op.line),
-                Kind::InsertBefore => format!("insert before line {}", op.line),
-                Kind::InsertAfter => format!("insert after line {}", op.line),
+        if section.generated {
+            out.push("(changes a generated file, as the user asked)".to_owned());
+        }
+        let placed = match place(&text, &section.ops) {
+            Ok(placed) => placed,
+            Err(message) => {
+                out.push(format!("[will be rejected: {message}]"));
+                return out.join("\n");
+            }
+        };
+        for (op, step) in section.ops.iter().zip(&placed) {
+            let end = step.end.unwrap_or(step.line).max(step.line);
+            let count = (end - step.line).saturating_add(1);
+            let verb = match (op.op, step.action) {
+                (Kind::Resolve, _) => format!(
+                    "resolve conflict {} at lines {}-{end}, keeping {}",
+                    op.conflict.unwrap_or_default(),
+                    step.line,
+                    op.take.map_or("the given text", Take::word)
+                ),
+                (_, Action::Replace) => format!("replace lines {}-{end}", step.line),
+                (_, Action::Delete) => format!("delete lines {}-{end}", step.line),
+                (_, Action::InsertBefore) => format!("insert before line {}", step.line),
+                (_, Action::InsertAfter) => format!("insert after line {}", step.line),
             };
             out.push(verb);
-            if matches!(op.op, Kind::Replace | Kind::Delete) {
+            if matches!(step.action, Action::Replace | Action::Delete) {
                 let removed = old
                     .iter()
-                    .skip(op.line.saturating_sub(1))
+                    .skip(step.line.saturating_sub(1))
                     .take(count)
-                    .cloned()
+                    .copied()
                     .collect::<Vec<_>>()
                     .join("\n");
                 if !removed.is_empty() {
                     out.push(marked_lines('-', &removed));
                 }
             }
-            if let Some(text) = &op.text {
+            if let Some(text) = &step.text {
                 out.push(marked_lines('+', text));
             }
         }
@@ -330,15 +395,25 @@ fn write_all(pending: &[Pending]) -> Result<(), ToolError> {
 ///
 /// See [`apply`].
 fn prepare(sandbox: &Sandbox, path: PathBuf, section: &Section) -> Result<Pending, ToolError> {
+    lookalike::require(sandbox, &path, &section.path)?;
     let bytes = std::fs::read(&path)?;
     let old = String::from_utf8(bytes.clone())
         .map_err(|_| ToolError::Failed(format!("{} is not a UTF-8 text file", section.path)))?;
+    generated::refuse(
+        &path,
+        &section.path,
+        &old,
+        section.generated,
+        "\"generated\": true in this file's section",
+    )?;
+    let ops = place(&old, &section.ops)
+        .map_err(|message| ToolError::Failed(format!("{}: {message}", section.path)))?;
     let current = tag(&bytes);
     let cited = section.tag.trim();
     let outlined =
         !cited.eq_ignore_ascii_case(&current) && cited.eq_ignore_ascii_case(&outline_tag(&bytes));
     if outlined {
-        refuse_folded(&path, &old, section)?;
+        refuse_folded(&path, &old, section, &ops)?;
     } else if !cited.eq_ignore_ascii_case(&current) {
         return Err(ToolError::Failed(format!(
             "{} has changed since it was read (you cited tag {:?}, it is now {current}); \
@@ -346,7 +421,7 @@ fn prepare(sandbox: &Sandbox, path: PathBuf, section: &Section) -> Result<Pendin
             section.path, section.tag
         )));
     }
-    let (new, region) = rewrite(&old, &section.ops)
+    let (new, region) = rewrite(&old, &ops)
         .map_err(|message| ToolError::Failed(format!("{}: {message}", section.path)))?;
     Ok(Pending {
         shown: sandbox.display(&path),
@@ -357,20 +432,26 @@ fn prepare(sandbox: &Sandbox, path: PathBuf, section: &Section) -> Result<Pendin
     })
 }
 
-/// Refuses the operations of `section` that act on a line the outline of the
-/// file at `path`, holding `old`, folded away, since the model cited the tag
-/// of that outline and has not seen those lines.
+/// Refuses the operations `ops` of `section`, placed on the lines of the
+/// snapshot, that act on a line the outline of the file at `path`, holding
+/// `old`, folded away, since the model cited the tag of that outline and has
+/// not seen those lines.
 ///
 /// # Errors
 ///
 /// Returns [`ToolError::Failed`] naming the first such operation, the folded
 /// range it touches and the selector that reads it.
-fn refuse_folded(path: &std::path::Path, old: &str, section: &Section) -> Result<(), ToolError> {
+fn refuse_folded(
+    path: &std::path::Path,
+    old: &str,
+    section: &Section,
+    ops: &[Placed],
+) -> Result<(), ToolError> {
     let hidden = folds(path, old).unwrap_or_default();
-    for (index, op) in section.ops.iter().enumerate() {
-        let last = match op.op {
-            Kind::Replace | Kind::Delete => op.end.unwrap_or(op.line).max(op.line),
-            Kind::InsertBefore | Kind::InsertAfter => op.line,
+    for (index, op) in ops.iter().enumerate() {
+        let last = match op.action {
+            Action::Replace | Action::Delete => op.end.unwrap_or(op.line).max(op.line),
+            Action::InsertBefore | Action::InsertAfter => op.line,
         };
         if let Some(fold) = hidden
             .iter()
@@ -392,6 +473,101 @@ fn folded_error(section: &Section, number: usize, fold: Fold) -> ToolError {
         first = fold.first,
         last = fold.last,
     ))
+}
+
+/// Anchors `ops` to the lines of `old`: a `resolve` becomes a replace, or a
+/// delete when nothing is kept, of its whole conflict block; the other
+/// operations keep the lines they name.
+///
+/// # Errors
+///
+/// Returns a message naming the operation when it lacks its line, or when a
+/// `resolve` is malformed as [`resolve`] says.
+fn place(old: &str, ops: &[Op]) -> Result<Vec<Placed>, String> {
+    let conflicts = if ops.iter().any(|op| op.op == Kind::Resolve) {
+        conflict::scan(old)
+    } else {
+        Vec::new()
+    };
+    let lines: Vec<&str> = old
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    ops.iter()
+        .enumerate()
+        .map(|(index, op)| {
+            let number = index + 1;
+            let action = match op.op {
+                Kind::Replace => Action::Replace,
+                Kind::InsertBefore => Action::InsertBefore,
+                Kind::InsertAfter => Action::InsertAfter,
+                Kind::Delete => Action::Delete,
+                Kind::Resolve => return resolve(op, number, &conflicts, &lines),
+            };
+            let line = op
+                .line
+                .ok_or_else(|| format!("operation {number} needs line"))?;
+            Ok(Placed {
+                action,
+                line,
+                end: op.end,
+                text: op.text.clone(),
+            })
+        })
+        .collect()
+}
+
+/// Turns the `resolve` operation `op`, number `number`, into the replace or
+/// delete of the whole block of its conflict among `conflicts`, found in the
+/// file whose lines are `lines`.
+///
+/// # Errors
+///
+/// Returns a message when the operation names no conflict of the file, gives
+/// both or neither of `take` and `text`, or takes a side its block lacks.
+fn resolve(
+    op: &Op,
+    number: usize,
+    conflicts: &[conflict::Conflict],
+    lines: &[&str],
+) -> Result<Placed, String> {
+    let id = op.conflict.ok_or_else(|| {
+        format!("operation {number}: resolve needs conflict, the number of the conflict to resolve")
+    })?;
+    let block = id
+        .checked_sub(1)
+        .and_then(|index| conflicts.get(index))
+        .ok_or_else(|| {
+            format!(
+                "operation {number}: there is no conflict {id}; this snapshot of the file has {} \
+                 (read the file with the :conflicts selector to list them)",
+                conflicts.len()
+            )
+        })?;
+    let kept = match (op.take, &op.text) {
+        (Some(take), None) => {
+            let kept = block
+                .resolve(lines, take)
+                .map_err(|message| format!("operation {number}: {message}"))?;
+            (!kept.is_empty()).then(|| kept.join("\n"))
+        }
+        (None, Some(text)) => (!text.is_empty()).then(|| text.clone()),
+        _ => {
+            return Err(format!(
+                "operation {number}: resolve takes either take or text, not both and not neither"
+            ));
+        }
+    };
+    Ok(Placed {
+        action: if kept.is_some() {
+            Action::Replace
+        } else {
+            Action::Delete
+        },
+        line: block.start,
+        end: Some(block.end),
+        text: kept,
+    })
 }
 
 /// A file split into lines, remembering how to join them again.
@@ -475,7 +651,7 @@ struct Step {
 ///
 /// Returns a message when a line is out of range, text is missing, or two
 /// operations overlap.
-fn rewrite(old: &str, ops: &[Op]) -> Result<(String, (usize, usize)), String> {
+fn rewrite(old: &str, ops: &[Placed]) -> Result<(String, (usize, usize)), String> {
     let file = Lines::split(old);
     let total = file.bodies.len();
     let mut ranges: Vec<Step> = Vec::new();
@@ -488,8 +664,8 @@ fn rewrite(old: &str, ops: &[Op]) -> Result<(String, (usize, usize)), String> {
                 .map(|t| file.fresh(t))
                 .ok_or_else(|| format!("operation {number} needs text"))
         };
-        match op.op {
-            Kind::Replace | Kind::Delete => {
+        match op.action {
+            Action::Replace | Action::Delete => {
                 let last = op.end.unwrap_or(op.line);
                 if op.line == 0 || op.line > last || last > total {
                     return Err(format!(
@@ -498,7 +674,7 @@ fn rewrite(old: &str, ops: &[Op]) -> Result<(String, (usize, usize)), String> {
                         op.line
                     ));
                 }
-                let lines = if op.op == Kind::Replace {
+                let lines = if op.action == Action::Replace {
                     text()?
                 } else {
                     Vec::new()
@@ -509,13 +685,13 @@ fn rewrite(old: &str, ops: &[Op]) -> Result<(String, (usize, usize)), String> {
                     lines,
                 });
             }
-            Kind::InsertBefore | Kind::InsertAfter => {
-                let gap = if op.op == Kind::InsertBefore {
+            Action::InsertBefore | Action::InsertAfter => {
+                let gap = if op.action == Action::InsertBefore {
                     op.line.wrapping_sub(1)
                 } else {
                     op.line
                 };
-                let valid = if op.op == Kind::InsertBefore {
+                let valid = if op.action == Action::InsertBefore {
                     (1..=total + 1).contains(&op.line)
                 } else {
                     op.line <= total
@@ -966,6 +1142,148 @@ mod tests {
         let (tool, _dir) = tool("edit-schema");
         let text = format!("{} {}", tool.description(), tool.schema());
         assert!(!text.contains("old_string") && !text.contains("new_string"));
+    }
+
+    /// A conflict is resolved by number with a side, with both sides or with
+    /// new text, replacing the whole block; the other conflict keeps its lines.
+    #[tokio::test]
+    async fn resolves_conflicts_by_number() {
+        use super::super::conflict::tests::TWO;
+        let (tool, dir) = tool("edit-resolve");
+        for (take, block) in [
+            (json!({ "take": "ours" }), "ours 1\n"),
+            (json!({ "take": "theirs" }), "theirs 1\ntheirs 2\n"),
+            (json!({ "take": "both" }), "ours 1\ntheirs 1\ntheirs 2\n"),
+            (json!({ "text": "merged" }), "merged\n"),
+            (json!({ "text": "" }), ""),
+        ] {
+            let t = put(&dir, "f.txt", TWO);
+            let mut op = json!({ "op": "resolve", "conflict": 1 });
+            op.as_object_mut()
+                .unwrap()
+                .extend(take.as_object().unwrap().clone());
+            tool.call(call("f.txt", &t, json!([op]))).await.unwrap();
+            let rest = TWO.split_once(">>>>>>> feature\n").unwrap().1;
+            assert_eq!(get(&dir, "f.txt"), format!("top\n{block}{rest}"));
+        }
+        let t = put(&dir, "f.txt", TWO);
+        tool.call(call(
+            "f.txt",
+            &t,
+            json!([
+                { "op": "resolve", "conflict": 2, "take": "base" },
+                { "op": "replace", "line": 1, "text": "TOP" }
+            ]),
+        ))
+        .await
+        .unwrap();
+        assert!(get(&dir, "f.txt").starts_with("TOP\n<<<<<<< HEAD\n"));
+        assert!(get(&dir, "f.txt").ends_with("middle\nancestor\nend\n"));
+    }
+
+    /// Resolving a conflict that does not exist, a side the block lacks, or
+    /// with both or neither of take and text fails without a write, as does a
+    /// stale tag.
+    #[tokio::test]
+    async fn rejects_bad_resolutions() {
+        use super::super::conflict::tests::TWO;
+        let (tool, dir) = tool("edit-resolve-bad");
+        let t = put(&dir, "f.txt", TWO);
+        for (op, expected) in [
+            (
+                json!({ "op": "resolve", "conflict": 3, "take": "ours" }),
+                "no conflict 3",
+            ),
+            (
+                json!({ "op": "resolve", "conflict": 1, "take": "base" }),
+                "no base side",
+            ),
+            (
+                json!({ "op": "resolve", "conflict": 1 }),
+                "either take or text",
+            ),
+            (
+                json!({ "op": "resolve", "conflict": 1, "take": "ours", "text": "x" }),
+                "either take or text",
+            ),
+            (json!({ "op": "resolve", "take": "ours" }), "needs conflict"),
+            (json!({ "op": "delete" }), "needs line"),
+        ] {
+            let result = tool.call(call("f.txt", &t, json!([op]))).await;
+            assert!(
+                matches!(&result, Err(ToolError::Failed(m)) if m.contains(expected)),
+                "{result:?}"
+            );
+        }
+        let stale = tool
+            .call(call(
+                "f.txt",
+                "0000",
+                json!([{ "op": "resolve", "conflict": 1, "take": "ours" }]),
+            ))
+            .await;
+        assert!(stale.is_err());
+        assert_eq!(get(&dir, "f.txt"), TWO);
+    }
+
+    /// The approval prompt of a resolution shows the block it removes and the side it keeps.
+    #[test]
+    fn describes_resolutions() {
+        use super::super::conflict::tests::TWO;
+        let (tool, dir) = tool("edit-resolve-describe");
+        put(&dir, "f.txt", TWO);
+        let shown = tool.describe(&call(
+            "f.txt",
+            "0000",
+            json!([{ "op": "resolve", "conflict": 1, "take": "theirs" }]),
+        ));
+        assert!(
+            shown.contains("resolve conflict 1 at lines 2-7, keeping theirs"),
+            "{shown}"
+        );
+        assert!(shown.contains("- <<<<<<< HEAD"), "{shown}");
+        assert!(shown.contains("+ theirs 2"), "{shown}");
+    }
+
+    /// A generated file is refused, naming the evidence, unless the section allows it.
+    #[tokio::test]
+    async fn refuses_generated_files_unless_allowed() {
+        let (tool, dir) = tool("edit-generated");
+        let code = "// Code generated by protoc-gen-go. DO NOT EDIT.\npackage a\n";
+        let t = put(&dir, "a.go", code);
+        let ops = json!([{ "op": "replace", "line": 2, "text": "package b" }]);
+        let refused = tool.call(call("a.go", &t, ops.clone())).await;
+        assert!(
+            matches!(&refused, Err(ToolError::Failed(m)) if m.contains("a.go is a generated file") && m.contains("line 1:") && m.contains("\"generated\": true")),
+            "{refused:?}"
+        );
+        assert_eq!(get(&dir, "a.go"), code);
+        tool.call(
+            json!({ "files": [{ "path": "a.go", "tag": t, "ops": ops, "generated": true }] }),
+        )
+        .await
+        .unwrap();
+        assert!(get(&dir, "a.go").ends_with("package b\n"));
+    }
+
+    /// A missing file is an error naming the file whose path ends with it, never an edit of that file.
+    #[tokio::test]
+    async fn names_lookalikes_of_missing_files() {
+        let (tool, dir) = tool("edit-lookalike");
+        std::fs::create_dir_all(dir.join("src/deep")).unwrap();
+        let t = put(&dir, "src/deep/f.txt", "a\n");
+        let result = tool
+            .call(call(
+                "deep/f.txt",
+                &t,
+                json!([{ "op": "delete", "line": 1 }]),
+            ))
+            .await;
+        assert!(
+            matches!(&result, Err(ToolError::Failed(m)) if m.contains("deep/f.txt does not exist; the only file whose path ends with it is src/deep/f.txt")),
+            "{result:?}"
+        );
+        assert_eq!(get(&dir, "src/deep/f.txt"), "a\n");
     }
 
     /// File permissions survive an edit.
