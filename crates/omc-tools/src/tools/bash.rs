@@ -1,6 +1,6 @@
 //! The `bash` tool: run a shell command with a timeout.
 //!
-//! Before a command runs, a plain use of the shell for something a dedicated tool does better is turned away in favour of that tool ([`intercept`]). While it runs, the output of known noisy commands is condensed for the model, the raw output staying saved whole ([`condense`]). Both can be switched off.
+//! Before a command runs, a plain use of the shell whose result a dedicated tool gives exactly is turned away in favour of that tool, and one the tool only comes close to runs with a tip ([`intercept`]). While it runs, the output of known noisy commands is condensed for the model, the raw output staying saved whole ([`condense`]). Both can be switched off.
 
 mod condense;
 mod intercept;
@@ -637,7 +637,7 @@ mod tests {
         else {
             panic!("expected the command to be turned away");
         };
-        assert!(message.contains(r#"Call `read` with {"path":"notes.txt"}"#));
+        assert!(message.contains(r#"Call `read` with {"path":"notes.txt:1-"}"#));
         let piped = tool
             .call(json!({ "command": "cat notes.txt | wc -l" }))
             .await

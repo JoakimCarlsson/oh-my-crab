@@ -5,13 +5,14 @@
 use std::collections::HashMap;
 
 use omc_providers::{Message, Reply, ToolCall, ToolResult};
+use omc_tools::FileChange;
 use serde_json::Value;
 
 /// The tool the model keeps its list with.
 const TODO: &str = "todo";
 
-/// The tools whose calls count as changing files.
-const MUTATING: [&str; 4] = ["edit", "write", "ast_edit", "bash"];
+/// The tools that change a file whenever they succeed but report no record of the change; every other call counts as changing files only when its records show a file whose text changed.
+const UNRECORDED: [&str; 1] = ["write"];
 
 /// How many file-changing calls since the list last changed earn a reminder.
 pub(crate) const CHANGES: u32 = 12;
@@ -48,6 +49,8 @@ pub(crate) struct TodoTracker {
     reminders: u32,
     /// Whether a file-changing call succeeded in this turn.
     worked: bool,
+    /// Whether a `todo` call succeeded in this turn.
+    listed: bool,
     /// Whether the model was already told not to end the turn with open items.
     nudged: bool,
 }
@@ -63,11 +66,14 @@ impl TodoTracker {
         }
     }
 
-    /// Takes in a batch: `calls` made in a reply whose text is `text`, and the `results` they gave. Returns the reminder to add to the results when the list still has open items after [`CHANGES`] file-changing calls since it changed, at most [`MAX_REMINDERS`] times between changes, and never when `text` asks the user a question.
+    /// Takes in a batch: `calls` made in a reply whose text is `text`, the `results` they gave, and the files each call changed, by call id, as `changed` records them. Returns the reminder to add to the results when the list still has open items after [`CHANGES`] file-changing calls since it changed, at most [`MAX_REMINDERS`] times between changes, and never when `text` asks the user a question.
+    ///
+    /// A call counts as changing files when it succeeded and its records show a file whose text changed, or when it is a call of one of [`UNRECORDED`]; a shell command that only looks, such as `ls` or a test run, does not count.
     pub(crate) fn observe(
         &mut self,
         calls: &[ToolCall],
         results: &[ToolResult],
+        changed: &[(String, Vec<FileChange>)],
         text: &str,
     ) -> Option<String> {
         for call in calls {
@@ -81,7 +87,8 @@ impl TodoTracker {
                 self.open = open_items(&call.arguments);
                 self.changes = 0;
                 self.reminders = 0;
-            } else if MUTATING.contains(&call.name.as_str()) {
+                self.listed = true;
+            } else if changes_files(call, changed) {
                 self.changes += 1;
                 self.worked = true;
             }
@@ -99,14 +106,28 @@ impl TodoTracker {
         Some(fill(REMINDER, &self.open).replace("{changes}", &changes.to_string()))
     }
 
-    /// The notice to send along when the turn is about to end with `reply`: once a turn, when files were changed in it, the list still has open items, and `reply` does not ask the user a question.
+    /// The notice to send along when the turn is about to end with `reply`: once a turn, when the list still has open items, it was written or files were changed in this turn, and `reply` does not ask the user a question. A list left over from an earlier turn does not hold up a turn that only answered a question.
     pub(crate) fn finishing(&mut self, reply: &Reply) -> Option<String> {
-        if self.nudged || !self.worked || self.open.is_empty() || asks_question(&reply.text) {
+        if self.nudged
+            || !(self.worked || self.listed)
+            || self.open.is_empty()
+            || asks_question(&reply.text)
+        {
             return None;
         }
         self.nudged = true;
         Some(fill(FINISH, &self.open))
     }
+}
+
+/// Whether `call` changed files: it is a call of one of [`UNRECORDED`], or `changed` holds a record for it of a file whose text changed.
+fn changes_files(call: &ToolCall, changed: &[(String, Vec<FileChange>)]) -> bool {
+    UNRECORDED.contains(&call.name.as_str())
+        || changed
+            .iter()
+            .filter(|(id, _)| *id == call.id)
+            .flat_map(|(_, files)| files)
+            .any(|file| file.old != file.new)
 }
 
 /// The open items of the latest list a successful `todo` call before position `at` of `history` wrote, with the position of that call, when there is one.
@@ -140,9 +161,9 @@ fn latest(history: &[Message], at: usize) -> Option<(usize, Vec<Item>)> {
         })
 }
 
-/// The text that restates the open items to the model after the compaction at position `at` of `history`, whose first kept message is at `first_kept`: only when the latest list before it was written before `first_kept`, where the model no longer sees it, and has open items.
-pub(crate) fn restated(history: &[Message], at: usize, first_kept: usize) -> Option<String> {
-    let (position, items) = latest(history, at)?;
+/// The text that restates the open items to the model after a compaction of `history` whose first kept message is at `first_kept`: only when the latest list in the whole history, after the compaction included, was written before `first_kept`, where the model no longer sees it, and has open items. A list written later is in the part the model sees, and stands in for the hidden one.
+pub(crate) fn restated(history: &[Message], first_kept: usize) -> Option<String> {
+    let (position, items) = latest(history, history.len())?;
     (position < first_kept && !items.is_empty()).then(|| fill(RESTATED, &items))
 }
 
@@ -242,7 +263,29 @@ mod tests {
         ]})
     }
 
-    /// Runs `count` batches of one successful edit through `tracker`, with replies saying `text`, and returns the reminders given.
+    /// The records of the call `id` changing `a.rs` from `old` to `new`.
+    fn changed(id: &str, old: &str, new: &str) -> Vec<(String, Vec<FileChange>)> {
+        vec![(
+            id.to_owned(),
+            vec![FileChange {
+                path: "a.rs".into(),
+                old: old.into(),
+                new: new.into(),
+            }],
+        )]
+    }
+
+    /// Writes the list `list()` through `tracker` in a batch of its own.
+    fn listed(tracker: &mut TodoTracker) -> Option<String> {
+        tracker.observe(
+            &[call("t", TODO, list())],
+            &[result("t", TODO, false)],
+            &[],
+            "",
+        )
+    }
+
+    /// Runs `count` batches of one successful edit that changed a file through `tracker`, with replies saying `text`, and returns the reminders given.
     fn edits(tracker: &mut TodoTracker, count: u32, text: &str) -> Vec<String> {
         (0..count)
             .filter_map(|round| {
@@ -250,7 +293,23 @@ mod tests {
                 tracker.observe(
                     &[call(&id, "edit", json!({}))],
                     &[result(&id, "edit", false)],
+                    &changed(&id, "a", "b"),
                     text,
+                )
+            })
+            .collect()
+    }
+
+    /// Runs `count` batches of one successful call of `name` that changed no file through `tracker`, and returns the reminders given.
+    fn looks(tracker: &mut TodoTracker, name: &str, count: u32) -> Vec<String> {
+        (0..count)
+            .filter_map(|round| {
+                let id = format!("l{round}");
+                tracker.observe(
+                    &[call(&id, name, json!({"command": "ls"}))],
+                    &[result(&id, name, false)],
+                    &[],
+                    "",
                 )
             })
             .collect()
@@ -261,11 +320,7 @@ mod tests {
     fn reminds_after_many_edits() {
         let mut tracker = TodoTracker::default();
         assert!(edits(&mut tracker, CHANGES * 2, "").is_empty(), "no list");
-        let todo = [call("t", TODO, list())];
-        assert_eq!(
-            tracker.observe(&todo, &[result("t", TODO, false)], ""),
-            None
-        );
+        assert_eq!(listed(&mut tracker), None);
         assert!(edits(&mut tracker, CHANGES - 1, "").is_empty());
         let first = edits(&mut tracker, 1, "");
         assert_eq!(first.len(), 1);
@@ -273,18 +328,47 @@ mod tests {
         assert!(first[0].contains("- [in progress] fix\n- [pending] test"));
         assert!(!first[0].contains("read"));
         assert_eq!(edits(&mut tracker, CHANGES * 3, "").len(), 1, "two at most");
-        tracker.observe(&todo, &[result("t", TODO, false)], "");
+        listed(&mut tracker);
         assert_eq!(edits(&mut tracker, CHANGES, "").len(), 1);
+    }
+
+    /// Only calls whose records show a file changed count: shell commands that only look, and edits that left the file as it was, do not; a write does.
+    #[test]
+    fn only_real_changes_count() {
+        let mut tracker = TodoTracker::default();
+        listed(&mut tracker);
+        assert!(looks(&mut tracker, "bash", CHANGES * 2).is_empty());
+        for round in 0..CHANGES {
+            let id = format!("n{round}");
+            let reminder = tracker.observe(
+                &[call(&id, "edit", json!({}))],
+                &[result(&id, "edit", false)],
+                &changed(&id, "same", "same"),
+                "",
+            );
+            assert_eq!(reminder, None);
+        }
+        assert_eq!(looks(&mut tracker, "write", CHANGES).len(), 1);
+        let mut idle = TodoTracker::default();
+        listed(&mut idle);
+        let shelled = idle.observe(
+            &[call("s", "bash", json!({"command": "sed -i s/a/b/ a.rs"}))],
+            &[result("s", "bash", false)],
+            &changed("s", "a", "b"),
+            "",
+        );
+        assert_eq!(shelled, None);
+        assert!(idle.worked, "a shell command with change records counts");
     }
 
     /// A reply that asks the user something is not answered with a reminder, and failed calls do not count.
     #[test]
     fn questions_and_failures_are_left_alone() {
         let mut tracker = TodoTracker::default();
-        tracker.observe(&[call("t", TODO, list())], &[result("t", TODO, false)], "");
+        listed(&mut tracker);
         assert!(edits(&mut tracker, CHANGES, "Shall I go on?").is_empty());
         let mut failing = TodoTracker::default();
-        failing.observe(&[call("t", TODO, list())], &[result("t", TODO, false)], "");
+        listed(&mut failing);
         for round in 0..CHANGES {
             let id = format!("e{round}");
             assert!(
@@ -292,6 +376,7 @@ mod tests {
                     .observe(
                         &[call(&id, "edit", json!({}))],
                         &[result(&id, "edit", true)],
+                        &changed(&id, "a", "b"),
                         ""
                     )
                     .is_none()
@@ -321,21 +406,57 @@ mod tests {
         let tracker = TodoTracker::new(&history);
         assert_eq!(tracker.open.len(), 2);
         assert_eq!(tracker.open[0].content, "fix");
-        let restated = restated(&history, history.len(), 3).unwrap();
+        let restated = restated(&history, 3).unwrap();
         assert!(restated.contains("- [pending] test"), "{restated}");
-        assert_eq!(super::restated(&history, history.len(), 1), None);
+        assert_eq!(super::restated(&history, 1), None);
     }
 
-    /// The turn may end once with open items before being nudged, never after a question, and not when nothing was changed.
+    /// A list written after the compaction, where the model sees it, stands in for the hidden one, which is not restated.
+    #[test]
+    fn a_newer_list_is_not_restated_over() {
+        let history = vec![
+            Message::User("go".into()),
+            Message::Assistant(Reply {
+                tool_calls: vec![call("a", TODO, list())],
+                ..Reply::default()
+            }),
+            Message::ToolResults(vec![result("a", TODO, false)]),
+            Message::User("next".into()),
+            Message::Assistant(Reply {
+                tool_calls: vec![call(
+                    "b",
+                    TODO,
+                    json!({"todos": [{"content": "fix", "status": "completed"}]}),
+                )],
+                ..Reply::default()
+            }),
+            Message::ToolResults(vec![result("b", TODO, false)]),
+        ];
+        assert_eq!(restated(&history, 3), None);
+        assert!(restated(&history[..3], 3).is_some());
+    }
+
+    /// The turn may end once with open items before being nudged when it wrote the list or changed files, never after a question.
     #[test]
     fn nudges_once_before_the_turn_ends() {
-        let mut tracker = TodoTracker::default();
-        tracker.observe(&[call("t", TODO, list())], &[result("t", TODO, false)], "");
         let done = Reply {
             text: "All done.".into(),
             ..Reply::default()
         };
-        assert_eq!(tracker.finishing(&done), None, "nothing changed yet");
+        let mut written = TodoTracker::default();
+        listed(&mut written);
+        assert!(written.finishing(&done).is_some(), "the list was written");
+        let history = vec![
+            Message::Assistant(Reply {
+                tool_calls: vec![call("t", TODO, list())],
+                ..Reply::default()
+            }),
+            Message::ToolResults(vec![result("t", TODO, false)]),
+        ];
+        let mut tracker = TodoTracker::new(&history);
+        assert_eq!(tracker.finishing(&done), None, "nothing done this turn");
+        looks(&mut tracker, "bash", 3);
+        assert_eq!(tracker.finishing(&done), None, "only looked around");
         edits(&mut tracker, 1, "");
         let asking = Reply {
             text: "Which file next?".into(),

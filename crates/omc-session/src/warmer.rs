@@ -45,6 +45,10 @@ pub(crate) struct Target {
     pub(crate) model: String,
     /// How long the cache entries the request wrote live.
     pub(crate) retention: Retention,
+    /// How hard the model was asked to think.
+    pub(crate) effort: Option<Effort>,
+    /// Whether the agent had the checkpoint and rewind tools, which changes the tool list.
+    pub(crate) checkpoints: bool,
 }
 
 /// A request as it was sent, kept to be sent again.
@@ -59,8 +63,6 @@ struct Snapshot {
     messages: Vec<Message>,
     /// The tools.
     tools: Vec<ToolSpec>,
-    /// How hard the model was asked to think.
-    effort: Option<Effort>,
     /// How many tokens the prompt held, as the provider counted them.
     prompt_tokens: u64,
     /// When it was sent, which is when the lifetime of the entries it read or wrote began.
@@ -74,7 +76,7 @@ impl Snapshot {
             system: &self.system,
             messages: &self.messages,
             tools: &self.tools,
-            effort: self.effort,
+            effort: self.target.effort,
         }
     }
 }
@@ -137,6 +139,19 @@ impl Warmer {
         self.with(|state| state.turns > 0)
     }
 
+    /// Whether a request is being kept warm.
+    #[cfg(test)]
+    pub(crate) fn armed(&self) -> bool {
+        self.with(|state| state.task.is_some())
+    }
+
+    /// Pretends to keep a request warm, with a task that never ends.
+    #[cfg(test)]
+    pub(crate) fn arm(&self) {
+        let task = tokio::spawn(std::future::pending::<()>()).abort_handle();
+        self.with(|state| state.task.replace(task));
+    }
+
     /// Stops warming until the next request.
     pub(crate) fn stop(&self) {
         if let Some(task) = self.with(|state| state.task.take()) {
@@ -192,7 +207,7 @@ fn expected_saving(pricing: &Pricing, retention: Retention, tokens: u64, continu
 
 /// Warms the entries of `snapshot` for the conversation `shared`, which live `ttl` and cost what `pricing` says, until warming no longer pays or is no longer wanted.
 ///
-/// Before each warm request it checks that the conversation is still there with warming on and the same model and cache lifetime, that the last real request is no older than the horizon (an hour while a turn runs, half an hour while the conversation waits for the reader), that the timer did not fire so late that the entry may be gone, and that the expected saving is at least [`MINIMUM_SAVING`]. A warm request that fails ends warming; one that is answered is saved with the conversation as what warming cost.
+/// Before each warm request it checks that the conversation is still there with warming on and the same model, cache lifetime, effort and checkpoint setting, that the last real request is no older than the horizon (an hour while a turn runs, half an hour while the conversation waits for the reader), that the timer did not fire so late that the entry may be gone, and that the expected saving is at least [`MINIMUM_SAVING`]. A warm request that fails ends warming; one that is answered is saved with the conversation as what warming cost.
 async fn keep_warm(shared: Weak<Shared>, snapshot: Snapshot, ttl: Duration, pricing: Pricing) {
     let Some(delay) = warm_delay(ttl) else {
         return;
@@ -214,7 +229,9 @@ async fn keep_warm(shared: Weak<Shared>, snapshot: Snapshot, ttl: Duration, pric
         };
         let current = held.warming()
             && held.retention() == target.retention
-            && held.model() == Some((target.provider, target.model.clone()));
+            && held.model() == Some((target.provider, target.model.clone()))
+            && held.effort_now() == target.effort
+            && held.checkpoints() == target.checkpoints;
         if !current || due > snapshot.started + horizon || Instant::now() > due + slack {
             return;
         }
@@ -256,6 +273,8 @@ pub(crate) struct Recorder {
     pub(crate) provider: Provider,
     /// The model id.
     pub(crate) model: String,
+    /// Whether the turn gave the agent the checkpoint and rewind tools.
+    pub(crate) checkpoints: bool,
 }
 
 impl Recorder {
@@ -278,11 +297,12 @@ impl Recorder {
                 provider: self.provider,
                 model: self.model.clone(),
                 retention,
+                effort: request.effort,
+                checkpoints: self.checkpoints,
             },
             system: request.system.to_owned(),
             messages: request.messages.to_vec(),
             tools: request.tools.to_vec(),
-            effort: request.effort,
             prompt_tokens,
             started,
         };
@@ -292,12 +312,13 @@ impl Recorder {
 
 #[async_trait]
 impl ChatModel for Recorder {
-    /// Sends `request` and, once it is answered, keeps it warm.
+    /// Sends `request` and, once it is answered, keeps it warm; the earlier request is no longer warmed from the moment this one is sent, since this one reads its entries anyway.
     async fn complete(
         &self,
         request: Request<'_>,
         sink: &mut dyn Sink,
     ) -> Result<Reply, ProviderError> {
+        self.shared.warmer.stop();
         let started = Instant::now();
         let reply = self.inner.complete(request, sink).await?;
         let prompt_tokens = reply.tokens.map_or(0, |tokens| tokens.context());
@@ -428,6 +449,7 @@ mod tests {
             shared: shared.clone(),
             provider: Provider::Claude,
             model: "claude-opus-5-5".into(),
+            checkpoints: false,
         };
         let turn = running.then(|| shared.warmer.running());
         let messages = [Message::User("hi".into())];
@@ -435,7 +457,7 @@ mod tests {
             system: "s",
             messages: &messages,
             tools: &[],
-            effort: Some(Effort::High),
+            effort: shared.effort_now(),
         };
         recorder.complete(request, &mut Nowhere).await.unwrap();
         tokio::time::sleep(Duration::from_secs(minutes * 60)).await;
@@ -483,6 +505,7 @@ mod tests {
             shared: shared.clone(),
             provider: Provider::Claude,
             model: "claude-opus-5-5".into(),
+            checkpoints: false,
         };
         let _turn = shared.warmer.running();
         let messages = [Message::User("hi".into())];
@@ -490,7 +513,7 @@ mod tests {
             system: "s",
             messages: &messages,
             tools: &[],
-            effort: None,
+            effort: shared.effort_now(),
         };
         recorder.complete(request, &mut Nowhere).await.unwrap();
         tokio::time::sleep(Duration::from_secs(600)).await;
@@ -502,5 +525,113 @@ mod tests {
         shared.set_model("claude-sonnet-5-5");
         tokio::time::sleep(Duration::from_secs(600)).await;
         assert_eq!(model.warms.load(Ordering::SeqCst), 1);
+    }
+
+    /// A conversation on Claude Opus 5.5 with a turn running, a recorder for it and the model behind that, which answers with a prompt of 100,000 tokens.
+    fn warming_turn() -> (Arc<Shared>, Running, Recorder, Arc<Counting>) {
+        let (out, _events) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared::new(out);
+        shared.open(
+            Provider::Claude,
+            Vec::new(),
+            "claude-opus-5-5".into(),
+            Mode::Yolo,
+        );
+        let model = Arc::new(Counting {
+            tokens: 100_000,
+            warms: AtomicUsize::new(0),
+        });
+        let recorder = Recorder {
+            inner: model.clone(),
+            shared: shared.clone(),
+            provider: Provider::Claude,
+            model: "claude-opus-5-5".into(),
+            checkpoints: false,
+        };
+        let turn = shared.warmer.running();
+        (shared, turn, recorder, model)
+    }
+
+    /// Another effort, or turning the checkpoint tools on or off, stops warming a request sent with the earlier setting, even when the warmer is not told.
+    #[tokio::test(start_paused = true)]
+    async fn warming_follows_effort_and_checkpoints() {
+        for change in ["effort", "checkpoints"] {
+            let (shared, _turn, recorder, model) = warming_turn();
+            let messages = [Message::User("hi".into())];
+            let request = Request {
+                system: "s",
+                messages: &messages,
+                tools: &[],
+                effort: shared.effort_now(),
+            };
+            recorder.complete(request, &mut Nowhere).await.unwrap();
+            let other = omc_providers::efforts(Provider::Claude, "claude-opus-5-5")
+                .into_iter()
+                .find(|effort| Some(*effort) != shared.effort_now());
+            shared.change_quietly(|effort, checkpoints| match change {
+                "effort" => *effort = other,
+                _ => *checkpoints = true,
+            });
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            assert_eq!(model.warms.load(Ordering::SeqCst), 0, "{change}");
+        }
+    }
+
+    /// A model that answers its first request at once and takes ten minutes over each later one, counting the warm requests it gets meanwhile.
+    struct Slow {
+        /// How many requests came.
+        asked: AtomicUsize,
+        /// How many warm requests came.
+        warms: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ChatModel for Slow {
+        /// Answers with usage only, at once the first time and after ten minutes afterwards.
+        async fn complete(&self, _: Request<'_>, _: &mut dyn Sink) -> Result<Reply, ProviderError> {
+            if self.asked.fetch_add(1, Ordering::SeqCst) > 0 {
+                tokio::time::sleep(Duration::from_secs(600)).await;
+            }
+            Ok(Reply {
+                tokens: Some(Tokens {
+                    cache_read: 100_000,
+                    ..Tokens::default()
+                }),
+                ..Reply::default()
+            })
+        }
+
+        /// Counts the warm request.
+        async fn warm(&self, _: Request<'_>) -> Result<Option<Tokens>, ProviderError> {
+            self.warms.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+    }
+
+    /// No warm request is sent while a later request is on its way, since that request reads the entries itself.
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_warmed_while_a_request_is_on_its_way() {
+        let (shared, _turn, _, _) = warming_turn();
+        let model = Arc::new(Slow {
+            asked: AtomicUsize::new(0),
+            warms: AtomicUsize::new(0),
+        });
+        let recorder = Recorder {
+            inner: model.clone(),
+            shared: shared.clone(),
+            provider: Provider::Claude,
+            model: "claude-opus-5-5".into(),
+            checkpoints: false,
+        };
+        let messages = [Message::User("hi".into())];
+        let request = Request {
+            system: "s",
+            messages: &messages,
+            tools: &[],
+            effort: shared.effort_now(),
+        };
+        recorder.complete(request, &mut Nowhere).await.unwrap();
+        recorder.complete(request, &mut Nowhere).await.unwrap();
+        assert_eq!(model.warms.load(Ordering::SeqCst), 0);
     }
 }

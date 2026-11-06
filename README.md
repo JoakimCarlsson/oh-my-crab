@@ -44,13 +44,16 @@ order they came, so the model reads them mid-turn; each is then reported as
 `Steered` and saved as a turn of its own under the id the client gave it. When
 the model's final answer ends the turn before a prompt could be put in, that
 prompt starts the next turn by itself and is reported as `Started`; any others
-wait for that turn. Prompts with files are handled like any other prompt. When
-the turn is cancelled, fails or needs signing in again, the prompts still
-waiting are never sent: each is reported as `Dropped` so the client can offer
-it again, and prompts already put into a cancelled or failed turn are saved
-with that turn as stopped or failed. A `/compact` sent while a turn is running
-is refused with a `Failed` event; the other commands work as they do between
-turns.
+wait for that turn; when that turn cannot start, the prompt is reported as
+`Dropped` after its `Started`. Prompts with files are handled like any other
+prompt. When the turn is cancelled, fails or needs signing in again, the
+prompts still waiting are never sent: each is reported as `Dropped` so the
+client can offer it again, and prompts already put into a cancelled or failed
+turn are saved with that turn as stopped or failed. A `/compact` sent while a
+turn is running is refused with a `Failed` event. An `Open` sent while a turn
+is running cancels that turn as `Cancel` does and drops the prompts waiting for
+it before the other conversation is opened; the other commands work as they do
+between turns.
 
 The commands and events are defined in `crates/omc-wire`. `crates/omc-client`
 is a small blocking client for programs that start `crab` and talk to it.
@@ -69,35 +72,48 @@ of each of stdout and stderr, and a tool server's text is cut to its first and
 last 10 KB; the whole output is saved to a file the result names, which the
 model can read in parts with `read`. The files go under
 `oh-my-crab/output/<conversation id>` in the user's cache folder, so they stay
-readable when the conversation is opened again, and folders nobody wrote to for
-seven days are removed when a conversation opens.
+readable when the conversation is opened again. On Unix the folders are made
+readable by the user alone (`0700`) and the files too (`0600`). When a
+conversation opens, other conversations' folders none of whose files was
+written for seven days are removed; the folder of the conversation being
+opened is always kept.
 
 `bash` condenses the output of noisy commands before the model reads it: git
-(status hints, blank lines in `log`, push, pull, fetch and clone progress),
-cargo, npm, pnpm, yarn and bun, make and ninja, gcc and clang, go, pytest,
-docker and podman, and apt and dnf. Build steps, downloads and passing tests are
-counted on one line ("… 143 Compiling lines"), progress and bookkeeping lines
-are dropped, colour codes and progress bars redrawn in place are cleaned up, and
-a line repeated straight after itself is counted. Lines that report an error or
-a warning are always kept. The command is recognised from the last command of
-each pipeline, past `cd x &&`, variable assignments, `sudo`, `env`, `time` and
-the like, so `cargo test | grep FAILED` is left alone. Whenever condensing
-leaves anything out, the raw output is saved whole, however short, and the
-result ends with a note such as `[stderr condensed: 412 lines → 38; the whole
-output is in <path>; …]`. The rules are TOML files, one per family of tools,
-in `crates/omc-tools/src/tools/bash/rules`. Set `OMC_BASH_CONDENSE=0` to show
-all output as it is.
+(status hints, and push, pull, fetch and clone progress), cargo, npm, pnpm,
+yarn and bun, make and ninja, gcc and clang, go, pytest, docker and podman, and
+apt and dnf. Build steps, downloads and passing tests are counted on one line
+("… 143 Compiling lines"), progress and bookkeeping lines are dropped, colour
+codes and progress bars redrawn in place are cleaned up, and a line repeated
+straight after itself is counted. Lines that report an error or a warning are
+always kept, and every line that is kept is shown byte for byte as printed.
+`git log`, `git show` and `git diff` are never condensed, nor are the version
+changes `cargo update` and `cargo add` report or compiler include chains. The
+command is recognised from the last command of the last pipeline only, past
+variable assignments, `sudo`, `env`, `time` and the like: `cd x && cargo build`
+is condensed, while `cargo build && ./target/debug/app` and
+`cargo test | grep FAILED` are left alone. Whenever condensing leaves a line
+out, the raw output is saved whole, however short, and the result ends with a
+note such as `[stderr condensed: 412 lines → 38; the whole output is in <path>;
+…]`; when it only cleaned up colour codes, redraws or blank lines, the raw
+output is shown instead. The rules are TOML files, one per family of tools, in
+`crates/omc-tools/src/tools/bash/rules`. Set `OMC_BASH_CONDENSE=0` to show all
+output as it is.
 
-`bash` also steers the model to the dedicated tools. A command line that is
-nothing but a plain `cat`, `head`, `tail` or `less` of a file, a `grep` or `rg`
-search, a `find -name` or `ls -R`, a `sed -i` on one file, or an `echo`,
-`printf` or `cat <<EOF` into a file is not run; the result names the tool to
-use (`read`, `grep`, `glob`, `edit` or `write`) and the arguments that do the
-same. Only forms whose meaning is certain are turned away: every word literal,
-every path inside the working directory, every option one the dedicated tool
-has. Pipelines, redirections and anything else that needs the shell run as
-usual, with a one-line tip when they start with such a command. Set
-`OMC_BASH_INTERCEPT=0` to run every command.
+`bash` also steers the model to the dedicated tools, turning a command away
+only when the tool gives exactly the same result. A command line that is
+nothing but `cat`, `less` or `more` of one to four text files, `head` or `tail`
+of a number of lines of one text file, or `echo`, `printf` or a `cat`
+here-document writing text the shell does not expand over a file (the
+delimiter quoted, or no `$`, backtick or backslash in the body) is not run; the
+result names the call that does the same (`read` with `path:1-` or a line
+range, or `write`). Every word must be literal, every path inside the working
+directory, every file text rather than binary, and every option one the tool
+reproduces. Everything else runs: searches with `grep` or `rg`, `find`,
+`ls -R` and `sed -i` (the dedicated tools skip ignored and binary files, match
+only files, or replace exact text, so their results differ), appending with
+`>>`, other options, pipelines, lists and commands sent to the background with
+`&`. Such a command runs with a one-line tip naming the tool when it starts a
+pipeline. Set `OMC_BASH_INTERCEPT=0` to run every command.
 
 ## Long conversations
 
@@ -129,15 +145,19 @@ A compaction deletes nothing. It is recorded at the point it happened, the
 summary goes to the model in place of the older messages, and the whole
 conversation stays saved and is still shown when it is opened again, with the
 compaction as a finished `compact` step holding the summary. When the todo
-list the model last wrote before a compaction is hidden by it and still has
-open items, they are listed again after the summary. A `/compact` the
+list the model last wrote is hidden by a compaction and still has open items,
+they are listed again after the summary; a list the model wrote after that,
+which it still sees, takes its place. A `/compact` the
 reader sent comes back as a turn of its own, and one that failed comes back
 with its reason.
 
 Nothing left out or summarized is lost to the model either. Once a
-conversation has been pruned or compacted, the model is offered a `recall` tool
-that reads the whole history again: the full output of one tool call, the
-lines that contain some text, or a range of messages by number.
+conversation has been pruned or compacted, the model can call `recall` to read
+the whole history again: the full output of one tool call, the lines that
+contain some text, or a range of messages by number. `recall` is on the tool
+list from the first turn, so the list does not change and cost the prompt
+cache when it becomes useful; called before anything was left out, it says
+there is nothing to read yet.
 
 ## When things go wrong
 
@@ -146,19 +166,26 @@ overloaded or failing server, a dropped connection or a stream that ends before
 the reply is complete) is sent again, up to 8 times. The wait doubles each
 time from about 2 seconds, with some jitter, up to 60 seconds; when the
 provider says how long to wait with `retry-after` or `retry-after-ms`, that wait
-is kept to, and a provider that asks for more than 60 seconds is not waited
-for. Each wait shows as a running `retry` step saying which attempt it is and
-why, and stopping the turn ends it. Sign-in problems, spent quotas, billing,
-missing credits and requests the provider will not take fail the turn at once.
+is kept to, and a provider that asks for more than 60 seconds, however much
+more, is not waited for. Each wait shows as a running `retry` step, under an id
+no other wait of the process has, saying which attempt it is and why, and
+stopping the turn ends it. Sign-in problems, spent quotas, billing, missing
+credits and requests the provider will not take fail the turn at once, and so
+does a reply the model declined to give or the provider's content filter
+stopped.
 
-A reply that is empty, or that the output limit cut off before any tool call,
+A reply that is empty, or that the output limit or a full context window cut
+off before any tool call,
 is not kept: the model is sent a short notice, which the client never shows as
 a turn and the history does not keep, and asked again, up to three times a
 turn. A reply cut off part of the way through its text is carried on and kept
 as one reply. The tool calls of a reply the output limit cut off are never run:
-each fails with the reason, and the model is told to take a smaller step. A
-call whose arguments are not a valid JSON object fails with what is wrong with
-them.
+each fails with the reason, and the model is told to take a smaller step, up
+to three times a turn, counted apart from the other recoveries, before the
+turn fails. Arguments sent as a JSON string holding an object are read out of
+it; a call whose arguments are not a JSON object fails with what is wrong with
+them. Arguments are put right against the tool's schema before the call is
+shown or approved, so what the reader approves is exactly what runs.
 
 When the model makes the same calls with the same arguments five times in a
 row, or makes three edits in a row to one file that leave it as it was, a
@@ -166,22 +193,32 @@ notice telling it to change course is added to the results of that step, and
 after six such edits it is told to stop and explain to the user.
 
 The todo list the model keeps with `todo` is watched as well. When it still
-has items pending or in progress after 12 successful `edit`, `write`,
-`ast_edit` or `bash` calls since it last changed, a reminder listing them is
-added to the results of that step, at most twice before the list changes
-again. When a turn that changed files is about to end with open items, the
-model is sent a notice, once a turn, to finish them or update the list, and its
-next reply is kept as one with the first. Neither happens when the model's
-reply ends by asking the user a question.
+has items pending or in progress after 12 calls that changed files since it
+last changed, a reminder listing them is added to the results of that step, at
+most twice before the list changes again. A call counts when the files it
+reports changing really changed, or when it is a successful `write`; a shell
+command that only looks, such as `ls` or a test run, does not. When a turn
+that wrote the list or changed files is about to end with open items, the
+model is sent a notice, once a turn, to finish them or update the list; a list
+left over from an earlier turn does not hold up a turn that only answered a
+question. Neither happens when the model's reply ends by asking the user a
+question.
 
-A reply without tool calls whose text holds a call written out as text is put
-right. A block marked as a call, such as `<tool_call>{"name": "read",
-"arguments": {...}}</tool_call>`, becomes that call when the tool exists, and so
-does a fenced JSON block that is a call of a known tool or the arguments of an
-`edit`, when the reply says little else. A fenced call amid a longer answer is
-never run; the model is sent a notice to make the call if it meant to, and its
-next reply is kept as one with the first. Either counts against the three
-recoveries of a turn. Any other code block, JSON included, is left alone.
+Nothing in the text of a reply is ever run, so a call the model quotes from a
+file or from what the user pasted cannot turn into a real one. When a reply
+without tool calls holds what looks like a call written out as text, a block
+marked as a call, such as `<tool_call>{"name": "read", "arguments":
+{...}}</tool_call>`, or a fenced JSON block that is a call of a known tool or
+the arguments of an `edit`, the model is sent a notice, once a turn, that
+nothing ran and that it should make a real call if it meant to. Any other code
+block, JSON included, is left alone.
+
+Both notices come after an answer that is already kept, in the history and in
+the saved conversation. The model's reply to a notice is kept as a reply of its
+own, and an empty one ends the turn; it is given to the model joined to the
+answer before it, since every provider wants a message from the reader between
+two replies. When the request that follows a notice fails, the turn ends with
+the answer it already had instead of being undone.
 
 ## Reading code
 
@@ -201,11 +238,15 @@ cleanly, is larger than 4 MiB, or when folding would hide less than a quarter of
 its lines. A selector always returns the text. A program that builds the
 tools itself can turn outlines off with `Read::with_outline(sandbox, false)`.
 
-An outline carries a tag of its own, different from the tag of the text.
-`edit` accepts that tag, works out the outline's folds again from the file and
-refuses any operation that touches a folded line, naming the range to read
-first. Reading a range returns the plain tag, which allows edits anywhere, as
-does the tag `edit` returns. Each kind of read is kept apart when old reads are
+An outline carries a tag of its own: the letter `O` and four hex digits, so it
+can never be mistaken for the four digits of the text's tag. `edit` accepts
+that tag, works out the outline's folds again from the file and refuses any
+operation that touches a folded line, naming the range to read first. An edit
+made with an outline's tag returns the outline tag of the new contents and
+says so, so a chained edit still keeps off the folded lines. Reading a range
+returns the plain tag, which allows edits anywhere, as does the tag an edit
+made with a plain tag returns. The tag is checked before anything else in the
+call, so a stale tag is reported as such. Each kind of read is kept apart when old reads are
 left out: an outline is only made out of date by another bare read of the same
 path, never by a read of a range, and a read of a range never by an outline.
 
@@ -232,9 +273,15 @@ place.
 `edit`, `write` (when it would overwrite a file) and `ast_edit` refuse files
 that a tool or package manager writes. A file counts as one when a comment in
 its first 30 lines carries a generator's banner, such as `Code generated …
-DO NOT EDIT`, `@generated`, `This file was automatically generated`,
-`<auto-generated>` or the banners of protoc, gRPC, sqlc, buf, Swagger, OpenAPI
-Generator, FlatBuffers and Thrift, or when its name is a lockfile
+DO NOT EDIT`, any other line saying generated and do not edit or modify,
+`@generated`, `This file was automatically generated` or `<auto-generated>`,
+or when a comment in its first 10 lines says `generated by` protoc, gRPC, sqlc,
+Swagger, OpenAPI Generator, FlatBuffers or Thrift. Comments are recognized in
+the syntax of the file's extension: `#` in shell, Python, TOML and YAML, `//`
+and `/* */` in C-like languages, only `<!-- -->` in Markdown, HTML and plain
+text, so a Markdown heading or bullet never counts, and a passing mention such
+as an id "auto-generated by the database" is no banner. A file also counts as
+one when its name is a lockfile
 (`Cargo.lock`, `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `go.sum` and
 others) or one generators use (`*.pb.go`, `*_pb2.py`, `*.g.dart`,
 `*.designer.cs` and others). The refusal names the evidence and tells the
@@ -263,7 +310,11 @@ as JPEG at quality 80 otherwise. Lower JPEG qualities and then smaller sizes
 are tried until it fits. The header names the original and shown sizes and
 the factor to multiply coordinates by to map them back to the original.
 Images that already fit are passed on unchanged; files over 64 MiB are
-refused.
+refused, and so is an image that must shrink but is more than 12000 pixels on
+a side or whose pixels would take more than 256 MiB to decode, which is
+checked from its header before any pixel is decoded, so a small file cannot
+unpack into a huge bitmap. Shrinking scales by averaging blocks of pixels and
+runs off the async runtime, for files and fetched URLs alike.
 
 The text after a database, archive or JSON file's name and a `:` names what
 to read inside it, and the usual line selectors page the result:
@@ -277,23 +328,45 @@ to read inside it, and the usual line selectors page the result:
 | `src.zip`                      | members with their sizes                                  |
 | `src.zip:lib/a.rs:10-40`       | a member's text, numbered, without a tag                  |
 | `src.zip:lib`                  | the members under a directory                             |
-| `data.json:.items[0].name`     | the jq filter's output, pretty-printed and numbered       |
+| `data.json:.items[0].name`     | the query's values, pretty-printed and numbered           |
 | `data.json:.items[]:100-200`   | lines of that output                                      |
 
 SQLite files are found by their header, whatever their name. The database is
 opened read-only with `query_only` set, only `SELECT`, `WITH` and
-`PRAGMA table_info` statements run, a statement that would write is refused,
-and a query is stopped after 10 seconds. Zip files are found by their header,
-tar files by their header or `.tar` name, and gzipped tar files by a gzip
-header and a `.tar.gz` or `.tgz` name. A member is unpacked only up to
-32 MiB and a gzip stream only up to 1 GiB, so a small archive cannot unpack
-into unbounded memory. Binary members are reported with their size; image
-and PDF members are shown as images and PDF files are. JSON filters run
-in-process with the full jq language of `jaq`; a JSON file followed by a line
-selector such as `data.json:20-40` is read as text, as before. A read inside
-a database, archive or JSON file that takes more than 20 seconds is given up
-on and fails, so a filter that never ends cannot hold the turn; it keeps its
-thread busy until `crab` exits.
+`PRAGMA table_info` statements run, and a statement that would write is
+refused. Every statement, the row counts of the table list and of a table
+included, is interrupted at the 20-second deadline of the read, so the thread
+running it stops too. Row ranges as large as the largest number are clamped,
+not overflowed. Zip files are found by their header, tar files by their
+header or `.tar` name, and gzipped tar files by a gzip header and a `.tar.gz`
+or `.tgz` name. A member is unpacked only up to 32 MiB and a gzip stream only
+up to 1 GiB, so a small archive cannot unpack into unbounded memory. The tar
+stream is followed block by block as it is read, and a long name of more than
+4096 bytes, an extended header of more than 64 KiB or a member path longer
+than 4096 bytes is refused before it is loaded into memory. Binary members
+are reported with their size; image and PDF members are shown as images and
+PDF files are. A JSON file followed by a line selector such as
+`data.json:20-40` is read as text, as before.
+
+A JSON query is a small path language of `crab`'s own, not jq: a pipeline of
+stages separated by `|`, each applied to every value the stage before it
+yields. A stage is a path or a builtin:
+
+- `.` is the value itself; `.name`, `."a key"` and `.["a key"]` take a key of
+  an object, `.[2]` and `.[-1]` an element of an array, `.[2:5]` and `.[:-1]`
+  part of an array or string, and `.[]` every element of an array or value of
+  an object. Steps chain, as in `.items[0].name` or `.items[].tags[]`. A
+  missing key or an index past the end gives `null`.
+- `keys` (an object's keys, sorted, or an array's indexes), `length`, `type`,
+  `first`, `last`, and `select(.path == literal)` or `select(.path != literal)`
+  with a string, number, `true`, `false` or `null` literal.
+
+Anything else, such as a function jq has but this language lacks, is refused
+with the character it starts at. A query yields at most 100,000 values and
+4 MB of output, and evaluation never recurses deeper than the query is long.
+The document is parsed with a nesting limit of 128 levels, and a deeper one
+is refused with a message saying so. A read inside a database, archive or
+JSON file that takes more than 20 seconds is given up on and fails.
 
 ## Prompt cache
 
@@ -311,7 +384,12 @@ prompt instead:
 - plan mode turning on, with its rules and the tools it allows, and turning
   off;
 - skills, subagent kinds and instruction files that were added, changed or
-  removed on disk since the system prompt was written.
+  removed on disk since the system prompt was written; the notice only points
+  at tools the agent is offered.
+
+The `skill` tool is on the list even when no skill exists yet, so that a skill
+added later can be loaded without changing the list; until then a call to it
+says there are no skills.
 
 The system prompt carries an outline of the working directory, so the agent
 need not list folders before it starts: three levels deep, folders first and
@@ -324,7 +402,8 @@ vendored packages (`.git`, `target`, `build`, `dist`, `node_modules`,
 deepest folders are left closed, a level at a time from the top, so the upper
 levels are always whole. A walk that finds more than 20,000 entries is tried
 again a level shallower, and one that takes longer than 300 milliseconds, on
-a network mount say, gives no outline at all. The outline is made once, when
+a network mount say, gives no outline at all; the walk runs on a thread of its
+own, so it never holds up the rest of `crab`. The outline is made once, when
 the conversation's first turn starts, and kept unchanged for the rest of it,
 also when the system prompt is made again for another model; the prompt says
 it is a snapshot from the start of the conversation. Subagents get the same
@@ -348,10 +427,13 @@ Two settings shape the cache on Claude:
   is at least $0.02: the chance is taken as certain while a turn runs (a long
   tool call) and as 15% while the conversation waits for the reader. Warming
   stops an hour after the last real request while a turn runs and half an hour
-  after it while idle, when the model or a cache setting changes, and for
-  models that think within a fixed token budget, whose requests cannot be
-  replayed without output. What warming cost is saved with the conversation
-  under `cache_warming`.
+  after it while idle; when the model, the effort, the checkpoint setting or a
+  cache setting changes; when the turn is cancelled or fails, before a
+  compaction the reader asked for, and when another conversation is opened;
+  and for models that think within a fixed token budget, whose requests cannot
+  be replayed without output. Nothing is warmed while a request is on its way,
+  since that request reads the cache itself. What warming cost is saved with
+  the conversation under `cache_warming`.
 
 Prices per model and cache lifetimes are in `crates/omc-providers/src/models.rs`.
 The requests that summarize a conversation for a compaction write nothing to

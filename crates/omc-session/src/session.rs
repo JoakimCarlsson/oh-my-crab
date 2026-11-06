@@ -9,7 +9,7 @@ use omc_auth::{AuthError, LoginPrompt};
 use omc_context::{Discovered, Locations, discover, expand_skill};
 use omc_providers::Message;
 use omc_providers::Provider;
-use omc_tools::{LanguageService, Registry, Sandbox, Skill, Spill};
+use omc_tools::{LanguageService, Registry, Sandbox, Skill, Spill, Tool, ToolError, ToolOutput};
 use omc_wire::{Command, Event, Opening, QueueState, Slash};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::AbortHandle;
@@ -162,6 +162,8 @@ impl Session {
     }
 
     /// Opens the conversation: finds the provider, the tools, the skills and the agents, and says what can be set.
+    ///
+    /// A turn of the conversation open before is cancelled first, and the prompts queued for it are dropped, so that nothing of it reaches the conversation opened now.
     async fn open(&mut self, opening: Opening) {
         let Opening {
             directory,
@@ -184,6 +186,7 @@ impl Session {
         let Some(provider) = Provider::from_id(provider) else {
             return self.say(Event::Failed(format!("unknown provider: {provider}")));
         };
+        self.cancel();
         self.journal = None;
         self.shared.jobs.stop_all();
         let saved = match &conversation {
@@ -213,9 +216,7 @@ impl Session {
         }
         let locations = Locations::detect(&directory);
         let discovered = discover(&locations, &disabled);
-        if !discovered.skills.is_empty() {
-            registry.register(Skill::new(discovered.skills.clone()));
-        }
+        register_skills(&mut registry, &discovered.skills);
         let credentials = match self
             .shared
             .with_home(omc_providers::credentials_for(provider))
@@ -374,7 +375,7 @@ impl Session {
         self.start(Job::Prompt(told), mark);
     }
 
-    /// Starts a turn doing `job`, whose prompt the client described as `mark` when it did, unless one is running or nothing is open; the skill a prompt invokes must already be expanded in it.
+    /// Starts a turn doing `job`, whose prompt the client described as `mark` when it did, unless one is running or nothing is open; the skill a prompt invokes must already be expanded in it. A compaction stops warming the last request first, since the request after it no longer starts the same way.
     fn start(&mut self, job: Job, mark: Option<omc_agent::Mark>) {
         let (true, Some((_, model))) = (self.open.is_some(), self.shared.model()) else {
             return self.say(Event::Failed("the conversation is not open".to_owned()));
@@ -392,6 +393,9 @@ impl Session {
         let Some(open) = &self.open else {
             return;
         };
+        if matches!(job, Job::Compact(_)) {
+            self.shared.warmer.stop();
+        }
         self.turns += 1;
         let number = self.turns;
         self.resets_at_start = self.shared.notebook.resets();
@@ -425,9 +429,7 @@ impl Session {
         let changed = found.skills != open.discovered.skills;
         if changed {
             let mut registry = open.base.filtered(|tool| tool.name() != SKILL_TOOL);
-            if !found.skills.is_empty() {
-                registry.register(Skill::new(found.skills.clone()));
-            }
+            register_skills(&mut registry, &found.skills);
             open.base = Arc::new(registry);
         }
         open.discovered = Arc::new(found);
@@ -439,7 +441,7 @@ impl Session {
 
     /// Takes in the end of turn `number`; a turn that was cancelled meanwhile is ignored.
     ///
-    /// A turn that answered is followed by a turn for the prompt that has waited longest for it, when one still waits; the others wait for that turn. When the turn failed or needs signing in again, the prompts waiting are dropped instead.
+    /// A turn that answered is followed by a turn for the prompt that has waited longest for it, when one still waits; the others wait for that turn. When the turn failed or needs signing in again, the prompts waiting are dropped instead, and its last request, which a failed turn's history no longer ends with, is no longer kept warm.
     fn finish(&mut self, number: u64, how: Ended) {
         if self.running.as_ref().map(|(running, _)| *running) != Some(number) {
             return;
@@ -452,6 +454,7 @@ impl Session {
                 self.follow_up();
             }
             Ended::SignedOut(reason) => {
+                self.shared.warmer.stop();
                 self.say(Event::SignedOut {
                     reason,
                     account: None,
@@ -459,6 +462,7 @@ impl Session {
                 self.drop_queue();
             }
             Ended::Failed(reason) => {
+                self.shared.warmer.stop();
                 self.shared.checkpoint.clear();
                 self.keep_fresh_window();
                 self.say(Event::Finished(Some(reason)));
@@ -467,7 +471,7 @@ impl Session {
         }
     }
 
-    /// Starts a turn with the prompt that has waited longest, when one waits, and tells the client it started; when the turn cannot start, the prompts still waiting are dropped.
+    /// Starts a turn with the prompt that has waited longest, when one waits, and tells the client it started; when the turn cannot start, that prompt and the ones still waiting are dropped, telling the client of each.
     fn follow_up(&mut self) {
         let Some(waiting) = self.shared.queue.pop() else {
             return;
@@ -475,8 +479,10 @@ impl Session {
         self.say(waiting.event(QueueState::Started));
         self.rescan();
         let mark = waiting.mark();
+        let dropped = waiting.event(QueueState::Dropped);
         self.start(Job::Prompt(waiting.told), mark);
         if self.running.is_none() {
+            self.say(dropped);
             self.drop_queue();
         }
     }
@@ -512,8 +518,9 @@ impl Session {
         }
     }
 
-    /// Records in the saved history that the turn that was stopped never happened.
+    /// Records in the saved history that the turn that was stopped never happened, and stops warming its last request, which the next one will not start with.
     fn forget_turn(&mut self) {
+        self.shared.warmer.stop();
         self.shared.checkpoint.clear();
         self.keep_fresh_window();
         if let Some(Err(error)) = self
@@ -620,7 +627,7 @@ const SAVED_OUTPUT_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Where the tools of the conversation `id`, or of a conversation that is not saved when there is none, save output too long to show, after clearing away the output of conversations nobody wrote to for [`SAVED_OUTPUT_AGE`].
 fn spill_for(id: Option<&str>) -> Spill {
-    Spill::prune(SAVED_OUTPUT_AGE);
+    Spill::prune(SAVED_OUTPUT_AGE, id);
     match id {
         Some(id) => Spill::for_conversation(id),
         None => Spill::default(),
@@ -803,6 +810,57 @@ fn restored_settings(
 
 /// The name the skill tool is registered under.
 const SKILL_TOOL: &str = "skill";
+
+/// Registers the skill tool for `skills` with `registry`: the tool that loads them, or, when there are none, one described the same way that says so when called, so that the agent is offered `skill` from its first turn and the tool list does not change when a skill appears later.
+pub(crate) fn register_skills(registry: &mut Registry, skills: &[omc_context::Skill]) {
+    match skills.is_empty() {
+        true => registry.register(NoSkills(Skill::new(Vec::new()))),
+        false => registry.register(Skill::new(skills.to_vec())),
+    }
+}
+
+/// The skill tool of a conversation that has no skills: described like the tool that loads them, and refusing every call.
+struct NoSkills(Skill);
+
+#[async_trait::async_trait]
+impl Tool for NoSkills {
+    /// The name of the skill tool.
+    fn name(&self) -> &'static str {
+        self.0.name()
+    }
+
+    /// The description of the skill tool.
+    fn description(&self) -> &str {
+        self.0.description()
+    }
+
+    /// The argument schema of the skill tool.
+    fn schema(&self) -> serde_json::Value {
+        self.0.schema()
+    }
+
+    /// Refusing changes nothing.
+    fn read_only(&self) -> bool {
+        true
+    }
+
+    /// Describes a call as the skill tool does.
+    fn describe(&self, args: &serde_json::Value) -> String {
+        self.0.describe(args)
+    }
+
+    /// Refuses the call, since there is no skill to load.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`ToolError::Failed`] saying that no skills are available.
+    async fn call(&self, _args: serde_json::Value) -> Result<ToolOutput, ToolError> {
+        Err(ToolError::Failed(NO_SKILLS.to_owned()))
+    }
+}
+
+/// What the agent is told when it calls `skill` in a conversation that has no skills.
+const NO_SKILLS: &str = "no skills are available in this conversation";
 
 /// The command that compacts the conversation.
 const COMPACT_COMMAND: &str = "compact";
@@ -1212,6 +1270,107 @@ mod tests {
         );
         assert!(session.running.is_none());
         session.stop();
+    }
+
+    /// When the turn for the prompt that waited longest cannot start, that prompt is dropped too, after the client was told it started, and so are the rest.
+    #[tokio::test]
+    async fn a_follow_up_that_cannot_start_is_dropped() {
+        let (mut session, mut events) = busy_session("queue-unstartable");
+        session.handle(prompt("first", "a")).await;
+        session.handle(prompt("second", "b")).await;
+        let _ = queue_events(&mut events);
+        session.open = None;
+        session.finish(1, Ended::Done(Vec::new()));
+        assert_eq!(
+            queue_events(&mut events),
+            vec![
+                (1, "a".into(), QueueState::Started),
+                (1, "a".into(), QueueState::Dropped),
+                (2, "b".into(), QueueState::Dropped),
+            ]
+        );
+        assert!(session.running.is_none());
+    }
+
+    /// Opening a conversation while a turn runs stops that turn and drops the prompts queued for it, saying so for each, before anything of the new conversation is touched.
+    #[tokio::test]
+    async fn opening_while_a_turn_runs_stops_it_and_drops_the_queue() {
+        let (mut session, mut events) = busy_session("queue-reopen");
+        session.handle(prompt("first", "a")).await;
+        session.handle(prompt("second", "b")).await;
+        let _ = queue_events(&mut events);
+        let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/queue-reopen");
+        session
+            .handle(Command::Open(Opening {
+                directory,
+                home: None,
+                provider: "claude".into(),
+                model: None,
+                yolo: false,
+                tools: Vec::new(),
+                denied: Vec::new(),
+                disabled: Vec::new(),
+                conversation: Some("not/usable".into()),
+                history: None,
+                keep: None,
+                defaults: Vec::new(),
+                before: None,
+                languages: false,
+            }))
+            .await;
+        assert!(session.running.is_none());
+        let told: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert!(told.contains(&Event::Halted));
+        let dropped: Vec<(u64, QueueState)> = told
+            .iter()
+            .filter_map(|event| match event {
+                Event::Queued(queued) => Some((queued.ticket, queued.state)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dropped,
+            vec![(1, QueueState::Dropped), (2, QueueState::Dropped)]
+        );
+        assert!(session.shared.queue.pop().is_none());
+    }
+
+    /// The last request stops being kept warm when the turn is cancelled, when it fails, and before a compaction.
+    #[tokio::test]
+    async fn warming_stops_with_a_turn_that_ends_badly_and_before_compacting() {
+        let (mut session, _events) = busy_session("warm-cancel");
+        session.shared.warmer.arm();
+        session.cancel();
+        assert!(!session.shared.warmer.armed());
+        let (mut session, _events) = busy_session("warm-failed");
+        session.shared.warmer.arm();
+        session.finish(1, Ended::Failed("broken".into()));
+        assert!(!session.shared.warmer.armed());
+        let (mut session, _events) = busy_session("warm-compact");
+        session.finish(1, Ended::Done(Vec::new()));
+        session.shared.warmer.arm();
+        session.handle(prompt("/compact", "c")).await;
+        assert!(!session.shared.warmer.armed());
+        session.stop();
+    }
+
+    /// A conversation without skills still has a `skill` tool, described like the one that loads skills, which says there are none.
+    #[tokio::test]
+    async fn the_skill_tool_is_there_without_skills() {
+        let mut registry = Registry::new();
+        register_skills(&mut registry, &[]);
+        let tool = registry.get(SKILL_TOOL).unwrap();
+        let loader = Skill::new(Vec::new());
+        assert_eq!(
+            (tool.description(), tool.schema()),
+            (loader.description(), loader.schema())
+        );
+        let refused = registry
+            .call(SKILL_TOOL, serde_json::json!({"name": "pdf"}))
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains(NO_SKILLS), "{refused}");
     }
 
     /// `/compact` asks for a compaction, with what follows it as the focus; other text, and commands that only start the same way, do not.

@@ -431,6 +431,40 @@ pub(crate) mod tests {
         assert!(out.contains("     4\tclass Thing:\n     5\t    def m0(self, x):\n     6\t        \"\"\"Does 0.\"\"\"\n      \t        … 9 lines folded (7-15)\n"), "{out}");
     }
 
+    /// A comment at the start of a line between two Python functions stays
+    /// visible rather than folded into the body before it.
+    #[test]
+    fn keeps_python_comments_between_functions() {
+        let mut code = String::from("import os\n\n");
+        for index in 0..20 {
+            code.push_str(&format!("def f{index}(x):\n"));
+            code.push_str(&"    x = os.getcwd()\n".repeat(8));
+            code.push_str("    return x\n");
+            if index % 2 == 1 {
+                code.push('\n');
+            }
+            code.push_str(&format!("# Section {index}: what follows.\n"));
+            code.push_str(&format!("    # indented note {index}\n"));
+        }
+        let found = fold("c.py", &code).unwrap();
+        assert_eq!(found[0], Fold { first: 4, last: 12 });
+        let out = render(&code, &found, "c.py");
+        assert!(
+            out.contains("    13\t# Section 0: what follows.\n    14\t    # indented note 0\n"),
+            "{out}"
+        );
+        for index in 0..20 {
+            assert!(
+                out.contains(&format!("\t# Section {index}: what follows.\n")),
+                "{index}: {out}"
+            );
+            assert!(
+                out.contains(&format!("\t    # indented note {index}\n")),
+                "{index}: {out}"
+            );
+        }
+    }
+
     /// Go, TypeScript, C and Lua functions are folded too.
     #[test]
     fn folds_other_languages() {

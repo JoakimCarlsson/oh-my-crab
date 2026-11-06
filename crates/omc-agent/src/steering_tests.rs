@@ -35,14 +35,15 @@ impl Steering for Waiting {
     }
 }
 
-/// Runs one turn of `go` against `model` on the built-in tools of a scratch folder holding `a.txt`, taking messages from `steering` and recording into `journal`.
+/// Runs one turn of `go` against `model` on the built-in tools of the scratch folder `folder`, which is given `a.txt`, taking messages from `steering` and recording into `journal`; each test passes a folder of its own, since tests run at the same time.
 async fn steered_turn(
+    folder: &str,
     model: &Router,
     history: &mut Vec<Message>,
     steering: &Waiting,
     journal: &Arc<Journal>,
 ) -> Result<(), AgentError> {
-    let dir = scratch("steering-tools");
+    let dir = scratch(folder);
     std::fs::write(dir.join("a.txt"), "a\n").unwrap();
     let registry = Registry::builtin(&dir).unwrap();
     run_turn_steered(
@@ -83,9 +84,15 @@ async fn a_queued_message_is_put_in_after_the_tool_round() {
             say("done")
         }
     });
-    steered_turn(&model, &mut history, &steering, &journal)
-        .await
-        .unwrap();
+    steered_turn(
+        "steering-queued-tools",
+        &model,
+        &mut history,
+        &steering,
+        &journal,
+    )
+    .await
+    .unwrap();
     let seen = model.seen.lock().unwrap();
     assert_eq!(seen.len(), 2);
     assert_eq!(seen[1].messages, 4);
@@ -118,12 +125,25 @@ async fn a_failed_turn_cuts_back_what_was_put_in() {
         _ => say(" "),
     });
     let blank = Router::new(|_| say(""));
-    steered_turn(&model, &mut history, &steering, &journal)
-        .await
-        .unwrap();
+    steered_turn(
+        "steering-failed-tools",
+        &model,
+        &mut history,
+        &steering,
+        &journal,
+    )
+    .await
+    .unwrap();
     assert_eq!(history.len(), 5);
     steering.push("never answered");
-    let failed = steered_turn(&blank, &mut history, &steering, &journal).await;
+    let failed = steered_turn(
+        "steering-failed-tools",
+        &blank,
+        &mut history,
+        &steering,
+        &journal,
+    )
+    .await;
     assert!(matches!(failed, Err(AgentError::Empty)));
     assert_eq!(history.len(), 5);
     drop(journal);

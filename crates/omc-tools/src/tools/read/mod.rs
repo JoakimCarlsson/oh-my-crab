@@ -1,7 +1,7 @@
 //! The `read` tool: numbered lines of a text file or an outline of a large
 //! code file, a directory listing, an image, the text of a PDF, a web page,
-//! the tables of a SQLite database, the members of an archive, or a jq query
-//! on a JSON file.
+//! the tables of a SQLite database, the members of an archive, or a path
+//! query on a JSON file.
 
 mod archive;
 mod container;
@@ -142,7 +142,8 @@ impl Tool for Read {
          - Directories: entries, directories first and ending in /, honoring .gitignore.\n\
          - Images (PNG, JPEG, GIF, WebP): returned for you to look at. One over 3.75 MB or \
          2000 px on a side is shrunk first; the header then gives the original size and \
-         the factor to multiply coordinates by to map them back to it.\n\
+         the factor to multiply coordinates by to map them back to it. Images over 12000 px \
+         on a side or 256 MiB of pixels cannot be shrunk and are refused.\n\
          - PDFs: extracted text, a [page N] line before each page; line suffixes work.\n\
          - SQLite databases: db.sqlite lists tables with row counts and schemas; \
          db.sqlite:users shows rows (50 at a time; db.sqlite:users:51-100 or :-20 for \
@@ -152,10 +153,13 @@ impl Tool for Read {
          a.zip:dir/file.txt reads a member as numbered text, with line suffixes such as \
          a.zip:dir/file.txt:10-40; a.zip:dir lists a directory. Members have no tag and \
          cannot be edited.\n\
-         - JSON: data.json:<jq filter> such as data.json:.items[0].name, \
-         data.json:.items[] | .id, data.json:keys or data.json:.items | length gives the \
-         result pretty-printed and numbered; add a line suffix to page it \
-         (data.json:.items:100-200). data.json:50-80 reads lines as text.\n\
+         - JSON: data.json:<query> gives the values a query picks, pretty-printed and \
+         numbered. A query is a small path language, not jq: a path such as .items[0].name, \
+         .items[].id, .[\"a key\"], .[-1] or .[2:5], piped with | through more paths or the \
+         builtins keys, length, type, first, last and select(.field == literal) (or !=), as \
+         in data.json:.items[] | select(.kind == \"x\") | .id. Nothing else is supported. Add \
+         a line suffix to page the output (data.json:.items:100-200). data.json:50-80 reads \
+         lines as text.\n\
          - http:// and https:// URLs: the page as Markdown with numbered lines; url:raw for \
          the original HTML. The user approves fetches per site. Redirects to another site \
          are not followed: read the URL the error names. A host name that resolves to a \

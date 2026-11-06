@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use omc_agent::RECALL;
 use omc_context::{
     Discovered, Environment, Notice, PromptInput, build_prompt, context_changes,
     environment_reminder, plan_mode_notice,
@@ -53,7 +54,7 @@ pub(crate) struct Prefix {
 }
 
 impl Prefix {
-    /// Makes the prefix for `key` from `toolset`: every tool of either mode, described as it is now, and a system prompt for that tool list outside plan mode, describing `environment`, the working directory outline `tree` and `discovered`, which asks the agent to name the conversation when it is `unnamed`.
+    /// Makes the prefix for `key` from `toolset`: every tool of either mode, described as it is now, with `recall` among them although the agent only answers it once the history has been pruned or compacted, and a system prompt for that tool list outside plan mode, describing `environment`, the working directory outline `tree` and `discovered`, which asks the agent to name the conversation when it is `unnamed`.
     pub(crate) fn freeze(
         key: Key,
         toolset: &Toolset,
@@ -75,6 +76,9 @@ impl Prefix {
                     schema: tool.schema(),
                 });
             }
+        }
+        if !specs.iter().any(|spec| spec.name == RECALL) {
+            specs.push(recall_spec());
         }
         specs.sort_by_key(|spec| spec.name);
         let names: Vec<String> = specs.iter().map(|spec| spec.name.to_owned()).collect();
@@ -125,7 +129,7 @@ impl Prefix {
             .collect()
     }
 
-    /// The notices the next prompt starts with, for a conversation whose history is `history`: the date and branch of `environment`, what differs between `discovered` and what the system prompt describes, and plan mode being `plan` with the tools `toolset` allows in it; each only when the latest notice of its kind the model still sees says something else.
+    /// The notices the next prompt starts with, for a conversation whose history is `history`: the date and branch of `environment`, what differs between `discovered` and what the system prompt describes, pointing only at tools the prefix offers, and plan mode being `plan` with the tools `toolset` allows in it; each only when the latest notice of its kind the model still sees says something else.
     pub(crate) fn notices(
         &self,
         history: &[Message],
@@ -140,7 +144,8 @@ impl Prefix {
         if last_notice(&visible, Notice::Environment) != Some(reminder.as_str()) {
             told.push(reminder);
         }
-        let changes = context_changes(&self.discovered, discovered);
+        let offered: Vec<String> = self.specs.iter().map(|spec| spec.name.to_owned()).collect();
+        let changes = context_changes(&self.discovered, discovered, &offered);
         match last_notice(&visible, Notice::ContextChanges) {
             None if *self.discovered == *discovered => {}
             Some(last) if last == changes => {}
@@ -188,6 +193,19 @@ fn last_plan_notice(messages: &[Message]) -> Option<&str> {
 /// The name of the tool that ends plan mode when its plan is approved.
 const EXIT_PLAN: &str = "exit_plan_mode";
 
+/// What the model is told when it calls `recall` before the history was pruned or compacted, when the agent does not answer the call itself.
+const NOTHING_TO_RECALL: &str = "`recall` has nothing to read yet: nothing has been left out of or summarized in this conversation, so all of it is still in your context.";
+
+/// `recall` as the agent offers it once the history has been pruned or compacted.
+fn recall_spec() -> Spec {
+    let spec = omc_agent::recall_spec();
+    Spec {
+        name: RECALL,
+        description: spec.description,
+        schema: spec.schema,
+    }
+}
+
 /// A tool of the prefix: described as it was when the prefix was made, and run as the tool of the mode that is on now.
 ///
 /// A tool the mode on now lacks asks for no approval and refuses the call, so plan mode never changes anything even though the tools that change things stay on the list. A call is checked when it starts, which is before `exit_plan_mode` in the same batch can end plan mode, since that waits for the reader's answer.
@@ -230,6 +248,8 @@ impl Gated {
             )
         } else if !planning && self.plan.is_some() {
             format!("`{name}` is only available in plan mode, which is off.")
+        } else if name == RECALL {
+            NOTHING_TO_RECALL.to_owned()
         } else {
             format!("`{name}` is no longer available in this conversation.")
         }
@@ -258,6 +278,11 @@ impl Tool for Gated {
         self.current().map_or(true, |tool| tool.read_only())
     }
 
+    /// Whether the tool of the mode on now checks its own arguments; a refused tool is said to, so that the call is refused with the reason rather than for its arguments.
+    fn checks_arguments(&self) -> bool {
+        self.current().map_or(true, |tool| tool.checks_arguments())
+    }
+
     /// Whether the tool of the mode on now needs approval; a refused tool does not.
     fn needs_approval(&self) -> bool {
         self.current().is_ok_and(|tool| tool.needs_approval())
@@ -274,6 +299,22 @@ impl Tool for Gated {
             .as_ref()
             .or(self.plan.as_ref())
             .map_or_else(|| args.to_string(), |tool| tool.describe(args))
+    }
+
+    /// The same tool with each mode's tool replaced by its copy that cannot start background runs, when either mode's tool can start them; nothing otherwise.
+    fn foreground(&self) -> Option<Arc<dyn Tool>> {
+        let copy = |tool: &Option<Arc<dyn Tool>>| tool.as_ref().and_then(|tool| tool.foreground());
+        let (full, plan) = (copy(&self.full), copy(&self.plan));
+        if full.is_none() && plan.is_none() {
+            return None;
+        }
+        Some(Arc::new(Gated {
+            spec: self.spec.clone(),
+            full: full.or_else(|| self.full.clone()),
+            plan: plan.or_else(|| self.plan.clone()),
+            planning: self.planning.clone(),
+            allowed: self.allowed.clone(),
+        }))
     }
 
     /// Runs the tool of the mode on now with `args`.
@@ -295,5 +336,80 @@ impl Tool for Gated {
             .map_err(ToolError::Failed)?
             .call_as(id, args)
             .await
+    }
+}
+
+#[cfg(test)]
+/// Tests for the tools of the prefix.
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// A tool that checks its own arguments and has a copy that cannot start background runs, which says it is that copy.
+    struct Careful {
+        /// Whether this is the copy.
+        copy: bool,
+    }
+
+    #[async_trait]
+    impl Tool for Careful {
+        /// Returns `careful`.
+        fn name(&self) -> &'static str {
+            "careful"
+        }
+
+        /// Describes the tool.
+        fn description(&self) -> &str {
+            "careful"
+        }
+
+        /// Takes anything.
+        fn schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        /// Checks its own arguments.
+        fn checks_arguments(&self) -> bool {
+            true
+        }
+
+        /// The copy that cannot start background runs.
+        fn foreground(&self) -> Option<Arc<dyn Tool>> {
+            Some(Arc::new(Careful { copy: true }))
+        }
+
+        /// Says whether it is the copy.
+        async fn call(&self, _: Value) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::new(self.copy.to_string()))
+        }
+    }
+
+    /// A gated tool for `careful` outside plan mode only, with plan mode on when `planning`.
+    fn gated(planning: bool) -> Gated {
+        let tool = Careful { copy: false };
+        Gated {
+            spec: Spec {
+                name: tool.name(),
+                description: tool.description().to_owned(),
+                schema: tool.schema(),
+            },
+            full: Some(Arc::new(tool)),
+            plan: None,
+            planning: Arc::new(move || planning),
+            allowed: Arc::from(Vec::new()),
+        }
+    }
+
+    /// Whether the tool checks its own arguments and its copy that cannot start background runs come from the tool of the mode on now; a refused tool leaves its arguments to the refusal.
+    #[tokio::test]
+    async fn gated_tools_forward_what_the_tool_says_of_itself() {
+        let tool = gated(false);
+        assert!(tool.checks_arguments());
+        let copy = tool.foreground().expect("no copy");
+        assert_eq!(copy.call(json!({})).await.unwrap().text, "true");
+        let refused = gated(true);
+        assert!(refused.checks_arguments());
+        assert!(refused.call(json!({})).await.is_err());
     }
 }

@@ -11,7 +11,7 @@ use omc_providers::{
 
 use crate::AgentEvent;
 use crate::recall::RECALL;
-use crate::todos;
+use crate::{recovery, todos};
 
 /// The fewest tokens kept free below the context window for the next request and its reply, on a window large enough to spare them.
 const RESERVE_TOKENS: u64 = 16_384;
@@ -60,16 +60,18 @@ pub(crate) struct Plan {
 }
 
 /// The messages the model is given for `history`: the history itself when it was never compacted or pruned; otherwise the latest summary as a user message, when there is one, followed by the messages kept with it and the messages after it, with every elided tool output replaced by its note.
+///
+/// A reply that follows a finished answer directly, as the reply to a notice sent after that answer does, is given joined to it as one reply, since the notice is not kept and every provider wants a reader's message between two replies.
 pub fn context(history: &[Message]) -> Cow<'_, [Message]> {
     let hidden = hidden(history);
     let compacted = latest(history);
     if compacted.is_none() && hidden.is_empty() {
-        return Cow::Borrowed(history);
+        return joined_replies(Cow::Borrowed(history));
     }
     let mut messages: Vec<Message> = compacted
-        .map(|(at, compaction)| {
+        .map(|(_, compaction)| {
             let mut text = summary_message(compaction);
-            if let Some(todos) = todos::restated(history, at, compaction.first_kept) {
+            if let Some(todos) = todos::restated(history, compaction.first_kept) {
                 text.push_str("\n\n");
                 text.push_str(&todos);
             }
@@ -82,7 +84,43 @@ pub fn context(history: &[Message]) -> Cow<'_, [Message]> {
             .into_iter()
             .map(|at| shown(history, at, &hidden).into_owned()),
     );
-    Cow::Owned(messages)
+    joined_replies(Cow::Owned(messages))
+}
+
+/// Whether `later` is a reply that directly follows `earlier`, a reply that made no tool calls.
+fn follows_answer(earlier: &Message, later: &Message) -> bool {
+    matches!(
+        (earlier, later),
+        (Message::Assistant(answer), Message::Assistant(_)) if answer.tool_calls.is_empty()
+    )
+}
+
+/// `messages` with each reply that directly follows a reply without tool calls joined to it, the text of the two kept a paragraph apart; `messages` as they are when there is none.
+fn joined_replies(messages: Cow<'_, [Message]>) -> Cow<'_, [Message]> {
+    if !messages
+        .windows(2)
+        .any(|pair| follows_answer(&pair[0], &pair[1]))
+    {
+        return messages;
+    }
+    let mut joined: Vec<Message> = Vec::with_capacity(messages.len());
+    for message in messages.iter() {
+        match message {
+            Message::Assistant(reply) => push_reply(&mut joined, reply.clone()),
+            other => joined.push(other.clone()),
+        }
+    }
+    Cow::Owned(joined)
+}
+
+/// Adds `reply` to the end of `messages`, the messages of a request: joined to the last of them, a paragraph after its text, when that is a reply without tool calls, and as a message of its own otherwise.
+pub(crate) fn push_reply(messages: &mut Vec<Message>, reply: Reply) {
+    match messages.last_mut() {
+        Some(Message::Assistant(earlier)) if earlier.tool_calls.is_empty() => {
+            *earlier = recovery::joined(recovery::carried_on(std::mem::take(earlier)), reply);
+        }
+        _ => messages.push(Message::Assistant(reply)),
+    }
 }
 
 /// The latest compaction in `history` and its position, when there is one.
@@ -779,6 +817,50 @@ mod tests {
             "{first}"
         );
         assert!(!first.contains("done"), "{first}");
+        history.extend([
+            Message::Assistant(Reply {
+                tool_calls: vec![ToolCall {
+                    id: "u".into(),
+                    name: "todo".into(),
+                    arguments: json!({"todos": [{"content": "left", "status": "completed"}]}),
+                }],
+                ..Reply::default()
+            }),
+            Message::ToolResults(vec![ToolResult {
+                call_id: "u".into(),
+                name: "todo".into(),
+                text: "ok".into(),
+                is_error: false,
+                images: Vec::new(),
+            }]),
+        ]);
+        let given = context(&history);
+        let Message::User(first) = &given[0] else {
+            panic!("no summary first");
+        };
+        assert!(!first.contains("<open-todos>"), "{first}");
+    }
+
+    /// A reply that follows a finished answer directly is given joined to it, so no request holds two replies in a row, while the history keeps them apart.
+    #[test]
+    fn replies_in_a_row_are_given_as_one() {
+        let history = vec![
+            user(1),
+            Message::Assistant(Reply {
+                text: "First.".into(),
+                ..Reply::default()
+            }),
+            reading("a", 1),
+            results("a", 1),
+        ];
+        let given = context(&history);
+        assert_eq!(given.len(), 3);
+        let Message::Assistant(joined) = &given[1] else {
+            panic!("expected the joined reply, got {:?}", given[1]);
+        };
+        assert_eq!(joined.text, format!("First.\n\n{}", "r".repeat(4)));
+        assert_eq!(joined.tool_calls.len(), 1);
+        assert!(matches!(context(&history[..2]), Cow::Borrowed(_)));
     }
 
     /// A second compaction only considers what the model is given now, and can keep messages from before the first one.

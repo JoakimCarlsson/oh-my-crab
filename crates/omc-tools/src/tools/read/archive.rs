@@ -4,7 +4,9 @@
 //! Members are read-only: their text comes numbered like a file's, but with
 //! no snapshot tag, since nothing can edit bytes inside an archive.
 //! Decompression is capped, per member and for a whole gzip stream, so a
-//! small archive cannot unpack into an unbounded amount of memory or time.
+//! small archive cannot unpack into an unbounded amount of memory or time,
+//! and the long names and extended headers of tar archives are refused when
+//! they are longer than any real name, before they are read into memory.
 
 use std::fs::File;
 use std::io::{self, BufReader, Read};
@@ -26,6 +28,15 @@ const MAX_STREAM_BYTES: u64 = 1 << 30;
 
 /// Most members listed; an archive with more is listed up to here.
 const MAX_MEMBERS: usize = 100_000;
+
+/// Longest member path listed or read, in bytes.
+const MAX_PATH_BYTES: usize = 4096;
+
+/// Largest extended header of a tar archive read, in bytes.
+const MAX_EXTENDED_HEADER_BYTES: u64 = 64 << 10;
+
+/// Size of a tar block, the unit headers and data are stored in.
+const BLOCK: usize = 512;
 
 /// Bytes of a member inspected to tell text from binary data.
 const SNIFF_BYTES: usize = 8192;
@@ -222,6 +233,12 @@ fn tar_member<R: Read>(entry: &tar::Entry<'_, R>) -> Result<Member, String> {
         .map_err(|e| e.to_string())?
         .to_string_lossy()
         .into_owned();
+    if stored.len() > MAX_PATH_BYTES {
+        return Err(format!(
+            "a member's path is {} bytes long, longer than the {MAX_PATH_BYTES} read lists",
+            stored.len()
+        ));
+    }
     let kind = match entry.header().entry_type() {
         tar::EntryType::Regular | tar::EntryType::Continuous | tar::EntryType::GNUSparse => {
             Kind::File
@@ -238,7 +255,8 @@ fn tar_member<R: Read>(entry: &tar::Entry<'_, R>) -> Result<Member, String> {
 }
 
 /// Opens the tar archive at `path` for streaming, unpacking it when it is
-/// gzipped, with the gzip stream capped at [`MAX_STREAM_BYTES`].
+/// gzipped, with the gzip stream capped at [`MAX_STREAM_BYTES`] and its
+/// extended headers checked by [`Headers`].
 ///
 /// # Errors
 ///
@@ -246,11 +264,198 @@ fn tar_member<R: Read>(entry: &tar::Entry<'_, R>) -> Result<Member, String> {
 fn open_tar(path: &Path, format: Format) -> Result<Box<dyn Read>, String> {
     let file = BufReader::new(File::open(path).map_err(|e| e.to_string())?);
     Ok(match format {
-        Format::TarGz => Box::new(Capped {
+        Format::TarGz => Box::new(Headers::new(Capped {
             inner: GzDecoder::new(file),
             left: MAX_STREAM_BYTES,
-        }),
-        _ => Box::new(file),
+        })),
+        _ => Box::new(Headers::new(file)),
+    })
+}
+
+/// Where a [`Headers`] reader is in the tar stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Part {
+    /// Inside a header block, with this many of its bytes seen.
+    Header(usize),
+    /// Inside a block of extra sparse-file entries after a header, with this
+    /// many of its bytes seen.
+    Sparse(usize),
+    /// Inside an entry's data and padding, with this many bytes left.
+    Data(u64),
+}
+
+/// A reader that follows the blocks of a tar stream as they pass through it
+/// and fails on a long name or extended header larger than any real one,
+/// before the tar reader would load it whole into memory.
+struct Headers<R> {
+    /// The tar stream.
+    inner: R,
+    /// Where the stream is.
+    part: Part,
+    /// The header or sparse block being read.
+    block: [u8; BLOCK],
+    /// The data of the local extended header being read, kept to find a
+    /// size it sets for the next entry.
+    extended: Option<Vec<u8>>,
+    /// How many bytes of the current entry's data are its contents, the rest
+    /// being padding.
+    contents: u64,
+    /// The size the last local extended header set for the next entry.
+    next_size: Option<u64>,
+}
+
+impl<R: Read> Headers<R> {
+    /// Follows the tar stream `inner` from its start.
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            part: Part::Header(0),
+            block: [0; BLOCK],
+            extended: None,
+            contents: 0,
+            next_size: None,
+        }
+    }
+
+    /// Follows `bytes`, the next bytes of the stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a header announces a long name or extended
+    /// header larger than [`MAX_PATH_BYTES`] or
+    /// [`MAX_EXTENDED_HEADER_BYTES`].
+    fn follow(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+        while !bytes.is_empty() {
+            match self.part {
+                Part::Header(seen) | Part::Sparse(seen) => {
+                    let sparse = matches!(self.part, Part::Sparse(_));
+                    let take = (BLOCK - seen).min(bytes.len());
+                    self.block[seen..seen + take].copy_from_slice(&bytes[..take]);
+                    bytes = &bytes[take..];
+                    let seen = seen + take;
+                    self.part = if seen < BLOCK {
+                        if sparse {
+                            Part::Sparse(seen)
+                        } else {
+                            Part::Header(seen)
+                        }
+                    } else if !sparse {
+                        self.read_header()?
+                    } else if self.block[504] != 0 {
+                        Part::Sparse(0)
+                    } else {
+                        self.data()
+                    };
+                }
+                Part::Data(left) => {
+                    let take = usize::try_from(left).unwrap_or(usize::MAX).min(bytes.len());
+                    if let Some(extended) = &mut self.extended {
+                        let wanted = usize::try_from(self.contents)
+                            .unwrap_or(usize::MAX)
+                            .saturating_sub(extended.len())
+                            .min(take);
+                        extended.extend_from_slice(&bytes[..wanted]);
+                    }
+                    bytes = &bytes[take..];
+                    let left = left - take as u64;
+                    self.part = if left == 0 {
+                        self.end_data()
+                    } else {
+                        Part::Data(left)
+                    };
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads the header block just completed and says what follows it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a long name or extended header that is too large.
+    fn read_header(&mut self) -> io::Result<Part> {
+        if self.block.iter().all(|byte| *byte == 0) {
+            return Ok(Part::Header(0));
+        }
+        let kind = self.block[156];
+        let size = block_size(&self.block[124..136]);
+        let too_long = |what: &str, limit: u64| {
+            io::Error::other(format!(
+                "{what} is {size} bytes long, longer than the {limit} read accepts"
+            ))
+        };
+        match kind {
+            b'L' | b'K' if size > MAX_PATH_BYTES as u64 + 1 => {
+                return Err(too_long("a member's long name", MAX_PATH_BYTES as u64));
+            }
+            b'x' | b'g' if size > MAX_EXTENDED_HEADER_BYTES => {
+                return Err(too_long("an extended header", MAX_EXTENDED_HEADER_BYTES));
+            }
+            _ => {}
+        }
+        self.contents = if matches!(kind, b'L' | b'K' | b'x' | b'g') {
+            size
+        } else {
+            self.next_size.take().unwrap_or(size)
+        };
+        self.extended = (kind == b'x').then(Vec::new);
+        if kind == b'S' && self.block[482] != 0 {
+            return Ok(Part::Sparse(0));
+        }
+        Ok(self.data())
+    }
+
+    /// The data of the current entry, padded to whole blocks, or the next
+    /// header when it has none.
+    fn data(&mut self) -> Part {
+        let padded = self.contents.div_ceil(BLOCK as u64) * BLOCK as u64;
+        if padded == 0 {
+            self.end_data()
+        } else {
+            Part::Data(padded)
+        }
+    }
+
+    /// Finishes the current entry's data: notes the size a local extended
+    /// header set for the next entry, and goes on to the next header.
+    fn end_data(&mut self) -> Part {
+        if let Some(extended) = self.extended.take() {
+            self.next_size = extended_size(&extended);
+        }
+        Part::Header(0)
+    }
+}
+
+impl<R: Read> Read for Headers<R> {
+    /// Reads from the tar stream, following its blocks.
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.follow(&buf[..read])?;
+        Ok(read)
+    }
+}
+
+/// The number in the size field `field` of a tar header: octal digits, or a
+/// big-endian binary number when its first byte has the high bit set; 0
+/// when it is neither.
+fn block_size(field: &[u8]) -> u64 {
+    if field.first().is_some_and(|byte| byte & 0x80 != 0) {
+        return field.iter().enumerate().fold(0u64, |size, (index, byte)| {
+            let byte = if index == 0 { byte & 0x7f } else { *byte };
+            size.saturating_mul(256).saturating_add(u64::from(byte))
+        });
+    }
+    let text = String::from_utf8_lossy(field);
+    u64::from_str_radix(text.trim_matches(|c: char| c == '\0' || c == ' '), 8).unwrap_or(0)
+}
+
+/// The `size` record of the extended header `data`, made of records such
+/// as `17 size=123456789\n`, when it has one.
+fn extended_size(data: &[u8]) -> Option<u64> {
+    String::from_utf8_lossy(data).lines().find_map(|record| {
+        let (_, field) = record.split_once(' ')?;
+        field.strip_prefix("size=")?.trim().parse().ok()
     })
 }
 
@@ -506,6 +711,101 @@ pub(super) mod tests {
     fn normalizes_paths() {
         assert_eq!(normalize("./src/a.rs"), "src/a.rs");
         assert_eq!(normalize("/src/"), "src");
+    }
+
+    /// Appends to `builder` an entry of type `kind`, such as a long name or
+    /// an extended header, holding `data`.
+    fn special(builder: &mut tar::Builder<Vec<u8>>, kind: tar::EntryType, data: &[u8]) {
+        let mut header = tar::Header::new_ustar();
+        header.set_path("././@LongLink").unwrap();
+        header.set_entry_type(kind);
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, data).unwrap();
+    }
+
+    /// Appends to `builder` a regular file `name` holding `data`.
+    fn file(builder: &mut tar::Builder<Vec<u8>>, name: &str, data: &[u8]) {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, name, data).unwrap();
+    }
+
+    /// Writes `bytes` to the file `name` of a fresh scratch directory and
+    /// lists it as a tar archive.
+    fn list_tar(name: &str, bytes: &[u8]) -> Result<Vec<String>, String> {
+        let dir = crate::testutil::scratch(name);
+        let path = dir.join("a.tar");
+        std::fs::write(&path, bytes).unwrap();
+        list(&path, Format::Tar).map(|(members, _)| members.into_iter().map(|m| m.path).collect())
+    }
+
+    /// Long names and extended headers of a sensible size are read; ones
+    /// larger than any real name are refused before they are loaded.
+    #[test]
+    fn refuses_huge_tar_headers() {
+        let long = format!("{}/end.txt", "d".repeat(300));
+        let mut builder = tar::Builder::new(Vec::new());
+        file(&mut builder, &long, b"x");
+        special(
+            &mut builder,
+            tar::EntryType::XHeader,
+            b"30 mtime=1700000000.123456789\n",
+        );
+        file(&mut builder, "after.txt", b"after\n");
+        let fine = list_tar("tar-headers-fine", &builder.into_inner().unwrap()).unwrap();
+        assert_eq!(fine, vec![long, "after.txt".to_string()]);
+        let mut builder = tar::Builder::new(Vec::new());
+        special(
+            &mut builder,
+            tar::EntryType::GNULongName,
+            &vec![b'a'; 8 << 20],
+        );
+        file(&mut builder, "x", b"x");
+        let error = list_tar("tar-headers-long", &builder.into_inner().unwrap()).unwrap_err();
+        assert!(error.contains("long name is 8388608 bytes long"), "{error}");
+        let mut builder = tar::Builder::new(Vec::new());
+        let record = format!("path={}\n", "p".repeat(1 << 20));
+        let record = format!("{} {record}", record.len() + 8);
+        special(&mut builder, tar::EntryType::XHeader, record.as_bytes());
+        file(&mut builder, "x", b"x");
+        let error = list_tar("tar-headers-pax", &builder.into_inner().unwrap()).unwrap_err();
+        assert!(error.contains("an extended header is"), "{error}");
+        let mut builder = tar::Builder::new(Vec::new());
+        let record = format!("path={}\n", "q".repeat(5000));
+        let record = format!("{} {record}", record.len() + 5);
+        special(&mut builder, tar::EntryType::XHeader, record.as_bytes());
+        file(&mut builder, "x", b"x");
+        let error = list_tar("tar-headers-path", &builder.into_inner().unwrap()).unwrap_err();
+        assert!(error.contains("path is 5000 bytes long"), "{error}");
+    }
+
+    /// A size set by an extended header moves the reader past the right
+    /// number of data blocks.
+    #[test]
+    fn follows_sizes_in_extended_headers() {
+        let mut builder = tar::Builder::new(Vec::new());
+        special(&mut builder, tar::EntryType::XHeader, b"13 size=1000\n");
+        let mut header = tar::Header::new_ustar();
+        header.set_path("big.bin").unwrap();
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append(&header, &[][..]).unwrap();
+        let mut bytes = builder.get_ref().clone();
+        bytes.extend_from_slice(&[7u8; 1024]);
+        let mut tail = tar::Builder::new(Vec::new());
+        file(&mut tail, "next.txt", b"n");
+        bytes.extend_from_slice(&tail.into_inner().unwrap());
+        let mut reader = Headers::new(&bytes[..]);
+        io::copy(&mut reader, &mut io::sink()).unwrap();
+        assert_eq!(reader.next_size, None);
+        assert_eq!(reader.part, Part::Header(0));
+        let listed = list_tar("tar-headers-size", &bytes).unwrap();
+        assert_eq!(listed, vec!["big.bin".to_string(), "next.txt".to_string()]);
     }
 
     /// A gzip stream that unpacks past the cap is stopped with an error.

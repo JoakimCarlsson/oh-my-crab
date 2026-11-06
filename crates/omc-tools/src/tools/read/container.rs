@@ -1,5 +1,5 @@
 //! Files `read` looks inside rather than reading as text: SQLite databases,
-//! zip and tar archives, and JSON files queried with a jq filter.
+//! zip and tar archives, and JSON files queried with a path.
 //!
 //! The part of a `read` path after the file names what to read inside it:
 //! `app.db:users`, `src.zip:lib/a.rs:10-20`, `data.json:.items[0]`. Such a
@@ -8,6 +8,7 @@
 
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use super::selector::Selector;
 use super::{archive, json, sqlite};
@@ -26,7 +27,7 @@ pub(super) enum Kind {
     Sqlite,
     /// An archive in one of the formats [`archive::Format`] names.
     Archive(archive::Format),
-    /// A JSON document, queried with a jq filter.
+    /// A JSON document, queried with a path.
     Json,
 }
 
@@ -111,19 +112,22 @@ fn kind(path: &Path) -> Option<Kind> {
 }
 
 /// Reads what `target` asks for, paging with the legacy `offset` and `limit`
-/// arguments when they are given.
+/// arguments when they are given; a database statement still running at
+/// `deadline` is interrupted.
 ///
 /// # Errors
 ///
 /// Returns [`ToolError`] when the container cannot be opened or read, what
-/// it asks for does not exist inside it, or the request is malformed.
+/// it asks for does not exist inside it, the request is malformed, or a
+/// database statement runs past `deadline`.
 pub(super) fn read(
     target: &Target,
     offset: Option<usize>,
     limit: Option<usize>,
+    deadline: Instant,
 ) -> Result<ToolOutput, ToolError> {
     match target.kind {
-        Kind::Sqlite => sqlite::read(target, offset, limit),
+        Kind::Sqlite => sqlite::read(target, offset, limit, deadline),
         Kind::Archive(format) => archive::read(target, format, offset, limit),
         Kind::Json => json::read(target, offset, limit),
     }
@@ -132,8 +136,8 @@ pub(super) fn read(
 /// Longest a read inside a container may take before the call gives up on it.
 const READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// Stack given to the thread a container read runs on, deep enough for the
-/// recursion a jq filter can nest into.
+/// Stack given to the thread a container read runs on, deep enough for a
+/// JSON query of the longest length accepted.
 const READ_STACK_BYTES: usize = 64 << 20;
 
 /// Reads what `target` asks for, as [`read`] does, giving up after
@@ -153,9 +157,9 @@ pub(super) async fn read_bounded(
 /// Reads what `target` asks for, as [`read`] does, on a thread of its own
 /// with a large stack, and gives up once `deadline` has passed.
 ///
-/// A jq filter cannot be interrupted, so one that never ends keeps its
-/// thread busy after the deadline; the call still returns and the turn goes
-/// on.
+/// Database statements are interrupted at the same deadline, so the thread
+/// stops too; any other read that is still going keeps its thread busy until
+/// it ends, but the call returns and the turn goes on.
 ///
 /// # Errors
 ///
@@ -169,11 +173,12 @@ async fn read_within(
 ) -> Result<ToolOutput, ToolError> {
     let (sender, receiver) = tokio::sync::oneshot::channel();
     let label = target.label.clone();
+    let until = Instant::now() + deadline;
     std::thread::Builder::new()
         .name("read-container".to_string())
         .stack_size(READ_STACK_BYTES)
         .spawn(move || {
-            let _ = sender.send(read(&target, offset, limit));
+            let _ = sender.send(read(&target, offset, limit, until));
         })
         .map_err(|error| ToolError::Failed(format!("cannot read {label}: {error}")))?;
     match tokio::time::timeout(deadline, receiver).await {
@@ -254,19 +259,24 @@ mod tests {
         tool.call(args).await.map(|output| output.text)
     }
 
-    /// A jq filter that never ends is given up on at the deadline instead of holding the call.
+    /// A read that runs long is given up on at the deadline instead of
+    /// holding the call, and a database read stops at it too.
     #[tokio::test]
-    async fn an_endless_query_is_abandoned() {
-        let dir = scratch("read-endless-json");
-        std::fs::write(dir.join("data.json"), "[1]").unwrap();
+    async fn a_slow_read_is_given_up_on() {
+        let dir = scratch("read-slow-sqlite");
+        sqlite::tests::slow_database(&dir.join("slow.db"));
         let sandbox = Sandbox::new(&dir).unwrap();
-        let target = locate(&sandbox, "data.json:last(repeat(1))").unwrap();
-        let started = std::time::Instant::now();
+        let target = locate(&sandbox, "slow.db:slow").unwrap();
+        let started = Instant::now();
         let error = read_within(target, None, None, std::time::Duration::from_secs(1))
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .to_string();
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
-        assert!(error.to_string().contains("was abandoned"), "{error}");
+        assert!(
+            error.contains("was abandoned") || error.contains("was stopped"),
+            "{error}"
+        );
     }
 
     /// A database lists its tables, pages a table's rows, runs read-only
@@ -410,7 +420,7 @@ mod tests {
         );
     }
 
-    /// A JSON file with a jq filter gives the filtered values, numbered and
+    /// A JSON file with a query gives the values it picks, numbered and
     /// pageable; with a line selector it reads as text.
     #[tokio::test]
     async fn queries_json_files() {

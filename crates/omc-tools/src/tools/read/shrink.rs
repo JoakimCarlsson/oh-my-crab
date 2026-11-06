@@ -1,20 +1,32 @@
 //! Shrinking images that are too large to hand to the model.
 //!
 //! An image larger than the byte limit, or with a side longer than
-//! [`MAX_SIDE`], is decoded, turned upright by its EXIF orientation, scaled
-//! so its long side fits and re-encoded: as PNG when it has transparent
+//! [`MAX_SIDE`], is decoded, scaled so its long side fits, turned upright by
+//! its EXIF orientation and re-encoded: as PNG when it has transparent
 //! pixels and stays small enough, otherwise as JPEG at falling qualities.
 //! While nothing fits, the dimensions shrink by a quarter and the encodings
 //! are tried again.
+//!
+//! Decoding is bounded so that a small file cannot unpack into a huge
+//! bitmap: images with a side over [`MAX_DECODED_SIDE`] pixels, or whose
+//! pixels would take more than [`MAX_DECODED_BYTES`], are refused before any
+//! pixel is decoded. Scaling averages blocks of pixels, which needs no
+//! buffer larger than its output.
 
 use std::io::Cursor;
 
 use image::codecs::jpeg::JpegEncoder;
-use image::imageops::FilterType;
-use image::{DynamicImage, ImageDecoder as _, ImageFormat, ImageReader, RgbImage};
+use image::metadata::Orientation;
+use image::{DynamicImage, ImageDecoder as _, ImageFormat, ImageReader, Limits, RgbImage};
 
 /// Longest side, in pixels, of an image handed to the model.
 pub(super) const MAX_SIDE: u32 = 2000;
+
+/// Longest side, in pixels, of an image decoded to be shrunk.
+pub(super) const MAX_DECODED_SIDE: u32 = 12_000;
+
+/// Most bytes the decoded pixels of an image may take.
+pub(super) const MAX_DECODED_BYTES: u64 = 256 << 20;
 
 /// JPEG qualities tried in turn at each size.
 const JPEG_QUALITIES: [u8; 4] = [80, 70, 55, 40];
@@ -63,7 +75,9 @@ impl Shrunk {
 /// # Errors
 ///
 /// Returns a description of the problem when the image must shrink but
-/// cannot be decoded, or no size down to one pixel fits `max_bytes`.
+/// cannot be decoded, is larger than [`MAX_DECODED_SIDE`] or
+/// [`MAX_DECODED_BYTES`] allow, or no size down to one pixel fits
+/// `max_bytes`.
 pub(super) fn shrink(bytes: &[u8], max_bytes: usize) -> Result<Option<Shrunk>, String> {
     let reader = || {
         ImageReader::new(Cursor::new(bytes))
@@ -77,18 +91,30 @@ pub(super) fn shrink(bytes: &[u8], max_bytes: usize) -> Result<Option<Shrunk>, S
     if bytes.len() <= max_bytes && fits_sides {
         return Ok(None);
     }
-    let mut decoder = reader()?.into_decoder().map_err(|e| e.to_string())?;
+    let mut bounded = reader()?;
+    bounded.limits(limits());
+    let mut decoder = bounded.into_decoder().map_err(too_large)?;
+    check_decoded_size(decoder.dimensions(), decoder.total_bytes())?;
     let orientation = decoder.orientation().map_err(|e| e.to_string())?;
-    let mut image = DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
-    image.apply_orientation(orientation);
-    let original = (image.width(), image.height());
+    let image = DynamicImage::from_decoder(decoder).map_err(too_large)?;
+    let turned = turns_sideways(orientation);
+    let upright = |(width, height): (u32, u32)| {
+        if turned {
+            (height, width)
+        } else {
+            (width, height)
+        }
+    };
+    let original = upright((image.width(), image.height()));
     let mut size = scaled(original, MAX_SIDE);
     loop {
-        let resized = if size == original {
+        let mut resized = if size == original {
             image.clone()
         } else {
-            image.resize_exact(size.0, size.1, FilterType::Lanczos3)
+            let (width, height) = upright(size);
+            image.thumbnail_exact(width, height)
         };
+        resized.apply_orientation(orientation);
         if let Some((bytes, media_type)) = encode(&resized, max_bytes)? {
             return Ok(Some(Shrunk {
                 bytes,
@@ -104,6 +130,61 @@ pub(super) fn shrink(bytes: &[u8], max_bytes: usize) -> Result<Option<Shrunk>, S
         }
         size = ((size.0 * 3 / 4).max(1), (size.1 * 3 / 4).max(1));
     }
+}
+
+/// The limits images are decoded under: sides of at most
+/// [`MAX_DECODED_SIDE`] and at most [`MAX_DECODED_BYTES`] allocated.
+fn limits() -> Limits {
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_DECODED_SIDE);
+    limits.max_image_height = Some(MAX_DECODED_SIDE);
+    limits.max_alloc = Some(MAX_DECODED_BYTES);
+    limits
+}
+
+/// Checks that an image of `(width, height)` pixels, whose decoded pixels
+/// take `bytes`, is small enough to decode.
+///
+/// # Errors
+///
+/// Returns a description of the problem when a side is over
+/// [`MAX_DECODED_SIDE`] or the pixels take more than [`MAX_DECODED_BYTES`].
+fn check_decoded_size((width, height): (u32, u32), bytes: u64) -> Result<(), String> {
+    if width > MAX_DECODED_SIDE || height > MAX_DECODED_SIDE || bytes > MAX_DECODED_BYTES {
+        return Err(format!(
+            "it is {width}x{height} pixels, which would take {} to decode; read decodes images \
+             of at most {MAX_DECODED_SIDE} pixels a side and {} of pixels, so make a smaller copy \
+             first",
+            super::media::size(usize::try_from(bytes).unwrap_or(usize::MAX)),
+            super::media::size(usize::try_from(MAX_DECODED_BYTES).unwrap_or(usize::MAX))
+        ));
+    }
+    Ok(())
+}
+
+/// Describes a decoding error, saying so plainly when it is a limit of
+/// [`limits`] that stopped it.
+fn too_large(error: image::ImageError) -> String {
+    match error {
+        image::ImageError::Limits(_) => format!(
+            "it is larger than read decodes ({error}); read decodes images of at most \
+             {MAX_DECODED_SIDE} pixels a side and {} of pixels, so make a smaller copy first",
+            super::media::size(usize::try_from(MAX_DECODED_BYTES).unwrap_or(usize::MAX))
+        ),
+        other => other.to_string(),
+    }
+}
+
+/// Whether turning an image upright by `orientation` swaps its width and
+/// height.
+fn turns_sideways(orientation: Orientation) -> bool {
+    matches!(
+        orientation,
+        Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH
+    )
 }
 
 /// Scales `(width, height)` so the longer side is at most `max_side`,
@@ -271,6 +352,38 @@ pub(super) mod tests {
         let jpeg = sideways_jpeg(60, 20);
         let shrunk = shrink(&jpeg, jpeg.len() - 1).unwrap().unwrap();
         assert_eq!(shrunk.original, (20, 60));
+    }
+
+    /// A one-pixel RGBA PNG whose header claims `width` by `height`
+    /// pixels, as a decompression bomb's does, at a few dozen bytes.
+    fn png_claiming(width: u32, height: u32) -> Vec<u8> {
+        let mut png = Cursor::new(Vec::new());
+        image::RgbaImage::new(1, 1)
+            .write_to(&mut png, ImageFormat::Png)
+            .unwrap();
+        let mut bytes = png.into_inner();
+        bytes[16..20].copy_from_slice(&width.to_be_bytes());
+        bytes[20..24].copy_from_slice(&height.to_be_bytes());
+        let mut crc = flate2::Crc::new();
+        crc.update(&bytes[12..29]);
+        bytes[29..33].copy_from_slice(&crc.sum().to_be_bytes());
+        bytes
+    }
+
+    /// A small file that would decode into a huge bitmap is refused before
+    /// it is decoded, with a message saying why.
+    #[test]
+    fn refuses_decompression_bombs() {
+        let tall = shrink(&png_claiming(100, MAX_DECODED_SIDE + 1), 1 << 20).unwrap_err();
+        assert!(
+            tall.contains("larger than read decodes") && tall.contains("12000 pixels a side"),
+            "{tall}"
+        );
+        let heavy = shrink(&png_claiming(9000, 9000), 1 << 20).unwrap_err();
+        assert!(
+            heavy.contains("9000x9000 pixels, which would take 324.0 MB to decode"),
+            "{heavy}"
+        );
     }
 
     /// Undecodable bytes pass when small and fail when they must shrink.

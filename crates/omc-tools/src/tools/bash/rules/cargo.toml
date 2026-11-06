@@ -16,7 +16,7 @@ collapse = [
   { pattern = '^\s+Documenting \S+ v\S+', label = "Documenting" },
   { pattern = '^\s+Fresh \S+ v\S+', label = "Fresh" },
   { pattern = '^\s+Download(ing|ed) ', label = "Downloading" },
-  { pattern = '^\s+(Locking|Adding|Updating|Removing|Unchanged) \S+ v\S+', label = "lock file" },
+  { pattern = '^\s+Locking \d+ packages? ', label = "lock file" },
   { pattern = '^test \S+( - .*)? \.\.\. ok$', label = "passing test" },
   { pattern = '^test \S+( - .*)? \.\.\. ignored(, .*)?$', label = "ignored test" },
   { pattern = '^\s+PASS \[\s*[\d.]+s\] ', label = "passing test" },
@@ -116,4 +116,44 @@ failures:
     parse::rejects_garbage
 
 test result: FAILED. 3 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+"""
+
+[[test]]
+command = "cargo update"
+input = """
+    Updating crates.io index
+     Locking 3 packages to latest compatible versions
+    Updating serde v1.0.200 -> v1.0.210
+    Updating serde_derive v1.0.200 -> v1.0.210
+      Adding windows-sys v0.59.0
+    Removing winapi v0.3.9
+   Unchanged rand v0.8.5 (available: v0.9.0)
+"""
+expected = """
+     Locking 3 packages to latest compatible versions
+    Updating serde v1.0.200 -> v1.0.210
+    Updating serde_derive v1.0.200 -> v1.0.210
+      Adding windows-sys v0.59.0
+    Removing winapi v0.3.9
+   Unchanged rand v0.8.5 (available: v0.9.0)
+"""
+
+[[test]]
+command = "cargo add tokio"
+input = """
+    Updating crates.io index
+      Adding tokio v1.40.0 to dependencies
+             Features:
+             + rt
+     Locking 2 packages to latest compatible versions
+      Adding mio v1.0.2
+      Adding tokio v1.40.0
+"""
+expected = """
+      Adding tokio v1.40.0 to dependencies
+             Features:
+             + rt
+     Locking 2 packages to latest compatible versions
+      Adding mio v1.0.2
+      Adding tokio v1.40.0
 """

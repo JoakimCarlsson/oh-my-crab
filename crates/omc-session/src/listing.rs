@@ -39,7 +39,7 @@ fn sentence(description: &str) -> String {
 
 /// Every tool a conversation can have in any mode, built-in ones and the ones that talk to the reader, in name order.
 ///
-/// Tools of tool servers are not included, since they depend on what the client configures. The skill tool is included although a conversation only has it when skills exist.
+/// Tools of tool servers are not included, since they depend on what the client configures. The skill tool is included; a conversation without skills has one too, which says there are none.
 ///
 /// # Errors
 ///

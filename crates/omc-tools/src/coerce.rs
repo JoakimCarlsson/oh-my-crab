@@ -22,9 +22,38 @@ pub(crate) fn prepare(schema: &Value, args: Value) -> Result<Value, ToolError> {
         return Ok(coerced);
     }
     Err(ToolError::InvalidArguments(format!(
-        "\n- {}\nreceived: {args}",
-        broken.join("\n- ")
+        "\n- {}\nreceived: {}",
+        broken.join("\n- "),
+        shortened(args)
     )))
+}
+
+/// Longest string, in characters, echoed whole in the arguments a refusal
+/// quotes back.
+const ECHO_CHARS: usize = 200;
+
+/// `value` with every string longer than [`ECHO_CHARS`] characters cut to
+/// its start and a note of its length, so that a refusal does not repeat a
+/// whole file the model sent.
+fn shortened(value: Value) -> Value {
+    match value {
+        Value::String(text) => match text.char_indices().nth(ECHO_CHARS) {
+            Some((end, _)) => Value::String(format!(
+                "{}… ({} chars)",
+                &text[..end],
+                text.chars().count()
+            )),
+            None => Value::String(text),
+        },
+        Value::Array(items) => Value::Array(items.into_iter().map(shortened).collect()),
+        Value::Object(fields) => Value::Object(
+            fields
+                .into_iter()
+                .map(|(key, value)| (key, shortened(value)))
+                .collect(),
+        ),
+        other => other,
+    }
 }
 
 /// `value` put right against `schema`, as far as the rules of this module go; anything it cannot put right is left as it is, for the check to report.
@@ -365,6 +394,27 @@ mod tests {
         assert!(message.contains("- args.limit: expected integer, got string"));
         assert!(message.contains("- args.edits[0]: missing required property `line`"));
         assert!(message.contains("received: {"));
+    }
+
+    /// Long strings in the arguments quoted back are cut to their start and
+    /// length; short ones are quoted whole.
+    #[test]
+    fn refusals_cut_long_arguments() {
+        let schema = tool_schema();
+        let long = "é".repeat(5000);
+        let Err(ToolError::InvalidArguments(message)) = prepare(
+            &schema,
+            json!({ "limit": "many", "edits": [{ "text": long }], "note": "short" }),
+        ) else {
+            panic!("expected the arguments to be turned away");
+        };
+        assert!(
+            message.contains(&format!("\"{}… (5000 chars)\"", "é".repeat(200))),
+            "{message}"
+        );
+        assert!(!message.contains(&"é".repeat(201)), "{message}");
+        assert!(message.contains("\"short\""), "{message}");
+        assert!(message.len() < 1000, "{}", message.len());
     }
 
     /// A schema that says nothing lets anything through untouched.

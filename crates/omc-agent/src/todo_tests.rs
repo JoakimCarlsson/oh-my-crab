@@ -51,10 +51,16 @@ impl ChatModel for Replies {
 
 /// Runs one turn of `go` against `model` with the built-in tools and `todo` in `dir`, everything allowed, and returns the history.
 async fn turn(model: &Replies, dir: &Path) -> Vec<Message> {
+    let mut history = Vec::new();
+    turn_on(model, dir, &mut history, "go").await;
+    history
+}
+
+/// Runs one turn of `prompt` against `model` with the built-in tools and `todo` in `dir`, everything allowed, adding to `history`.
+async fn turn_on(model: &Replies, dir: &Path, history: &mut Vec<Message>, prompt: &str) {
     let mut registry = Registry::builtin(dir).unwrap();
     registry.register(Todo::new(Arc::new(Reader::default())));
     let approvals = Approvals::new(Arc::new(DenyAll), true);
-    let mut history = Vec::new();
     run_turn(
         &Context {
             model,
@@ -67,13 +73,12 @@ async fn turn(model: &Replies, dir: &Path) -> Vec<Message> {
             window: None,
             checkpoint: None,
         },
-        &mut history,
-        "go".into(),
+        history,
+        prompt.into(),
         &|_| {},
     )
     .await
     .unwrap();
-    history
 }
 
 /// A reply that sets a list with one item in progress and one pending.
@@ -137,7 +142,7 @@ async fn a_stale_list_earns_a_reminder() {
     );
 }
 
-/// A turn about to end with open items after changing files is nudged once, with a notice only the model sees, and the reply that carries on is kept as one with the first.
+/// A turn about to end with open items after changing files is nudged once, with a notice only the model sees after the answer, which is kept as it is; the reply to the notice is kept as a reply of its own.
 #[tokio::test]
 async fn ending_with_open_items_is_nudged_once() {
     let dir = scratch("todo-finish");
@@ -155,16 +160,39 @@ async fn ending_with_open_items_is_nudged_once() {
     };
     assert!(notice.contains("still open"), "{notice}");
     assert!(notice.contains("- [pending] add a test"), "{notice}");
-    let Some(Message::Assistant(answer)) = history.last() else {
-        panic!("no answer");
-    };
     assert_eq!(
-        answer.text,
-        "Fixed the parser.\n\nThe test is left for later."
+        seen[3][seen[3].len() - 2],
+        Message::Assistant(say("Fixed the parser."))
+    );
+    assert_eq!(
+        history[history.len() - 2..],
+        [
+            Message::Assistant(say("Fixed the parser.")),
+            Message::Assistant(say("The test is left for later."))
+        ]
     );
     assert!(
         !history
             .iter()
             .any(|message| matches!(message, Message::User(text) if text.contains("still open")))
+    );
+}
+
+/// A list left open by an earlier turn does not hold up a later turn that only looked around to answer a question, shell commands included.
+#[tokio::test]
+async fn an_old_list_does_not_hold_up_a_question() {
+    let dir = scratch("todo-old-list");
+    let mut history = Vec::new();
+    let earlier = Replies::new(vec![plan(), say("Shall I start on the parser?")]);
+    turn_on(&earlier, &dir, &mut history, "plan it").await;
+    let model = Replies::new(vec![
+        call("l", "bash", json!({"command": "ls"})),
+        say("There are three files."),
+    ]);
+    turn_on(&model, &dir, &mut history, "what is in here").await;
+    assert_eq!(model.seen.lock().unwrap().len(), 2);
+    assert_eq!(
+        history.last(),
+        Some(&Message::Assistant(say("There are three files.")))
     );
 }

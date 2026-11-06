@@ -29,17 +29,33 @@ pub fn tag(bytes: &[u8]) -> String {
     render(feed(BASIS, bytes))
 }
 
-/// What the hash of an outline tag starts from, so that it differs from the
-/// plain tag of the same contents.
+/// What the hash of an outline tag starts from, so that its digits differ
+/// from those of the plain tag of the same contents.
 const OUTLINE_SALT: &[u8] = b"outline\0";
 
-/// Returns the tag a `read` outline of a file holding `bytes` carries.
+/// The letter every outline tag starts with, which no plain tag has.
+const OUTLINE_PREFIX: char = 'O';
+
+/// Returns the tag a `read` outline of a file holding `bytes` carries: the
+/// letter `O` and four uppercase hex digits.
 ///
-/// It is as stable as [`tag`] but almost always differs from it, so that
+/// It is as stable as [`tag`] and never equal to any plain tag, so that
 /// `edit` can tell an edit made against an outline, which must keep off the
-/// folded lines, from one made against the whole text.
+/// folded lines, from one made against the whole text by the form of the tag
+/// alone.
 pub(crate) fn outline_tag(bytes: &[u8]) -> String {
-    render(feed(feed(BASIS, OUTLINE_SALT), bytes))
+    format!(
+        "{OUTLINE_PREFIX}{}",
+        render(feed(feed(BASIS, OUTLINE_SALT), bytes))
+    )
+}
+
+/// Whether `cited` has the form of an outline tag rather than a plain one.
+pub(crate) fn is_outline_tag(cited: &str) -> bool {
+    cited
+        .trim()
+        .strip_prefix([OUTLINE_PREFIX, OUTLINE_PREFIX.to_ascii_lowercase()])
+        .is_some_and(|digits| digits.len() == 4 && digits.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// Returns the tag of the file at `path`, reading it in chunks so a large file is never held in memory.
@@ -77,14 +93,20 @@ mod tests {
         assert_ne!(a, tag(b"alpha \n"));
     }
 
-    /// An outline tag is stable for equal input and differs from the plain tag.
+    /// An outline tag is stable for equal input and differs from the plain
+    /// tag, and the two kinds are told apart by their form alone.
     #[test]
     fn outline_tag_differs_from_plain_tag() {
         let outline = outline_tag(b"alpha\n");
-        assert_eq!(outline.len(), 4);
+        assert_eq!(outline.len(), 5);
+        assert!(outline.starts_with('O'), "{outline}");
         assert_eq!(outline, outline_tag(b"alpha\n"));
         assert_ne!(outline, tag(b"alpha\n"));
         assert_ne!(outline, outline_tag(b"alpha \n"));
+        assert!(is_outline_tag(&outline));
+        assert!(is_outline_tag(&outline.to_lowercase()));
+        assert!(!is_outline_tag(&tag(b"alpha\n")));
+        assert!(!is_outline_tag("OXYZW"));
     }
 
     /// Hashing a file in chunks gives the tag of its bytes.

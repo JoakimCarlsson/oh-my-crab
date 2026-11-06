@@ -1,12 +1,10 @@
-# Condensing rules for make and ninja: directory changes, include chains and step counters.
+# Condensing rules for make and ninja: directory changes and step counters. Compiler include chains stay, since they say how a header was reached.
 
 [[filter]]
 name = "make"
 programs = ["make", "gmake", "ninja"]
 drop = [
   '^g?make(\[\d+\])?: (Entering|Leaving) directory ',
-  '^In file included from ',
-  '^\s+from \S+:\d+[:,]$',
 ]
 collapse = [
   { pattern = '^\[\d+/\d+\] (Building|Linking|Generating|Running|Copying|Install)', label = "build step" },
@@ -27,6 +25,8 @@ make[1]: Leaving directory '/work/app'
 """
 expected = """
 cc -O2 -c util.c -o util.o
+In file included from util.c:1:
+                 from util.h:3,
 util.h:9:6: warning: unused parameter 'n' [-Wunused-parameter]
 cc -O2 -c main.c -o main.o
 """

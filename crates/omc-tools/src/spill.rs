@@ -1,6 +1,6 @@
 //! Where tool output too long to show the model in full is saved whole, so that the model can read the rest with `read` instead of running the tool again.
 //!
-//! Each conversation saves into a folder of its own under the harness's cache folder, `oh-my-crab/output/<conversation>`, so the files outlive a turn and stay readable when the conversation is resumed. Folders nobody wrote to for a while are removed by [`Spill::prune`].
+//! Each conversation saves into a folder of its own under the harness's cache folder, `oh-my-crab/output/<conversation>`, so the files outlive a turn and stay readable when the conversation is resumed. Folders and files are readable by the user alone on Unix, since output can hold secrets. Folders none of whose files was written for a while are removed by [`Spill::prune`], which leaves the current conversation's folder alone.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write as _;
@@ -74,17 +74,18 @@ impl Spill {
                 "there is no folder to save output in",
             )
         })?;
-        std::fs::create_dir_all(dir)?;
+        make_private_dir(dir)?;
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
         let number = NEXT.fetch_add(1, Ordering::Relaxed);
         let path = dir.join(format!("{label}-{stamp}-{number}.log"));
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options.open(&path)?;
         Ok((path, file))
     }
 
@@ -132,24 +133,68 @@ impl Spill {
         }
     }
 
-    /// Removes the conversation folders under the harness's cache folder that were not written to for `age`, so saved output does not pile up.
-    pub fn prune(age: Duration) {
+    /// Removes the conversation folders under the harness's cache folder that were not written to for `age`, so saved output does not pile up; the folder of the conversation `keep`, when given, and this process's own folder are never removed.
+    pub fn prune(age: Duration, keep: Option<&str>) {
         let Some(root) = output_root() else { return };
-        let Ok(entries) = std::fs::read_dir(&root) else {
-            return;
-        };
-        let now = SystemTime::now();
-        for entry in entries.flatten() {
-            let stale = entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .ok()
-                .and_then(|modified| now.duration_since(modified).ok())
-                .is_some_and(|since| since > age);
-            if stale {
-                let _ = std::fs::remove_dir_all(entry.path());
-            }
+        prune_in(&root, age, keep);
+    }
+}
+
+/// Removes the folders in `root` whose newest file, or the folder itself when it has none newer, was last written more than `age` ago, except the folder named `keep` and this process's own folder.
+fn prune_in(root: &Path, age: Duration, keep: Option<&str>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let own = PROCESS_DIR.get().cloned().flatten();
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if keep.is_some_and(|keep| entry.file_name() == keep) || own.as_ref() == Some(&path) {
+            continue;
         }
+        let stale = last_written(&path)
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|since| since > age);
+        if stale {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// When anything in the folder at `path` was last written: the newest modification time of the folder and the entries directly inside it, which is all a folder of saved output holds. `None` when the folder's own time cannot be read.
+fn last_written(path: &Path) -> Option<SystemTime> {
+    let own = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    let newest = std::fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.metadata().and_then(|m| m.modified()).ok())
+        .max();
+    Some(newest.map_or(own, |newest| newest.max(own)))
+}
+
+/// Makes the folder `dir` and any missing parents, readable by the user alone on Unix, and narrows an existing folder to the user alone as well.
+///
+/// # Errors
+///
+/// Fails when the folder cannot be made or its permissions set.
+fn make_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        let permissions = std::fs::metadata(dir)?.permissions();
+        if permissions.mode() & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
     }
 }
 
@@ -203,6 +248,57 @@ mod tests {
         let capped = Spill::disabled().cap("mcp", text, 51);
         assert!(capped.starts_with(&"é".repeat(12)));
         assert!(capped.contains("could not be saved"));
+    }
+
+    /// Saved output is readable by the user alone, folder and files.
+    #[cfg(unix)]
+    #[test]
+    fn saves_privately() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch("spill-private");
+        let spill = Spill::new(dir.join("out"));
+        let path = spill.save("bash", b"secret").unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir.join("out")), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        std::fs::set_permissions(dir.join("out"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        spill.save("bash", b"more").unwrap();
+        assert_eq!(mode(&dir.join("out")), 0o700);
+    }
+
+    /// Sets when `path`, a file or folder, was last written to `days` days ago.
+    fn age(path: &Path, days: u64) {
+        let then = SystemTime::now() - Duration::from_secs(days * 24 * 60 * 60);
+        File::open(path).unwrap().set_modified(then).unwrap();
+    }
+
+    /// Folders go when nothing in them was written for the age; a folder
+    /// whose file is still being written, or the current conversation's,
+    /// stays.
+    #[test]
+    fn prunes_by_the_newest_file() {
+        let root = scratch("spill-prune");
+        for name in ["old", "live", "current", "empty"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        for name in ["old", "live", "current"] {
+            std::fs::write(root.join(name).join("a.log"), "x").unwrap();
+        }
+        for file in ["old/a.log", "current/a.log"] {
+            age(&root.join(file), 10);
+        }
+        for folder in ["old", "live", "current", "empty"] {
+            age(&root.join(folder), 10);
+        }
+        prune_in(
+            &root,
+            Duration::from_secs(7 * 24 * 60 * 60),
+            Some("current"),
+        );
+        assert!(!root.join("old").exists());
+        assert!(!root.join("empty").exists());
+        assert!(root.join("live/a.log").exists());
+        assert!(root.join("current/a.log").exists());
     }
 
     /// Only files inside the folder are held.

@@ -53,6 +53,8 @@ pub struct Opening {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Command {
     /// Opens the conversation, which must come before anything else.
+    ///
+    /// Sent while a turn of the conversation open before is running, it cancels that turn as [`Command::Cancel`] does, with a [`crate::Event::Halted`] and a [`crate::Event::Finished`], and drops the prompts queued for it, each reported as [`crate::Event::Queued`] in the dropped state, before the new conversation is opened.
     Open(Opening),
     /// Starts a turn with these words and these files.
     ///

@@ -1,28 +1,38 @@
 //! Steering the model from shell commands to the dedicated tool that does the same job better.
 //!
-//! A command line that is nothing but one plain use of `cat`, `head`, `tail`, `less`, `grep`, `rg`, `find`, `ls -R`, `sed -i`, or `echo`/`printf`/`cat` into a file is turned away with a message naming the tool to use and the arguments that do the same. Only forms whose meaning is certain are turned away: every word must be literal, every path must lie inside the working directory, and every option must have an equivalent in the dedicated tool. Anything else runs, and a command line that holds such a use inside a pipeline or a list of commands runs with a short tip naming the tool.
+//! A command is turned away only when a dedicated tool gives exactly the same result: `cat`, `less` or `more` of a few text files, `head` or `tail` of a number of lines of one text file, and `echo`, `printf` or a `cat` here-document whose text the shell does not expand, written over one file. Every word must be literal, every path must lie inside the working directory, every option must be one the dedicated tool reproduces, and the line must be that one command alone, with no control operator and not sent to the background. Anything else runs. Searches with `grep` or `rg`, `find` by name, `ls -R`, `sed -i` and appending to a file run too, since the dedicated tools differ from them in what they see or do, and such a command, like a command that would be turned away when it stands inside a pipeline or a list, runs with a one-line tip naming the tool.
 
-use std::path::PathBuf;
+use std::io::Read as _;
 
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
-use super::shell::{self, CommandLine, Simple, Word};
+use super::shell::{self, CommandLine, Simple, Word, program_name};
 use crate::Sandbox;
 
-/// Most files a `cat` may name and still be turned away, one `read` per file.
+/// Most files a `cat`, `less` or `more` may name and still be turned away, one `read` per file.
 const MAX_FILES: usize = 4;
 
 /// Lines `head` and `tail` show when given no count.
 const DEFAULT_LINES: &str = "10";
 
-/// Short options of `grep` that the `grep` tool does the same as, or that change nothing it shows.
-const GREP_FLAGS: &str = "rRniEHsI";
+/// Bytes from the start of a file looked at for a NUL byte, which marks it as binary rather than text.
+const TEXT_PROBE_BYTES: u64 = 8 * 1024;
 
-/// Short options of `rg` that the `grep` tool does the same as, or that change nothing it shows.
-const RG_FLAGS: &str = "niH";
+/// The tip for a search of file contents.
+const GREP_TIP: &str = "[tip: the `grep` tool searches file contents too, skipping ignored and binary files, and gives the snapshot tags `edit` needs]";
 
-/// Characters that mean something in an extended or Rust regular expression but are plain in a basic one, so a basic `grep` pattern holding one means something else to the `grep` tool.
-const BASIC_REGEX_PLAIN: [char; 8] = ['\\', '+', '?', '(', ')', '{', '}', '|'];
+/// The tip for finding or listing files by name.
+const GLOB_TIP: &str = "[tip: the `glob` tool finds files by name, skipping ignored files and listing the newest first]";
+
+/// The tip for editing a file in place.
+const SED_TIP: &str = "[tip: for a targeted change, the `edit` tool checks the lines against a `read` snapshot and shows the change]";
+
+/// The tip for appending to a file that exists.
+const APPEND_TIP: &str = "[tip: to add to an existing file, `edit` with `insert_after` on its last line shows the change]";
+
+/// The tip for appending to a file that does not exist yet.
+const CREATE_TIP: &str =
+    "[tip: the `write` tool creates a file from its whole text, with no shell quoting in the way]";
 
 /// What to do with a command line.
 #[derive(Debug, PartialEq, Eq)]
@@ -35,7 +45,7 @@ pub(super) enum Verdict {
     Refuse(String),
 }
 
-/// A dedicated tool that does what a command does.
+/// A dedicated tool that does exactly what a command does.
 struct Redirection {
     /// The tool's name.
     tool: &'static str,
@@ -49,10 +59,10 @@ struct Redirection {
 pub(super) fn check(command: &str, sandbox: &Sandbox) -> Verdict {
     let line = shell::parse(command);
     if let Some(alone) = only_command(&line)
-        && let Some(redirection) = redirect(alone, sandbox)
+        && let Some(redirection) = equivalent(alone, sandbox)
     {
         return Verdict::Refuse(format!(
-            "Not run: {} {} Pipelines, redirections and anything else that needs the shell still run with bash.",
+            "Not run: {} {} Anything the tool does differently, such as other options, pipelines or commands sent to the background, still runs with bash.",
             redirection.reason, redirection.advice
         ));
     }
@@ -62,25 +72,98 @@ pub(super) fn check(command: &str, sandbox: &Sandbox) -> Verdict {
     line.pipelines
         .iter()
         .filter_map(|pipeline| pipeline.stages.first())
-        .find_map(|first| Some((first, redirect(first, sandbox)?)))
-        .map_or(Verdict::Run, |(simple, redirection)| {
-            Verdict::Hint(format!(
-                "[tip: the `{}` tool does what `{}` did here, without the shell]",
-                redirection.tool, simple.words[0].text
-            ))
-        })
+        .find_map(|first| tip(first, sandbox))
+        .map_or(Verdict::Run, Verdict::Hint)
 }
 
-/// The one command `line` consists of, when it is a single plain command.
+/// The one command `line` consists of, when it is a single plain command with no control operator and is not sent to the background.
 fn only_command(line: &CommandLine) -> Option<&Simple> {
     match line.pipelines.as_slice() {
-        [pipeline] if !line.unusual && pipeline.stages.len() == 1 => pipeline.stages.first(),
+        [pipeline]
+            if !line.unusual
+                && line.operators.is_empty()
+                && !pipeline.background
+                && pipeline.stages.len() == 1 =>
+        {
+            pipeline.stages.first()
+        }
         _ => None,
     }
 }
 
-/// The dedicated tool that does what `simple` does, when it is a plain use of a command one of them replaces.
-fn redirect(simple: &Simple, sandbox: &Sandbox) -> Option<Redirection> {
+/// The one-line tip for `simple`, the first command of a pipeline, when a dedicated tool does the same job or a similar one; the program is found past assignments and wrappers such as `sudo`.
+fn tip(simple: &Simple, sandbox: &Sandbox) -> Option<String> {
+    if let Some(redirection) = equivalent(simple, sandbox) {
+        return Some(format!(
+            "[tip: the `{}` tool does what `{}` did here, without the shell]",
+            redirection.tool, simple.words[0].text
+        ));
+    }
+    let (program, arguments) = simple.invocation().split_first()?;
+    let arguments: Vec<&str> = arguments.iter().map(|word| word.text.as_str()).collect();
+    let tip = match program_name(program) {
+        "grep" | "egrep" | "fgrep" | "rg" if !reads_stdin_redirect(simple) => GREP_TIP,
+        "find" if finds_by_name(&arguments) => GLOB_TIP,
+        "ls" if lists_recursively(&arguments) => GLOB_TIP,
+        "sed" if edits_in_place(&arguments) => SED_TIP,
+        "echo" | "printf" | "cat" => appended(simple, &Paths(sandbox))?,
+        _ => return None,
+    };
+    Some(tip.to_owned())
+}
+
+/// Whether `simple` reads its standard input from a redirection, so that it searches what it is fed rather than files.
+fn reads_stdin_redirect(simple: &Simple) -> bool {
+    simple.redirects.iter().any(|redirect| {
+        matches!(
+            redirect.operator.as_str(),
+            "<" | "0<" | "<<" | "<<-" | "<<<" | "0<<" | "0<<-" | "0<<<"
+        )
+    })
+}
+
+/// Whether a `find` with `arguments` matches files by name or path.
+fn finds_by_name(arguments: &[&str]) -> bool {
+    arguments
+        .iter()
+        .any(|word| matches!(*word, "-name" | "-iname" | "-path" | "-ipath"))
+}
+
+/// Whether an `ls` with `arguments` lists directories recursively.
+fn lists_recursively(arguments: &[&str]) -> bool {
+    arguments.iter().any(|word| {
+        *word == "--recursive"
+            || (word.starts_with('-') && !word.starts_with("--") && word.contains('R'))
+    })
+}
+
+/// Whether a `sed` with `arguments` edits its files in place.
+fn edits_in_place(arguments: &[&str]) -> bool {
+    arguments
+        .iter()
+        .any(|word| word.starts_with("-i") || word.starts_with("--in-place"))
+}
+
+/// The tip for `simple` appending its output to one file inside the working directory: `edit` when the file exists, `write` when it does not.
+fn appended(simple: &Simple, paths: &Paths) -> Option<&'static str> {
+    let output = simple
+        .redirects
+        .iter()
+        .find(|redirect| redirect.writes_stdout() && redirect.appends())?;
+    let target = output.target.as_ref().filter(|target| target.literal)?;
+    let resolved = paths.inside(&target.text)?;
+    if target.text.starts_with("/dev/") || resolved.is_dir() {
+        return None;
+    }
+    Some(if resolved.is_file() {
+        APPEND_TIP
+    } else {
+        CREATE_TIP
+    })
+}
+
+/// The dedicated tool that gives exactly what `simple` gives, when there is one.
+fn equivalent(simple: &Simple, sandbox: &Sandbox) -> Option<Redirection> {
     let literal = |word: &Word| word.literal;
     let targets_literal = simple
         .redirects
@@ -90,23 +173,18 @@ fn redirect(simple: &Simple, sandbox: &Sandbox) -> Option<Redirection> {
         return None;
     }
     let (program, arguments) = simple.words.split_first()?;
+    let program = program_name(program);
     let arguments: Vec<&str> = arguments.iter().map(|word| word.text.as_str()).collect();
     let paths = Paths(sandbox);
     if !simple.redirects.is_empty() {
-        return match program.text.as_str() {
-            "echo" | "printf" | "cat" => written(simple, &program.text, &arguments, &paths),
+        return match program {
+            "echo" | "printf" | "cat" => written(simple, program, &arguments, &paths),
             _ => None,
         };
     }
-    match program.text.as_str() {
-        "cat" => concatenated(&arguments, &paths),
-        "head" | "tail" => sliced(&program.text, &arguments, &paths),
-        "less" | "more" => paged(&arguments, &paths),
-        "grep" | "egrep" => grepped(program.text == "egrep", &arguments, &paths),
-        "rg" => ripgrepped(&arguments, &paths),
-        "find" => found(&arguments, &paths),
-        "ls" => listed(&arguments, &paths),
-        "sed" => edited(&arguments, &paths),
+    match program {
+        "cat" | "less" | "more" => shown(program, &arguments, &paths),
+        "head" | "tail" => sliced(program, &arguments, &paths),
         _ => None,
     }
 }
@@ -115,30 +193,28 @@ fn redirect(simple: &Simple, sandbox: &Sandbox) -> Option<Redirection> {
 struct Paths<'a>(&'a Sandbox);
 
 impl Paths<'_> {
-    /// Whether `path` names a file `read` can open.
-    fn readable_file(&self, path: &str) -> bool {
-        !path.starts_with('-')
-            && self
-                .0
-                .resolve_readable(path)
-                .is_ok_and(|resolved| resolved.is_file())
+    /// Whether `path` names a text file `read` can open: a file whose first bytes hold no NUL byte.
+    fn text_file(&self, path: &str) -> bool {
+        if path.starts_with('-') {
+            return false;
+        }
+        let Ok(resolved) = self.0.resolve_readable(path) else {
+            return false;
+        };
+        let Ok(file) = std::fs::File::open(&resolved) else {
+            return false;
+        };
+        let mut start = Vec::new();
+        resolved.is_file()
+            && file.take(TEXT_PROBE_BYTES).read_to_end(&mut start).is_ok()
+            && !start.contains(&0)
     }
 
     /// Where `path` lies inside the working directory, when it does.
-    fn inside(&self, path: &str) -> Option<PathBuf> {
+    fn inside(&self, path: &str) -> Option<std::path::PathBuf> {
         (!path.starts_with('-'))
             .then(|| self.0.resolve(path).ok())
             .flatten()
-    }
-
-    /// Whether `path` names a file inside the working directory.
-    fn file(&self, path: &str) -> bool {
-        self.inside(path).is_some_and(|resolved| resolved.is_file())
-    }
-
-    /// Whether `path` names a directory inside the working directory.
-    fn directory(&self, path: &str) -> bool {
-        self.inside(path).is_some_and(|resolved| resolved.is_dir())
     }
 }
 
@@ -151,321 +227,92 @@ fn advise(tool: &str, calls: &[Value]) -> String {
     )
 }
 
-/// `cat` of one or a few files, which `read` does.
-fn concatenated(arguments: &[&str], paths: &Paths) -> Option<Redirection> {
+/// `cat`, with `-n` at most, or `less` or `more`, with no option, named `program`, of one to [`MAX_FILES`] text files, which `read` shows whole when asked for every line.
+fn shown(program: &str, arguments: &[&str], paths: &Paths) -> Option<Redirection> {
+    let cat = program == "cat";
     let files: Vec<&str> = arguments
         .iter()
         .copied()
-        .filter(|word| *word != "-n")
+        .filter(|word| !(cat && *word == "-n"))
         .collect();
     let readable = !files.is_empty()
         && files.len() <= MAX_FILES
-        && files.iter().all(|file| paths.readable_file(file));
+        && files.iter().all(|file| paths.text_file(file));
+    let reason = if cat {
+        "`cat` on a text file is what the `read` tool is for: it numbers the lines and gives the snapshot tag `edit` needs."
+    } else {
+        "a pager on a text file is what the `read` tool is for: it numbers the lines and gives the snapshot tag `edit` needs."
+    };
     readable.then(|| Redirection {
         tool: "read",
-        reason: "`cat` on a file is what the `read` tool is for: it numbers the lines and gives the snapshot tag `edit` needs.",
-        advice: advise("read", &files.iter().map(|file| json!({ "path": file })).collect::<Vec<_>>()),
-    })
-}
-
-/// `head` or `tail` of one file, which `read` does with a line range.
-fn sliced(program: &str, arguments: &[&str], paths: &Paths) -> Option<Redirection> {
-    let mut count = None;
-    let mut file = None;
-    let mut words = arguments.iter().copied();
-    while let Some(word) = words.next() {
-        let value = match word {
-            "-n" | "--lines" => words.next()?,
-            _ if word.starts_with("--lines=") => &word["--lines=".len()..],
-            _ if word.starts_with("-n") => &word[2..],
-            _ if word.starts_with('-') => &word[1..],
-            _ if file.is_none() => {
-                file = Some(word);
-                continue;
-            }
-            _ => return None,
-        };
-        count = Some(value);
-    }
-    let file = file.filter(|file| paths.readable_file(file))?;
-    let count = count.unwrap_or(DEFAULT_LINES);
-    let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
-    let range = match (program, count.strip_prefix('+')) {
-        ("tail", Some(from)) if digits(from) => format!("{from}-"),
-        ("tail", None) if digits(count) => format!("-{count}"),
-        ("head", None) if digits(count) => format!("1-{count}"),
-        _ => return None,
-    };
-    Some(Redirection {
-        tool: "read",
-        reason: "`head` and `tail` on a file are what the `read` tool is for: give it a line range.",
-        advice: advise("read", &[json!({ "path": format!("{file}:{range}") })]),
-    })
-}
-
-/// `less` or `more` of one file, which `read` does.
-fn paged(arguments: &[&str], paths: &Paths) -> Option<Redirection> {
-    let [file] = arguments else { return None };
-    paths.readable_file(file).then(|| Redirection {
-        tool: "read",
-        reason: "a pager on a file is what the `read` tool is for.",
-        advice: advise("read", &[json!({ "path": file })]),
-    })
-}
-
-/// The options and operands of a search, as the `grep` tool takes them.
-#[derive(Default)]
-struct Search<'a> {
-    /// The pattern given with `-e`.
-    pattern: Option<&'a str>,
-    /// The glob paths must match.
-    glob: Option<&'a str>,
-    /// Whether to search directories.
-    recursive: bool,
-    /// Whether the pattern is an extended rather than a basic regular expression.
-    extended: bool,
-    /// Whether to ignore case.
-    ignore_case: bool,
-    /// The words that are not options.
-    operands: Vec<&'a str>,
-}
-
-impl<'a> Search<'a> {
-    /// Sets the flag the short option `flag` stands for.
-    fn flag(&mut self, flag: char) {
-        match flag {
-            'r' | 'R' => self.recursive = true,
-            'i' => self.ignore_case = true,
-            'E' => self.extended = true,
-            _ => {}
-        }
-    }
-
-    /// Sets `slot` to `value`, failing when it was set already.
-    fn once(slot: &mut Option<&'a str>, value: Option<&'a str>) -> Option<()> {
-        match (slot.is_none(), value) {
-            (true, Some(value)) => {
-                *slot = Some(value);
-                Some(())
-            }
-            _ => None,
-        }
-    }
-
-    /// The pattern and the one path to search, when the operands give them.
-    fn pattern_and_path(&mut self) -> Option<(&'a str, Option<&'a str>)> {
-        let pattern = match self.pattern {
-            Some(pattern) => pattern,
-            None if !self.operands.is_empty() => self.operands.remove(0),
-            None => return None,
-        };
-        match self.operands.as_slice() {
-            [] => Some((pattern, None)),
-            [path] if *path != "-" => Some((pattern, Some(path))),
-            _ => None,
-        }
-    }
-
-    /// The `grep` tool call that does the same search of `path`.
-    fn call(&self, pattern: &str, path: &str) -> Redirection {
-        let mut args = Map::new();
-        args.insert("pattern".into(), json!(pattern));
-        if path != "." {
-            args.insert("path".into(), json!(path));
-        }
-        if let Some(glob) = self.glob {
-            args.insert("glob".into(), json!(glob));
-        }
-        if self.ignore_case {
-            args.insert("case_insensitive".into(), json!(true));
-        }
-        Redirection {
-            tool: "grep",
-            reason: "searching files is what the `grep` tool is for: it skips ignored and binary files and gives the snapshot tags `edit` needs.",
-            advice: advise("grep", &[Value::Object(args)]),
-        }
-    }
-}
-
-/// A `grep` search of one file, or of one directory with `-r`, using options the `grep` tool has; `egrep` when `extended`.
-fn grepped(extended: bool, arguments: &[&str], paths: &Paths) -> Option<Redirection> {
-    let mut search = Search {
-        extended,
-        ..Search::default()
-    };
-    let mut words = arguments.iter().copied();
-    let mut options_ended = false;
-    while let Some(word) = words.next() {
-        if options_ended || !word.starts_with('-') || word == "-" {
-            search.operands.push(word);
-            continue;
-        }
-        match word {
-            "--" => options_ended = true,
-            "-e" | "--regexp" => Search::once(&mut search.pattern, words.next())?,
-            "--include" => Search::once(&mut search.glob, words.next())?,
-            "--recursive" | "--dereference-recursive" => search.recursive = true,
-            "--ignore-case" => search.ignore_case = true,
-            "--extended-regexp" => search.extended = true,
-            "--line-number" | "--with-filename" | "--no-messages" => {}
-            _ if word.starts_with("--include=") => {
-                Search::once(&mut search.glob, word.strip_prefix("--include="))?
-            }
-            _ if word.starts_with("--color") => {}
-            _ if word[1..].chars().all(|flag| GREP_FLAGS.contains(flag)) => {
-                word[1..].chars().for_each(|flag| search.flag(flag));
-            }
-            _ => return None,
-        }
-    }
-    let (pattern, path) = search.pattern_and_path()?;
-    let same_meaning = if search.extended {
-        !pattern.contains("\\<") && !pattern.contains("\\>") && !has_backreference(pattern)
-    } else {
-        !pattern.contains(BASIC_REGEX_PLAIN)
-    };
-    let searchable = match (path, search.recursive) {
-        (None, true) => Some("."),
-        (Some(path), true) if paths.inside(path).is_some_and(|resolved| resolved.exists()) => {
-            Some(path)
-        }
-        (Some(path), false) if paths.file(path) => Some(path),
-        _ => None,
-    }?;
-    (same_meaning && regex::Regex::new(pattern).is_ok()).then(|| search.call(pattern, searchable))
-}
-
-/// Whether `pattern` refers back to a group, as `\1` does, which Rust regular expressions cannot.
-fn has_backreference(pattern: &str) -> bool {
-    pattern
-        .as_bytes()
-        .windows(2)
-        .any(|pair| pair[0] == b'\\' && pair[1].is_ascii_digit())
-}
-
-/// An `rg` search of one path, using options the `grep` tool has.
-fn ripgrepped(arguments: &[&str], paths: &Paths) -> Option<Redirection> {
-    let mut search = Search {
-        extended: true,
-        recursive: true,
-        ..Search::default()
-    };
-    let mut words = arguments.iter().copied();
-    let mut options_ended = false;
-    while let Some(word) = words.next() {
-        if options_ended || !word.starts_with('-') || word == "-" {
-            search.operands.push(word);
-            continue;
-        }
-        match word {
-            "--" => options_ended = true,
-            "-e" | "--regexp" => Search::once(&mut search.pattern, words.next())?,
-            "-g" | "--glob" => Search::once(&mut search.glob, words.next())?,
-            "--ignore-case" => search.ignore_case = true,
-            "--line-number" | "--with-filename" | "--no-heading" => {}
-            _ if word.starts_with("--glob=") => {
-                Search::once(&mut search.glob, word.strip_prefix("--glob="))?
-            }
-            _ if word.starts_with("--color") => {}
-            _ if word[1..].chars().all(|flag| RG_FLAGS.contains(flag)) => {
-                word[1..].chars().for_each(|flag| search.flag(flag));
-            }
-            _ => return None,
-        }
-    }
-    let (pattern, path) = search.pattern_and_path()?;
-    let path = path.unwrap_or(".");
-    let usable = search.glob.is_none_or(|glob| !glob.starts_with('!'))
-        && paths.inside(path).is_some_and(|resolved| resolved.exists())
-        && regex::Regex::new(pattern).is_ok();
-    usable.then(|| search.call(pattern, path))
-}
-
-/// `find [dir] -name pattern [-type f]`, which `glob` does.
-fn found(arguments: &[&str], paths: &Paths) -> Option<Redirection> {
-    let (directory, expression) = match arguments.split_first() {
-        Some((first, rest)) if !first.starts_with('-') => (*first, rest),
-        _ => (".", arguments),
-    };
-    let mut name = None;
-    let mut words = expression.iter().copied();
-    while let Some(word) = words.next() {
-        match (word, words.next()) {
-            ("-name", Some(pattern)) if name.is_none() => name = Some(pattern),
-            ("-type", Some("f")) => {}
-            _ => return None,
-        }
-    }
-    let name = name.filter(|name| !name.contains('/'))?;
-    if !paths.directory(directory) {
-        return None;
-    }
-    let mut args = Map::new();
-    args.insert("pattern".into(), json!(name));
-    if directory != "." {
-        args.insert("path".into(), json!(directory));
-    }
-    Some(Redirection {
-        tool: "glob",
-        reason: "finding files by name is what the `glob` tool is for: it skips ignored files and lists the newest first.",
-        advice: advise("glob", &[Value::Object(args)]),
-    })
-}
-
-/// `ls -R [dir]`, which `glob` does.
-fn listed(arguments: &[&str], paths: &Paths) -> Option<Redirection> {
-    let directory = match arguments {
-        ["-R"] => ".",
-        ["-R", directory] => directory,
-        _ => return None,
-    };
-    if !paths.directory(directory) {
-        return None;
-    }
-    let mut args = Map::new();
-    args.insert("pattern".into(), json!("**/*"));
-    if directory != "." {
-        args.insert("path".into(), json!(directory));
-    }
-    Some(Redirection {
-        tool: "glob",
-        reason: "listing a directory tree is what the `glob` tool is for: it skips ignored files.",
-        advice: advise("glob", &[Value::Object(args)]),
-    })
-}
-
-/// `sed -i` on one file, which `read` and `edit` do.
-fn edited(arguments: &[&str], paths: &Paths) -> Option<Redirection> {
-    let mut in_place = false;
-    let mut script = None;
-    let mut operands = Vec::new();
-    let mut words = arguments.iter().copied();
-    while let Some(word) = words.next() {
-        match word {
-            "-e" | "--expression" => Search::once(&mut script, words.next())?,
-            "-E" | "-r" | "--regexp-extended" => {}
-            _ if word.starts_with("-i") || word.starts_with("--in-place") => in_place = true,
-            _ if word.starts_with('-') => return None,
-            _ => operands.push(word),
-        }
-    }
-    if script.is_none() && !operands.is_empty() {
-        operands.remove(0);
-    }
-    let [file] = operands.as_slice() else {
-        return None;
-    };
-    (in_place && paths.file(file)).then(|| Redirection {
-        tool: "edit",
-        reason: "editing a file with `sed -i` is what the `edit` tool is for: it checks the lines against a snapshot and shows the change.",
-        advice: format!(
-            "Call `read` with {} for the lines and their snapshot tag, then `edit`. To change many files at once, sed over several files still runs.",
-            json!({ "path": file })
+        reason,
+        advice: advise(
+            "read",
+            &files
+                .iter()
+                .map(|file| json!({ "path": format!("{file}:1-") }))
+                .collect::<Vec<_>>(),
         ),
     })
 }
 
-/// `echo`, `printf` or a `cat` here-document sent into one file inside the working directory, which `write` or `edit` does.
+/// The file and the line count of a `head` or `tail` with `arguments`, read in any order, when they hold one file and no option but a line count.
+fn head_or_tail_operands<'a>(arguments: &[&'a str]) -> Option<(&'a str, &'a str)> {
+    let mut count = None;
+    let mut file = None;
+    let mut options_ended = false;
+    let mut words = arguments.iter().copied();
+    while let Some(word) = words.next() {
+        if options_ended || !word.starts_with('-') || word == "-" {
+            if file.replace(word).is_some() {
+                return None;
+            }
+            continue;
+        }
+        let value = match word {
+            "--" => {
+                options_ended = true;
+                continue;
+            }
+            "-n" | "--lines" => words.next()?,
+            _ if word.starts_with("--lines=") => &word["--lines=".len()..],
+            _ if word.starts_with("--") => return None,
+            _ if word.starts_with("-n") => &word["-n".len()..],
+            _ if word[1..].bytes().all(|byte| byte.is_ascii_digit()) => &word[1..],
+            _ => return None,
+        };
+        if count.replace(value).is_some() {
+            return None;
+        }
+    }
+    Some((file?, count.unwrap_or(DEFAULT_LINES)))
+}
+
+/// `head` or `tail`, named `program`, of a number of lines of one text file, which `read` does with a line range.
+fn sliced(program: &str, arguments: &[&str], paths: &Paths) -> Option<Redirection> {
+    let (file, count) = head_or_tail_operands(arguments)?;
+    if !paths.text_file(file) {
+        return None;
+    }
+    let lines = |text: &str| {
+        !text.is_empty()
+            && text.bytes().all(|byte| byte.is_ascii_digit())
+            && text.bytes().any(|byte| byte != b'0')
+    };
+    let range = match (program, count.strip_prefix('+')) {
+        ("tail", Some(from)) if lines(from) => format!("{from}-"),
+        ("tail", None) if lines(count) => format!("-{count}"),
+        ("head", None) if lines(count) => format!("1-{count}"),
+        _ => return None,
+    };
+    Some(Redirection {
+        tool: "read",
+        reason: "`head` and `tail` on a text file are what the `read` tool is for: give it a line range.",
+        advice: advise("read", &[json!({ "path": format!("{file}:{range}") })]),
+    })
+}
+
+/// `echo`, `printf` or a `cat` here-document, named `program`, whose text the shell passes on as written, sent over one file inside the working directory, which `write` does.
 fn written(
     simple: &Simple,
     program: &str,
@@ -479,29 +326,24 @@ fn written(
     let [output] = outputs.as_slice() else {
         return None;
     };
+    if output.appends() {
+        return None;
+    }
     let here_doc = match inputs.as_slice() {
-        [] => false,
-        [input] if input.is_here_doc() => true,
+        [] => None,
+        [input] if input.is_here_doc() => Some(input),
         _ => return None,
     };
-    let fed_by_here_doc = program == "cat" && here_doc && arguments.is_empty();
-    let printed = program != "cat" && !here_doc;
+    let fed_by_here_doc = program == "cat"
+        && arguments.is_empty()
+        && here_doc.is_some_and(|input| input.here_doc_verbatim());
+    let printed = program != "cat" && here_doc.is_none();
     let target = output.target.as_ref()?.text.as_str();
     let inside = paths
         .inside(target)
         .is_some_and(|resolved| !resolved.is_dir());
     if !(fed_by_here_doc || printed) || !inside || target.starts_with("/dev/") {
         return None;
-    }
-    if output.appends() {
-        return Some(Redirection {
-            tool: "edit",
-            reason: "adding to a file through the shell is what the `edit` tool is for.",
-            advice: format!(
-                "Call `read` with {} for its last lines and snapshot tag, then `edit` with `insert_after` on the last line.",
-                json!({ "path": target })
-            ),
-        });
     }
     let plain_echo = program == "echo"
         && arguments
@@ -525,13 +367,14 @@ mod tests {
     use super::*;
     use crate::testutil::scratch;
 
-    /// A sandbox holding `src/main.rs`, `notes.txt` and an empty `docs` directory.
+    /// A sandbox holding `src/main.rs`, `notes.txt`, a binary `image.bin` and an empty `docs` directory.
     fn sandbox(name: &str) -> Sandbox {
         let dir = scratch(name);
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::create_dir_all(dir.join("docs")).unwrap();
         std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
         std::fs::write(dir.join("notes.txt"), "a\nb\n").unwrap();
+        std::fs::write(dir.join("image.bin"), b"PNG\0\x01\x02").unwrap();
         Sandbox::new(&dir).unwrap()
     }
 
@@ -543,59 +386,55 @@ mod tests {
         }
     }
 
-    /// Plain reads, searches, listings and edits are turned away with the tool and arguments that do the same.
+    /// The tip `command` runs with, failing when it would be turned away or run without one.
+    fn hinted(sandbox: &Sandbox, command: &str) -> String {
+        match check(command, sandbox) {
+            Verdict::Hint(tip) => tip,
+            other => panic!("`{command}` did not run with a tip: {other:?}"),
+        }
+    }
+
+    /// Reads of whole text files or of a number of their lines, and unexpanded text written over a file, are turned away with the call that does exactly the same.
     #[test]
-    fn refuses_plain_uses_with_equivalent_calls() {
+    fn refuses_exact_equivalents_with_their_calls() {
         let sandbox = sandbox("intercept-refuse");
         for (command, call) in [
-            ("cat src/main.rs", r#"`read` with {"path":"src/main.rs"}"#),
+            (
+                "cat src/main.rs",
+                r#"`read` with {"path":"src/main.rs:1-"}"#,
+            ),
             (
                 "cat -n src/main.rs notes.txt",
-                r#"{"path":"src/main.rs"}, and again with {"path":"notes.txt"}"#,
+                r#"{"path":"src/main.rs:1-"}, and again with {"path":"notes.txt:1-"}"#,
+            ),
+            ("less notes.txt", r#"{"path":"notes.txt:1-"}"#),
+            (
+                "more notes.txt src/main.rs",
+                r#"{"path":"notes.txt:1-"}, and again with {"path":"src/main.rs:1-"}"#,
             ),
             ("head -n 50 src/main.rs", r#"{"path":"src/main.rs:1-50"}"#),
             ("head -20 src/main.rs", r#"{"path":"src/main.rs:1-20"}"#),
+            ("head src/main.rs -n 3", r#"{"path":"src/main.rs:1-3"}"#),
             ("tail notes.txt", r#"{"path":"notes.txt:-10"}"#),
             ("tail -n +5 notes.txt", r#"{"path":"notes.txt:5-"}"#),
-            ("less notes.txt", r#"{"path":"notes.txt"}"#),
-            (
-                "grep -rn 'fn main' src",
-                r#"`grep` with {"path":"src","pattern":"fn main"}"#,
-            ),
-            (
-                "grep -ri --include='*.rs' todo",
-                r#"{"case_insensitive":true,"glob":"*.rs","pattern":"todo"}"#,
-            ),
-            (
-                "grep -E 'a|b' notes.txt",
-                r#"{"path":"notes.txt","pattern":"a|b"}"#,
-            ),
-            (
-                "rg -n 'fn \\w+' -g '*.rs'",
-                r#"{"glob":"*.rs","pattern":"fn \\w+"}"#,
-            ),
-            (
-                "find . -name '*.rs' -type f",
-                r#"`glob` with {"pattern":"*.rs"}"#,
-            ),
-            (
-                "find src -name main.rs",
-                r#"{"path":"src","pattern":"main.rs"}"#,
-            ),
-            ("ls -R docs", r#"{"path":"docs","pattern":"**/*"}"#),
-            (
-                "sed -i 's/main/start/' src/main.rs",
-                r#"`read` with {"path":"src/main.rs"}"#,
-            ),
+            ("tail --lines=2 notes.txt", r#"{"path":"notes.txt:-2"}"#),
+            ("tail -- notes.txt", r#"{"path":"notes.txt:-10"}"#),
             (
                 "echo hello world > notes.txt",
                 r#"`write` with {"content":"hello world\n","path":"notes.txt"}"#,
             ),
             (
-                "cat > new.txt <<'EOF'\nhello\nEOF",
+                "printf 'a b' > new.txt",
                 r#"`write` with {"content":"…","path":"new.txt"}"#,
             ),
-            ("echo more >> notes.txt", "`insert_after`"),
+            (
+                "cat > new.txt <<'EOF'\nhello $USER\nEOF",
+                r#"`write` with {"content":"…","path":"new.txt"}"#,
+            ),
+            (
+                "cat > new.txt <<EOF\nplain text\nEOF",
+                r#"`write` with {"content":"…","path":"new.txt"}"#,
+            ),
         ] {
             let message = refused(&sandbox, command);
             assert!(message.contains(call), "`{command}`: {message}");
@@ -603,7 +442,7 @@ mod tests {
         }
     }
 
-    /// Anything that needs the shell, or whose meaning differs in the dedicated tool, runs.
+    /// Anything the dedicated tools would do differently runs, with no tip.
     #[test]
     fn runs_everything_else() {
         let sandbox = sandbox("intercept-run");
@@ -614,53 +453,83 @@ mod tests {
             "cat $FILE",
             "cat",
             "cat a b c d e",
+            "cat image.bin",
+            "cat docs",
+            "less -N notes.txt",
+            "head -n 3 image.bin",
             "tail -f notes.txt",
+            "tail -F notes.txt",
+            "tail --follow notes.txt",
+            "tail -n 5 -f notes.txt",
             "head -c 100 notes.txt",
-            "grep pattern",
-            "grep -v x notes.txt",
-            "grep -c x notes.txt",
-            "grep -A 3 x notes.txt",
-            "grep 'a\\|b' notes.txt",
-            "grep x src",
-            "grep -r x ../elsewhere",
-            "rg -F 'a(' src",
-            "rg -g '!*.rs' x",
-            "find . -name '*.rs' -exec rm {} +",
-            "find . -mtime -1",
-            "find . -type d -name src",
-            "ls -la",
-            "ls -R /",
-            "sed 's/a/b/' notes.txt",
-            "sed -n -i 1p notes.txt",
-            "sed -i s/a/b/ notes.txt src/main.rs",
+            "head --bytes=3 notes.txt",
+            "head -q notes.txt",
+            "head -v notes.txt",
+            "head -n 0 notes.txt",
+            "head -n -2 notes.txt",
+            "tail -n 5 -n 6 notes.txt",
+            "head -n 5 notes.txt src/main.rs",
             "echo hi",
             "echo hi > /dev/null",
             "echo hi > ../outside.txt",
             "echo $HOME > notes.txt",
             "echo hi 2> err.txt",
             "sudo cat notes.txt",
-            "LC_ALL=C grep -r x .",
             "cat notes.txt > copy.txt",
             "cat < notes.txt",
+            "cat > new.txt",
+            "cat > new.txt <<EOF\n$HOME\nEOF",
+            "cat > new.txt <<EOF\n`date`\nEOF",
+            "cat > new.txt <<EOF\na\\tb\nEOF",
+            "cat > new.txt <<< hello",
+            "grep x < notes.txt",
+            "wc -l notes.txt | sort",
+            "cargo test | grep -rn x src",
             "git status",
         ] {
             assert_eq!(check(command, &sandbox), Verdict::Run, "`{command}`");
         }
     }
 
-    /// A replaceable command inside a pipeline or list runs, with a tip naming the tool.
+    /// Searches, finds, recursive listings, in-place edits and appends run, with a tip naming the tool that does a similar job.
     #[test]
-    fn hints_inside_pipelines_and_lists() {
+    fn runs_near_equivalents_with_a_tip() {
+        let sandbox = sandbox("intercept-near");
+        for (command, tool) in [
+            ("grep -rn 'fn main' src", "`grep`"),
+            ("grep x notes.txt", "`grep`"),
+            ("rg -n 'fn \\w+' -g '*.rs'", "`grep`"),
+            ("LC_ALL=C grep -r x .", "`grep`"),
+            ("find . -name '*.rs' -type f", "`glob`"),
+            ("find src -name main.rs", "`glob`"),
+            ("ls -R docs", "`glob`"),
+            ("ls -laR", "`glob`"),
+            ("sed -i 's/main/start/' src/main.rs", "`edit`"),
+            ("echo more >> notes.txt", "`insert_after`"),
+            ("echo first >> new.txt", "`write`"),
+        ] {
+            let tip = hinted(&sandbox, command);
+            assert!(tip.contains(tool), "`{command}`: {tip}");
+        }
+    }
+
+    /// A command that would be turned away alone runs with a tip when it is sent to the background, followed by a control operator, or part of a pipeline or list.
+    #[test]
+    fn hints_when_not_alone() {
         let sandbox = sandbox("intercept-hint");
-        let Verdict::Hint(tip) = check("cat src/main.rs | wc -l", &sandbox) else {
-            panic!("expected a tip");
-        };
-        assert!(tip.contains("`read`") && tip.contains("`cat`"), "{tip}");
+        for command in [
+            "cat notes.txt &",
+            "cat notes.txt;",
+            "cat src/main.rs | wc -l",
+            "head -n 3 notes.txt && echo done",
+            "cargo build; tail -n 5 notes.txt",
+        ] {
+            let tip = hinted(&sandbox, command);
+            assert!(tip.contains("`read`"), "`{command}`: {tip}");
+        }
         assert!(matches!(
             check("cargo build && grep -rn x src", &sandbox),
             Verdict::Hint(_)
         ));
-        assert_eq!(check("wc -l notes.txt | sort", &sandbox), Verdict::Run);
-        assert_eq!(check("cargo test | grep -rn x src", &sandbox), Verdict::Run);
     }
 }

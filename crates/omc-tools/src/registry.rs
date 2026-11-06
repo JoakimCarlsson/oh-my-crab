@@ -160,11 +160,13 @@ impl Registry {
 
     /// The tool called `name` and `args` put right against its schema: checked as well, unless the tool checks its arguments itself.
     ///
+    /// A caller that shows or approves a call before running it prepares the arguments with this first, so that what is shown and approved is what runs, and then runs the tool with them.
+    ///
     /// # Errors
     ///
     /// Returns [`ToolError::Unknown`] when no such tool exists, and
     /// [`ToolError::InvalidArguments`] when the arguments break the schema.
-    fn prepared(&self, name: &str, args: Value) -> Result<(&Arc<dyn Tool>, Value), ToolError> {
+    pub fn prepared(&self, name: &str, args: Value) -> Result<(&Arc<dyn Tool>, Value), ToolError> {
         let tool = self
             .get(name)
             .ok_or_else(|| ToolError::Unknown(name.to_string()))?;

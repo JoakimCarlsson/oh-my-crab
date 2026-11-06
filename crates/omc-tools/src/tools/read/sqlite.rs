@@ -4,8 +4,9 @@
 //!
 //! Rows are numbered from 1 and paged with the usual line selectors, so
 //! `app.db:users:51-100` shows rows 51 to 100. The database is opened
-//! read-only with writes refused, and only `SELECT`, `WITH` and
-//! `PRAGMA table_info` statements run.
+//! read-only with writes refused, only `SELECT`, `WITH` and
+//! `PRAGMA table_info` statements run, and every statement, counting rows
+//! included, is interrupted at the deadline of the read.
 
 use std::time::{Duration, Instant};
 
@@ -26,11 +27,11 @@ const MAX_ROWS: usize = 500;
 /// Longest cell shown, in characters; longer values are cut.
 const MAX_CELL_CHARS: usize = 200;
 
+/// Virtual machine steps SQLite takes between checks of the deadline.
+const PROGRESS_STEPS: std::os::raw::c_int = 10_000;
+
 /// Rows counted for a table in the table list before it is called larger.
 const COUNT_CAP: usize = 1_000_000;
-
-/// Longest a query may run before it is interrupted.
-const QUERY_TIME: Duration = Duration::from_secs(10);
 
 /// A table or view of the database.
 struct Table {
@@ -43,21 +44,23 @@ struct Table {
 }
 
 /// Reads what `target` asks for in the SQLite database it points at: the
-/// table list, a page of one table's rows, or a page of a query's rows.
+/// table list, a page of one table's rows, or a page of a query's rows,
+/// interrupting any statement still running at `deadline`.
 ///
 /// # Errors
 ///
 /// Returns [`ToolError::InvalidArguments`] for a statement that is not a
 /// read-only query, or a selector that does not apply, and
 /// [`ToolError::Failed`] when the database cannot be opened, no table has
-/// the name given, or the query fails.
+/// the name given, or the query fails or runs past `deadline`.
 pub(super) fn read(
     target: &Target,
     offset: Option<usize>,
     limit: Option<usize>,
+    deadline: Instant,
 ) -> Result<ToolOutput, ToolError> {
     let label = &target.label;
-    let mut conn = open(target).map_err(|error| failed(label, error))?;
+    let conn = open(target, deadline).map_err(|error| failed(label, error))?;
     let tables = tables(&conn).map_err(|error| failed(label, error))?;
     if target.inner.trim().is_empty() {
         if offset.is_some() || limit.is_some() {
@@ -66,7 +69,7 @@ pub(super) fn read(
                  such as {label}:<table>"
             )));
         }
-        return Ok(ToolOutput::new(table_list(&conn, label, &tables)));
+        return table_list(&conn, label, &tables).map(ToolOutput::new);
     }
     let (name, selector) = container::split_window(&target.inner, offset, limit)?;
     let name = name.trim();
@@ -75,7 +78,7 @@ pub(super) fn read(
     }
     if is_query(name) {
         check_query(name)?;
-        return query_rows(&mut conn, label, name, &selector);
+        return query_rows(&conn, label, name, &selector);
     }
     let names: Vec<&str> = tables.iter().map(|table| table.name.as_str()).collect();
     Err(ToolError::Failed(format!(
@@ -90,28 +93,27 @@ pub(super) fn read(
 
 /// Builds the error for a database operation on `label` that failed.
 fn failed(label: &str, error: rusqlite::Error) -> ToolError {
-    if let rusqlite::Error::SqliteFailure(code, _) = &error
-        && code.code == rusqlite::ErrorCode::OperationInterrupted
-    {
+    if interrupted(&error) {
         return ToolError::Failed(format!(
-            "the query on {label} ran past {} s and was stopped",
-            QUERY_TIME.as_secs()
+            "reading {label} ran past the time limit and was stopped; narrow the query"
         ));
     }
     ToolError::Failed(format!("SQLite error on {label}: {error}"))
 }
 
 /// Opens the database `target` points at read-only, with writes refused even
-/// to temporary tables.
+/// to temporary tables, and every statement on it interrupted once
+/// `deadline` has passed.
 ///
 /// # Errors
 ///
 /// Returns the SQLite error when the file cannot be opened as a database.
-fn open(target: &Target) -> rusqlite::Result<Connection> {
-    let conn = Connection::open_with_flags(
+fn open(target: &Target, deadline: Instant) -> rusqlite::Result<Connection> {
+    let mut conn = Connection::open_with_flags(
         &target.path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
+    conn.progress_handler(PROGRESS_STEPS, Some(move || Instant::now() >= deadline))?;
     conn.busy_timeout(Duration::from_secs(2))?;
     conn.pragma_update(None, "query_only", true)?;
     Ok(conn)
@@ -145,8 +147,12 @@ fn quote(name: &str) -> String {
 }
 
 /// Counts the rows of the table `name`, stopping past `cap` when one is
-/// given; returns `None` when the count fails, as it can for virtual tables.
-fn count(conn: &Connection, name: &str, cap: Option<usize>) -> Option<usize> {
+/// given; `Ok(None)` when the count fails, as it can for virtual tables.
+///
+/// # Errors
+///
+/// Returns the SQLite error when the count is interrupted at the deadline.
+fn count(conn: &Connection, name: &str, cap: Option<usize>) -> rusqlite::Result<Option<usize>> {
     let sql = match cap {
         Some(cap) => format!(
             "SELECT COUNT(*) FROM (SELECT 1 FROM {} LIMIT {})",
@@ -155,9 +161,21 @@ fn count(conn: &Connection, name: &str, cap: Option<usize>) -> Option<usize> {
         ),
         None => format!("SELECT COUNT(*) FROM {}", quote(name)),
     };
-    conn.query_row(&sql, [], |row| row.get::<_, i64>(0))
-        .ok()
-        .and_then(|count| usize::try_from(count).ok())
+    match conn.query_row(&sql, [], |row| row.get::<_, i64>(0)) {
+        Ok(count) => Ok(usize::try_from(count).ok()),
+        Err(error) if interrupted(&error) => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Whether `error` is SQLite's report of a statement interrupted at the
+/// deadline.
+fn interrupted(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if code.code == rusqlite::ErrorCode::OperationInterrupted
+    )
 }
 
 /// Says how many rows a table has, such as `1 row` or `12 rows`.
@@ -171,7 +189,12 @@ fn rows(count: usize) -> String {
 
 /// Lists `tables` of the database `conn`, called `label`, with their row
 /// counts and the statements that created them.
-fn table_list(conn: &Connection, label: &str, tables: &[Table]) -> String {
+///
+/// # Errors
+///
+/// Returns [`ToolError::Failed`] when counting is interrupted at the
+/// deadline.
+fn table_list(conn: &Connection, label: &str, tables: &[Table]) -> Result<String, ToolError> {
     let views = tables.iter().filter(|table| table.view).count();
     let mut out = format!(
         "[sqlite {label}, {} tables, {views} views; read {label}:<table> for rows or \
@@ -185,7 +208,7 @@ fn table_list(conn: &Connection, label: &str, tables: &[Table]) -> String {
         let size = if table.view {
             "view".to_string()
         } else {
-            match count(conn, &table.name, Some(COUNT_CAP)) {
+            match count(conn, &table.name, Some(COUNT_CAP)).map_err(|error| failed(label, error))? {
                 Some(n) if n > COUNT_CAP => format!("over {}", rows(COUNT_CAP)),
                 Some(n) => rows(n),
                 None => "rows not countable".to_string(),
@@ -196,7 +219,7 @@ fn table_list(conn: &Connection, label: &str, tables: &[Table]) -> String {
             out.push_str(&format!("  {}\n", line.trim_end()));
         }
     }
-    out
+    Ok(out)
 }
 
 /// Fits `selector` to a result of `total` rows, when known, as the first row
@@ -241,7 +264,7 @@ fn table_rows(
     table: &Table,
     selector: &Selector,
 ) -> Result<ToolOutput, ToolError> {
-    let total = count(conn, &table.name, None);
+    let total = count(conn, &table.name, None).map_err(|error| failed(label, error))?;
     let (first, last) = page(selector, total.or(Some(0)))?;
     let shown = format!("{label}:{}", table.name);
     let mut out = format!(
@@ -256,11 +279,17 @@ fn table_rows(
     let sql = format!(
         "SELECT * FROM {} LIMIT -1 OFFSET {}",
         quote(&table.name),
-        first.saturating_sub(1)
+        i64::try_from(first.saturating_sub(1)).unwrap_or(i64::MAX)
     );
     let mut statement = conn.prepare(&sql).map_err(|error| failed(label, error))?;
-    let body = render(&mut statement, &shown, (first, last), total, first - 1)
-        .map_err(|error| failed(label, error))?;
+    let body = render(
+        &mut statement,
+        &shown,
+        (first, last),
+        total,
+        first.saturating_sub(1),
+    )
+    .map_err(|error| failed(label, error))?;
     out.push_str(&body);
     Ok(ToolOutput::new(out))
 }
@@ -307,22 +336,19 @@ fn check_query(sql: &str) -> Result<(), ToolError> {
 }
 
 /// Runs the read-only query `sql` on `conn`, called `label`, and shows the
-/// rows `selector` picks, stopping it after [`QUERY_TIME`].
+/// rows `selector` picks.
 ///
 /// # Errors
 ///
-/// Returns [`ToolError`] when the statement writes, does not prepare or
-/// fails, or the selector does not apply.
+/// Returns [`ToolError`] when the statement writes, does not prepare, fails
+/// or runs past the deadline, or the selector does not apply.
 fn query_rows(
-    conn: &mut Connection,
+    conn: &Connection,
     label: &str,
     sql: &str,
     selector: &Selector,
 ) -> Result<ToolOutput, ToolError> {
     let range = page(selector, None)?;
-    let started = Instant::now();
-    conn.progress_handler(10_000, Some(move || started.elapsed() > QUERY_TIME))
-        .map_err(|error| failed(label, error))?;
     let mut statement = conn.prepare(sql).map_err(|error| failed(label, error))?;
     if !statement.readonly() && !sql.trim_start().to_ascii_lowercase().starts_with("pragma") {
         return Err(ToolError::InvalidArguments(
@@ -355,7 +381,7 @@ fn render(
     let columns: Vec<String> = statement.column_names().map(str::to_string).collect();
     let width = columns.len();
     let wanted = last.map_or(PAGE_ROWS, |last| {
-        (last + 1).saturating_sub(first).min(MAX_ROWS)
+        last.saturating_add(1).saturating_sub(first).min(MAX_ROWS)
     });
     let mut out = format!("      \t{}\n", columns.join(" | "));
     let mut result = statement.query([])?;
@@ -441,6 +467,98 @@ pub(super) mod tests {
             )
             .unwrap();
         }
+    }
+
+    /// Writes a database at `path` with a `big` table of 300,000 rows and a
+    /// `slow` view whose rows take far longer to count than any deadline.
+    pub(in super::super) fn slow_database(path: &std::path::Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE big (n INTEGER);
+             WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 300000)
+             INSERT INTO big SELECT x FROM c;
+             CREATE VIEW slow AS WITH RECURSIVE c(x) AS
+               (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1000000000000) SELECT x FROM c;",
+        )
+        .unwrap();
+    }
+
+    /// The target `inner` inside the database at `path`.
+    fn target(path: &std::path::Path, inner: &str) -> Target {
+        Target {
+            path: path.to_path_buf(),
+            label: "slow.db".to_string(),
+            kind: container::Kind::Sqlite,
+            inner: inner.to_string(),
+        }
+    }
+
+    /// Counting a table's or view's rows stops at the deadline, for the
+    /// table list and for a table's rows alike, not only for queries.
+    #[test]
+    fn every_statement_stops_at_the_deadline() {
+        let dir = crate::testutil::scratch("sqlite-deadline");
+        let path = dir.join("slow.db");
+        slow_database(&path);
+        let started = Instant::now();
+        let rows = read(
+            &target(&path, "slow"),
+            None,
+            None,
+            Instant::now() + Duration::from_millis(300),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(rows.contains("ran past the time limit"), "{rows}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let list = read(&target(&path, ""), None, None, Instant::now())
+            .unwrap_err()
+            .to_string();
+        assert!(list.contains("ran past the time limit"), "{list}");
+    }
+
+    /// Row ranges reaching the largest number neither panic nor wrap.
+    #[test]
+    fn huge_row_ranges_do_not_overflow() {
+        let dir = crate::testutil::scratch("sqlite-huge-range");
+        let path = dir.join("app.db");
+        database(&path, 3);
+        let later = Instant::now() + Duration::from_secs(20);
+        let all = read(
+            &target(&path, "users:1-18446744073709551615"),
+            None,
+            None,
+            later,
+        )
+        .unwrap()
+        .text;
+        assert!(all.contains("     3\t3 | user3"), "{all}");
+        let windowed = read(&target(&path, "users"), Some(2), Some(usize::MAX), later)
+            .unwrap()
+            .text;
+        assert!(windowed.contains("     3\t3 | user3"), "{windowed}");
+        assert!(!windowed.contains("     1\t1 |"), "{windowed}");
+        let past = read(
+            &target(&path, "users:18446744073709551615"),
+            None,
+            None,
+            later,
+        );
+        assert!(
+            past.unwrap()
+                .text
+                .contains("[row 18446744073709551615 is past the end; there are 3 rows]"),
+            "past the end"
+        );
+        let query = read(
+            &target(&path, "SELECT id FROM users:2-18446744073709551615"),
+            None,
+            None,
+            later,
+        )
+        .unwrap()
+        .text;
+        assert!(query.ends_with("     2\t2\n     3\t3\n"), "{query}");
     }
 
     /// Only read-only statements pass the check.

@@ -21,7 +21,7 @@ pub use agent::{
 pub use approval::{ApprovalRequest, Approvals, Decision, Prompter};
 pub use compaction::{COMPACT, context, replayed};
 pub use journal::{INTERRUPTED, Journal, JournalError, Lost, Mark, Marked, STOPPED, Saved, Scribe};
-pub use recall::RECALL;
+pub use recall::{RECALL, spec as recall_spec};
 pub use steering::Steering;
 pub use task::{EventSink, MAX_CONCURRENT, MAX_TASKS, PromptBuilder, Task, TaskSettings};
 

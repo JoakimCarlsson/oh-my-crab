@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use super::atomic::write_atomic;
 use super::conflict::{self, Take};
 use super::read::{Fold, folds};
-use super::snapshot::{outline_tag, tag};
+use super::snapshot::{is_outline_tag, outline_tag, tag};
 use super::{generated, lookalike};
 use crate::language::{Languages, Written, settle};
 use crate::tool::{marked_lines, parse_args};
@@ -133,6 +133,9 @@ struct Pending {
     new: String,
     /// The first and one past the last line of `new` that the edit touched, 0-indexed.
     region: (usize, usize),
+    /// Whether the edit cited an outline's tag, so that the tag it returns is
+    /// an outline tag too and the lines folded away stay locked.
+    outlined: bool,
 }
 
 #[async_trait]
@@ -148,8 +151,10 @@ impl Tool for Edit {
          grep or edit result for that file, and operations anchored to the line numbers of that \
          snapshot: replace a line or a range, insert before or after a line, delete a line or a \
          range. All line numbers refer to the file as you read it, however many operations \
-         come before. With the tag of an outline only the lines it showed can be changed: \
-         read a folded range first. If the file changed since the tag was issued the call is rejected and \
+         come before. With the tag of an outline (it starts with O) only the lines it showed \
+         can be changed: read a folded range first. An edit made with an outline's tag returns \
+         the outline tag of the new contents, so folded lines stay locked until a read of their \
+         range shows them. If the file changed since the tag was issued the call is rejected and \
          nothing is written; read the file again. A call either applies to every file or to \
          none. A successful edit returns the new tag and a preview of the changed lines, so you \
          can edit again without reading. The user is asked to approve each edit.\n\
@@ -178,7 +183,7 @@ impl Tool for Edit {
                         "type": "object",
                         "properties": {
                             "path": { "type": "string", "description": "File to edit, relative to the working directory." },
-                            "tag": { "type": "string", "description": "Four-digit snapshot tag from the latest read, grep or edit result for this file." },
+                            "tag": { "type": "string", "description": "Snapshot tag from the latest read, grep or edit result for this file: four hex digits, or O and four hex digits for an outline."},
                             "ops": {
                                 "type": "array",
                                 "minItems": 1,
@@ -354,10 +359,18 @@ fn report(pending: &[Pending], written: &[Written], diagnostics: &str) -> ToolOu
         } else {
             ""
         };
+        let (next, note) = if item.outlined {
+            (
+                outline_tag(item.new.as_bytes()),
+                " (an outline tag, as the edit cited one: lines the outline folds stay locked; \
+                 read a folded range to edit inside it)",
+            )
+        } else {
+            (tag(item.new.as_bytes()), "")
+        };
         report.push(format!(
-            "{}: tag {}{formatted}\n{}",
+            "{}: tag {next}{note}{formatted}\n{}",
             item.shown,
-            tag(item.new.as_bytes()),
             preview(&item.new, item.region)
         ));
         changes.push(FileChange {
@@ -406,20 +419,24 @@ fn prepare(sandbox: &Sandbox, path: PathBuf, section: &Section) -> Result<Pendin
         section.generated,
         "\"generated\": true in this file's section",
     )?;
-    let ops = place(&old, &section.ops)
-        .map_err(|message| ToolError::Failed(format!("{}: {message}", section.path)))?;
-    let current = tag(&bytes);
     let cited = section.tag.trim();
-    let outlined =
-        !cited.eq_ignore_ascii_case(&current) && cited.eq_ignore_ascii_case(&outline_tag(&bytes));
-    if outlined {
-        refuse_folded(&path, &old, section, &ops)?;
-    } else if !cited.eq_ignore_ascii_case(&current) {
+    let outlined = is_outline_tag(cited);
+    let current = if outlined {
+        outline_tag(&bytes)
+    } else {
+        tag(&bytes)
+    };
+    if !cited.eq_ignore_ascii_case(&current) {
         return Err(ToolError::Failed(format!(
             "{} has changed since it was read (you cited tag {:?}, it is now {current}); \
              read the file again and redo the edit against the new tag and line numbers",
             section.path, section.tag
         )));
+    }
+    let ops = place(&old, &section.ops)
+        .map_err(|message| ToolError::Failed(format!("{}: {message}", section.path)))?;
+    if outlined {
+        refuse_folded(&path, &old, section, &ops)?;
     }
     let (new, region) = rewrite(&old, &ops)
         .map_err(|message| ToolError::Failed(format!("{}: {message}", section.path)))?;
@@ -429,6 +446,7 @@ fn prepare(sandbox: &Sandbox, path: PathBuf, section: &Section) -> Result<Pendin
         old,
         new,
         region,
+        outlined,
     })
 }
 
@@ -1084,7 +1102,7 @@ mod tests {
         let read = crate::tools::Read::new(Sandbox::new(&dir).unwrap());
         let outline = read.call(json!({ "path": "a.rs" })).await.unwrap().text;
         assert!(outline.contains("… 11 lines folded (4-14)"), "{outline}");
-        let outline_tag = outline[5..9].to_owned();
+        let outline_tag = outline[5..10].to_owned();
         assert_eq!(outline_tag, super::outline_tag(code.as_bytes()));
         let folded = tool
             .call(call(
@@ -1119,6 +1137,94 @@ mod tests {
             "{edited}"
         );
         assert!(edited.contains("    y\n    .min(9)\n}\n"), "{edited}");
+    }
+
+    /// An edit made with an outline's tag returns the outline tag of the new
+    /// contents, so a chained edit still cannot touch folded lines; a read
+    /// of the folded range unlocks them.
+    #[tokio::test]
+    async fn chained_edits_keep_folds_locked() {
+        let (tool, dir) = tool("edit-outline-chain");
+        let mut code = String::from("use std::fmt;\n\n");
+        for index in 0..20 {
+            code.push_str(&format!("pub fn f{index}(x: u32) -> u32 {{\n"));
+            code.push_str(&"    let y = x + 1;\n".repeat(10));
+            code.push_str("    y\n}\n\n");
+        }
+        put(&dir, "a.rs", &code);
+        let read = crate::tools::Read::new(Sandbox::new(&dir).unwrap());
+        let outline = read.call(json!({ "path": "a.rs" })).await.unwrap().text;
+        let first = outline[5..10].to_owned();
+        let out = tool
+            .call(call(
+                "a.rs",
+                &first,
+                json!([{ "op": "replace", "line": 1, "text": "use std::fmt::Debug;" }]),
+            ))
+            .await
+            .unwrap()
+            .text;
+        let edited = get(&dir, "a.rs");
+        let next = super::outline_tag(edited.as_bytes());
+        assert!(
+            out.starts_with(&format!("a.rs: tag {next} (an outline tag")),
+            "{out}"
+        );
+        let folded = tool
+            .call(call(
+                "a.rs",
+                &next,
+                json!([{ "op": "replace", "line": 8, "text": "    let v3 = 0;" }]),
+            ))
+            .await;
+        assert!(
+            matches!(&folded, Err(ToolError::Failed(m)) if m.contains("folded away")),
+            "{folded:?}"
+        );
+        let ranged = read
+            .call(json!({ "path": "a.rs:4-14" }))
+            .await
+            .unwrap()
+            .text;
+        let plain = ranged[5..9].to_owned();
+        assert_eq!(plain, tag(edited.as_bytes()));
+        assert!(
+            tool.call(call(
+                "a.rs",
+                &plain,
+                json!([{ "op": "replace", "line": 8, "text": "    let v3 = 0;" }]),
+            ))
+            .await
+            .is_ok()
+        );
+    }
+
+    /// A stale tag is reported as such, before the operations are placed,
+    /// rather than as a problem with the conflict a resolve names.
+    #[tokio::test]
+    async fn stale_tags_are_reported_before_operations() {
+        let (tool, dir) = tool("edit-stale-resolve");
+        put(&dir, "f.txt", "a\nb\n");
+        let error = tool
+            .call(call(
+                "f.txt",
+                "0000",
+                json!([{ "op": "resolve", "conflict": 1, "take": "ours" }]),
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("has changed since it was read"), "{error}");
+        let outline = tool
+            .call(call(
+                "f.txt",
+                "O0000",
+                json!([{ "op": "replace", "line": 1, "text": "x" }]),
+            ))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(outline.contains("it is now O"), "{outline}");
     }
 
     /// The approval prompt shows the old and new lines.
@@ -1349,6 +1455,7 @@ mod tests {
             old: "old\n".into(),
             new: "new\n".into(),
             region: (0, 1),
+            outlined: false,
         };
         let pending = vec![item(dir.join("a.txt")), item(dir.join("missing/b.txt"))];
         assert!(write_all(&pending).is_err());

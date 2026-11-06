@@ -18,6 +18,8 @@ pub(super) struct Word {
     pub(super) text: String,
     /// Whether the shell passes the word on as it is: no variable, command substitution, glob, brace or tilde expansion.
     pub(super) literal: bool,
+    /// Whether any part of it was quoted or escaped, which, for the delimiter of a here-document, keeps the shell from expanding the body.
+    pub(super) quoted: bool,
 }
 
 /// A redirection of one of a command's streams.
@@ -27,6 +29,8 @@ pub(super) struct Redirect {
     pub(super) operator: String,
     /// The file, descriptor or here-document delimiter redirected to, when one was given.
     pub(super) target: Option<Word>,
+    /// The body of a here-document, its lines each ending in a newline, once its delimiter line was found.
+    pub(super) body: Option<String>,
 }
 
 impl Redirect {
@@ -47,10 +51,27 @@ impl Redirect {
         self.operator.ends_with(">>")
     }
 
-    /// Whether it feeds a here-document to the command: `<<` or `<<-`.
+    /// Whether it feeds a here-document to the command: `<<` or `<<-`, but not the here-string `<<<`.
     pub(super) fn is_here_doc(&self) -> bool {
-        self.operator.ends_with("<<") || self.operator.ends_with("<<-")
+        opens_here_doc(&self.operator)
     }
+
+    /// Whether the here-document it feeds reaches the command as written: its body was read, and its delimiter was quoted or the body holds nothing the shell would expand or unescape.
+    pub(super) fn here_doc_verbatim(&self) -> bool {
+        let quoted = self.target.as_ref().is_some_and(|target| target.quoted);
+        let Some(body) = self.body.as_deref() else {
+            return false;
+        };
+        self.is_here_doc() && (quoted || !body.contains(['$', '`', '\\']))
+    }
+}
+
+/// Whether the redirection operator `operator`, with any descriptor number in front, opens a here-document: `<<` or `<<-`.
+fn opens_here_doc(operator: &str) -> bool {
+    matches!(
+        operator.trim_start_matches(|c: char| c.is_ascii_digit()),
+        "<<" | "<<-"
+    )
 }
 
 /// One command: its words and redirections.
@@ -82,6 +103,8 @@ impl Simple {
 pub(super) struct Pipeline {
     /// The commands, in order.
     pub(super) stages: Vec<Simple>,
+    /// Whether a lone `&` after it runs it in the background.
+    pub(super) background: bool,
 }
 
 /// A whole command line: pipelines run one after another, separated by `;`, `&&`, `||`, `&` or newlines.
@@ -91,6 +114,8 @@ pub(super) struct CommandLine {
     pub(super) pipelines: Vec<Pipeline>,
     /// Whether the line holds something this reading does not follow, so what it read may be wrong.
     pub(super) unusual: bool,
+    /// The control operators that ended pipelines, in order: `;`, `&&`, `||` and `&`; newlines are not counted.
+    pub(super) operators: Vec<&'static str>,
 }
 
 /// Reads `command` into its pipelines, commands, words and redirections.
@@ -176,6 +201,8 @@ struct HereDoc {
     delimiter: String,
     /// Whether leading tabs are stripped from body lines, as `<<-` asks.
     strip_tabs: bool,
+    /// Where its redirection is: the index of the pipeline in the line, of the command in the pipeline, and of the redirection in the command.
+    redirect: (usize, usize, usize),
 }
 
 /// The state of reading one command line.
@@ -252,7 +279,15 @@ impl Reader {
         self.word.get_or_insert_with(|| Word {
             text: String::new(),
             literal: true,
+            quoted: false,
         })
+    }
+
+    /// The word being read, starting one when none has, marked as quoted.
+    fn quoted_word(&mut self) -> &mut Word {
+        let word = self.word();
+        word.quoted = true;
+        word
     }
 
     /// Adds `c` to the word being read.
@@ -271,15 +306,21 @@ impl Reader {
     fn end_word(&mut self) {
         let Some(word) = self.word.take() else { return };
         if let Some(operator) = self.redirect.take() {
-            if operator.ends_with("<<") || operator.ends_with("<<-") {
+            if opens_here_doc(&operator) {
                 self.here_docs.push(HereDoc {
                     delimiter: word.text.clone(),
                     strip_tabs: operator.ends_with('-'),
+                    redirect: (
+                        self.line.pipelines.len(),
+                        self.pipeline.stages.len(),
+                        self.simple.redirects.len(),
+                    ),
                 });
             }
             self.simple.redirects.push(Redirect {
                 operator,
                 target: Some(word),
+                body: None,
             });
             return;
         }
@@ -297,6 +338,7 @@ impl Reader {
             self.simple.redirects.push(Redirect {
                 operator,
                 target: None,
+                body: None,
             });
         }
         let simple = std::mem::take(&mut self.simple);
@@ -314,21 +356,33 @@ impl Reader {
         }
     }
 
-    /// Ends the pipeline at a newline and skips the bodies of the here-documents opened on the line.
+    /// Ends the pipeline at a newline and reads the bodies of the here-documents opened on the line into their redirections.
     fn end_line(&mut self) {
         self.end_pipeline();
         for here_doc in std::mem::take(&mut self.here_docs) {
-            if !self.skip_here_doc(&here_doc) {
+            let Some(body) = self.here_doc_body(&here_doc) else {
                 self.line.unusual = true;
+                continue;
+            };
+            let (pipeline, stage, redirect) = here_doc.redirect;
+            if let Some(redirect) = self
+                .line
+                .pipelines
+                .get_mut(pipeline)
+                .and_then(|pipeline| pipeline.stages.get_mut(stage))
+                .and_then(|simple| simple.redirects.get_mut(redirect))
+            {
+                redirect.body = Some(body);
             }
         }
     }
 
-    /// Skips the lines of a here-document body up to and including its delimiter line, saying whether the delimiter was found.
-    fn skip_here_doc(&mut self, here_doc: &HereDoc) -> bool {
+    /// Reads the lines of a here-document body up to and including its delimiter line, returning the body without the delimiter line, or nothing when the delimiter is not found.
+    fn here_doc_body(&mut self, here_doc: &HereDoc) -> Option<String> {
+        let mut body = String::new();
         for _ in 0..MAX_HERE_DOC_LINES {
             if self.at >= self.chars.len() {
-                return false;
+                return None;
             }
             let line = self.take_line();
             let line = if here_doc.strip_tabs {
@@ -337,10 +391,12 @@ impl Reader {
                 line.as_str()
             };
             if line == here_doc.delimiter {
-                return true;
+                return Some(body);
             }
+            body.push_str(line);
+            body.push('\n');
         }
-        false
+        None
     }
 
     /// Takes the rest of the current line, without its newline.
@@ -364,7 +420,7 @@ impl Reader {
 
     /// Reads the rest of a `'…'` string into the word: everything up to the closing quote, as it is.
     fn single_quoted(&mut self) {
-        self.word();
+        self.quoted_word();
         loop {
             match self.next() {
                 Some('\'') => return,
@@ -379,7 +435,7 @@ impl Reader {
 
     /// Reads the rest of a `"…"` string into the word, keeping the escapes bash keeps and noting expansions.
     fn double_quoted(&mut self) {
-        self.word();
+        self.quoted_word();
         loop {
             match self.next() {
                 Some('"') => return,
@@ -408,11 +464,11 @@ impl Reader {
         }
     }
 
-    /// Reads what follows a backslash outside quotes: the character itself, or nothing for a line continuation.
+    /// Reads what follows a backslash outside quotes: the character itself, marking the word as quoted, or nothing for a line continuation.
     fn escaped(&mut self) {
         match self.next() {
             Some('\n') => {}
-            Some(c) => self.push(c),
+            Some(c) => self.quoted_word().text.push(c),
             None => self.push('\\'),
         }
     }
@@ -471,23 +527,24 @@ impl Reader {
     /// Reads after a `|`: `||` ends the pipeline, `|` and `|&` start the next stage.
     fn pipe(&mut self) {
         if self.eat('|') {
-            self.end_pipeline();
+            self.control("||");
         } else {
             self.eat('&');
             self.end_simple();
         }
     }
 
-    /// Reads after a `&`: `&&` and a lone `&` end the pipeline, `&>` and `&>>` redirect both streams.
+    /// Reads after a `&`: `&&` ends the pipeline, a lone `&` ends it and sends it to the background, `&>` and `&>>` redirect both streams.
     fn ampersand(&mut self) {
         if self.eat('&') {
-            self.end_pipeline();
+            self.control("&&");
         } else if self.eat('>') {
             self.end_word();
             let operator = if self.eat('>') { "&>>" } else { "&>" };
             self.redirect = Some(operator.to_owned());
         } else {
-            self.end_pipeline();
+            self.pipeline.background = true;
+            self.control("&");
         }
     }
 
@@ -496,6 +553,16 @@ impl Reader {
         if self.eat(';') {
             self.line.unusual = true;
         }
+        self.control(";");
+    }
+
+    /// Ends the pipeline at the control operator `operator` and records the operator; an operator with no command before it makes the line unusual.
+    fn control(&mut self, operator: &'static str) {
+        self.end_simple();
+        if self.pipeline.stages.is_empty() {
+            self.line.unusual = true;
+        }
+        self.line.operators.push(operator);
         self.end_pipeline();
     }
 
@@ -619,6 +686,58 @@ mod tests {
         assert!(redirects[1].is_here_doc());
         assert_eq!(redirects[1].target.as_ref().unwrap().text, "EOF");
         assert!(parse("cat <<EOF\nnever ends").unusual);
+    }
+
+    /// A here-document keeps its body and whether its delimiter was quoted, which decides whether the body reaches the command as written.
+    #[test]
+    fn keeps_here_document_bodies_and_quoting() {
+        let redirect = |command: &str| parse(command).pipelines[0].stages[0].redirects[1].clone();
+        let quoted = redirect("cat > a <<'EOF'\n$HOME `x`\nEOF");
+        assert!(quoted.target.as_ref().unwrap().quoted);
+        assert_eq!(quoted.body.as_deref(), Some("$HOME `x`\n"));
+        assert!(quoted.here_doc_verbatim());
+        for delimiter in ["\"EOF\"", "\\EOF", "E'O'F"] {
+            let command = format!("cat > a <<{delimiter}\n$HOME\nEOF");
+            assert!(redirect(&command).here_doc_verbatim(), "{command}");
+        }
+        let plain = redirect("cat > a <<-EOF\n\tplain text\n\tEOF");
+        assert!(!plain.target.as_ref().unwrap().quoted);
+        assert_eq!(plain.body.as_deref(), Some("plain text\n"));
+        assert!(plain.here_doc_verbatim());
+        for body in ["$HOME", "`date`", "a \\$ b"] {
+            let command = format!("cat > a <<EOF\n{body}\nEOF");
+            assert!(!redirect(&command).here_doc_verbatim(), "{command}");
+        }
+    }
+
+    /// A here-string is not a here-document: the lines after it are read as commands.
+    #[test]
+    fn here_strings_are_not_here_documents() {
+        let line = parse("grep x <<< \"$text\"\necho next");
+        assert!(!line.unusual);
+        assert_eq!(
+            words(&line),
+            vec![vec![vec!["grep", "x"]], vec![vec!["echo", "next"]]]
+        );
+        let redirect = &line.pipelines[0].stages[0].redirects[0];
+        assert_eq!(redirect.operator, "<<<");
+        assert!(!redirect.is_here_doc());
+        assert!(!parse("cat 0<<< EOF").unusual);
+    }
+
+    /// Control operators are recorded, and a lone `&` sends its pipeline to the background.
+    #[test]
+    fn records_control_operators_and_background() {
+        let line = parse("sleep 5 & cat a && b || c; d");
+        assert_eq!(line.operators, vec!["&", "&&", "||", ";"]);
+        assert!(line.pipelines[0].background);
+        assert!(!line.pipelines[1].background);
+        let trailing = parse("cat notes.txt &");
+        assert_eq!(trailing.pipelines.len(), 1);
+        assert!(trailing.pipelines[0].background);
+        assert_eq!(trailing.operators, vec!["&"]);
+        assert!(parse("cmd 2>&1 >&2 |& tee log").operators.is_empty());
+        assert!(parse("& ls").unusual);
     }
 
     /// Subshells, groups, control flow and broken quotes mark the line unusual.

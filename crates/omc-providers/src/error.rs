@@ -197,7 +197,7 @@ fn mentions(text: &str, phrases: &[&str]) -> bool {
     phrases.iter().any(|phrase| text.contains(phrase))
 }
 
-/// The wait `headers` ask for before a request is sent again: the longer of `retry-after-ms`, in milliseconds, and `retry-after`, in seconds. A `retry-after` given as a date is not read.
+/// The wait `headers` ask for before a request is sent again: the longer of `retry-after-ms`, in milliseconds, and `retry-after`, in seconds. A `retry-after` given as a date is not read, and neither is a value that is not a positive number.
 fn retry_after(headers: &HeaderMap) -> Option<Duration> {
     let number = |name: &str| {
         headers
@@ -207,11 +207,16 @@ fn retry_after(headers: &HeaderMap) -> Option<Duration> {
             .trim()
             .parse::<f64>()
             .ok()
-            .filter(|value| value.is_finite() && *value > 0.0)
+            .filter(|value| *value > 0.0)
     };
-    let millis = number("retry-after-ms").map(|ms| Duration::from_secs_f64(ms / 1000.0));
-    let seconds = number("retry-after").map(Duration::from_secs_f64);
+    let millis = number("retry-after-ms").map(|ms| seconds_to_wait(ms / 1000.0));
+    let seconds = number("retry-after").map(seconds_to_wait);
     millis.max(seconds)
+}
+
+/// The wait of `seconds`, a positive number, held at the longest [`Duration`] when it is too long, or infinite, to be one.
+fn seconds_to_wait(seconds: f64) -> Duration {
+    Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX)
 }
 
 #[cfg(test)]
@@ -305,6 +310,35 @@ mod tests {
         );
         assert_eq!(retry_after(&headers(&[("retry-after", "-3")])), None);
         assert_eq!(retry_after(&headers(&[])), None);
+    }
+
+    /// A wait too long to hold, infinite or not a number is read without panicking: the first two as the longest wait, the last not at all.
+    #[test]
+    fn reads_absurd_waits_without_panicking() {
+        let headers = |name: &'static str, value: &'static str| {
+            let mut map = HeaderMap::new();
+            map.insert(name, value.parse().unwrap());
+            map
+        };
+        assert_eq!(
+            retry_after(&headers("retry-after", "1e20")),
+            Some(Duration::MAX)
+        );
+        assert_eq!(
+            retry_after(&headers("retry-after-ms", "1e300")),
+            Some(Duration::MAX)
+        );
+        assert_eq!(
+            retry_after(&headers("retry-after", "inf")),
+            Some(Duration::MAX)
+        );
+        assert_eq!(retry_after(&headers("retry-after", "-inf")), None);
+        assert_eq!(retry_after(&headers("retry-after", "NaN")), None);
+        assert_eq!(retry_after(&headers("retry-after", "-1e20")), None);
+        assert_eq!(
+            retry_after(&headers("retry-after", "Fri, 31 Dec 9999 23:59:59 GMT")),
+            None
+        );
     }
 
     /// The overflow messages of the main providers count, and so does any 413.

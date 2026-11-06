@@ -331,7 +331,7 @@ impl Accumulator {
     ///
     /// # Errors
     ///
-    /// Returns [`ProviderError::Stream`] for an `error` or `response.failed` event.
+    /// Returns [`ProviderError::Stream`] for an `error` or `response.failed` event, and for a response the provider's content filter cut, which would otherwise pass for a short or empty answer.
     pub(crate) fn feed(&mut self, data: &str, sink: &mut dyn Sink) -> Result<bool, ProviderError> {
         let Ok(event) = serde_json::from_str::<Value>(data) else {
             return Ok(false);
@@ -389,12 +389,17 @@ impl Accumulator {
             }
             "response.completed" | "response.incomplete" => {
                 self.tokens = event.pointer("/response/usage").and_then(tokens_from);
-                if event
+                match event
                     .pointer("/response/incomplete_details/reason")
                     .and_then(Value::as_str)
-                    == Some("max_output_tokens")
                 {
-                    self.stop = Stop::Length;
+                    Some("max_output_tokens") => self.stop = Stop::Length,
+                    Some("content_filter") => {
+                        return Err(ProviderError::Stream(
+                            "the provider's content filter stopped the answer".to_owned(),
+                        ));
+                    }
+                    _ => {}
                 }
                 self.ended = true;
                 return Ok(true);
@@ -751,6 +756,19 @@ mod tests {
         assert_eq!(run(&cut, &mut Recorder::default()).stop, Stop::Length);
         let whole = [json!({ "type": "response.completed", "response": {} })];
         assert_eq!(run(&whole, &mut Recorder::default()).stop, Stop::Finished);
+    }
+
+    /// A response the provider's content filter cut is an error, not a short answer.
+    #[test]
+    fn content_filter_is_an_error() {
+        let mut accumulator = Accumulator::default();
+        let filtered = json!({ "type": "response.incomplete", "response": {
+            "incomplete_details": { "reason": "content_filter" } } });
+        let error = accumulator
+            .feed(&filtered.to_string(), &mut Recorder::default())
+            .unwrap_err();
+        assert!(error.to_string().contains("content filter"), "{error}");
+        assert!(!error.is_transient());
     }
 
     /// A stream that ends before the response does is unfinished rather than a short reply.

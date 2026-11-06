@@ -249,25 +249,24 @@ impl Rules {
 
 /// The rules for the output of `command`, or nothing when no filter applies to it.
 ///
-/// What reaches the model is what the last command of each pipeline prints, so only those commands are looked at: `cd x && cargo build` is condensed as cargo output, while `cargo test | grep foo` is left alone.
+/// Only the last command of the last pipeline is looked at, since that is the command whose output the line is run for: `cd x && cargo build` is condensed as cargo output, while `cargo build && ./target/debug/app`, whose output is mostly the app's, and `cargo test | grep foo` are left alone.
 pub(super) fn rules_for(command: &str) -> Option<Rules> {
     let line = shell::parse(command);
-    let mut filters: Vec<&'static Filter> = Vec::new();
-    for pipeline in &line.pipelines {
-        let Some(last) = pipeline.stages.last() else {
-            continue;
-        };
-        let invocation = last.invocation();
-        for filter in FILTERS
-            .iter()
-            .filter(|filter| filter.applies_to(invocation))
-        {
-            if !filters.iter().any(|known| std::ptr::eq(*known, filter)) {
-                filters.push(filter);
-            }
-        }
-    }
+    let invocation = line.pipelines.last()?.stages.last()?.invocation();
+    let filters: Vec<&'static Filter> = FILTERS
+        .iter()
+        .filter(|filter| filter.applies_to(invocation))
+        .collect();
     (!filters.is_empty()).then_some(Rules { filters })
+}
+
+/// What a terminal would show of `line` once its carriage returns have sent the cursor back: the last non-empty part, byte for byte, a carriage return ending the line aside.
+fn last_written(line: &str) -> String {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    line.rsplit('\r')
+        .find(|part| !part.is_empty())
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// Lines collapsed so far in the current run.
@@ -312,7 +311,7 @@ pub(in crate::tools) struct Condenser {
     lines_in: usize,
     /// Lines shown.
     lines_out: usize,
-    /// Whether anything was left out.
+    /// Whether a line was left out: dropped, collapsed into a count, or folded into a count of its repeats. Cleaning up colour codes, redraws and repeated blank lines does not count.
     removed: bool,
 }
 
@@ -367,7 +366,7 @@ impl Condenser {
         self.lines_out
     }
 
-    /// Whether anything was left out, so that the stream must be kept whole elsewhere.
+    /// Whether a line was left out, so that the condensed text is worth showing and the stream must be kept whole elsewhere.
     pub(in crate::tools) fn removed(&self) -> bool {
         self.removed
     }
@@ -380,7 +379,6 @@ impl Condenser {
             .rposition(|&byte| byte == b'\r')
         {
             self.pending.drain(..=cut);
-            self.removed = true;
         }
     }
 
@@ -389,7 +387,7 @@ impl Condenser {
         self.lines_in += 1;
         let text = String::from_utf8_lossy(raw);
         let text = ANSI_CODE.replace_all(&text, "");
-        let text = self.last_written(&text);
+        let text = last_written(&text);
         if self.rules.protects(&text) {
             self.keep(text);
         } else if self.rules.drops(&text) {
@@ -399,17 +397,6 @@ impl Condenser {
         } else {
             self.keep(text);
         }
-    }
-
-    /// What a terminal would show of `line` once its carriage returns have sent the cursor back: the last non-empty part.
-    fn last_written(&mut self, line: &str) -> String {
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        let mut parts = line.split('\r').filter(|part| !part.is_empty());
-        let last = parts.next_back().unwrap_or_default();
-        if parts.next().is_some() {
-            self.removed = true;
-        }
-        last.trim_end().to_owned()
     }
 
     /// Adds `line` to the run of collapsed lines, calling it `label`.
@@ -434,9 +421,7 @@ impl Condenser {
             && let Some((last, count)) = &mut self.repeat
             && *last == line
         {
-            if line.is_empty() {
-                self.removed = true;
-            } else {
+            if !line.is_empty() {
                 *count += 1;
             }
             return;
@@ -530,7 +515,7 @@ mod tests {
         }
     }
 
-    /// Filters are picked by program and subcommand from the last command of each pipeline, past `cd`, assignments and `sudo`.
+    /// Filters are picked by program and subcommand from the last command of the last pipeline only, past `cd`, assignments and `sudo`; logs and diffs are never condensed.
     #[test]
     fn picks_filters_by_command() {
         let names = |command: &str| rules_for(command).map(|rules| rules.names().join(","));
@@ -544,13 +529,34 @@ mod tests {
             Some("apt")
         );
         assert_eq!(names("git -C repo status").as_deref(), Some("git status"));
-        assert_eq!(
-            names("git pull && npm ci").as_deref(),
-            Some("git transfer,npm")
-        );
+        assert_eq!(names("git pull && npm ci").as_deref(), Some("npm"));
+        assert_eq!(names("cargo build && ./target/debug/app"), None);
+        assert_eq!(names("make; ./run-tests"), None);
         assert_eq!(names("cargo test 2>&1 | grep FAILED"), None);
-        assert_eq!(names("git diff"), None);
+        for command in ["git diff", "git log -p", "git show HEAD", "git -C repo log"] {
+            assert_eq!(names(command), None, "{command}");
+        }
         assert_eq!(names("ls -la"), None);
+    }
+
+    /// Lines that are kept stay byte for byte as they were, trailing spaces and tabs included.
+    #[test]
+    fn keeps_lines_byte_exact() {
+        let input = "   Compiling a v1.0.0\n   Compiling b v1.0.0\nkept with spaces   \n\tand a tab\t\n  |\n";
+        assert_eq!(
+            condense("cargo build", input).unwrap(),
+            "… 2 Compiling lines\nkept with spaces   \n\tand a tab\t\n  |\n"
+        );
+    }
+
+    /// Stripping colour codes, settling redraws and folding blank lines leave nothing meaningful out, so the output is not marked as condensed.
+    #[test]
+    fn cleanup_alone_is_not_condensing() {
+        let mut condenser = Condenser::new(rules_for("make").unwrap());
+        condenser.push(b"\x1b[1mbold\x1b[0m\n 10%\r 50%\r100%\n\n\n\nend\n");
+        condenser.push(b"0%\r50%\r");
+        condenser.finish();
+        assert!(!condenser.removed());
     }
 
     /// Errors and warnings are kept even where a rule would remove them, and a run of collapsed lines is split around them.

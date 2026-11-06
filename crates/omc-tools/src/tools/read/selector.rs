@@ -75,7 +75,7 @@ impl Selector {
         }
         let first = offset.unwrap_or(1).max(1);
         self.spans.push(match limit {
-            Some(count) => Span::Between(first, first + count.max(1) - 1),
+            Some(count) => Span::Between(first, first.saturating_add(count.max(1) - 1)),
             None => Span::From(first),
         });
         Ok(self)
@@ -117,7 +117,7 @@ impl Selector {
         let mut merged: Vec<Range> = Vec::with_capacity(ranges.len());
         for (first, last) in ranges {
             match merged.last_mut() {
-                Some((_, end)) if end.is_none_or(|end| first <= end + 1) => {
+                Some((_, end)) if end.is_none_or(|end| first <= end.saturating_add(1)) => {
                     *end = end.zip(last).map(|(a, b)| a.max(b));
                 }
                 _ => merged.push((first, last)),
@@ -134,7 +134,10 @@ fn span(part: &str) -> Option<Span> {
     }
     if let Some((first, count)) = part.split_once('+') {
         let first = number(first)?;
-        return Some(Span::Between(first, first + number(count)? - 1));
+        return Some(Span::Between(
+            first,
+            first.saturating_add(number(count)? - 1),
+        ));
     }
     if let Some((first, last)) = part.split_once('-') {
         let first = number(first)?;

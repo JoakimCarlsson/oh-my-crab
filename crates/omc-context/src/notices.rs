@@ -72,17 +72,20 @@ pub fn plan_mode_notice(on: bool, tools: &[String]) -> String {
     )
 }
 
-/// The notice of what changed on disk between `before`, what the system prompt describes, and `after`: skills and agent kinds added, changed or removed, and instruction files changed or removed with what they now say. When nothing differs, it says that the system prompt holds again.
-pub fn context_changes(before: &Discovered, after: &Discovered) -> String {
+/// The notice of what changed on disk between `before`, what the system prompt describes, and `after`, for an agent offered the tools named `tools`: skills and agent kinds added, changed or removed, and instruction files changed or removed with what they now say. A new skill is said to load with `skill`, and a new agent kind to run with `task`, only when `tools` names that tool. When nothing differs, it says that the system prompt holds again.
+pub fn context_changes(before: &Discovered, after: &Discovered, tools: &[String]) -> String {
+    let offered = |name: &str| tools.iter().any(|tool| tool == name);
     let mut lines = Vec::new();
     for skill in after.skills.iter().filter(|skill| !skill.hidden) {
         let known = before.skills.iter().find(|old| old.name == skill.name);
         if known.is_none_or(|old| old.description != skill.description || old.hidden) {
+            let how = match offered("skill") {
+                true => format!("with `skill` or by reading `{}`", skill.path.display()),
+                false => format!("by reading `{}`", skill.path.display()),
+            };
             lines.push(format!(
-                "- Skill `{}` is now available: {} Load it with `skill` or by reading `{}`.",
-                skill.name,
-                skill.description,
-                skill.path.display()
+                "- Skill `{}` is now available: {} Load it {how}.",
+                skill.name, skill.description
             ));
         }
     }
@@ -94,8 +97,12 @@ pub fn context_changes(before: &Discovered, after: &Discovered) -> String {
     for agent in &after.agents {
         let known = before.agents.iter().find(|old| old.name == agent.name);
         if known.is_none_or(|old| old.description != agent.description) {
+            let to = match offered("task") {
+                true => " to `task`",
+                false => "",
+            };
             lines.push(format!(
-                "- Subagent kind `{}` is now available to `task`: {}",
+                "- Subagent kind `{}` is now available{to}: {}",
                 agent.name, agent.description
             ));
         }
@@ -207,7 +214,8 @@ mod tests {
             codex: None,
         };
         let before = discover(&locations, &[]);
-        let same = context_changes(&before, &before);
+        let tools: Vec<String> = vec!["skill".into(), "task".into()];
+        let same = context_changes(&before, &before, &tools);
         assert!(same.contains("again as the system prompt describes it"));
         put(&base, "AGENTS.md", "New rule.");
         std::fs::remove_dir_all(base.join(".claude/skills/pdf")).unwrap();
@@ -222,12 +230,43 @@ mod tests {
             "---\ndescription: Finds flaws\n---\nBe critical.",
         );
         let after = discover(&locations, &[]);
-        let told = context_changes(&before, &after);
+        let told = context_changes(&before, &after, &tools);
         assert!(told.starts_with("<context-changes>"));
         assert!(told.contains("Skill `csv` is now available: Reads CSV"));
         assert!(told.contains("Skill `pdf` is no longer available."));
         assert!(told.contains("Subagent kind `critic` is now available to `task`: Finds flaws"));
         assert!(told.contains("New rule."));
         assert!(!told.contains("Old rule."));
+        assert!(told.contains("Load it with `skill` or by reading"));
+    }
+
+    /// A new skill or agent kind is never said to be used through a tool the agent is not offered.
+    #[test]
+    fn changes_point_only_at_offered_tools() {
+        let base = scratch("notices-unoffered");
+        let locations = Locations {
+            directory: base.clone(),
+            root: Some(base.clone()),
+            home: None,
+            claude: None,
+            codex: None,
+        };
+        let before = discover(&locations, &[]);
+        put(
+            &base,
+            ".claude/skills/csv/SKILL.md",
+            "---\ndescription: Reads CSV\n---\nbody",
+        );
+        put(
+            &base,
+            ".claude/agents/critic.md",
+            "---\ndescription: Finds flaws\n---\nBe critical.",
+        );
+        let after = discover(&locations, &[]);
+        let told = context_changes(&before, &after, &[]);
+        assert!(told.contains("Skill `csv` is now available: Reads CSV Load it by reading `"));
+        assert!(!told.contains("`skill`"));
+        assert!(told.contains("Subagent kind `critic` is now available: Finds flaws"));
+        assert!(!told.contains("`task`"));
     }
 }

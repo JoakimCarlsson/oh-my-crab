@@ -156,11 +156,28 @@ impl Shared {
     }
 
     /// The outline of `directory` the system prompts of the conversation carry, made the first time it is asked for after the conversation was opened and kept unchanged after that, so that a system prompt made again for another model stays the same and the agent's subagents see the same outline.
-    pub(crate) fn tree(&self, directory: &std::path::Path) -> Arc<str> {
+    ///
+    /// The walk that makes it runs on a thread for blocking work, with nothing locked, so it holds up neither the other tasks nor anyone else asking; when two ask at once, the outline that is ready first is kept.
+    pub(crate) async fn tree(&self, directory: &std::path::Path) -> Arc<str> {
+        if let Some(made) = self.made_tree() {
+            return made;
+        }
+        let directory = directory.to_path_buf();
+        let walked = tokio::task::spawn_blocking(move || omc_context::workspace_tree(&directory))
+            .await
+            .unwrap_or_default();
         self.tree
             .lock()
             .unwrap_or_else(|held| held.into_inner())
-            .get_or_insert_with(|| Arc::from(omc_context::workspace_tree(directory)))
+            .get_or_insert_with(|| Arc::from(walked))
+            .clone()
+    }
+
+    /// The outline of the working directory, once it has been made.
+    fn made_tree(&self) -> Option<Arc<str>> {
+        self.tree
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
             .clone()
     }
 
@@ -363,18 +380,23 @@ impl Shared {
         });
     }
 
-    /// Picks the effort level `value` names, when the model in use takes it; whether it was taken.
+    /// Picks the effort level `value` names, when the model in use takes it; whether it was taken. A new effort stops warming the last request, which was sent with the old one.
     pub(crate) fn set_effort(&self, value: &str) -> bool {
-        self.state(|state| {
+        let (taken, changed) = self.state(|state| {
             let (Some(provider), Some(effort)) = (state.provider, Effort::parse(value)) else {
-                return false;
+                return (false, false);
             };
             let taken = omc_providers::efforts(provider, &state.model).contains(&effort);
+            let changed = taken && state.effort != Some(effort);
             if taken {
                 state.effort = Some(effort);
             }
-            taken
-        })
+            (taken, changed)
+        });
+        if changed {
+            self.warmer.stop();
+        }
+        taken
     }
 
     /// Whether the agent has the checkpoint and rewind tools.
@@ -382,10 +404,19 @@ impl Shared {
         self.state(|state| state.checkpoints)
     }
 
-    /// Turns the checkpoint and rewind tools on or off for the turns that start from now on, and ends the checkpoint that is active.
+    /// Turns the checkpoint and rewind tools on or off for the turns that start from now on, and ends the checkpoint that is active; turning them either way stops warming the last request, whose tool list the next turn no longer sends.
     pub(crate) fn set_checkpoints(&self, enabled: bool) {
-        self.state(|state| state.checkpoints = enabled);
+        let was = self.state(|state| std::mem::replace(&mut state.checkpoints, enabled));
+        if was != enabled {
+            self.warmer.stop();
+        }
         self.checkpoint.clear();
+    }
+
+    /// Changes the effort the reader picked and the checkpoint setting with `with`, without anything else that changing them does.
+    #[cfg(test)]
+    pub(crate) fn change_quietly(&self, with: impl FnOnce(&mut Option<Effort>, &mut bool)) {
+        self.state(|state| with(&mut state.effort, &mut state.checkpoints));
     }
 
     /// How long the provider is asked to keep the prompt cache entries requests write.
@@ -538,6 +569,45 @@ mod tests {
         let settings = announced(&mut events);
         let setting = settings.iter().find(|s| s.id == "checkpoints").unwrap();
         assert_eq!(setting.current, "on");
+    }
+
+    /// Another effort or turning the checkpoint tools on or off stops warming the last request; picking the same effort again does not.
+    #[tokio::test]
+    async fn effort_and_checkpoints_stop_warming() {
+        let (shared, _events) = opened();
+        let levels = omc_providers::efforts(Provider::Claude, "m");
+        if let [first, second, ..] = levels[..] {
+            assert!(shared.set_effort(first.as_str()));
+            shared.warmer.arm();
+            assert!(shared.set_effort(first.as_str()));
+            assert!(shared.warmer.armed());
+            assert!(shared.set_effort(second.as_str()));
+            assert!(!shared.warmer.armed());
+        }
+        shared.warmer.arm();
+        shared.set_checkpoints(false);
+        assert!(shared.warmer.armed());
+        shared.set_checkpoints(true);
+        assert!(!shared.warmer.armed());
+    }
+
+    /// The outline is walked off the runtime's threads: the task asking for it gives way while the walk runs, and the outline it gets is kept.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_outline_is_walked_without_holding_up_other_tasks() {
+        let (shared, _events) = opened();
+        let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let order = Mutex::new(Vec::new());
+        let (made, ()) = tokio::join!(
+            async {
+                let made = shared.tree(&directory).await;
+                order.lock().unwrap().push("tree");
+                made
+            },
+            async { order.lock().unwrap().push("other") }
+        );
+        assert_eq!(*order.lock().unwrap(), vec!["other", "tree"]);
+        assert!(made.contains("crates/"));
+        assert!(Arc::ptr_eq(&made, &shared.tree(&directory).await));
     }
 
     /// Plan mode remembers the mode it came from and gives it back.

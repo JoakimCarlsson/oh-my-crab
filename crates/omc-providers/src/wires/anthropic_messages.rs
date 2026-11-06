@@ -23,6 +23,9 @@ const URL: &str = "https://api.anthropic.com/v1/messages";
 /// Model list endpoint.
 const MODELS_URL: &str = "https://api.anthropic.com/v1/models";
 
+/// What the reader is told when the model declined to answer.
+const REFUSAL: &str = "the model declined to answer this request";
+
 /// Output tokens kept free for the visible answer when a thinking budget is set.
 const ANSWER_RESERVE: u64 = 4_000;
 
@@ -194,7 +197,7 @@ impl Accumulator {
     ///
     /// # Errors
     ///
-    /// Returns [`ProviderError::Stream`] for an `error` event.
+    /// Returns [`ProviderError::Stream`] for an `error` event, and for a reply the model stopped because it declined to answer, which would otherwise pass for a short or empty answer.
     pub(crate) fn feed(&mut self, data: &str, sink: &mut dyn Sink) -> Result<bool, ProviderError> {
         let Ok(payload) = serde_json::from_str::<Payload>(data) else {
             return Ok(false);
@@ -209,12 +212,14 @@ impl Accumulator {
                 if let Some(usage) = payload.usage {
                     self.count(usage);
                 }
-                if payload
-                    .delta
-                    .and_then(|delta| delta.stop_reason)
-                    .is_some_and(|reason| reason == "max_tokens")
-                {
-                    self.stop = Stop::Length;
+                match payload.delta.and_then(|delta| delta.stop_reason).as_deref() {
+                    Some("max_tokens" | "model_context_window_exceeded") => {
+                        self.stop = Stop::Length;
+                    }
+                    Some("refusal") => {
+                        return Err(ProviderError::Stream(REFUSAL.to_owned()));
+                    }
+                    _ => {}
                 }
             }
             "content_block_start" => {
@@ -1324,6 +1329,37 @@ mod tests {
             run(&whole, false, &mut Recorder::default()).stop,
             Stop::Finished
         );
+    }
+
+    /// A reply the context window cut off counts as cut by the output limit.
+    #[test]
+    fn a_full_context_window_is_a_cut_reply() {
+        let cut = [
+            json!({ "type": "content_block_start", "index": 0,
+                "content_block": { "type": "text", "text": "" } }),
+            json!({ "type": "content_block_delta", "index": 0,
+                "delta": { "type": "text_delta", "text": "half a" } }),
+            json!({ "type": "message_delta",
+                "delta": { "stop_reason": "model_context_window_exceeded" } }),
+            json!({ "type": "message_stop" }),
+        ];
+        assert_eq!(
+            run(&cut, false, &mut Recorder::default()).stop,
+            Stop::Length
+        );
+    }
+
+    /// A reply the model declined to give is an error that is not sent again, not an empty answer.
+    #[test]
+    fn a_refusal_is_an_error() {
+        let mut accumulator = Accumulator::new(false);
+        let event = json!({ "type": "message_delta", "delta": { "stop_reason": "refusal" } });
+        let error = accumulator
+            .feed(&event.to_string(), &mut Recorder::default())
+            .unwrap_err();
+        assert!(error.to_string().contains("declined"), "{error}");
+        assert!(!error.is_transient());
+        assert!(!error.is_context_overflow());
     }
 
     /// A stream that ends before `message_stop` is unfinished rather than a short reply.

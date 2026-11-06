@@ -45,8 +45,8 @@ pub(crate) fn offered(history: &[Message]) -> bool {
         .any(|message| matches!(message, Message::Compaction(_) | Message::Pruning(_)))
 }
 
-/// The tool, as offered to the model.
-pub(crate) fn spec() -> ToolSpec {
+/// The `recall` tool as it is offered to the model once the history was pruned or compacted, for a client that lists it from the start so the tool list does not change then.
+pub fn spec() -> ToolSpec {
     ToolSpec {
         name: RECALL.to_owned(),
         description: DESCRIPTION.to_owned(),

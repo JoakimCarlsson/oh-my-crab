@@ -118,7 +118,7 @@ impl Turn {
             .then(|| self.shared.checkpoint.clone());
         let environment = Arc::new(self.environment());
         let unnamed = self.shared.title().is_none();
-        let tree = self.shared.tree(&self.locations.directory);
+        let tree = self.shared.tree(&self.locations.directory).await;
         let toolset = Toolset::build(&Inputs {
             base: &self.base,
             denied: &self.denied,
@@ -159,6 +159,7 @@ impl Turn {
             shared: self.shared.clone(),
             provider: self.provider,
             model: self.model.clone(),
+            checkpoints: checkpoint.is_some(),
         };
         let context = Context {
             model: &recorder,
@@ -516,6 +517,113 @@ mod tests {
         assert_eq!(seen[0].prompt.as_deref(), Some("second"));
         let third = seen[1].prompt.as_deref().unwrap();
         assert!(third.starts_with("<environment>") && third.ends_with("third"));
+    }
+
+    /// A model that calls `skill` and `recall` together, then answers, and keeps what each request carried with the results it was given.
+    struct Reacher {
+        /// What each request carried, with the results it was given.
+        seen: Mutex<Vec<(Sent, Option<Vec<omc_providers::ToolResult>>)>>,
+    }
+
+    #[async_trait]
+    impl ChatModel for Reacher {
+        /// Calls both tools the first time, then answers.
+        async fn complete(
+            &self,
+            request: Request<'_>,
+            _: &mut dyn Sink,
+        ) -> Result<Reply, ProviderError> {
+            let results = match request.messages.last() {
+                Some(Message::ToolResults(results)) => Some(results.clone()),
+                _ => None,
+            };
+            let mut seen = self.seen.lock().unwrap();
+            seen.push((Sent::of(&request), results));
+            Ok(match seen.len() {
+                1 => Reply {
+                    tool_calls: vec![
+                        ToolCall {
+                            id: "s".into(),
+                            name: "skill".into(),
+                            arguments: json!({"name": "pdf"}),
+                        },
+                        ToolCall {
+                            id: "r".into(),
+                            name: "recall".into(),
+                            arguments: json!({"search": "x"}),
+                        },
+                    ],
+                    ..Reply::default()
+                },
+                _ => Reply {
+                    text: "ok".into(),
+                    ..Reply::default()
+                },
+            })
+        }
+    }
+
+    /// `skill` and `recall` are on the tool list from the first turn, before any skill exists and before anything was left out of the history, and say why they have nothing to give; the list stays the same once a pruning has made `recall` worth calling, and `recall` is then answered by the agent itself.
+    #[tokio::test]
+    async fn skill_and_recall_are_offered_from_the_start() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/turn-reach");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (out, _events) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared::new(out);
+        shared.open(Provider::Claude, vec!["m".into()], "m".into(), Mode::Yolo);
+        let mut base = Registry::builtin(&dir).unwrap();
+        crate::session::register_skills(&mut base, &[]);
+        let base = Arc::new(base);
+        let model = Arc::new(Reacher {
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut turn = turn_in(&dir, &shared, Vec::new());
+        turn.base = base.clone();
+        let Ended::Done(mut history) = turn.run_with(model.clone(), Job::Prompt("go".into())).await
+        else {
+            panic!("turn failed");
+        };
+        history.push(Message::Pruning(omc_providers::Pruning {
+            elided: Vec::new(),
+            excised: Vec::new(),
+            tokens_after: 0,
+        }));
+        let model_after = Arc::new(Reacher {
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut turn = turn_in(&dir, &shared, history);
+        turn.base = base;
+        let Ended::Done(_) = turn
+            .run_with(model_after.clone(), Job::Prompt("again".into()))
+            .await
+        else {
+            panic!("turn failed");
+        };
+        let seen = model.seen.lock().unwrap();
+        let names: Vec<&str> = seen[0]
+            .0
+            .tools
+            .iter()
+            .map(|tool| tool[0].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"skill") && names.contains(&"recall"));
+        let results = seen[1].1.as_ref().unwrap();
+        assert!(results[0].is_error && results[0].text.contains("no skills are available"));
+        assert!(results[1].is_error && results[1].text.contains("nothing to read yet"));
+        let after = model_after.seen.lock().unwrap();
+        assert_eq!(
+            serde_json::to_vec(&after[0].0.tools).unwrap(),
+            serde_json::to_vec(&seen[0].0.tools).unwrap()
+        );
+        let recalled = &after[1].1.as_ref().unwrap()[1];
+        assert!(
+            !recalled.is_error && recalled.text.contains("#1: calls recall"),
+            "{}",
+            recalled.text
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Rejecting the plan keeps plan mode on.

@@ -1,4 +1,4 @@
-# Condensing rules for git: status hints, blank lines in logs, and transfer progress.
+# Condensing rules for git: status hints and transfer progress. Logs, diffs and shown commits are never condensed, so their text and hunks reach the model whole.
 
 [[filter]]
 name = "git status"
@@ -9,14 +9,6 @@ drop = [
   '^\s+\(use "git .*\)$',
   '^\s+\(commit or discard the untracked or modified content in submodules\)$',
 ]
-
-[[filter]]
-name = "git log"
-programs = ["git"]
-subcommands = ["log"]
-value_options = ["-C", "-c", "--git-dir", "--work-tree", "--namespace"]
-drop = ['^$']
-dedupe = false
 
 [[filter]]
 name = "git transfer"
@@ -54,32 +46,6 @@ Untracked files:
 	notes.txt
 
 no changes added to commit (use "git add" and/or "git commit -a")
-"""
-
-[[test]]
-command = "git log -n 2"
-input = """
-commit 1111111111111111111111111111111111111111
-Author: A <a@example.com>
-Date:   Mon Jan 1 10:00:00 2024 +0000
-
-    Fix the parser
-
-commit 2222222222222222222222222222222222222222
-Author: B <b@example.com>
-Date:   Sun Dec 31 10:00:00 2023 +0000
-
-    Add the parser
-"""
-expected = """
-commit 1111111111111111111111111111111111111111
-Author: A <a@example.com>
-Date:   Mon Jan 1 10:00:00 2024 +0000
-    Fix the parser
-commit 2222222222222222222222222222222222222222
-Author: B <b@example.com>
-Date:   Sun Dec 31 10:00:00 2023 +0000
-    Add the parser
 """
 
 [[test]]

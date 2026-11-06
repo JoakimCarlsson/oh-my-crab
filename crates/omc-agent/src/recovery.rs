@@ -1,6 +1,7 @@
 //! Getting a turn past failures that need not end it: requests that fail for a while, and replies that stop short or cannot be read.
 
 use std::hash::{BuildHasher, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use omc_providers::{Message, ProviderError, Reply, ToolCall};
@@ -18,8 +19,14 @@ const FIRST_WAIT: Duration = Duration::from_secs(2);
 /// The longest wait before a request is sent again; a provider that asks for a longer one is not waited for.
 pub(crate) const MAX_WAIT: Duration = Duration::from_secs(60);
 
-/// How many replies that stopped short, empty or at the output limit, a turn recovers from by nudging the model on.
+/// How many replies that stopped short, empty or cut off by the output limit before any tool call, a turn recovers from by nudging the model on.
 pub(crate) const MAX_RECOVERIES: u32 = 3;
+
+/// How many replies whose tool calls the output limit cut off a turn answers with a notice to take a smaller step before it fails; counted apart from [`MAX_RECOVERIES`], so harmless recoveries earlier in the turn do not use it up.
+pub(crate) const MAX_CUT_CALLS: u32 = 3;
+
+/// The serial number of the next wait shown, counted over the life of the process so that no two waits are shown under the same id, whatever turn they belong to.
+static NEXT_WAIT: AtomicU64 = AtomicU64::new(1);
 
 /// The name a wait before sending a request again is shown under, as if it were a tool call.
 pub(crate) const RETRY: &str = "retry";
@@ -74,20 +81,27 @@ fn seconds(wait: Duration) -> u64 {
 
 /// One wait before a failed request is sent again, as the reader is shown it.
 pub(crate) struct Retry {
-    /// How many messages the history held when the request was made.
-    pub(crate) at: usize,
-    /// Which wait of the turn this is, counted from one, so that each is shown on its own.
-    pub(crate) serial: u32,
+    /// The serial number of the wait in the process, so that each is shown on its own.
+    serial: u64,
     /// Which time the request is to be sent again, counted from one.
-    pub(crate) attempt: u32,
+    attempt: u32,
     /// How long the wait is.
-    pub(crate) wait: Duration,
+    wait: Duration,
 }
 
 impl Retry {
+    /// A wait of `wait` before the request is sent again for the `attempt`th time, counted from one, under a serial number no other wait of the process has.
+    pub(crate) fn new(attempt: u32, wait: Duration) -> Self {
+        Self {
+            serial: NEXT_WAIT.fetch_add(1, Ordering::Relaxed),
+            attempt,
+            wait,
+        }
+    }
+
     /// The id the wait is shown under.
     fn id(&self) -> String {
-        format!("{RETRY}-{}-{}", self.at, self.serial)
+        format!("{RETRY}-{}", self.serial)
     }
 
     /// The event that shows the wait starting after the request failed with `error`: which attempt comes, how soon, and why.
@@ -157,17 +171,30 @@ pub(crate) fn joined(cut: Reply, rest: Reply) -> Reply {
     }
 }
 
-/// Why `call` cannot be run as it stands, when its arguments are not a JSON object: the problem with them and what to do instead, for the model.
-pub(crate) fn malformed(call: &ToolCall) -> Option<String> {
+/// `reply`, a whole reply that is to be carried on by the next one, with a paragraph break after its text so the two read as one.
+pub(crate) fn carried_on(mut reply: Reply) -> Reply {
+    if !reply.text.trim().is_empty() {
+        reply.text.push_str("\n\n");
+    }
+    reply
+}
+
+/// The arguments of `call` as a JSON object, read out of a string when the model sent the object encoded as JSON text.
+///
+/// # Errors
+///
+/// Returns why the call cannot be run, for the model, when the arguments are not a JSON object and not a string holding one: the problem with them and what to do instead.
+pub(crate) fn readable(call: &ToolCall) -> Result<Value, String> {
     let problem = match &call.arguments {
-        Value::Object(_) => return None,
+        Value::Object(_) => return Ok(call.arguments.clone()),
         Value::String(raw) => match serde_json::from_str::<Value>(raw) {
+            Ok(object @ Value::Object(_)) => return Ok(object),
             Err(error) => format!("they are not valid JSON ({error})"),
-            Ok(value) => format!("they are {}, not a JSON object", kind(&value)),
+            Ok(value) => format!("they hold {}, not a JSON object", kind(&value)),
         },
         other => format!("they are {}, not a JSON object", kind(other)),
     };
-    Some(format!(
+    Err(format!(
         "Not run: the arguments of this call could not be read: {problem}. Send the call again with its arguments as one JSON object that matches the schema of `{}`.",
         call.name
     ))
@@ -284,7 +311,7 @@ mod tests {
         assert_eq!(whole.stop, Stop::Finished);
     }
 
-    /// Arguments that are not an object are turned away with what is wrong with them.
+    /// Arguments that are not an object are turned away with what is wrong with them, and an object sent as JSON text is read out of it.
     #[test]
     fn unreadable_arguments_are_explained() {
         let call = |arguments: Value| ToolCall {
@@ -292,11 +319,34 @@ mod tests {
             name: "edit".into(),
             arguments,
         };
-        assert_eq!(malformed(&call(json!({ "path": "a" }))), None);
-        let broken = malformed(&call(json!("{\"path\": \"a\""))).unwrap();
+        assert_eq!(
+            readable(&call(json!({ "path": "a" }))),
+            Ok(json!({ "path": "a" }))
+        );
+        assert_eq!(
+            readable(&call(json!("{\"path\": \"a\"}"))),
+            Ok(json!({ "path": "a" }))
+        );
+        let broken = readable(&call(json!("{\"path\": \"a\""))).unwrap_err();
         assert!(broken.contains("not valid JSON"), "{broken}");
         assert!(broken.contains("`edit`"), "{broken}");
-        let listed = malformed(&call(json!("[1, 2]"))).unwrap();
-        assert!(listed.contains("an array, not a JSON object"), "{listed}");
+        let listed = readable(&call(json!("[1, 2]"))).unwrap_err();
+        assert!(
+            listed.contains("hold an array, not a JSON object"),
+            "{listed}"
+        );
+        let number = readable(&call(json!(3))).unwrap_err();
+        assert!(
+            number.contains("are a number, not a JSON object"),
+            "{number}"
+        );
+    }
+
+    /// Waits are shown under ids that never repeat, even for the same attempt of the same request.
+    #[test]
+    fn waits_are_shown_under_ids_of_their_own() {
+        let first = Retry::new(1, Duration::from_secs(1));
+        let again = Retry::new(1, Duration::from_secs(1));
+        assert_ne!(first.id(), again.id());
     }
 }

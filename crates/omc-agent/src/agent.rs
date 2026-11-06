@@ -8,17 +8,18 @@ use omc_providers::{
     ChatModel, Effort, Message, Part, ProviderError, Pruning, Reply, Request, Sink, Stop, Tokens,
     ToolCall, ToolResult, ToolSpec,
 };
-use omc_tools::{Checkpoint, FileChange, Notebook, Registry, sanitize};
+use omc_tools::{Checkpoint, FileChange, Notebook, Registry, Tool, sanitize};
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::compaction;
 use crate::loop_guard::LoopGuard;
 use crate::pruning;
 use crate::recall::{self, RECALL};
-use crate::recovery::{self, MAX_RECOVERIES, Retry};
+use crate::recovery::{self, MAX_CUT_CALLS, MAX_RECOVERIES, Retry};
 use crate::shake;
 use crate::steering::{self, Steering};
-use crate::text_calls::{self, TextCalls};
+use crate::text_calls;
 use crate::todos::TodoTracker;
 use crate::{ApprovalRequest, Approvals, Scribe};
 
@@ -212,9 +213,13 @@ fn rewind(history: &mut Vec<Message>, length: usize, report: &str, scribe: Optio
 /// calls whose arguments cannot be read; the model is told why in their
 /// results. When the model keeps making the same calls, or keeps making edits
 /// that change nothing, a notice telling it to change course is added to the
-/// results; when it works on for long without updating a todo list with open
-/// items, a reminder is. A call the model wrote out as text instead of making
-/// it is made, or the model is told to make it.
+/// results; when it changes many files without updating a todo list with open
+/// items, a reminder is. Nothing in the text of a reply is ever run: a call the
+/// model wrote out as text only earns a notice telling it so.
+///
+/// A finished answer is kept before the model is sent a notice after it, to
+/// make a call it wrote as text or to finish its todo list; when the request
+/// that follows fails, the turn still ends with that answer.
 ///
 /// # Errors
 ///
@@ -272,10 +277,18 @@ pub async fn run_turn_steered(
     let resets = context.notebook.map_or(0, Notebook::resets);
     history.push(Message::User(prompt));
     record(scribe, &history[start]);
-    let result = drive(context, history, events, scribe, steering).await;
+    let mut settled = None;
+    let result = drive(context, history, events, scribe, steering, &mut settled).await;
     if let Some(checkpoint) = context.checkpoint {
         checkpoint.clear();
     }
+    let result = match (result, settled) {
+        (Err(error), Some(length)) => {
+            keep_answer(history, length, &error, scribe);
+            Ok(())
+        }
+        (result, _) => result,
+    };
     if result.is_err() {
         let keep = if context.notebook.map_or(0, Notebook::resets) == resets {
             start
@@ -296,6 +309,21 @@ pub async fn run_turn_steered(
         eprintln!("history not saved: {error}");
     }
     result
+}
+
+/// Ends a turn that failed with `error` after its answer was kept: cuts `history` and the journal of `scribe` back to `length` messages, which end with that answer, and reports on standard error that what followed it failed.
+fn keep_answer(
+    history: &mut Vec<Message>,
+    length: usize,
+    error: &AgentError,
+    scribe: Option<&Scribe>,
+) {
+    history.truncate(length);
+    let reason = error.to_string();
+    eprintln!("the turn ended with its answer; the request after it failed: {reason}");
+    if let Some(Err(error)) = scribe.map(|scribe| scribe.cut_losing(length, &reason)) {
+        eprintln!("history not saved: {error}");
+    }
 }
 
 /// Appends `message` to the journal of `scribe`, when there is one, and reports a failure on standard error.
@@ -359,7 +387,7 @@ fn stopped_short(reply: &Reply) -> Option<&'static str> {
     }
 }
 
-/// The messages a request is made with: what the model is given of `history`, then `cut`, a reply the output limit cut off that the model is to carry on, and `notice`, when there are, at the end.
+/// The messages a request is made with: what the model is given of `history`, then `cut`, a reply the output limit cut off that the model is to carry on, joined to a finished answer it follows, and `notice`, when there are, at the end.
 fn request_messages<'h>(
     history: &'h [Message],
     cut: Option<&Reply>,
@@ -367,7 +395,7 @@ fn request_messages<'h>(
 ) -> Cow<'h, [Message]> {
     let mut messages = compaction::context(history);
     if let Some(cut) = cut {
-        messages.to_mut().push(Message::Assistant(cut.clone()));
+        compaction::push_reply(messages.to_mut(), cut.clone());
     }
     if let Some(notice) = notice {
         recovery::add_notice(messages.to_mut(), notice);
@@ -394,14 +422,6 @@ fn refuse(
         .collect()
 }
 
-/// `reply`, a whole reply that is to be carried on by the next one after a notice, with a paragraph break after its text so the two read as one.
-fn carried_on(mut reply: Reply) -> Reply {
-    if !reply.text.trim().is_empty() {
-        reply.text.push_str("\n\n");
-    }
-    reply
-}
-
 /// Adds `notice` to the end of the last of `results`, where the model reads it with them.
 fn append_notice(results: &mut [ToolResult], notice: &str) {
     if let Some(last) = results.last_mut() {
@@ -410,7 +430,9 @@ fn append_notice(results: &mut [ToolResult], notice: &str) {
     }
 }
 
-/// Repeats model request and tool execution until no tool is requested, recording each step with `scribe` and putting the messages waiting in `steering` into the history before each request that does not carry on a cut-off reply.
+/// Repeats model request and tool execution until no tool is requested, recording each step with `scribe` and putting the messages waiting in `steering` into the history before each request that does not carry on a cut-off reply or follow up on a finished answer.
+///
+/// `settled` is set to the length of the history once it ends with a finished answer that a notice follows up on, and cleared when a rewind or a fresh context window replaces that part of the history; a turn that fails after that is to be ended with the answer rather than undone.
 ///
 /// # Errors
 ///
@@ -419,13 +441,15 @@ fn append_notice(results: &mut [ToolResult], notice: &str) {
 ///
 /// A request that fails in a way likely to pass is sent again after a wait that doubles each time, or that the provider asked for, up to [`recovery::MAX_RETRIES`] times; the wait is shown as a `retry` call and ends early when the turn is aborted. Nothing of a failed request reaches the history, so nothing is repeated in it.
 ///
-/// A reply that is empty, or that the output limit cut off before any tool call, is not taken: the request is made again with a notice to the model added to its end, which is not kept in the history, up to [`MAX_RECOVERIES`] times a turn. A reply cut off part of the way through its text is carried on by the next one, the two kept as one. The calls of a reply cut off in its tool calls are answered with an error without being run, the last result telling the model to take a smaller step; this counts against the same limit, past which the turn fails.
+/// A reply that is empty, or that the output limit cut off before any tool call, is not taken: the request is made again with a notice to the model added to its end, which is not kept in the history, up to [`MAX_RECOVERIES`] times a turn. A reply cut off part of the way through its text is carried on by the next one, the two kept as one. The calls of a reply cut off in its tool calls are answered with an error without being run, the last result telling the model to take a smaller step, up to [`MAX_CUT_CALLS`] times a turn, counted apart; past that the turn fails.
 ///
 /// The batches of calls are watched for circles: the same calls made again and again, or edits that change nothing, earn a notice to the model at the end of the batch's results.
 ///
-/// The model's todo list is watched too: when it still has open items after [`crate::todos::CHANGES`] file-changing calls since it last changed, a reminder listing them is added to the batch's results, at most [`crate::todos::MAX_REMINDERS`] times between changes; and a turn that changed files and is about to end with open items is carried on once with a notice to finish them or update the list. Neither happens when the model's reply ends by asking the user a question.
+/// The model's todo list is watched too: when it still has open items after [`crate::todos::CHANGES`] calls that changed files since it last changed, a reminder listing them is added to the batch's results, at most [`crate::todos::MAX_REMINDERS`] times between changes; and a turn that wrote the list or changed files and is about to end with open items is followed up once with a notice to finish them or update the list. Neither happens when the model's reply ends by asking the user a question.
 ///
-/// A reply without tool calls whose text holds calls written out as text is either given those calls, when they are marked as calls or are fenced calls with little else said, or carried on with a notice telling the model to make the call instead; either counts against [`MAX_RECOVERIES`].
+/// A reply without tool calls whose text holds a call written out as text is never run; it is followed up once a turn with a notice telling the model to make the call if it meant to.
+///
+/// A follow-up keeps the finished answer in the history and sends its notice with the next request only; the model's next reply is kept as a reply of its own, and an empty one ends the turn.
 ///
 /// When the provider refuses a request while the history holds images, the
 /// images are taken out, with a note left in their place, and the request is
@@ -438,6 +462,7 @@ async fn drive(
     events: &(dyn Fn(AgentEvent) + Send + Sync),
     scribe: Option<&Scribe>,
     steering: Option<&dyn Steering>,
+    settled: &mut Option<usize>,
 ) -> Result<(), AgentError> {
     let mut saved = context.notebook.map_or(0, Notebook::revision);
     let mut reminded = false;
@@ -446,8 +471,10 @@ async fn drive(
     let mut overflowed = false;
     let mut compaction_failed = false;
     let mut retries = 0;
-    let mut waits = 0;
     let mut recoveries = 0;
+    let mut cut_calls = 0;
+    let mut written_noticed = false;
+    let mut following_up = false;
     let mut notice: Option<Cow<'static, str>> = None;
     let mut cut: Option<Reply> = None;
     let mut guard = LoopGuard::default();
@@ -469,7 +496,7 @@ async fn drive(
         {
             compaction_failed = true;
         }
-        if cut.is_none() {
+        if cut.is_none() && !following_up {
             steering::inject(steering, history, scribe);
         }
         let mut specs = tool_specs(registry);
@@ -507,13 +534,7 @@ async fn drive(
             }
             Err(error) if let Some(wait) = recovery::retry_wait(&error, retries + 1) => {
                 retries += 1;
-                waits += 1;
-                let retry = Retry {
-                    at: history.len(),
-                    serial: waits,
-                    attempt: retries,
-                    wait,
-                };
+                let retry = Retry::new(retries, wait);
                 events(retry.started(&error));
                 tokio::time::sleep(wait).await;
                 events(retry.finished(&error));
@@ -525,12 +546,14 @@ async fn drive(
         if let Some(tokens) = reply.tokens {
             events(AgentEvent::Used(tokens));
         }
-        let carried = cut.is_some();
         let reply = match cut.take() {
             Some(earlier) => recovery::joined(earlier, reply),
             None => reply,
         };
         notice = None;
+        if std::mem::take(&mut following_up) && is_empty(&reply) && reply.stop != Stop::Length {
+            return Ok(());
+        }
         if recoveries < MAX_RECOVERIES
             && let Some(next) = stopped_short(&reply)
         {
@@ -545,32 +568,6 @@ async fn drive(
             return Err(AgentError::Empty);
         }
         first = false;
-        let written = if carried {
-            None
-        } else {
-            text_calls::recover(&reply, &|name| registry.get(name).is_some(), history.len())
-        };
-        let reply = match written {
-            Some(TextCalls::Made(made)) if recoveries < MAX_RECOVERIES => {
-                recoveries += 1;
-                made
-            }
-            Some(TextCalls::Unclear(asked)) if recoveries < MAX_RECOVERIES => {
-                recoveries += 1;
-                notice = Some(Cow::Owned(asked));
-                cut = Some(carried_on(reply));
-                continue;
-            }
-            _ => reply,
-        };
-        if reply.tool_calls.is_empty()
-            && reply.stop == Stop::Finished
-            && let Some(finish) = todos.finishing(&reply)
-        {
-            notice = Some(Cow::Owned(finish));
-            cut = Some(carried_on(reply));
-            continue;
-        }
         let nearly_full = reply
             .tokens
             .zip(context.window)
@@ -578,16 +575,27 @@ async fn drive(
         let calls = reply.tool_calls.clone();
         let said = reply.text.clone();
         let truncated = reply.stop == Stop::Length;
+        if truncated && !calls.is_empty() && cut_calls >= MAX_CUT_CALLS {
+            return Err(AgentError::OutputLimit);
+        }
+        let follow_up = if calls.is_empty() {
+            follow_up(&reply, registry, &mut written_noticed, &mut todos)
+        } else {
+            None
+        };
         history.push(Message::Assistant(reply));
         record(scribe, &history[history.len() - 1]);
         if calls.is_empty() {
-            return Ok(());
+            let Some(follow_up) = follow_up else {
+                return Ok(());
+            };
+            *settled = Some(history.len());
+            following_up = true;
+            notice = Some(Cow::Owned(follow_up));
+            continue;
         }
         if truncated {
-            if recoveries >= MAX_RECOVERIES {
-                return Err(AgentError::OutputLimit);
-            }
-            recoveries += 1;
+            cut_calls += 1;
             let mut results = refuse(&calls, recovery::CUT_CALL, events);
             append_notice(&mut results, recovery::LENGTH_CALLS);
             history.push(Message::ToolResults(results));
@@ -619,7 +627,7 @@ async fn drive(
         if let Some(redirect) = guard.observe(&calls, &results, &changed) {
             append_notice(&mut results, &redirect);
         }
-        if let Some(reminder) = todos.observe(&calls, &results, &said) {
+        if let Some(reminder) = todos.observe(&calls, &results, &changed, &said) {
             append_notice(&mut results, &reminder);
         }
         if nearly_full && !reminded && context.notebook.is_some() {
@@ -634,6 +642,7 @@ async fn drive(
             checkpoint.settle(history.len());
             if let Some((length, report)) = checkpoint.take_rewind() {
                 rewind(history, length, &report, scribe);
+                *settled = None;
             }
         }
         if let Some(notebook) = context.notebook
@@ -655,8 +664,27 @@ async fn drive(
             }
             history.clear();
             history.push(opening);
+            *settled = None;
         }
     }
+}
+
+/// The notice to follow up `answer`, a reply without tool calls that would end the turn, with: that it wrote a call of a tool in `registry` out as text, when it did and the model was not yet told so this turn, which `written_noticed` keeps; otherwise, for a finished answer, that the list `todos` tracks still has open items, once a turn. Nothing when the turn is to end.
+fn follow_up(
+    answer: &Reply,
+    registry: &Registry,
+    written_noticed: &mut bool,
+    todos: &mut TodoTracker,
+) -> Option<String> {
+    if !*written_noticed
+        && let Some(written) = text_calls::notice(answer, &|name| registry.get(name).is_some())
+    {
+        *written_noticed = true;
+        return Some(written);
+    }
+    (answer.stop == Stop::Finished)
+        .then(|| todos.finishing(answer))
+        .flatten()
 }
 
 /// Compacts `history` now, as the reader asked: summarizes all but the most recent messages, giving particular attention to `focus` when there is one, and records the compaction with `scribe`, which is synced when it is done.
@@ -818,9 +846,13 @@ fn tool_specs(registry: &Registry) -> Vec<ToolSpec> {
 
 /// Runs the calls of one model reply and returns their results in call order.
 ///
-/// Every call is announced first. Calls that need approval are asked about one
-/// at a time, in order. Approved calls then run one after another so edits
-/// cannot race, while calls that need no approval run concurrently.
+/// Every call is announced first. The arguments of a call of a registered tool
+/// are read and put right against its schema once, before the call is
+/// described, asked about or run, so the user approves exactly what runs; a
+/// call whose arguments cannot be read or put right fails without being asked
+/// about. Calls that need approval are asked about one at a time, in order.
+/// Approved calls then run one after another so edits cannot race, while calls
+/// that need no approval run concurrently.
 async fn run_calls(
     registry: &Registry,
     approvals: &Approvals,
@@ -832,10 +864,14 @@ async fn run_calls(
     let mut concurrent = Vec::new();
     let mut sequential = Vec::new();
     for (index, call) in calls.iter().enumerate() {
-        let tool = registry.get(&call.name);
-        let recalls = tool.is_none() && call.name == RECALL && recall::offered(history);
-        let summary = sanitize(&match tool {
-            Some(tool) => tool.describe(&call.arguments),
+        let recalls = call.name == RECALL && recall::offered(history);
+        let prepared = registry
+            .get(&call.name)
+            .filter(|_| !recalls)
+            .map(|tool| (tool, prepare(registry, call)));
+        let summary = sanitize(&match &prepared {
+            Some((tool, Ok(arguments))) => tool.describe(arguments),
+            Some((tool, Err(_))) => tool.describe(&call.arguments),
             None if recalls => recall::describe(&call.arguments),
             None => call.arguments.to_string(),
         });
@@ -844,7 +880,7 @@ async fn run_calls(
             name: call.name.clone(),
             summary: summary.clone(),
         });
-        match tool {
+        match prepared {
             None if recalls => {
                 slots[index] = Some(match recall::run(history, call.arguments.clone()) {
                     Ok((text, images)) => {
@@ -859,52 +895,67 @@ async fn run_calls(
                 let message = format!("unknown tool: {}", call.name);
                 slots[index] = Some(finish(call, message, true, Vec::new(), events));
             }
-            Some(_) if let Some(message) = recovery::malformed(call) => {
+            Some((_, Err(message))) => {
                 slots[index] = Some(finish(call, message, true, Vec::new(), events));
             }
-            Some(tool) if let Some(scope) = tool.approval_scope(&call.arguments) => {
+            Some((tool, Ok(arguments))) => {
+                let Some(scope) = tool.approval_scope(&arguments) else {
+                    concurrent.push((index, tool, arguments));
+                    continue;
+                };
                 let request = ApprovalRequest {
                     tool: call.name.clone(),
                     scope,
                     summary,
                 };
                 if approvals.allows(&request).await {
-                    sequential.push(index);
+                    sequential.push((index, tool, arguments));
                 } else {
                     let message = "the user denied this tool call".to_string();
                     slots[index] = Some(finish(call, message, true, Vec::new(), events));
                 }
             }
-            Some(_) => concurrent.push(index),
         }
     }
+    let indices: Vec<usize> = concurrent.iter().map(|(index, ..)| *index).collect();
     let done = join_all(
         concurrent
-            .iter()
-            .map(|&index| run_call(registry, &calls[index], events)),
+            .into_iter()
+            .map(|(index, tool, arguments)| run_call(tool, &calls[index], arguments, events)),
     )
     .await;
-    for (index, result) in concurrent.into_iter().zip(done) {
+    for (index, result) in indices.into_iter().zip(done) {
         slots[index] = Some(result);
     }
-    for index in sequential {
-        slots[index] = Some(run_call(registry, &calls[index], events).await);
+    for (index, tool, arguments) in sequential {
+        slots[index] = Some(run_call(tool, &calls[index], arguments, events).await);
     }
     slots.into_iter().flatten().collect()
 }
 
-/// Runs one approved tool call and reports its outcome.
+/// The arguments of `call`, a call of a tool in `registry`, read as a JSON object and put right against the tool's schema, as they are described, approved and run.
+///
+/// # Errors
+///
+/// Returns the result text, for the model, when the arguments are not a JSON object or a string holding one, or break the tool's schema in a way that cannot be put right.
+fn prepare(registry: &Registry, call: &ToolCall) -> Result<Value, String> {
+    let arguments = recovery::readable(call)?;
+    registry
+        .prepared(&call.name, arguments)
+        .map(|(_, arguments)| arguments)
+        .map_err(|error| error.to_string())
+}
+
+/// Runs one approved call of `tool` with `arguments`, already put right against its schema, and reports its outcome.
 ///
 /// A failing tool yields a result with `is_error` set.
 async fn run_call(
-    registry: &Registry,
+    tool: &Arc<dyn Tool>,
     call: &ToolCall,
+    arguments: Value,
     events: &(dyn Fn(AgentEvent) + Send + Sync),
 ) -> ToolResult {
-    match registry
-        .call_as(&call.id, &call.name, call.arguments.clone())
-        .await
-    {
+    match tool.call_as(&call.id, arguments).await {
         Ok(output) => {
             let images = output.images.into_iter().map(image).collect();
             let mut result = finish(call, output.text, false, output.changes, events);

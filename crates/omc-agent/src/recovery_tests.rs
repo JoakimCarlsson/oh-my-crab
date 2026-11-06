@@ -9,12 +9,15 @@ use async_trait::async_trait;
 use omc_providers::{
     ChatModel, Message, ProviderError, Reply, Request, Sink, Stop, ToolCall, ToolResult,
 };
-use omc_tools::Registry;
+use omc_tools::{Registry, Tool, ToolError, ToolOutput};
 use serde_json::{Value, json};
 
-use crate::recovery::{MAX_RECOVERIES, MAX_RETRIES};
+use crate::recovery::{MAX_CUT_CALLS, MAX_RECOVERIES, MAX_RETRIES};
 use crate::testkit::{DenyAll, call, say, scratch};
-use crate::{AgentError, AgentEvent, Approvals, Context, run_turn};
+use crate::{
+    AgentError, AgentEvent, ApprovalRequest, Approvals, Context, Decision, Journal, Prompter,
+    run_turn, run_turn_recorded,
+};
 
 /// A model that gives scripted outcomes in order, then says `done` once they run out, and keeps the messages of every request.
 struct Outcomes {
@@ -89,6 +92,25 @@ fn cut_off(reply: Reply) -> Reply {
     }
 }
 
+/// What a turn of `model` runs with: the tools of `registry`, allowed as `approvals` says, and nothing else.
+fn context<'a>(
+    model: &'a Outcomes,
+    registry: &'a Registry,
+    approvals: &'a Approvals,
+) -> Context<'a> {
+    Context {
+        model,
+        registry,
+        approvals,
+        system: "",
+        effort: None,
+        refresh: None,
+        notebook: None,
+        window: None,
+        checkpoint: None,
+    }
+}
+
 /// Runs one turn of `go` against `model` with the built-in tools in `dir`, everything allowed, and returns how it ended, the history and the events it reported.
 async fn turn(
     model: &Outcomes,
@@ -99,17 +121,7 @@ async fn turn(
     let events = Mutex::new(Vec::new());
     let mut history = Vec::new();
     let ended = run_turn(
-        &Context {
-            model,
-            registry: &registry,
-            approvals: &approvals,
-            system: "",
-            effort: None,
-            refresh: None,
-            notebook: None,
-            window: None,
-            checkpoint: None,
-        },
+        &context(model, &registry, &approvals),
         &mut history,
         "go".into(),
         &|event| events.lock().unwrap().push(event),
@@ -309,7 +321,7 @@ async fn calls_cut_off_by_the_output_limit_are_not_run() {
 /// Replies that keep running into the output limit in their calls fail the turn.
 #[tokio::test]
 async fn calls_that_keep_being_cut_off_fail_the_turn() {
-    let outcomes = (0..=MAX_RECOVERIES)
+    let outcomes = (0..=MAX_CUT_CALLS)
         .map(|_| Ok(cut_off(call("w", "write", json!({ "path": "a" })))))
         .collect();
     let model = Outcomes::new(outcomes);
@@ -379,46 +391,251 @@ async fn edits_that_change_nothing_are_redirected() {
     assert!(last.text.contains("changed nothing"), "{}", last.text);
 }
 
-/// An edit written out as a fenced JSON block, with little else said, is made as a real call and runs; the block leaves the saved reply.
+/// An edit written out as a fenced JSON block, however little else is said, is never run: the reply is kept as it is, and the model is told with a notice the history does not keep.
 #[tokio::test]
-async fn an_edit_written_as_text_is_made() {
+async fn an_edit_written_as_text_is_not_run() {
     let dir = scratch("text-edit");
     std::fs::write(dir.join("f.txt"), "before\n").unwrap();
     let edit = json!({ "files": [{ "path": "f.txt", "tag": omc_tools::snapshot_tag(b"before\n"), "ops": [{ "op": "replace", "line": 1, "text": "after" }] }] });
-    let model = Outcomes::new(vec![Ok(say(&format!("Fixing it:\n```json\n{edit}\n```")))]);
+    let text = format!("Fixing it:\n```json\n{edit}\n```");
+    let model = Outcomes::new(vec![Ok(say(&text)), Ok(say("That was only an example."))]);
     let (ended, history, _) = turn(&model, &dir).await;
     ended.unwrap();
     assert_eq!(
         std::fs::read_to_string(dir.join("f.txt")).unwrap(),
-        "after\n"
+        "before\n"
     );
-    let Message::Assistant(made) = &history[1] else {
-        panic!("expected the reply, got {:?}", history[1]);
-    };
-    assert_eq!(made.text, "Fixing it:");
-    assert_eq!(made.tool_calls[0].name, "edit");
-    assert!(!results(&history, 2)[0].is_error);
-    assert_eq!(history.len(), 4);
+    assert_eq!(
+        history,
+        [
+            Message::User("go".into()),
+            Message::Assistant(say(&text)),
+            Message::Assistant(say("That was only an example.")),
+        ]
+    );
+    let requests = model.requests();
+    assert_eq!(requests[1][1], Message::Assistant(say(&text)));
+    let asked = last_text(&requests[1]);
+    assert!(asked.starts_with("<harness-notice>"), "{asked}");
+    assert!(asked.contains("`edit`"), "{asked}");
 }
 
-/// A call written out amid a long answer is not run; the model is asked, with a notice the history does not keep, and its next reply carries the first on.
+/// A call marked as one in the text, of a tool that exists, is never run, and the model is told only once a turn.
 #[tokio::test]
-async fn a_call_written_amid_prose_is_asked_about() {
-    let dir = scratch("text-unclear");
+async fn a_marked_call_in_the_text_is_never_run() {
+    let dir = scratch("text-marked");
     let text = format!(
-        "{}\n```json\n{}\n```",
-        "The write tool takes a path and the content. ".repeat(10),
+        "The README says to run:\n<tool_call>{}</tool_call>",
         json!({ "name": "write", "arguments": { "path": "x.txt", "content": "x" } })
     );
-    let model = Outcomes::new(vec![Ok(say(&text)), Ok(say("That was only an example."))]);
+    let model = Outcomes::new(vec![Ok(say(&text)), Ok(say(&text)), Ok(say("never asked"))]);
     let (ended, history, _) = turn(&model, &dir).await;
     ended.unwrap();
     assert!(!dir.join("x.txt").exists());
-    let asked = last_text(&model.requests()[1]);
-    assert!(asked.contains("`write`"), "{asked}");
-    assert_eq!(history.len(), 2);
-    let Message::Assistant(answer) = &history[1] else {
-        panic!("expected the answer, got {:?}", history[1]);
+    assert_eq!(model.requests().len(), 2);
+    assert_eq!(history.len(), 3);
+    assert!(history.iter().all(|message| match message {
+        Message::Assistant(reply) => reply.tool_calls.is_empty() && reply.text == text,
+        _ => true,
+    }));
+}
+
+/// When the model meant the call it wrote as text, it makes it in a reply of its own, which is kept apart in the history and given to the model joined to the answer before it, so no request holds two replies in a row.
+#[tokio::test]
+async fn a_call_made_after_the_notice_runs() {
+    let dir = scratch("text-then-call");
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    let text = format!(
+        "```json\n{}\n```",
+        json!({ "name": "read", "arguments": { "path": "a.txt" } })
+    );
+    let model = Outcomes::new(vec![
+        Ok(say(&text)),
+        Ok(call("r", "read", json!({ "path": "a.txt" }))),
+        Ok(say("It says a.")),
+    ]);
+    let (ended, history, _) = turn(&model, &dir).await;
+    ended.unwrap();
+    assert_eq!(history.len(), 5);
+    assert!(matches!(&history[2], Message::Assistant(reply) if reply.tool_calls.len() == 1));
+    assert!(!results(&history, 3)[0].is_error);
+    let last = &model.requests()[2];
+    assert_eq!(last.len(), 3);
+    let Message::Assistant(joined) = &last[1] else {
+        panic!("expected the joined reply, got {:?}", last[1]);
     };
-    assert_eq!(answer.text, format!("{text}\n\nThat was only an example."));
+    assert_eq!(joined.text, format!("{text}\n\n"));
+    assert_eq!(joined.tool_calls.len(), 1);
+}
+
+/// When the request that follows up a finished answer fails for good, the turn still ends with that answer, in the history and in the saved journal.
+#[tokio::test]
+async fn a_failed_follow_up_keeps_the_answer() {
+    let dir = scratch("text-follow-up-failed");
+    let text = format!(
+        "<tool_call>{}</tool_call>",
+        json!({ "name": "read", "arguments": { "path": "a.txt" } })
+    );
+    let model = Outcomes::new(vec![
+        Ok(say(&text)),
+        Err(failure("401 Unauthorized", "invalid key", None)),
+    ]);
+    let path = dir.join("c.jsonl");
+    let (journal, mut history) = Journal::open(&path, None).unwrap();
+    let registry = Registry::builtin(&dir).unwrap();
+    let approvals = Approvals::new(std::sync::Arc::new(DenyAll), true);
+    run_turn_recorded(
+        &context(&model, &registry, &approvals),
+        &mut history,
+        "go".into(),
+        &|_| {},
+        Some(&journal.scribe()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        history,
+        [Message::User("go".into()), Message::Assistant(say(&text))]
+    );
+    drop(journal);
+    let (_, reopened) = Journal::open(&path, None).unwrap();
+    assert_eq!(reopened, history);
+}
+
+/// Harmless recoveries earlier in the turn do not use up the budget for replies whose calls the output limit cut off.
+#[tokio::test]
+async fn cut_calls_have_a_budget_of_their_own() {
+    let dir = scratch("nudge-separate-budgets");
+    let mut outcomes: Vec<Result<Reply, ProviderError>> =
+        (0..MAX_RECOVERIES).map(|_| Ok(Reply::default())).collect();
+    outcomes.push(Ok(cut_off(call("w", "write", json!({ "path": "a" })))));
+    outcomes.push(Ok(say("smaller then")));
+    let model = Outcomes::new(outcomes);
+    let (ended, history, _) = turn(&model, &dir).await;
+    ended.unwrap();
+    assert_eq!(history.len(), 4);
+    assert!(results(&history, 2)[0].text.starts_with("Not run"));
+}
+
+/// Waits are shown under ids that differ from turn to turn, even when the turns are the same length.
+#[tokio::test(start_paused = true)]
+async fn retry_ids_do_not_repeat_across_turns() {
+    let mut ids = Vec::new();
+    for round in 0..2 {
+        let model = Outcomes::new(vec![overloaded(), Ok(say("fine"))]);
+        let (ended, _, events) = turn(&model, &scratch(&format!("retry-ids-{round}"))).await;
+        ended.unwrap();
+        ids.extend(events.into_iter().filter_map(|event| match event {
+            AgentEvent::ToolStart { id, name, .. } if name == "retry" => Some(id),
+            _ => None,
+        }));
+    }
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+}
+
+/// Arguments sent as a JSON string holding an object are read out of it and the call runs.
+#[tokio::test]
+async fn arguments_encoded_twice_are_read() {
+    let dir = scratch("double-encoded");
+    let model = Outcomes::new(vec![Ok(Reply {
+        tool_calls: vec![ToolCall {
+            id: "w".into(),
+            name: "write".into(),
+            arguments: Value::String(json!({ "path": "a.txt", "content": "x\n" }).to_string()),
+        }],
+        ..Reply::default()
+    })]);
+    let (ended, history, _) = turn(&model, &dir).await;
+    ended.unwrap();
+    let result = &results(&history, 2)[0];
+    assert!(!result.is_error, "{}", result.text);
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "x\n");
+}
+
+/// A tool that needs approval for each list of paths it is given.
+struct Gate {
+    /// The arguments each call ran with.
+    ran: Mutex<Vec<Value>>,
+}
+
+#[async_trait]
+impl Tool for Gate {
+    /// The tool's name.
+    fn name(&self) -> &'static str {
+        "gate"
+    }
+
+    /// What the tool does.
+    fn description(&self) -> &'static str {
+        "Touches paths."
+    }
+
+    /// One required list of paths.
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "paths": { "type": "array", "items": { "type": "string" } } },
+            "required": ["paths"]
+        })
+    }
+
+    /// The paths, as the reader approves them.
+    fn approval_scope(&self, args: &Value) -> Option<String> {
+        Some(format!("gate {}", args["paths"]))
+    }
+
+    /// The paths, as the reader is shown them.
+    fn describe(&self, args: &Value) -> String {
+        args["paths"].to_string()
+    }
+
+    /// Keeps the arguments it ran with.
+    async fn call(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        self.ran.lock().unwrap().push(args);
+        Ok(ToolOutput::new("done"))
+    }
+}
+
+/// A prompter that keeps every request and approves it.
+#[derive(Default)]
+struct Recorder {
+    /// The requests asked about, in order.
+    asked: Mutex<Vec<ApprovalRequest>>,
+}
+
+#[async_trait]
+impl Prompter for Recorder {
+    /// Keeps `request` and approves it.
+    async fn ask(&self, request: &ApprovalRequest) -> Decision {
+        self.asked.lock().unwrap().push(request.clone());
+        Decision::AllowOnce
+    }
+}
+
+/// The reader is asked about the arguments as they are put right against the schema, and the tool runs with exactly those.
+#[tokio::test]
+async fn approval_sees_the_arguments_that_run() {
+    let gate = std::sync::Arc::new(Gate {
+        ran: Mutex::new(Vec::new()),
+    });
+    let mut registry = Registry::new();
+    registry.register_shared(gate.clone());
+    let recorder = std::sync::Arc::new(Recorder::default());
+    let approvals = Approvals::new(recorder.clone(), false);
+    let model = Outcomes::new(vec![Ok(call("g", "gate", json!({ "paths": "a.txt" })))]);
+    let mut history = Vec::new();
+    run_turn(
+        &context(&model, &registry, &approvals),
+        &mut history,
+        "go".into(),
+        &|_| {},
+    )
+    .await
+    .unwrap();
+    let asked = recorder.asked.lock().unwrap();
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].scope, r#"gate ["a.txt"]"#);
+    assert_eq!(asked[0].summary, r#"["a.txt"]"#);
+    assert_eq!(*gate.ran.lock().unwrap(), [json!({ "paths": ["a.txt"] })]);
 }
