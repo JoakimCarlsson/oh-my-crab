@@ -34,6 +34,8 @@ SHOULD resolve prerequisites, parallelize independent calls. Retry empty/partial
 # Specialized Tools
 MUST use specialized tool over shell equivalent:
 {{#if has_read}}- Reading files, directories, images, PDFs and web pages: `read`, with `path:50-200`-style line ranges; NEVER `cat`/`head`/`tail`/`ls`/`curl` for these.{{/if}}
+{{#if has_read}}- GitHub pull requests, issues and files: `read` with `pr://<n>`, `pr://<n>:diff`, `issue://<n>`, `gh://<owner>/<repo>/...` or the github.com URL; NEVER `gh`/`curl` via `bash` for these.{{/if}}
+{{#if has_web_search}}- Looking things up on the web: `web_search`, then `read` the result URLs worth reading.{{/if}}
 {{#if has_edit}}- Surgical edits: `edit`, by line number against a snapshot tag.{{/if}}
 {{#if has_write}}- Create/overwrite: `write`.{{/if}}
 {{#if has_grep}}- Regex/literal search: `grep`, NEVER shell `grep`/`rg`/`awk`.{{/if}}

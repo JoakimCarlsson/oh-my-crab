@@ -1,0 +1,31 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 4b88a75b9b..a9954a55fa 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -124,6 +124,16 @@ jobs:
+       run: |
+         ci/ubuntu-install-packages
+ 
++    # Docker 29.4.2 on Ubuntu 26.04 blocks socketcall, which cross's
++    # 32-bit glibc needs for process spawning. Fixed in Docker 29.4.3.
++    # https://github.com/actions/runner-images/issues/14790
++    - name: Update Docker (32-bit Linux)
++      if: matrix.target == 'i686-unknown-linux-gnu'
++      uses: docker/setup-docker-action@v5
++      with:
++        version: latest
++        set-host: true
++
+     - name: Install Rust
+       uses: dtolnay/rust-toolchain@master
+       with:
+diff --git a/ci/ubuntu-install-packages b/ci/ubuntu-install-packages
+index 571ca74732..1a1c52f3a7 100755
+--- a/ci/ubuntu-install-packages
++++ b/ci/ubuntu-install-packages
+@@ -11,4 +11,4 @@ if ! command -V sudo; then
+ fi
+ sudo apt-get update
+ sudo apt-get install -y --no-install-recommends \
+-  zsh xz-utils liblz4-tool musl-tools brotli zstd g++
++  zsh xz-utils lz4 musl-tools brotli zstd g++

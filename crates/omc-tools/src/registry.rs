@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::coerce::{coerce, prepare};
-use crate::tools::{AstEdit, AstGrep, Bash, Edit, Glob, Grep, Read, Write};
+use crate::tools::{AstEdit, AstGrep, Bash, Edit, Glob, Grep, Read, WebSearch, Write};
 use crate::{Jobs, Languages, Sandbox, Tool, ToolError, ToolOutput};
 
 /// A set of tools addressable by name.
@@ -70,6 +70,7 @@ impl Registry {
         registry.register(Edit::with_languages(sandbox.clone(), languages.clone()));
         registry.register(AstEdit::new(sandbox.clone()));
         registry.register(Write::with_languages(sandbox, languages));
+        registry.register(WebSearch::new());
         registry
     }
 
@@ -219,9 +220,9 @@ mod tests {
         let registry = Registry::builtin(crate::testutil::scratch("registry-read-only")).unwrap();
         assert_eq!(
             registry.read_only().names(),
-            vec!["ast_grep", "glob", "grep", "read"]
+            vec!["ast_grep", "glob", "grep", "read", "web_search"]
         );
-        assert_eq!(registry.names().len(), 8);
+        assert_eq!(registry.names().len(), 9);
     }
 
     /// A registered tool runs by name and an unknown name is an error.

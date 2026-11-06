@@ -1,0 +1,16 @@
+[
+  {
+    "user": {
+      "login": "manoj-1407"
+    },
+    "created_at": "2026-10-21T05:45:14Z",
+    "body": "With this change the Ubuntu jobs get past the package install, and 20 checks pass. The stable-x86 (i686) job still fails, for a different reason. Its tests panic at tests/util.rs:339 because the i686 rg binary can't be spawned, which looks like a missing 32-bit runtime on the Ubuntu 26.04 image. I haven't changed that job. Pinning it to ubuntu-24.04 or installing the 32-bit libraries would probably fix it, but I wanted to ask which you prefer first."
+  },
+  {
+    "user": {
+      "login": "BurntSushi"
+    },
+    "created_at": "2026-10-23T13:42:51Z",
+    "body": "Thanks! The 32-bit runner had a more subtle problem where the version of Docker on 32-bit Ubuntu 26.04 was preventing process spawning."
+  }
+]

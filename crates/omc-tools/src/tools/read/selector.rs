@@ -24,13 +24,15 @@ pub(super) struct Selector {
     pub(super) spans: Vec<Span>,
     /// Whether the original HTML of a web page is wanted instead of its text.
     pub(super) raw: bool,
+    /// Whether the whole of a web page is wanted, rather than its main content.
+    pub(super) full: bool,
     /// Whether only the merge conflicts of a file are wanted.
     pub(super) conflicts: bool,
 }
 
 impl Selector {
     /// Parses a selector such as `50`, `50-`, `50-200`, `50+150`, `-60`, `raw`,
-    /// or a comma-separated list of them, or `conflicts` alone.
+    /// `full`, or a comma-separated list of them, or `conflicts` alone.
     ///
     /// Returns `None` when `text` is not a selector, so that the caller can
     /// treat it as part of a file name instead.
@@ -45,6 +47,8 @@ impl Selector {
         for part in text.split(',').map(str::trim) {
             if part == "raw" {
                 selector.raw = true;
+            } else if part == "full" {
+                selector.full = true;
             } else {
                 selector.spans.push(span(part)?);
             }
@@ -79,6 +83,12 @@ impl Selector {
             None => Span::From(first),
         });
         Ok(self)
+    }
+
+    /// Whether the selector asks for something only a web page has: its
+    /// original HTML or its whole text.
+    pub(super) fn web_only(&self) -> bool {
+        self.raw || self.full
     }
 
     /// Whether the selector names any lines, or the conflicts, rather than the
@@ -217,6 +227,8 @@ mod tests {
         );
         let raw = Selector::parse("raw").unwrap();
         assert!(raw.raw && raw.spans.is_empty());
+        let full = Selector::parse("full,1-20").unwrap();
+        assert!(full.full && full.web_only() && full.picks_lines());
         let conflicts = Selector::parse("conflicts").unwrap();
         assert!(conflicts.conflicts && conflicts.picks_lines());
         assert_eq!(Selector::parse("conflicts,1-2"), None);

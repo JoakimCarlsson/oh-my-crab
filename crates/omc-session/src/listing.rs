@@ -125,6 +125,7 @@ mod tests {
                 "task",
                 "todo",
                 "wait",
+                "web_search",
                 "write"
             ]
         );

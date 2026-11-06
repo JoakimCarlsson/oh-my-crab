@@ -199,7 +199,7 @@ async fn read_within(
 /// # Errors
 ///
 /// Returns [`ToolError::InvalidArguments`] when a suffix and `offset` or
-/// `limit` are both given, or the suffix is `raw`.
+/// `limit` are both given, or the suffix is `raw` or `full`.
 pub(super) fn split_window(
     inner: &str,
     offset: Option<usize>,
@@ -212,21 +212,21 @@ pub(super) fn split_window(
     Ok((rest, window(selector, offset, limit)?))
 }
 
-/// Folds `offset` and `limit` into `selector`, refusing `raw`, which applies
-/// to URLs only.
+/// Folds `offset` and `limit` into `selector`, refusing `raw` and `full`,
+/// which apply to URLs only.
 ///
 /// # Errors
 ///
 /// Returns [`ToolError::InvalidArguments`] when the selector is `raw` or
-/// already names lines and `offset` or `limit` is given too.
+/// `full`, or already names lines and `offset` or `limit` is given too.
 pub(super) fn window(
     selector: Selector,
     offset: Option<usize>,
     limit: Option<usize>,
 ) -> Result<Selector, ToolError> {
-    if selector.raw {
+    if selector.web_only() {
         return Err(ToolError::InvalidArguments(
-            "the raw selector applies to URLs, not files".to_string(),
+            "the raw and full selectors apply to URLs, not files".to_string(),
         ));
     }
     selector.windowed(offset, limit)

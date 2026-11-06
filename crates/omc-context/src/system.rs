@@ -96,6 +96,7 @@ pub(crate) fn flags(tools: &[String]) -> Vec<(String, String)> {
         "remember",
         "memory_search",
         "memory_edit",
+        "web_search",
     ]
     .iter()
     .map(|tool| {

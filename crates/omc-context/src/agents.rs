@@ -13,6 +13,7 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "grep",
     "glob",
     "ast_grep",
+    "web_search",
     "skill",
     "ask",
     "todo",

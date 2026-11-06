@@ -32,5 +32,5 @@ pub use tool::{FileChange, Image, Tool, ToolOutput, marked_lines, parse_args, sa
 pub use tools::{
     Ask, AstEdit, AstGrep, Bash, CheckpointTool, ContextNotes, Edit, ExitPlanMode, Glob, Grep,
     MemoryEdit, MemorySearch, NewContext, Read, Remember, Rewind, SetTitle, Skill, Todo, Wait,
-    Write, snapshot_tag,
+    WebSearch, Write, snapshot_tag,
 };

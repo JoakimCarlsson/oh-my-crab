@@ -1,0 +1,12 @@
+[
+  {
+    "user": {
+      "login": "BurntSushi"
+    },
+    "path": "ci/ubuntu-install-packages",
+    "line": 12,
+    "original_line": 12,
+    "body": "Is lz4 available on every runner image?",
+    "created_at": "2026-10-21T08:05:00Z"
+  }
+]

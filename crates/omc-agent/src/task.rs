@@ -1046,7 +1046,15 @@ mod tests {
         assert_eq!(
             tools_of("SUB:task"),
             vec![
-                "ast_edit", "ast_grep", "bash", "edit", "glob", "grep", "read", "write"
+                "ast_edit",
+                "ast_grep",
+                "bash",
+                "edit",
+                "glob",
+                "grep",
+                "read",
+                "web_search",
+                "write"
             ]
         );
     }

@@ -1,11 +1,13 @@
 //! The `read` tool: numbered lines of a text file or an outline of a large
 //! code file, a directory listing, an image, the text of a PDF, a web page,
-//! the tables of a SQLite database, the members of an archive, or a path
-//! query on a JSON file.
+//! a GitHub pull request, issue or file, the tables of a SQLite database, the
+//! members of an archive, or a path query on a JSON file.
 
 mod archive;
 mod container;
+mod github;
 mod guard;
+pub(super) mod html;
 mod json;
 mod lines;
 mod listing;
@@ -35,7 +37,7 @@ use selector::Selector;
 /// binary files apart.
 const SNIFF_BYTES: usize = 8192;
 
-/// Reads files, directories, images, PDFs and web pages.
+/// Reads files, directories, images, PDFs, web pages and GitHub resources.
 pub struct Read {
     /// The directory paths are confined to.
     sandbox: Sandbox,
@@ -54,6 +56,18 @@ impl Read {
     /// like any other file, when it is not.
     pub fn with_outline(sandbox: Sandbox, outline: bool) -> Self {
         Self { sandbox, outline }
+    }
+
+    /// The GitHub read the path `raw` asks for, when it is a GitHub path; a
+    /// `github.com/...` path without a scheme is a file instead when that file
+    /// exists.
+    fn github(&self, raw: &str) -> Option<Result<github::Request, ToolError>> {
+        if raw.to_ascii_lowercase().starts_with("github.com/")
+            && self.sandbox.resolve(raw).is_ok_and(|path| path.exists())
+        {
+            return None;
+        }
+        github::parse(raw)
     }
 
     /// Resolves the `path` argument to a file inside the sandbox, the name it is
@@ -110,16 +124,20 @@ impl Tool for Read {
     }
 
     /// Fetching a URL reaches the network, so the user approves it, per origin:
-    /// allowing one site always never allows another. Reading files does not
-    /// ask.
+    /// allowing one site always never allows another. Every GitHub path counts
+    /// as github.com, however it is written. Reading files does not ask.
     fn approval_scope(&self, args: &Value) -> Option<String> {
-        let path = args["path"].as_str().filter(|path| web::is_url(path))?;
-        Some(format!("read {}", web::scope(path)))
+        let path = args["path"].as_str()?;
+        if self.github(path).is_some() {
+            return Some(github::SCOPE.to_owned());
+        }
+        web::is_url(path).then(|| format!("read {}", web::scope(path)))
     }
 
     /// Describes the tool to the model.
     fn description(&self) -> &'static str {
-        "Read a file, directory, image, PDF, SQLite database, archive or web page.\n\
+        "Read a file, directory, image, PDF, SQLite database, archive, web page or GitHub \
+         pull request, issue or file.\n\
          - Text files: lines prefixed with line numbers, under a header with the file's snapshot \
          tag; pass that tag and those line numbers to edit.\n\
          - Pick lines with a suffix on the path: file:50 or file:50- (from line 50), \
@@ -160,11 +178,21 @@ impl Tool for Read {
          in data.json:.items[] | select(.kind == \"x\") | .id. Nothing else is supported. Add \
          a line suffix to page the output (data.json:.items:100-200). data.json:50-80 reads \
          lines as text.\n\
-         - http:// and https:// URLs: the page as Markdown with numbered lines; url:raw for \
-         the original HTML. The user approves fetches per site. Redirects to another site \
-         are not followed: read the URL the error names. A host name that resolves to a \
-         local or private address is refused; only read localhost or a local address when \
-         the user asks for one."
+         - http:// and https:// URLs: the page's main content as Markdown with numbered \
+         lines and absolute links; url:full for the whole page, url:raw for the original \
+         HTML. PDFs give their text, JSON comes pretty-printed. Line suffixes work as for \
+         files (url:100-200); a page longer than one read is saved to a file the result \
+         names: page that file rather than fetching again. Page scripts never run. The user \
+         approves fetches per site. Redirects to another site are not followed: read the \
+         URL the error names. A host name that resolves to a local or private address is \
+         refused; only read localhost or a local address when the user asks for one.\n\
+         - GitHub: pr://123 and issue://45 in the repository origin points at, \
+         pr://owner/repo/123, gh://owner/repo (facts, files and README), \
+         gh://owner/repo/pull/123, gh://owner/repo/issues/45, \
+         gh://owner/repo/blob/<ref>/<path>, gh://owner/repo/tree/<ref>/<path>, or the same \
+         github.com URLs. A pull request gives its state, description, changed files, \
+         reviews and comments; add :diff (pr://123:diff, pr://123:diff:1-400) for its \
+         unified diff. Prefer these over gh or curl in bash."
     }
 
     /// Returns the argument schema.
@@ -174,16 +202,20 @@ impl Tool for Read {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "File or directory path relative to the working directory, or an http(s) URL, optionally with a selector suffix: src/main.rs:120-180, log.txt:-50, src/lib.rs:conflicts, https://example.com/docs:raw, app.db:users, src.zip:lib/a.rs, data.json:.items[0]."
+                    "description": "File or directory path relative to the working directory, an http(s) URL, or a GitHub path, optionally with a selector suffix: src/main.rs:120-180, log.txt:-50, src/lib.rs:conflicts, https://example.com/docs:raw, pr://12:diff, gh://owner/repo/issues/4, app.db:users, src.zip:lib/a.rs, data.json:.items[0]."
                 }
             },
             "required": ["path"]
         })
     }
 
-    /// Shows the path or URL being read.
+    /// Shows the path or URL being read; a GitHub path shows as its
+    /// github.com URL.
     fn describe(&self, args: &Value) -> String {
         let path = args["path"].as_str().unwrap_or("?");
+        if let Some(Ok(request)) = self.github(path) {
+            return request.describe(self.sandbox.root(), path);
+        }
         match web::is_url(path).then(|| web::target(path)) {
             Some(Ok((url, _))) => url.to_string(),
             _ => path.to_string(),
@@ -195,10 +227,16 @@ impl Tool for Read {
     /// directory otherwise.
     async fn call(&self, args: Value) -> Result<ToolOutput, ToolError> {
         let args: Args = parse_args(args)?;
+        if let Some(request) = self.github(&args.path) {
+            let mut request = request?;
+            request.selector =
+                std::mem::take(&mut request.selector).windowed(args.offset, args.limit)?;
+            return github::read(request, self.sandbox.root(), self.sandbox.spill().clone()).await;
+        }
         if web::is_url(&args.path) {
             let (url, selector) = web::target(&args.path)?;
             let selector = selector.windowed(args.offset, args.limit)?;
-            return web::read(url.as_str(), selector).await;
+            return web::read(url.as_str(), selector, self.sandbox.spill().clone()).await;
         }
         if let Some(target) = container::locate(&self.sandbox, &args.path) {
             return container::read_bounded(target, args.offset, args.limit).await;
@@ -234,9 +272,9 @@ fn read_path(
     if !path.exists() {
         return Err(ToolError::Failed(format!("{label} does not exist")));
     }
-    if selector.raw {
+    if selector.web_only() {
         return Err(ToolError::InvalidArguments(
-            "the raw selector applies to URLs, not files".to_string(),
+            "the raw and full selectors apply to URLs, not files".to_string(),
         ));
     }
     if path.is_dir() {
@@ -629,6 +667,40 @@ mod tests {
         );
         assert_eq!(scope("src/main.rs"), None);
         assert!(tool.read_only());
+    }
+
+    /// Every GitHub path asks under the one github.com scope, and a
+    /// `github.com/...` path that is a file in the working directory is read
+    /// as that file without asking.
+    #[tokio::test]
+    async fn asks_approval_for_github_as_github_com() {
+        let (tool, dir) = tool("read-github-approval");
+        let scope = |path: &str| tool.approval_scope(&json!({ "path": path }));
+        for path in [
+            "pr://12",
+            "issue://o/r/3",
+            "gh://o/r/blob/main/a.rs:1-5",
+            "https://github.com/o/r/pull/1",
+            "github.com/o/r/issues/2",
+        ] {
+            assert_eq!(
+                scope(path).as_deref(),
+                Some("read https://github.com"),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            scope("https://github.com/o/r/actions").as_deref(),
+            Some("read https://github.com")
+        );
+        std::fs::create_dir_all(dir.join("github.com/o/r/issues")).unwrap();
+        std::fs::write(dir.join("github.com/o/r/issues/2"), "local\n").unwrap();
+        assert_eq!(scope("github.com/o/r/issues/2"), None);
+        assert!(
+            text(&tool, "github.com/o/r/issues/2")
+                .await
+                .contains("local")
+        );
     }
 
     /// A URL is fetched over HTTP and its HTML read as Markdown or, with `raw`, as source.

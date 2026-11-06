@@ -1,0 +1,50 @@
+[
+  {
+    "name": "default_types.rs",
+    "path": "crates/ignore/src/default_types.rs",
+    "type": "file",
+    "size": 13521
+  },
+  {
+    "name": "dir.rs",
+    "path": "crates/ignore/src/dir.rs",
+    "type": "file",
+    "size": 61862
+  },
+  {
+    "name": "gitignore.rs",
+    "path": "crates/ignore/src/gitignore.rs",
+    "type": "file",
+    "size": 32420
+  },
+  {
+    "name": "incremental.rs",
+    "path": "crates/ignore/src/incremental.rs",
+    "type": "file",
+    "size": 51424
+  },
+  {
+    "name": "lib.rs",
+    "path": "crates/ignore/src/lib.rs",
+    "type": "file",
+    "size": 18628
+  },
+  {
+    "name": "overrides.rs",
+    "path": "crates/ignore/src/overrides.rs",
+    "type": "file",
+    "size": 10043
+  },
+  {
+    "name": "pathutil.rs",
+    "path": "crates/ignore/src/pathutil.rs",
+    "type": "file",
+    "size": 6373
+  },
+  {
+    "name": "types.rs",
+    "path": "crates/ignore/src/types.rs",
+    "type": "file",
+    "size": 19836
+  }
+]

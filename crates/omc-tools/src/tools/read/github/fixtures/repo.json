@@ -1,0 +1,28 @@
+{
+  "full_name": "BurntSushi/ripgrep",
+  "description": "ripgrep recursively searches directories for a regex pattern while respecting your gitignore",
+  "html_url": "https://github.com/BurntSushi/ripgrep",
+  "homepage": "",
+  "stargazers_count": 69812,
+  "forks_count": 4183,
+  "open_issues_count": 224,
+  "default_branch": "master",
+  "language": "Rust",
+  "topics": [
+    "cli",
+    "command-line",
+    "command-line-tool",
+    "gitignore",
+    "grep",
+    "recursively-search",
+    "regex",
+    "ripgrep",
+    "rust",
+    "search"
+  ],
+  "archived": false,
+  "pushed_at": "2026-10-27T18:31:31Z",
+  "license": {
+    "spdx_id": "Unlicense"
+  }
+}

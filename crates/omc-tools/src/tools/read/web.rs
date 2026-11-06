@@ -1,12 +1,12 @@
 //! Reading `http://` and `https://` URLs: fetching, then turning HTML into
-//! Markdown, PDFs into text and images into images.
+//! Markdown, PDFs into text, JSON into indented JSON and images into images.
 
 use std::time::Duration;
 
 use super::media::{self, Media};
 use super::selector::Selector;
-use super::{guard, lines};
-use crate::{ToolError, ToolOutput};
+use super::{guard, html, lines};
+use crate::{Spill, ToolError, ToolOutput};
 
 /// Most bytes of a response body read; the rest is dropped.
 const MAX_BODY: usize = 10 << 20;
@@ -19,11 +19,6 @@ const MAX_REDIRECTS: usize = 10;
 
 /// The `User-Agent` sent with every fetch.
 const USER_AGENT: &str = concat!("crab/", env!("CARGO_PKG_VERSION"));
-
-/// Elements whose content is never text a reader sees.
-const SKIPPED_TAGS: [&str; 9] = [
-    "head", "script", "style", "noscript", "template", "svg", "canvas", "iframe", "object",
-];
 
 /// Whether `path` is an `http://` or `https://` URL rather than a file path.
 pub(super) fn is_url(path: &str) -> bool {
@@ -82,15 +77,19 @@ pub(super) struct Page {
     pub(super) truncated: bool,
 }
 
-/// Fetches `url` and reads it as `selector` asks.
+/// Fetches `url` and reads it as `selector` asks, saving long text in `spill`.
 ///
 /// # Errors
 ///
 /// Returns [`ToolError::Failed`] when the request fails, the server answers
 /// with an error status, or the body is binary data `read` cannot show.
-pub(super) async fn read(url: &str, selector: Selector) -> Result<ToolOutput, ToolError> {
+pub(super) async fn read(
+    url: &str,
+    selector: Selector,
+    spill: Spill,
+) -> Result<ToolOutput, ToolError> {
     let page = fetch(url).await?;
-    tokio::task::spawn_blocking(move || render(&page, &selector))
+    tokio::task::spawn_blocking(move || render(&page, &selector, &spill))
         .await
         .map_err(|e| ToolError::Failed(e.to_string()))?
 }
@@ -219,18 +218,25 @@ async fn fetch(url: &str) -> Result<Page, ToolError> {
     })
 }
 
-/// Turns a fetched `page` into what the model reads, as `selector` asks.
+/// Turns a fetched `page` into what the model reads, as `selector` asks,
+/// saving text too long to show whole in `spill`.
 ///
-/// Images are handed over as images; PDFs give their text; HTML gives Markdown,
-/// or its source when the selector says `raw`; other text is shown as it is.
-/// Text comes back with numbered lines under a header naming the URL.
+/// Images are handed over as images; PDFs give their text; HTML gives the
+/// Markdown of its main content, of the whole page when the selector says
+/// `full`, or its source when it says `raw`; JSON is pretty-printed unless the
+/// selector says `raw`; other text is shown as it is. Text comes back with
+/// numbered lines under a header naming the URL.
 ///
 /// # Errors
 ///
 /// Returns [`ToolError::Failed`] when the body is binary data of another kind,
 /// a cut-off image, or a PDF without text, and
 /// [`ToolError::InvalidArguments`] when lines are picked from an image.
-pub(super) fn render(page: &Page, selector: &Selector) -> Result<ToolOutput, ToolError> {
+pub(super) fn render(
+    page: &Page,
+    selector: &Selector,
+    spill: &Spill,
+) -> Result<ToolOutput, ToolError> {
     let mime = page
         .content_type
         .split(';')
@@ -278,11 +284,29 @@ pub(super) fn render(page: &Page, selector: &Selector) -> Result<ToolOutput, Too
                 notes.push("raw HTML".to_string());
                 html.into_owned()
             } else {
-                notes.push("converted to Markdown".to_string());
-                html_to_markdown(&html)
+                let base = reqwest::Url::parse(&page.url).ok();
+                let converted = html::to_markdown(&html, base.as_ref(), selector.full);
+                notes.push(if converted.narrowed {
+                    "main content as Markdown; :full for the whole page".to_string()
+                } else {
+                    "converted to Markdown".to_string()
+                });
+                converted.text
             }
         }
-        None if is_text(&mime, &page.body) => String::from_utf8_lossy(&page.body).into_owned(),
+        None if is_text(&mime, &page.body) => {
+            let text = String::from_utf8_lossy(&page.body).into_owned();
+            let pretty = (!selector.raw && !page.truncated && is_json(&mime, &text))
+                .then(|| pretty_json(&text))
+                .flatten();
+            match pretty {
+                Some(pretty) => {
+                    notes.push("pretty-printed".to_string());
+                    pretty
+                }
+                None => text,
+            }
+        }
         None => {
             return Err(ToolError::Failed(format!(
                 "{label} is {}, which read cannot show",
@@ -294,15 +318,122 @@ pub(super) fn render(page: &Page, selector: &Selector) -> Result<ToolOutput, Too
             )));
         }
     };
-    let numbered = lines::number(
-        || Ok(std::io::Cursor::new(text.as_bytes())),
-        selector,
-        label,
-    )?;
+    let numbered = number_saved(&text, selector, label, spill, "read-url")?;
     Ok(ToolOutput::new(format!(
         "[url {label}, {}]\n{numbered}",
         notes.join(", ")
     )))
+}
+
+/// Numbers the lines of `text`, called `label`, that `selector` picks, as a
+/// file's lines are numbered.
+///
+/// When `text` is longer than one read shows, it is saved whole in `spill`
+/// under a name made from `kind`, a note names the file, and the note saying
+/// where to go on points into it, so that the rest is read from there with
+/// line suffixes instead of being fetched again.
+///
+/// # Errors
+///
+/// Returns [`ToolError`] when the text cannot be numbered.
+pub(super) fn number_saved(
+    text: &str,
+    selector: &Selector,
+    label: &str,
+    spill: &Spill,
+    kind: &str,
+) -> Result<String, ToolError> {
+    let mut numbered = lines::number(
+        || Ok(std::io::Cursor::new(text.as_bytes())),
+        selector,
+        label,
+    )?;
+    let total = text.lines().count();
+    if (total > lines::MAX_LINES || text.len() > lines::MAX_BYTES)
+        && let Ok(path) = spill.save(kind, text.as_bytes())
+    {
+        let path = path.display().to_string();
+        numbered = numbered.replace(
+            &format!("[more lines remain; continue with {label}:"),
+            &format!("[more lines remain; continue with {path}:"),
+        );
+        numbered.push_str(&format!(
+            "[all {total} lines are saved in {path}; read the rest there with line suffixes \
+             instead of fetching again]\n"
+        ));
+    }
+    Ok(numbered)
+}
+
+/// Whether a text body of type `mime` reading `text` is JSON: served as JSON,
+/// or served as plain text or with no type and starting like a JSON object or
+/// array.
+fn is_json(mime: &str, text: &str) -> bool {
+    if mime == "application/json" || mime.ends_with("+json") || mime.contains("/json") {
+        return true;
+    }
+    matches!(mime, "" | "text/plain" | "application/octet-stream")
+        && text.trim_start().starts_with(['{', '['])
+}
+
+/// `text` re-indented two spaces a level, with keys in the order written,
+/// when it is valid JSON; nothing when it is not.
+pub(super) fn pretty_json(text: &str) -> Option<String> {
+    serde_json::from_str::<serde::de::IgnoredAny>(text).ok()?;
+    let mut out = String::with_capacity(text.len() * 2);
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut chars = text.trim().chars().peekable();
+    let newline = |out: &mut String, depth: usize| {
+        out.push('\n');
+        out.push_str(&"  ".repeat(depth));
+    };
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '{' | '[' => {
+                out.push(c);
+                while chars.peek().is_some_and(|next| next.is_whitespace()) {
+                    chars.next();
+                }
+                if chars.peek().is_some_and(|next| matches!(next, '}' | ']')) {
+                    out.extend(chars.next());
+                } else {
+                    depth += 1;
+                    newline(&mut out, depth);
+                }
+            }
+            '}' | ']' => {
+                depth = depth.saturating_sub(1);
+                newline(&mut out, depth);
+                out.push(c);
+            }
+            ',' => {
+                out.push(c);
+                newline(&mut out, depth);
+            }
+            ':' => out.push_str(": "),
+            c if c.is_whitespace() => {}
+            c => out.push(c),
+        }
+    }
+    out.push('\n');
+    Some(out)
 }
 
 /// Whether a body of type `mime` starting with `body` is an HTML page.
@@ -335,36 +466,6 @@ fn is_text(mime: &str, body: &[u8]) -> bool {
     textual
         || (matches!(mime, "" | "application/octet-stream")
             && !body[..body.len().min(8192)].contains(&0))
-}
-
-/// Converts the HTML page `html` into Markdown, with a `Title:` line first
-/// naming the page's `<title>`, kept apart from the headings of the body.
-///
-/// Scripts, styles and other content no reader sees are dropped, and runs of
-/// blank lines are squeezed into one.
-pub(super) fn html_to_markdown(html: &str) -> String {
-    let converter = htmd::HtmlToMarkdown::builder()
-        .skip_tags(SKIPPED_TAGS.to_vec())
-        .build();
-    let body = media::tidy(&converter.convert(html).unwrap_or_default());
-    match title(html, &converter) {
-        Some(title) => format!("Title: {title}\n\n{body}"),
-        None => body,
-    }
-}
-
-/// The text of the `<title>` of `html`, with entities decoded by `converter`,
-/// when it has a non-empty one.
-fn title(html: &str, converter: &htmd::HtmlToMarkdown) -> Option<String> {
-    let lower = html.to_ascii_lowercase();
-    let open = lower.find("<title")?;
-    let start = open + lower[open..].find('>')? + 1;
-    let end = start + lower[start..].find("</title")?;
-    let text = converter
-        .convert(&format!("<p>{}</p>", &html[start..end]))
-        .ok()?;
-    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    (!text.is_empty()).then_some(text)
 }
 
 #[cfg(test)]
@@ -451,7 +552,7 @@ mod tests {
     /// HTML becomes Markdown with the title first and scripts and styles gone.
     #[test]
     fn converts_html_to_markdown() {
-        let markdown = html_to_markdown(HTML);
+        let markdown = html::to_markdown(HTML, None, false).text;
         assert!(
             markdown.starts_with("Title: Fish & Chips\n\n"),
             "{markdown}"
@@ -469,20 +570,29 @@ mod tests {
     #[test]
     fn renders_html_pages() {
         let html = page("text/html; charset=utf-8", HTML.as_bytes());
-        let text = render(&html, &Selector::default()).unwrap().text;
+        let text = render(&html, &Selector::default(), &Spill::disabled())
+            .unwrap()
+            .text;
         assert!(
             text.starts_with("[url https://example.com/doc, text/html, converted to Markdown]\n"),
             "{text}"
         );
         assert!(text.contains("\tTitle: Fish & Chips\n"), "{text}");
-        let raw = render(&html, &Selector::parse("raw").unwrap())
+        let raw = render(&html, &Selector::parse("raw").unwrap(), &Spill::disabled())
             .unwrap()
             .text;
         assert!(raw.contains("raw HTML"), "{raw}");
         assert!(raw.contains("<script>alert('x')</script>"), "{raw}");
-        let first = render(&html, &Selector::parse("1").unwrap()).unwrap().text;
+        let first = render(&html, &Selector::parse("1").unwrap(), &Spill::disabled())
+            .unwrap()
+            .text;
         assert!(first.contains("     1\tTitle: Fish & Chips\n"), "{first}");
-        let sniffed = render(&page("", HTML.as_bytes()), &Selector::default()).unwrap();
+        let sniffed = render(
+            &page("", HTML.as_bytes()),
+            &Selector::default(),
+            &Spill::disabled(),
+        )
+        .unwrap();
         assert!(sniffed.text.contains("converted to Markdown"));
     }
 
@@ -490,25 +600,110 @@ mod tests {
     #[test]
     fn renders_other_bodies() {
         let png = page("image/png", b"\x89PNG\r\n\x1a\nrest");
-        let output = render(&png, &Selector::default()).unwrap();
+        let output = render(&png, &Selector::default(), &Spill::disabled()).unwrap();
         assert_eq!(output.images.len(), 1);
-        assert!(render(&png, &Selector::parse("1-2").unwrap()).is_err());
+        assert!(render(&png, &Selector::parse("1-2").unwrap(), &Spill::disabled()).is_err());
         let zip = page("application/zip", b"PK\x03\x04\0\0");
         assert!(matches!(
-            render(&zip, &Selector::default()),
+            render(&zip, &Selector::default(), &Spill::disabled()),
             Err(ToolError::Failed(m)) if m.contains("application/zip")
         ));
         let json = page("application/json", b"{\"a\": 1}\n");
-        let text = render(&json, &Selector::default()).unwrap().text;
-        assert!(text.ends_with("     1\t{\"a\": 1}\n"), "{text}");
+        let text = render(&json, &Selector::default(), &Spill::disabled())
+            .unwrap()
+            .text;
+        assert!(text.contains("pretty-printed"), "{text}");
+        assert!(
+            text.ends_with("     1\t{\n     2\t  \"a\": 1\n     3\t}\n"),
+            "{text}"
+        );
+        let raw = render(&json, &Selector::parse("raw").unwrap(), &Spill::disabled())
+            .unwrap()
+            .text;
+        assert!(raw.ends_with("     1\t{\"a\": 1}\n"), "{raw}");
     }
 
     /// A PDF served over HTTP gives its text.
     #[test]
     fn renders_pdfs() {
         let pdf = page("application/pdf", &media::tests::pdf("Served PDF"));
-        let text = render(&pdf, &Selector::default()).unwrap().text;
+        let text = render(&pdf, &Selector::default(), &Spill::disabled())
+            .unwrap()
+            .text;
         assert!(text.contains("application/pdf, 1 page]"), "{text}");
         assert!(text.contains("Served PDF"), "{text}");
+    }
+
+    /// JSON is re-indented with its keys in the order written, strings left
+    /// alone, and anything that is not JSON is refused.
+    #[test]
+    fn pretty_prints_json() {
+        let text = r#"{"z":1,"a":[1,{"s":"x,{y}: \"q\""}],"e":{},"l":[ ]}"#;
+        assert_eq!(
+            pretty_json(text).unwrap(),
+            "{\n  \"z\": 1,\n  \"a\": [\n    1,\n    {\n      \"s\": \"x,{y}: \\\"q\\\"\"\n    }\n  ],\n  \
+             \"e\": {},\n  \"l\": []\n}\n"
+        );
+        assert_eq!(pretty_json("{\"a\": "), None);
+        assert!(is_json("text/plain", " [1]"));
+        assert!(is_json("application/vnd.api+json", "x"));
+        assert!(!is_json("text/plain", "plain"));
+    }
+
+    /// A page longer than one read shows is saved whole, and the result says
+    /// where.
+    #[test]
+    fn saves_long_pages() {
+        let dir = crate::testutil::scratch("web-spill");
+        let spill = Spill::new(&dir);
+        let body: String = (1..=2500).map(|n| format!("line {n}\n")).collect();
+        let text = render(
+            &page("text/plain", body.as_bytes()),
+            &Selector::default(),
+            &spill,
+        )
+        .unwrap()
+        .text;
+        let saved = std::fs::read_dir(&dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let shown = saved.display();
+        assert!(
+            text.contains(&format!(
+                "[more lines remain; continue with {shown}:2001]\n"
+            )),
+            "{text}"
+        );
+        let note = text.lines().last().unwrap();
+        assert!(
+            note.starts_with(&format!("[all 2500 lines are saved in {shown};")),
+            "{note}"
+        );
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), body);
+        let short = render(&page("text/plain", b"one\n"), &Selector::default(), &spill)
+            .unwrap()
+            .text;
+        assert!(!short.contains("saved in"), "{short}");
+    }
+
+    /// An HTML page keeps its main content and says so.
+    #[test]
+    fn renders_main_content() {
+        let html = page("text/html", include_bytes!("fixtures/docs_page.html"));
+        let text = render(&html, &Selector::default(), &Spill::disabled())
+            .unwrap()
+            .text;
+        assert!(
+            text.contains("main content as Markdown; :full for the whole page"),
+            "{text}"
+        );
+        assert!(!text.contains("Products"), "{text}");
+        let full = render(&html, &Selector::parse("full").unwrap(), &Spill::disabled())
+            .unwrap()
+            .text;
+        assert!(full.contains("Products"), "{full}");
     }
 }

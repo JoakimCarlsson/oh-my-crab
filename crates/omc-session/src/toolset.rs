@@ -270,7 +270,8 @@ mod tests {
                 "set_title",
                 "task",
                 "todo",
-                "wait"
+                "wait",
+                "web_search"
             ]
         );
         assert_eq!(
@@ -290,6 +291,7 @@ mod tests {
                 "task",
                 "todo",
                 "wait",
+                "web_search",
                 "write"
             ]
         );

@@ -1,0 +1,8 @@
+{
+  "results": [
+    { "title": "Tokio", "url": "https://tokio.rs/", "snippet": "An asynchronous runtime.", "date": "2025-03-02", "last_updated": "2025-05-01" },
+    { "title": "async-std", "url": "https://docs.rs/async-std", "snippet": "Async version of the standard library.", "date": null, "last_updated": null }
+  ],
+  "id": "p-1",
+  "server_time": null
+}

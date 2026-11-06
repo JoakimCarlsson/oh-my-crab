@@ -1,0 +1,11 @@
+{
+  "meta": { "trace": "t", "node": "n", "ms": 321 },
+  "data": {
+    "search": [
+      { "url": "https://tokio.rs/", "title": "Tokio", "snippet": "An asynchronous runtime.", "time": "2024-11-29T03:54:26Z", "props": {} },
+      { "url": "https://docs.rs/tokio", "title": "tokio - Rust" }
+    ],
+    "related_search": [],
+    "direct_answer": []
+  }
+}

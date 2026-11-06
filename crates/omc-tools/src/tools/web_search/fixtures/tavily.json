@@ -1,0 +1,11 @@
+{
+  "query": "tokio runtime",
+  "answer": "Tokio is the most widely used async runtime for Rust.",
+  "images": [],
+  "results": [
+    { "title": "Tokio", "url": "https://tokio.rs/", "content": "Build reliable network applications.", "score": 0.91 },
+    { "title": "tokio - Rust", "url": "https://docs.rs/tokio", "content": "A runtime for writing reliable network applications.", "score": 0.85 }
+  ],
+  "response_time": 1.2,
+  "request_id": "r-1"
+}

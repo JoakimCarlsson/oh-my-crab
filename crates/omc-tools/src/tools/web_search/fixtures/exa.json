@@ -1,0 +1,20 @@
+{
+  "requestId": "e-1",
+  "results": [
+    {
+      "id": "https://tokio.rs/",
+      "title": "Tokio",
+      "url": "https://tokio.rs/",
+      "publishedDate": "2025-02-01T00:00:00.000Z",
+      "highlights": ["Tokio is a runtime", "It provides I/O"]
+    },
+    {
+      "id": "https://docs.rs/smol",
+      "title": "smol",
+      "url": "https://docs.rs/smol",
+      "summary": "A summary of smol.",
+      "text": "Long text of the page."
+    }
+  ],
+  "costDollars": { "total": 0.005 }
+}

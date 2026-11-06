@@ -1,0 +1,26 @@
+[
+  {
+    "user": {
+      "login": "BurntSushi"
+    },
+    "state": "CHANGES_REQUESTED",
+    "body": "Please pin the package version.",
+    "submitted_at": "2026-10-21T08:00:00Z"
+  },
+  {
+    "user": {
+      "login": "BurntSushi"
+    },
+    "state": "COMMENTED",
+    "body": "",
+    "submitted_at": "2026-10-21T08:05:00Z"
+  },
+  {
+    "user": {
+      "login": "BurntSushi"
+    },
+    "state": "APPROVED",
+    "body": "",
+    "submitted_at": "2026-10-23T13:40:00Z"
+  }
+]

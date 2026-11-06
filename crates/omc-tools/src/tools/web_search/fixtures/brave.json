@@ -1,0 +1,22 @@
+{
+  "type": "search",
+  "query": { "original": "tokio runtime", "more_results_available": true },
+  "web": {
+    "type": "search",
+    "results": [
+      {
+        "title": "Tokio - An asynchronous Rust runtime",
+        "url": "https://tokio.rs/",
+        "description": "<strong>Tokio</strong> is an asynchronous <strong>runtime</strong> for the Rust programming language &amp; more."
+      },
+      {
+        "title": "tokio - Rust",
+        "url": "https://docs.rs/tokio",
+        "description": "A runtime for writing reliable network applications.",
+        "page_age": "2026-01-04T00:00:00",
+        "age": "January 4, 2026"
+      },
+      { "title": "No address", "description": "dropped" }
+    ]
+  }
+}

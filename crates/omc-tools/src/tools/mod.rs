@@ -23,6 +23,7 @@ mod snapshot;
 mod title;
 mod todo;
 mod wait;
+mod web_search;
 mod write;
 
 pub use ask::Ask;
@@ -43,4 +44,5 @@ pub use snapshot::tag as snapshot_tag;
 pub use title::SetTitle;
 pub use todo::Todo;
 pub use wait::Wait;
+pub use web_search::WebSearch;
 pub use write::Write;

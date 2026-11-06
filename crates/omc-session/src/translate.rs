@@ -4,15 +4,24 @@ use omc_agent::AgentEvent;
 use omc_providers::Part;
 use omc_wire::{Diff, Event, Kind, PastTurn, Tool, ToolState, Usage};
 
-/// What kind of tool the tool called `name` is.
-fn kind_of(name: &str) -> Kind {
+/// What kind of tool use a call of the tool called `name` is, its target
+/// shown as `target`: a `read` whose target is a web address, as a URL or a
+/// GitHub path shows, fetches rather than reads.
+fn kind_of(name: &str, target: &str) -> Kind {
     match name {
+        "read" if is_web(target) => Kind::Fetch,
         "read" | "skill" => Kind::Read,
         "edit" | "write" | "ast_edit" => Kind::Edit,
-        "grep" | "glob" | "ast_grep" => Kind::Search,
+        "grep" | "glob" | "ast_grep" | "web_search" => Kind::Search,
         "bash" => Kind::Execute,
         _ => Kind::Other,
     }
+}
+
+/// Whether `target` is an `http://` or `https://` address.
+fn is_web(target: &str) -> bool {
+    let start = target.get(..8).unwrap_or(target).to_ascii_lowercase();
+    start.starts_with("http://") || start.starts_with("https://")
 }
 
 /// A tool event with only its `id` set.
@@ -163,7 +172,7 @@ pub(crate) fn replay(
                     }
                     turn.events.push(Event::Tool(Tool {
                         title: Some(call.name.clone()),
-                        kind: Some(kind_of(&call.name)),
+                        kind: Some(kind_of(&call.name, &target)),
                         state: Some(ToolState::Running),
                         target: Some(target),
                         ..bare(call.id.clone())
@@ -257,7 +266,7 @@ pub(crate) fn translate(event: AgentEvent, window: u64) -> Option<Event> {
         }),
         AgentEvent::ToolStart { id, name, summary } => Event::Tool(Tool {
             title: Some(name.clone()),
-            kind: Some(kind_of(&name)),
+            kind: Some(kind_of(&name, &summary)),
             state: Some(ToolState::Running),
             target: Some(summary),
             ..bare(id)
@@ -312,6 +321,20 @@ pub(crate) fn translate(event: AgentEvent, window: u64) -> Option<Event> {
 /// Tests for the event translation.
 mod tests {
     use super::*;
+
+    /// A read of a web address or GitHub path fetches, a web search searches,
+    /// and a read of a file reads.
+    #[test]
+    fn kinds_follow_the_target() {
+        assert_eq!(
+            kind_of("read", "https://github.com/o/r/pull/1"),
+            Kind::Fetch
+        );
+        assert_eq!(kind_of("read", "HTTP://example.com"), Kind::Fetch);
+        assert_eq!(kind_of("read", "src/http.rs"), Kind::Read);
+        assert_eq!(kind_of("web_search", "rust async"), Kind::Search);
+        assert_eq!(kind_of("bash", "https://x"), Kind::Execute);
+    }
 
     /// A started tool carries its kind and target, and a failed one its state.
     #[test]
