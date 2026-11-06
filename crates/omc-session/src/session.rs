@@ -2,19 +2,22 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use omc_agent::Journal;
 use omc_auth::{AuthError, LoginPrompt};
 use omc_context::{Discovered, Locations, discover, expand_skill};
 use omc_providers::Message;
 use omc_providers::Provider;
-use omc_tools::{LanguageService, Registry, Skill};
-use omc_wire::{Command, Event, Opening, Slash};
+use omc_tools::{LanguageService, Registry, Sandbox, Skill, Spill};
+use omc_wire::{Command, Event, Opening, QueueState, Slash};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::AbortHandle;
 
 use crate::prompt::compose;
-use crate::settings::{CHECKPOINTS, EFFORT, MODE, MODEL, Mode, OFF, ON};
+use crate::settings::{
+    CACHE, CHECKPOINTS, EFFORT, MODE, MODEL, Mode, OFF, ON, WARMING, parse_retention,
+};
 use crate::shared::Shared;
 use crate::turn::{Ended, Job, Turn};
 
@@ -112,25 +115,26 @@ impl Session {
                             "/compact takes no files; send them with a prompt instead".to_owned(),
                         ));
                     }
+                    if self.running.is_some() {
+                        return self.say(Event::Failed(
+                            "/compact cannot run while a turn is running; send it again when the turn has finished".to_owned(),
+                        ));
+                    }
                     let mark = turn.map(|id| omc_agent::Mark {
                         id,
                         text: text.clone(),
                         files: Vec::new(),
                     });
+                    self.rescan();
                     return self.start(Job::Compact(focus), mark);
                 }
-                let names = files
+                let names: Vec<String> = files
                     .iter()
                     .filter_map(|file| file.file_name())
                     .map(|name| name.to_string_lossy().into_owned())
                     .collect();
-                let mark = turn.map(|id| omc_agent::Mark {
-                    id,
-                    text: text.clone(),
-                    files: names,
-                });
                 let told = format!("{}{}", context.unwrap_or_default(), compose(&text, &files));
-                self.start(Job::Prompt(told), mark);
+                self.prompt(told, turn, text, names);
             }
             Command::Choose { ticket, option } => {
                 self.shared.questions.answer(ticket, option.as_deref());
@@ -182,23 +186,25 @@ impl Session {
         };
         self.journal = None;
         self.shared.jobs.stop_all();
-        let saved = match conversation {
-            Some(id) => match load_history(&id, history, keep, before.as_deref()) {
+        let saved = match &conversation {
+            Some(id) => match load_history(id, history, keep, before.as_deref()) {
                 Ok(saved) => Some(saved),
                 Err(reason) => return self.say(Event::Failed(reason)),
             },
             None => None,
         };
         self.shared.languages.set(None);
-        let mut registry = match Registry::builtin_in(
-            &directory,
-            Some(self.shared.jobs.clone()),
-            self.shared.languages.clone(),
-        ) {
-            Ok(registry) => registry,
+        let spill = spill_for(conversation.as_deref());
+        let sandbox = match Sandbox::new(&directory) {
+            Ok(sandbox) => sandbox.with_spill(spill.clone()),
             Err(error) => return self.say(Event::Failed(error.to_string())),
         };
-        let (tools, unreachable) = omc_mcp::tools(&servers).await;
+        let mut registry = Registry::builtin_for(
+            sandbox,
+            Some(self.shared.jobs.clone()),
+            self.shared.languages.clone(),
+        );
+        let (tools, unreachable) = omc_mcp::tools(&servers, &spill).await;
         for tool in tools {
             registry.register_shared(tool);
         }
@@ -348,7 +354,27 @@ impl Session {
         }));
     }
 
-    /// Starts a turn doing `job`, whose prompt the client described as `mark` when it did, unless one is running or nothing is open.
+    /// Answers the prompt that tells the model `told`, which the client sent as `text` with the files named `files` under the turn id `turn`: starts a turn with it, or queues it for the turn that is running and tells the client so.
+    ///
+    /// The skills are read again first, so that a skill added since the last turn can be invoked.
+    fn prompt(&mut self, told: String, turn: Option<String>, text: String, files: Vec<String>) {
+        if self.open.is_none() {
+            return self.say(Event::Failed("the conversation is not open".to_owned()));
+        }
+        self.rescan();
+        let Some(open) = &self.open else {
+            return;
+        };
+        let told = expand_skill(&told, &open.discovered.skills);
+        if self.running.is_some() {
+            let waiting = self.shared.queue.push(told, turn, text, files);
+            return self.say(waiting);
+        }
+        let mark = turn.map(|id| omc_agent::Mark { id, text, files });
+        self.start(Job::Prompt(told), mark);
+    }
+
+    /// Starts a turn doing `job`, whose prompt the client described as `mark` when it did, unless one is running or nothing is open; the skill a prompt invokes must already be expanded in it.
     fn start(&mut self, job: Job, mark: Option<omc_agent::Mark>) {
         let (true, Some((_, model))) = (self.open.is_some(), self.shared.model()) else {
             return self.say(Event::Failed("the conversation is not open".to_owned()));
@@ -363,17 +389,12 @@ impl Session {
                 "cannot save the conversation: {error}"
             )));
         }
-        self.rescan();
         let Some(open) = &self.open else {
             return;
         };
         self.turns += 1;
         let number = self.turns;
         self.resets_at_start = self.shared.notebook.resets();
-        let job = match job {
-            Job::Prompt(prompt) => Job::Prompt(expand_skill(&prompt, &open.discovered.skills)),
-            compact => compact,
-        };
         let turn = Turn {
             provider: open.provider,
             model,
@@ -417,6 +438,8 @@ impl Session {
     }
 
     /// Takes in the end of turn `number`; a turn that was cancelled meanwhile is ignored.
+    ///
+    /// A turn that answered is followed by a turn for the prompt that has waited longest for it, when one still waits; the others wait for that turn. When the turn failed or needs signing in again, the prompts waiting are dropped instead.
     fn finish(&mut self, number: u64, how: Ended) {
         if self.running.as_ref().map(|(running, _)| *running) != Some(number) {
             return;
@@ -426,22 +449,48 @@ impl Session {
             Ended::Done(history) => {
                 self.history = history;
                 self.say(Event::Finished(None));
+                self.follow_up();
             }
-            Ended::SignedOut(reason) => self.say(Event::SignedOut {
-                reason,
-                account: None,
-            }),
+            Ended::SignedOut(reason) => {
+                self.say(Event::SignedOut {
+                    reason,
+                    account: None,
+                });
+                self.drop_queue();
+            }
             Ended::Failed(reason) => {
                 self.shared.checkpoint.clear();
                 self.keep_fresh_window();
                 self.say(Event::Finished(Some(reason)));
+                self.drop_queue();
             }
         }
     }
 
-    /// Stops the turn that is running, subagents included, and declines what it waited on.
+    /// Starts a turn with the prompt that has waited longest, when one waits, and tells the client it started; when the turn cannot start, the prompts still waiting are dropped.
+    fn follow_up(&mut self) {
+        let Some(waiting) = self.shared.queue.pop() else {
+            return;
+        };
+        self.say(waiting.event(QueueState::Started));
+        self.rescan();
+        let mark = waiting.mark();
+        self.start(Job::Prompt(waiting.told), mark);
+        if self.running.is_none() {
+            self.drop_queue();
+        }
+    }
+
+    /// Drops every prompt waiting for the turn, telling the client of each, so that none is lost without a word.
+    fn drop_queue(&self) {
+        for waiting in self.shared.queue.drain() {
+            self.say(waiting.event(QueueState::Dropped));
+        }
+    }
+
+    /// Stops the turn that is running, subagents included, declines what it waited on and drops the prompts queued for it, telling the client of each.
     ///
-    /// The turn's task owns everything it started, so aborting it ends them all; its history is never taken in.
+    /// The turn's task owns everything it started, so aborting it ends them all; its history is never taken in. Queued prompts it had already taken in are cut back with it and saved as stopped.
     fn cancel(&mut self) {
         self.shared.questions.decline_all();
         if let Some((_, task)) = self.running.take() {
@@ -450,6 +499,7 @@ impl Session {
             self.say(Event::Halted);
             self.say(Event::Finished(None));
         }
+        self.drop_queue();
     }
 
     /// Ends whatever is running, for good, background runs included.
@@ -519,6 +569,17 @@ impl Session {
                 }
                 _ => false,
             },
+            CACHE => parse_retention(value).is_some_and(|retention| {
+                self.shared.set_retention(retention);
+                true
+            }),
+            WARMING => match value {
+                ON | OFF => {
+                    self.shared.set_warming(value == ON);
+                    true
+                }
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -553,6 +614,18 @@ const RESERVED_NAMES: [&str; 22] = [
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
     "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
+
+/// How long the output a conversation saved is kept after it was last written to.
+const SAVED_OUTPUT_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Where the tools of the conversation `id`, or of a conversation that is not saved when there is none, save output too long to show, after clearing away the output of conversations nobody wrote to for [`SAVED_OUTPUT_AGE`].
+fn spill_for(id: Option<&str>) -> Spill {
+    Spill::prune(SAVED_OUTPUT_AGE);
+    match id {
+        Some(id) => Spill::for_conversation(id),
+        None => Spill::default(),
+    }
+}
 
 /// The file the saved history of the conversation `id` is kept in, inside `folder` or a folder under the harness's own data folder.
 ///
@@ -1016,6 +1089,129 @@ mod tests {
         jobs.spawn("forever".into(), None, std::future::pending());
         session.stop();
         assert!(jobs.wait().await.is_err());
+    }
+
+    /// A session opened on an empty scratch folder named `name`, with no login and a turn that never ends running, and the events it sends.
+    fn busy_session(name: &str) -> (Session, UnboundedReceiver<Event>) {
+        let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let locations = Locations {
+            directory: directory.clone(),
+            root: Some(directory.clone()),
+            home: None,
+            claude: None,
+            codex: None,
+        };
+        let (out, events) = unbounded_channel();
+        let (ended, _finished) = unbounded_channel();
+        let shared = Shared::new(out);
+        shared.set_home(Some(directory.join("home")));
+        shared.open(Provider::Claude, vec!["m".into()], "m".into(), Mode::Asking);
+        let mut session = Session {
+            shared,
+            history: Vec::new(),
+            journal: None,
+            open: Some(Open {
+                provider: Provider::Claude,
+                base: Arc::new(Registry::builtin(&directory).unwrap()),
+                denied: Arc::new(Vec::new()),
+                discovered: Arc::new(discover(&locations, &[])),
+                locations: Arc::new(locations),
+                disabled: Vec::new(),
+            }),
+            running: None,
+            turns: 1,
+            resets_at_start: 0,
+            ended,
+        };
+        let task = tokio::spawn(std::future::pending::<()>());
+        session.running = Some((1, task.abort_handle()));
+        (session, events)
+    }
+
+    /// The prompt command `text` with no files, under the turn id `turn`.
+    fn prompt(text: &str, turn: &str) -> Command {
+        Command::Prompt {
+            text: text.into(),
+            files: Vec::new(),
+            turn: Some(turn.into()),
+            context: None,
+        }
+    }
+
+    /// The events sent so far, with the queue's events as their ticket, turn id and state.
+    fn queue_events(events: &mut UnboundedReceiver<Event>) -> Vec<(u64, String, QueueState)> {
+        std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                Event::Queued(queued) => {
+                    Some((queued.ticket, queued.turn.unwrap_or_default(), queued.state))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Prompts sent while a turn runs are queued and said to wait, a `/compact` is refused, and cancelling the turn drops what waits, saying so for each.
+    #[tokio::test]
+    async fn prompts_sent_while_running_wait_and_cancelling_drops_them() {
+        let (mut session, mut events) = busy_session("queue-cancel");
+        session.handle(prompt("first", "a")).await;
+        session.handle(prompt("second", "b")).await;
+        session.handle(prompt("/compact", "c")).await;
+        let told: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert!(
+            told.iter().any(
+                |event| matches!(event, Event::Failed(reason) if reason.starts_with("/compact"))
+            )
+        );
+        let waiting: Vec<(u64, Option<String>, QueueState)> = told
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Queued(queued) => Some((queued.ticket, queued.turn, queued.state)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            waiting,
+            vec![
+                (1, Some("a".into()), QueueState::Waiting),
+                (2, Some("b".into()), QueueState::Waiting),
+            ]
+        );
+        session.cancel();
+        assert_eq!(
+            queue_events(&mut events),
+            vec![
+                (1, "a".into(), QueueState::Dropped),
+                (2, "b".into(), QueueState::Dropped),
+            ]
+        );
+        assert!(session.shared.queue.pop().is_none());
+    }
+
+    /// A turn that answers is followed by a turn for the prompt that waited longest, and the rest keep waiting; a turn that fails drops what waits.
+    #[tokio::test]
+    async fn a_finished_turn_starts_the_next_prompt_and_a_failed_one_drops_them() {
+        let (mut session, mut events) = busy_session("queue-follow");
+        session.handle(prompt("first", "a")).await;
+        session.handle(prompt("second", "b")).await;
+        let _ = queue_events(&mut events);
+        session.finish(1, Ended::Done(Vec::new()));
+        assert_eq!(
+            queue_events(&mut events),
+            vec![(1, "a".into(), QueueState::Started)]
+        );
+        assert_eq!(session.running.as_ref().map(|(number, _)| *number), Some(2));
+        session.finish(2, Ended::Failed("broken".into()));
+        assert_eq!(
+            queue_events(&mut events),
+            vec![(2, "b".into(), QueueState::Dropped)]
+        );
+        assert!(session.running.is_none());
+        session.stop();
     }
 
     /// `/compact` asks for a compaction, with what follows it as the focus; other text, and commands that only start the same way, do not.

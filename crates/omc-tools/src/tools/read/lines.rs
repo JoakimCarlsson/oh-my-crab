@@ -120,7 +120,7 @@ pub(super) fn not_text(label: &str) -> ToolError {
 }
 
 /// Cuts `line` to [`MAX_LINE_CHARS`] characters, marking the cut.
-fn clip(line: &str) -> String {
+pub(super) fn clip(line: &str) -> String {
     match line.char_indices().nth(MAX_LINE_CHARS) {
         Some((end, _)) => format!("{}… [line truncated]", &line[..end]),
         None => line.to_string(),

@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
+use super::capture::Capture;
 use crate::tool::parse_args;
 use crate::{Jobs, Sandbox, Tool, ToolError, ToolOutput};
 
@@ -19,20 +20,18 @@ const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// Largest timeout in seconds a caller may ask for.
 const MAX_TIMEOUT_SECS: u64 = 600;
 
-/// Most bytes kept from each of stdout and stderr.
-const MAX_STREAM_BYTES: usize = 30_000;
-
 /// How long to wait for output pipes to close after the shell has exited.
 const DRAIN_GRACE: Duration = Duration::from_secs(1);
 
 /// What the model is told about the tool.
 const DESCRIPTION: &str = "Run a shell command in the working directory, with bash (cmd on Windows). Returns the exit code, stdout \
-     and stderr. The command is killed after the timeout, and long output is truncated. \
+     and stderr. The command is killed after the timeout. Long output shows its start and end only, \
+     and the result names a file holding the whole of it, to read in parts with `read` instead of running the command again. \
      The user is asked to approve each command.";
 
 /// What the model is told about the `background` flag, when the tool has it.
 const BACKGROUND_NOTE: &str = " Pass `background: true` to start a long-running command (a dev server, a long build) and get a handle \
-     back at once; it has no timeout unless you give one, and `wait` returns its exit code and the tail of its output when it ends.";
+     back at once; it has no timeout unless you give one, and `wait` returns its exit code and output, long output cut the same way, when it ends.";
 
 /// Runs shell commands in the working directory.
 pub struct Bash {
@@ -74,17 +73,6 @@ struct Args {
     /// Whether to start the command in the background and return a handle.
     #[serde(default)]
     background: bool,
-}
-
-/// The head of one output stream plus the number of bytes it produced.
-#[derive(Default)]
-struct Capture {
-    /// The first [`MAX_STREAM_BYTES`] bytes, or the last ones when `tail` is set.
-    data: Vec<u8>,
-    /// Total bytes the stream produced.
-    total: usize,
-    /// Whether the end of the stream is kept instead of the start.
-    tail: bool,
 }
 
 #[async_trait]
@@ -149,10 +137,9 @@ impl Tool for Bash {
                 .unwrap_or(DEFAULT_TIMEOUT_SECS)
                 .clamp(1, MAX_TIMEOUT_SECS);
             return run(
-                self.sandbox.root(),
+                &self.sandbox,
                 &args.command,
                 Some(Duration::from_secs(seconds)),
-                false,
             )
             .await;
         }
@@ -162,7 +149,7 @@ impl Tool for Bash {
         let timeout = args
             .timeout
             .map(|seconds| Duration::from_secs(seconds.clamp(1, MAX_TIMEOUT_SECS)));
-        let dir = self.sandbox.root().to_path_buf();
+        let sandbox = self.sandbox.clone();
         let command = args.command;
         let label: String = command
             .lines()
@@ -174,7 +161,7 @@ impl Tool for Bash {
         let work = {
             let command = command.clone();
             async move {
-                run(&dir, &command, timeout, true)
+                run(&sandbox, &command, timeout)
                     .await
                     .map(|output| output.text)
                     .map_err(|error| error.to_string())
@@ -206,22 +193,21 @@ impl Drop for GroupGuard {
     }
 }
 
-/// Runs `command` in `dir`, waiting at most `limit` when there is one.
+/// Runs `command` in the root of `sandbox`, waiting at most `limit` when there is one.
 ///
-/// With `tail` set the end of each output stream is kept when it is too long, instead of the start. The command is killed, with its process group, when the returned future is dropped.
+/// An output stream too long to show is saved whole in the sandbox's spill folder, and only its start and end are reported, with the file's path. The command is killed, with its process group, when the returned future is dropped.
 ///
 /// # Errors
 ///
 /// Returns [`ToolError::Io`] when the shell cannot start and
 /// [`ToolError::Failed`], carrying the partial output, on timeout.
 async fn run(
-    dir: &std::path::Path,
+    sandbox: &Sandbox,
     command: &str,
     limit: Option<Duration>,
-    tail: bool,
 ) -> Result<ToolOutput, ToolError> {
     let mut child = shell(command)
-        .current_dir(dir)
+        .current_dir(sandbox.root())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -229,14 +215,9 @@ async fn run(
         .spawn()?;
     let pid = child.id();
     let mut guard = GroupGuard(pid);
-    let fresh = || {
-        Arc::new(Mutex::new(Capture {
-            tail,
-            ..Capture::default()
-        }))
-    };
-    let stdout = fresh();
-    let stderr = fresh();
+    let fresh = |label| Arc::new(Mutex::new(Capture::new(label, sandbox.spill().clone())));
+    let stdout = fresh("stdout");
+    let stderr = fresh("stderr");
     let readers = [
         tokio::spawn(capture(child.stdout.take(), stdout.clone())),
         tokio::spawn(capture(child.stderr.take(), stderr.clone())),
@@ -269,7 +250,7 @@ async fn run(
     }
 }
 
-/// Reads `source` to the end, keeping the head of it in `into`, or the tail when `into` asks for it.
+/// Reads `source` to the end into `into`.
 async fn capture<R: AsyncRead + Unpin>(source: Option<R>, into: Arc<Mutex<Capture>>) {
     let Some(mut source) = source else { return };
     let mut chunk = [0u8; 8192];
@@ -277,16 +258,7 @@ async fn capture<R: AsyncRead + Unpin>(source: Option<R>, into: Arc<Mutex<Captur
         if read == 0 {
             break;
         }
-        let mut capture = into.lock().unwrap();
-        if capture.tail {
-            capture.data.extend_from_slice(&chunk[..read]);
-            let excess = capture.data.len().saturating_sub(MAX_STREAM_BYTES);
-            capture.data.drain(..excess);
-        } else {
-            let room = MAX_STREAM_BYTES.saturating_sub(capture.data.len());
-            capture.data.extend_from_slice(&chunk[..read.min(room)]);
-        }
-        capture.total += read;
+        into.lock().unwrap().push(&chunk[..read]);
     }
 }
 
@@ -336,22 +308,10 @@ fn format_output(
         },
         None => "no exit code".to_string(),
     };
-    for (label, capture) in [("stdout", stdout), ("stderr", stderr)] {
-        let capture = capture.lock().unwrap();
-        if capture.total == 0 {
-            continue;
-        }
-        text.push_str(&format!(
-            "\n--- {label} ---\n{}",
-            String::from_utf8_lossy(&capture.data).trim_end()
-        ));
-        if capture.total > capture.data.len() {
-            let part = if capture.tail { "the last " } else { "" };
-            text.push_str(&format!(
-                "\n[{label} truncated: showing {part}{} of {} bytes]",
-                capture.data.len(),
-                capture.total
-            ));
+    for capture in [stdout, stderr] {
+        if let Some(stream) = capture.lock().unwrap().render() {
+            text.push('\n');
+            text.push_str(&stream);
         }
     }
     text
@@ -364,10 +324,23 @@ mod tests {
     use super::*;
     use crate::testutil::scratch;
 
+    /// A sandbox rooted at the scratch directory `name`, saving long output in a scratch directory of its own outside the root.
+    fn sandbox(name: &str) -> (Sandbox, std::path::PathBuf) {
+        let dir = scratch(name);
+        let spill = crate::Spill::new(scratch(&format!("{name}-output")));
+        (Sandbox::new(&dir).unwrap().with_spill(spill), dir)
+    }
+
     /// Builds a `bash` tool rooted at the scratch directory `name`.
     fn tool(name: &str) -> (Bash, std::path::PathBuf) {
-        let dir = scratch(name);
-        (Bash::new(Sandbox::new(&dir).unwrap()), dir)
+        let (sandbox, dir) = sandbox(name);
+        (Bash::new(sandbox), dir)
+    }
+
+    /// The path of the file the result `text` says holds the whole output.
+    fn saved_path(text: &str) -> String {
+        let (_, rest) = text.split_once("the whole output is in ").unwrap();
+        rest.split_once(';').unwrap().0.to_owned()
     }
 
     /// Stdout, stderr and the exit code are reported, in the working directory.
@@ -402,19 +375,30 @@ mod tests {
         assert!(message.contains("started"));
     }
 
-    /// Output beyond the cap is cut and says how much was kept.
+    /// Output beyond the cap keeps its start and end, says how long it was, and is saved whole where `read` can open it.
     #[tokio::test]
-    async fn truncates_long_output() {
-        let (tool, _dir) = tool("bash-truncate");
+    async fn truncates_long_output_and_saves_it_whole() {
+        let (sandbox, _dir) = sandbox("bash-truncate");
+        let tool = Bash::new(sandbox.clone());
         let out = tool
-            .call(json!({ "command": "head -c 100000 /dev/zero | tr '\\0' x" }))
+            .call(json!({ "command": "seq 1 50000; echo failed >&2" }))
             .await
             .unwrap();
+        assert!(out.text.contains("--- stdout ---\n1\n2\n3\n"));
         assert!(
             out.text
-                .contains("stdout truncated: showing 30000 of 100000 bytes")
+                .contains("49999\n50000\n[stdout truncated: 288894 bytes in all")
         );
+        assert!(out.text.contains("--- stderr ---\nfailed"));
         assert!(out.text.len() < 31_000);
+        let path = saved_path(&out.text);
+        let whole = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(whole.lines().count(), 50_000);
+        let read = crate::Read::new(sandbox)
+            .call(json!({ "path": format!("{path}:-2") }))
+            .await
+            .unwrap();
+        assert!(read.text.contains("50000"));
     }
 
     /// A background command returns a handle at once, `wait` reports its exit code and output, and a failing command is reported as failed.
@@ -442,12 +426,12 @@ mod tests {
         assert!(finished.text.contains("timed out after 1s"));
     }
 
-    /// A background command keeps the tail of long output and says so.
+    /// A background command cuts long output the same way, keeping its end and saving the whole of it.
     #[tokio::test]
-    async fn background_output_keeps_the_tail() {
-        let dir = scratch("bash-bg-tail");
+    async fn background_output_keeps_the_tail_and_saves_it_whole() {
+        let (sandbox, _dir) = sandbox("bash-bg-tail");
         let jobs = Arc::new(Jobs::new(|_| {}));
-        let tool = Bash::with_jobs(Sandbox::new(&dir).unwrap(), jobs.clone());
+        let tool = Bash::with_jobs(sandbox, jobs.clone());
         tool.call(json!({
             "command": "head -c 100000 /dev/zero | tr '\\0' x; echo END",
             "background": true
@@ -455,8 +439,12 @@ mod tests {
         .await
         .unwrap();
         let text = jobs.wait().await.unwrap().text;
-        assert!(text.contains("stdout truncated: showing the last 30000 of 100004 bytes"));
+        assert!(text.contains(
+            "stdout truncated: 100004 bytes in all, showing the first 4000 and the last 26000"
+        ));
         assert!(text.contains("xxxEND"));
+        let whole = std::fs::read_to_string(saved_path(&text)).unwrap();
+        assert_eq!(whole.len(), 100_004);
     }
 
     /// The foreground copy of the tool refuses background runs and does not offer them.

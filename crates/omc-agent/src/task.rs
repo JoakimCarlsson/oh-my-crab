@@ -6,12 +6,12 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use omc_context::{AgentDefinition, render, subagent_assignment};
 use omc_providers::{ChatModel, Effort, Message};
+use omc_tools::schema::check_schema;
 use omc_tools::{Jobs, Registry, Tool, ToolError, ToolOutput, parse_args};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 
-use crate::schema::check_schema;
 use crate::submit::{Slot, SubmitResult};
 use crate::{AgentError, AgentEvent, Approvals, Context, run_turn};
 

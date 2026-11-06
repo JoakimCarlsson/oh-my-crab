@@ -29,6 +29,19 @@ pub fn tag(bytes: &[u8]) -> String {
     render(feed(BASIS, bytes))
 }
 
+/// What the hash of an outline tag starts from, so that it differs from the
+/// plain tag of the same contents.
+const OUTLINE_SALT: &[u8] = b"outline\0";
+
+/// Returns the tag a `read` outline of a file holding `bytes` carries.
+///
+/// It is as stable as [`tag`] but almost always differs from it, so that
+/// `edit` can tell an edit made against an outline, which must keep off the
+/// folded lines, from one made against the whole text.
+pub(crate) fn outline_tag(bytes: &[u8]) -> String {
+    render(feed(feed(BASIS, OUTLINE_SALT), bytes))
+}
+
 /// Returns the tag of the file at `path`, reading it in chunks so a large file is never held in memory.
 ///
 /// # Errors
@@ -62,6 +75,16 @@ mod tests {
         );
         assert_eq!(a, tag(b"alpha\n"));
         assert_ne!(a, tag(b"alpha \n"));
+    }
+
+    /// An outline tag is stable for equal input and differs from the plain tag.
+    #[test]
+    fn outline_tag_differs_from_plain_tag() {
+        let outline = outline_tag(b"alpha\n");
+        assert_eq!(outline.len(), 4);
+        assert_eq!(outline, outline_tag(b"alpha\n"));
+        assert_ne!(outline, tag(b"alpha\n"));
+        assert_ne!(outline, outline_tag(b"alpha \n"));
     }
 
     /// Hashing a file in chunks gives the tag of its bytes.

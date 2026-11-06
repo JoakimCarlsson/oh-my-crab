@@ -13,7 +13,8 @@ use crate::models::{
     claude_thinking_mode, parse_claude,
 };
 use crate::{
-    Effort, Message, Part, ProviderError, Reply, Request, Sink, Tokens, ToolCall, ToolSpec, sse,
+    Effort, Message, Part, ProviderError, Reply, Request, Retention, Sink, Stop, Tokens, ToolCall,
+    ToolSpec, sse,
 };
 
 /// Messages endpoint.
@@ -94,6 +95,8 @@ struct Delta {
     signature: Option<String>,
     /// Fragment of a tool call's argument JSON, absent for other deltas.
     partial_json: Option<String>,
+    /// Why the model stopped, carried by the `message_delta` event.
+    stop_reason: Option<String>,
 }
 
 /// The error carried by an `error` event.
@@ -146,6 +149,10 @@ pub(crate) struct Accumulator {
     tokens: Tokens,
     /// Whether any usage was reported.
     counted: bool,
+    /// Why the model stopped, once the stream said.
+    stop: Stop,
+    /// Whether the stream reached its `message_stop` event.
+    ended: bool,
 }
 
 impl Accumulator {
@@ -159,6 +166,8 @@ impl Accumulator {
             streaming: Blocks::default(),
             tokens: Tokens::default(),
             counted: false,
+            stop: Stop::Finished,
+            ended: false,
         }
     }
 
@@ -200,6 +209,13 @@ impl Accumulator {
                 if let Some(usage) = payload.usage {
                     self.count(usage);
                 }
+                if payload
+                    .delta
+                    .and_then(|delta| delta.stop_reason)
+                    .is_some_and(|reason| reason == "max_tokens")
+                {
+                    self.stop = Stop::Length;
+                }
             }
             "content_block_start" => {
                 if let (Some(index), Some(block)) = (payload.index, payload.content_block) {
@@ -217,7 +233,10 @@ impl Accumulator {
                     .map_or_else(|| data.to_string(), |e| e.message);
                 return Err(ProviderError::Stream(message));
             }
-            "message_stop" => return Ok(true),
+            "message_stop" => {
+                self.ended = true;
+                return Ok(true);
+            }
             _ => {}
         }
         Ok(false)
@@ -275,7 +294,19 @@ impl Accumulator {
     }
 
     /// Ends the stream and returns the reply it described.
-    pub(crate) fn finish(self) -> Reply {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Unfinished`] when the stream ended before its `message_stop` event, since the reply may then be cut short anywhere.
+    pub(crate) fn finish(self) -> Result<Reply, ProviderError> {
+        if !self.ended {
+            return Err(ProviderError::Unfinished);
+        }
+        Ok(self.reply())
+    }
+
+    /// The reply the events so far describe.
+    fn reply(self) -> Reply {
         let mut opaque = Vec::new();
         let mut tool_calls = Vec::new();
         for block in self.blocks.into_values() {
@@ -311,6 +342,7 @@ impl Accumulator {
             tool_calls,
             tokens: self.counted.then_some(self.tokens),
             opaque,
+            stop: self.stop,
         }
     }
 }
@@ -514,8 +546,32 @@ pub(crate) fn tools_json(tools: &[ToolSpec], prefixed: bool) -> Vec<Value> {
         .collect()
 }
 
-/// Marks the last content block of the last message as a cache breakpoint.
-fn mark_last_message(messages: &mut [Value]) {
+/// How a request is sent: whether it writes to the prompt cache and for how long, and whether it only warms the cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Form {
+    /// How long the cache entries the request writes live, or nothing to mark no cache breakpoint at all.
+    pub cache: Option<Retention>,
+    /// Whether the request asks for no output and is not streamed, which only reads or writes the cache.
+    pub warm: bool,
+}
+
+impl Form {
+    /// A streamed request whose cache entries live as `cache` says, or that writes none when it is nothing.
+    pub(crate) const fn streamed(cache: Option<Retention>) -> Self {
+        Self { cache, warm: false }
+    }
+}
+
+/// The `cache_control` value of a breakpoint whose entry lives as `retention` says.
+fn breakpoint(retention: Retention) -> Value {
+    match retention {
+        Retention::Short => json!({ "type": "ephemeral" }),
+        Retention::Long => json!({ "type": "ephemeral", "ttl": "1h" }),
+    }
+}
+
+/// Marks the last content block of the last message as the cache breakpoint `marker`.
+fn mark_last_message(messages: &mut [Value], marker: &Value) {
     let Some(last) = messages.last_mut() else {
         return;
     };
@@ -526,7 +582,7 @@ fn mark_last_message(messages: &mut [Value]) {
         .as_array_mut()
         .and_then(|blocks| blocks.last_mut())
     {
-        block["cache_control"] = json!({ "type": "ephemeral" });
+        block["cache_control"] = marker.clone();
     }
 }
 
@@ -541,38 +597,46 @@ fn first_user_text(messages: &[Message]) -> &str {
         .unwrap_or("")
 }
 
-/// Builds the request body, with the billing placeholder still in place for OAuth.
+/// Builds the request body sent in `form`, with the billing placeholder still in place for OAuth.
+///
+/// Every breakpoint gets the same lifetime, since the API refuses a longer-lived entry after a shorter-lived one.
 pub(crate) fn build_body(
     model: &str,
     request: &Request<'_>,
     credentials: &Credentials,
     params: &ThinkingParams,
+    form: Form,
 ) -> Value {
     let oauth = identity::is_oauth_token(&credentials.access);
     let parsed = parse_claude(model);
+    let marker = form.cache.map(breakpoint);
     let mut messages = messages_json(request.messages, oauth, replays_thinking(&parsed, params));
-    mark_last_message(&mut messages);
+    if let Some(marker) = &marker {
+        mark_last_message(&mut messages, marker);
+    }
     let mut system = Vec::new();
     if oauth {
         system.push(json!({
             "type": "text",
             "text": identity::billing_header(first_user_text(request.messages)),
         }));
-        system.push(json!({
-            "type": "text",
-            "text": identity::IDENTITY,
-            "cache_control": { "type": "ephemeral" },
-        }));
+        let mut block = json!({ "type": "text", "text": identity::IDENTITY });
+        if let Some(marker) = &marker {
+            block["cache_control"] = marker.clone();
+        }
+        system.push(block);
     }
     if !request.system.trim().is_empty() {
         let mut block = json!({ "type": "text", "text": request.system });
-        block["cache_control"] = json!({ "type": "ephemeral" });
+        if let Some(marker) = &marker {
+            block["cache_control"] = marker.clone();
+        }
         system.push(block);
     }
     let mut body = json!({
         "model": model,
-        "max_tokens": params.max_tokens,
-        "stream": true,
+        "max_tokens": if form.warm { 0 } else { params.max_tokens },
+        "stream": !form.warm,
         "messages": messages,
     });
     if !system.is_empty() {
@@ -660,26 +724,22 @@ pub async fn list_models(credentials: &Credentials) -> Result<Vec<String>, Provi
         false,
     );
     let response = request.send().await?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(ProviderError::Status {
-            status: status.to_string(),
-            body,
-        });
+    if !response.status().is_success() {
+        return Err(ProviderError::from_response(response).await);
     }
     let list: ModelList = response.json().await?;
     Ok(list.data.into_iter().map(|entry| entry.id).collect())
 }
 
-/// Serializes the request for `model` to the bytes to send, attested for OAuth.
+/// Serializes the request for `model` sent in `form` to the bytes to send, attested for OAuth.
 fn encode(
     model: &str,
     request: &Request<'_>,
     credentials: &Credentials,
     params: &ThinkingParams,
+    form: Form,
 ) -> Vec<u8> {
-    let body = build_body(model, request, credentials, params);
+    let body = build_body(model, request, credentials, params, form);
     let mut bytes = serde_json::to_vec(&body).unwrap_or_default();
     if identity::is_oauth_token(&credentials.access) {
         identity::attest(&mut bytes);
@@ -687,11 +747,55 @@ fn encode(
     bytes
 }
 
-/// Sends the conversation to Claude using `model` and returns its reply,
-/// streaming text and thinking chunks to `sink`.
+/// Sends the request for `model` in `form` and returns the successful response.
 ///
 /// A rejection that says the claimed Claude Code version is too old is retried
 /// once with the version it asks for.
+///
+/// # Errors
+///
+/// Returns [`ProviderError`] on network failure or a non-success status.
+async fn send(
+    credentials: &Credentials,
+    model: &str,
+    request: &Request<'_>,
+    params: &ThinkingParams,
+    form: Form,
+) -> Result<reqwest::Response, ProviderError> {
+    let oauth = identity::is_oauth_token(&credentials.access);
+    let betas = betas(credentials, params);
+    let url = if oauth {
+        format!("{URL}?beta=true")
+    } else {
+        URL.to_string()
+    };
+    let client = reqwest::Client::new();
+    let mut attempt = 0;
+    loop {
+        let bytes = encode(model, request, credentials, params, form);
+        let response = authorized(client.post(&url), credentials, &betas, !form.warm)
+            .body(bytes)
+            .send()
+            .await?;
+        if response.status().is_success() {
+            return Ok(response);
+        }
+        let error = ProviderError::from_response(response).await;
+        if let ProviderError::Status { body, .. } = &error
+            && oauth
+            && attempt == 0
+            && identity::adopt_required_version(body)
+        {
+            attempt += 1;
+            continue;
+        }
+        return Err(error);
+    }
+}
+
+/// Sends the conversation to Claude using `model` and returns its reply,
+/// streaming text and thinking chunks to `sink`; the cache entries the request
+/// writes live as `cache` says, and it writes none when that is nothing.
 ///
 /// # Errors
 ///
@@ -702,37 +806,11 @@ pub async fn complete(
     model: &str,
     request: Request<'_>,
     sink: &mut dyn Sink,
+    cache: Option<Retention>,
 ) -> Result<Reply, ProviderError> {
     let oauth = identity::is_oauth_token(&credentials.access);
     let params = thinking_params(model, request.effort);
-    let betas = betas(credentials, &params);
-    let url = if oauth {
-        format!("{URL}?beta=true")
-    } else {
-        URL.to_string()
-    };
-    let client = reqwest::Client::new();
-    let mut attempt = 0;
-    let response = loop {
-        let bytes = encode(model, &request, credentials, &params);
-        let response = authorized(client.post(&url), credentials, &betas, true)
-            .body(bytes)
-            .send()
-            .await?;
-        let status = response.status();
-        if status.is_success() {
-            break response;
-        }
-        let body = response.text().await.unwrap_or_default();
-        if oauth && attempt == 0 && identity::adopt_required_version(&body) {
-            attempt += 1;
-            continue;
-        }
-        return Err(ProviderError::Status {
-            status: status.to_string(),
-            body,
-        });
-    };
+    let response = send(credentials, model, &request, &params, Form::streamed(cache)).await?;
     let mut events = sse::events(response).await?;
     let mut accumulator = Accumulator::new(oauth);
     while let Some(event) = events.next().await {
@@ -740,7 +818,54 @@ pub async fn complete(
             break;
         }
     }
-    Ok(accumulator.finish())
+    accumulator.finish()
+}
+
+/// The body of an answer that is not streamed, of which only the usage is read.
+#[derive(Deserialize)]
+struct Answered {
+    /// What the request cost.
+    usage: Option<Usage>,
+}
+
+/// Sends `request` to `model` again asking for no output and without streaming, which reads the cache entries it wrote and so keeps them alive for another lifetime of `retention`; returns what it cost.
+///
+/// Nothing is sent, and nothing returned, when the request thinks within a token budget: a request with no output cannot keep that budget, and the cache is keyed on it.
+///
+/// # Errors
+///
+/// Returns [`ProviderError`] on network failure, a non-success status or a body that is not JSON.
+pub async fn warm(
+    credentials: &Credentials,
+    model: &str,
+    request: Request<'_>,
+    retention: Retention,
+) -> Result<Option<Tokens>, ProviderError> {
+    let params = thinking_params(model, request.effort);
+    if params
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking["type"] == "enabled")
+    {
+        return Ok(None);
+    }
+    let form = Form {
+        cache: Some(retention),
+        warm: true,
+    };
+    let response = send(credentials, model, &request, &params, form).await?;
+    let answered: Answered = response.json().await?;
+    Ok(Some(tokens_of(answered.usage.unwrap_or_default())))
+}
+
+/// The token counts `usage` reports, with what it leaves out as zero.
+fn tokens_of(usage: Usage) -> Tokens {
+    Tokens {
+        input: usage.input_tokens.unwrap_or(0),
+        output: usage.output_tokens.unwrap_or(0),
+        cache_read: usage.cache_read_input_tokens.unwrap_or(0),
+        cache_write: usage.cache_creation_input_tokens.unwrap_or(0),
+    }
 }
 
 #[cfg(test)]
@@ -944,7 +1069,8 @@ mod tests {
         };
         let creds = credentials("sk-ant-oat01-x");
         let params = thinking_params("claude-opus-5-5", request.effort);
-        let body = build_body("claude-opus-5-5", &request, &creds, &params);
+        let short = Form::streamed(Some(Retention::Short));
+        let body = build_body("claude-opus-5-5", &request, &creds, &params, short);
         let system = body["system"].as_array().unwrap();
         assert!(
             system[0]["text"]
@@ -961,7 +1087,7 @@ mod tests {
         assert_eq!(body["output_config"]["effort"], "high");
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert!(body["context_management"].is_object());
-        let bytes = encode("claude-opus-5-5", &request, &creds, &params);
+        let bytes = encode("claude-opus-5-5", &request, &creds, &params, short);
         let text = String::from_utf8(bytes).unwrap();
         assert!(!text.contains("cch=00000"));
         assert!(text.contains("cch="));
@@ -982,15 +1108,101 @@ mod tests {
         };
         let creds = credentials("sk-ant-api03-x");
         let params = thinking_params("claude-haiku-5-5", None);
-        let body = build_body("claude-haiku-5-5", &request, &creds, &params);
+        let body = build_body(
+            "claude-haiku-5-5",
+            &request,
+            &creds,
+            &params,
+            Form::streamed(Some(Retention::Short)),
+        );
         assert_eq!(body["system"].as_array().unwrap().len(), 1);
         assert!(body.get("tools").is_none());
         assert!(body.get("metadata").is_none());
         assert!(body.get("thinking").is_none());
     }
 
-    /// Feeds each of `events` into a fresh accumulator and returns the reply.
-    fn run(events: &[Value], prefixed: bool, sink: &mut Recorder) -> Reply {
+    /// The `cache_control` values of every block of `body` that carries one, system blocks first.
+    fn breakpoints(body: &Value) -> Vec<Value> {
+        let system = body["system"].as_array().into_iter().flatten();
+        let messages = body["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|message| message["content"].as_array())
+            .flatten();
+        system
+            .chain(messages)
+            .filter_map(|block| block.get("cache_control").cloned())
+            .collect()
+    }
+
+    /// The hour-long lifetime marks every breakpoint with it, an uncached request marks none, and a warm request asks for no output without streaming.
+    #[test]
+    fn cache_forms_shape_the_body() {
+        let messages = [
+            Message::User("a".into()),
+            Message::Assistant(Reply {
+                text: "b".into(),
+                ..Reply::default()
+            }),
+            Message::User("c".into()),
+        ];
+        let request = Request {
+            system: "be brief",
+            messages: &messages,
+            tools: &[],
+            effort: Some(Effort::High),
+        };
+        let creds = credentials("sk-ant-oat01-x");
+        let params = thinking_params("claude-opus-5-5", request.effort);
+        let body = |form| build_body("claude-opus-5-5", &request, &creds, &params, form);
+        let short = body(Form::streamed(Some(Retention::Short)));
+        assert_eq!(breakpoints(&short), vec![json!({ "type": "ephemeral" }); 3]);
+        let long = body(Form::streamed(Some(Retention::Long)));
+        assert_eq!(
+            breakpoints(&long),
+            vec![json!({ "type": "ephemeral", "ttl": "1h" }); 3]
+        );
+        let uncached = body(Form::streamed(None));
+        assert!(breakpoints(&uncached).is_empty());
+        assert_eq!(uncached["messages"][2]["content"], "c");
+        let warm = body(Form {
+            cache: Some(Retention::Short),
+            warm: true,
+        });
+        assert_eq!(
+            (warm["max_tokens"].clone(), warm["stream"].clone()),
+            (json!(0), json!(false))
+        );
+        let mut same = warm.clone();
+        same["max_tokens"] = short["max_tokens"].clone();
+        same["stream"] = json!(true);
+        assert_eq!(same, short);
+    }
+
+    /// Usage the API leaves out counts as zero.
+    #[test]
+    fn warm_usage_fills_gaps() {
+        let usage: Usage =
+            serde_json::from_value(json!({ "cache_read_input_tokens": 900, "input_tokens": 3 }))
+                .unwrap();
+        assert_eq!(
+            tokens_of(usage),
+            Tokens {
+                input: 3,
+                output: 0,
+                cache_read: 900,
+                cache_write: 0,
+            }
+        );
+    }
+
+    /// Feeds each of `events` into a fresh accumulator and returns how the stream ended.
+    fn ended(
+        events: &[Value],
+        prefixed: bool,
+        sink: &mut Recorder,
+    ) -> Result<Reply, ProviderError> {
         let mut accumulator = Accumulator::new(prefixed);
         for event in events {
             if accumulator.feed(&event.to_string(), sink).unwrap() {
@@ -998,6 +1210,11 @@ mod tests {
             }
         }
         accumulator.finish()
+    }
+
+    /// Feeds each of `events` into a fresh accumulator and returns the reply.
+    fn run(events: &[Value], prefixed: bool, sink: &mut Recorder) -> Reply {
+        ended(events, prefixed, sink).unwrap()
     }
 
     /// Thinking, signature, text and tool deltas become sink chunks and reply fields.
@@ -1082,5 +1299,43 @@ mod tests {
             .feed(&event.to_string(), &mut Recorder::default())
             .unwrap_err();
         assert!(error.to_string().contains("overloaded"));
+    }
+
+    /// A reply the output limit cut off says so, and one that ends normally does not.
+    #[test]
+    fn the_output_limit_is_reported() {
+        let cut = [
+            json!({ "type": "content_block_start", "index": 0,
+                "content_block": { "type": "text", "text": "" } }),
+            json!({ "type": "content_block_delta", "index": 0,
+                "delta": { "type": "text_delta", "text": "half a" } }),
+            json!({ "type": "message_delta", "delta": { "stop_reason": "max_tokens" } }),
+            json!({ "type": "message_stop" }),
+        ];
+        assert_eq!(
+            run(&cut, false, &mut Recorder::default()).stop,
+            Stop::Length
+        );
+        let whole = [
+            json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" } }),
+            json!({ "type": "message_stop" }),
+        ];
+        assert_eq!(
+            run(&whole, false, &mut Recorder::default()).stop,
+            Stop::Finished
+        );
+    }
+
+    /// A stream that ends before `message_stop` is unfinished rather than a short reply.
+    #[test]
+    fn a_stream_without_its_stop_is_unfinished() {
+        let events = [
+            json!({ "type": "content_block_start", "index": 0,
+                "content_block": { "type": "text", "text": "" } }),
+            json!({ "type": "content_block_delta", "index": 0,
+                "delta": { "type": "text_delta", "text": "half" } }),
+        ];
+        let error = ended(&events, false, &mut Recorder::default()).unwrap_err();
+        assert!(matches!(error, ProviderError::Unfinished), "{error}");
     }
 }

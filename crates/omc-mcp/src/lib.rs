@@ -8,7 +8,7 @@ mod tool;
 use std::sync::Arc;
 use std::time::Duration;
 
-use omc_tools::Tool;
+use omc_tools::{Spill, Tool};
 use omc_wire::ToolServer;
 use serde_json::Value;
 
@@ -18,10 +18,10 @@ use crate::tool::McpTool;
 /// How long a server has to connect and list its tools.
 const PATIENCE: Duration = Duration::from_secs(20);
 
-/// The tools of `servers`, each as a tool of the agent, and the reasons the servers that could not be reached give.
-pub async fn tools(servers: &[ToolServer]) -> (Vec<Arc<dyn Tool>>, Vec<String>) {
+/// The tools of `servers`, each as a tool of the agent saving output too long to show in `spill`, and the reasons the servers that could not be reached give.
+pub async fn tools(servers: &[ToolServer], spill: &Spill) -> (Vec<Arc<dyn Tool>>, Vec<String>) {
     let attempts = servers.iter().map(|server| async move {
-        match tokio::time::timeout(PATIENCE, connected(server)).await {
+        match tokio::time::timeout(PATIENCE, connected(server, spill)).await {
             Ok(result) => result.map_err(|reason| format!("{}: {reason}", server.name)),
             Err(_) => Err(format!("{}: did not answer in time", server.name)),
         }
@@ -37,17 +37,24 @@ pub async fn tools(servers: &[ToolServer]) -> (Vec<Arc<dyn Tool>>, Vec<String>) 
     (found, failed)
 }
 
-/// Connects to `server` and takes its tools.
+/// Connects to `server` and takes its tools, which save output too long to show in `spill`.
 ///
 /// # Errors
 ///
 /// Fails with the reason when the server cannot be reached or listed.
-async fn connected(server: &ToolServer) -> Result<Vec<Arc<dyn Tool>>, String> {
+async fn connected(server: &ToolServer, spill: &Spill) -> Result<Vec<Arc<dyn Tool>>, String> {
     let client = Arc::new(Client::connect(server).await?);
     let offered = client.tools().await?;
     Ok(offered
         .into_iter()
-        .map(|tool| Arc::new(McpTool::new(&server.name, tool, client.clone())) as Arc<dyn Tool>)
+        .map(|tool| {
+            Arc::new(McpTool::new(
+                &server.name,
+                tool,
+                client.clone(),
+                spill.clone(),
+            )) as Arc<dyn Tool>
+        })
         .collect())
 }
 

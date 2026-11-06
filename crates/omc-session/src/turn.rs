@@ -2,17 +2,19 @@
 
 use std::sync::Arc;
 
-use omc_agent::{Context, EventSink, Live, Scribe, compact, run_turn_recorded};
+use omc_agent::{Context, EventSink, Scribe, compact, run_turn_steered};
 use omc_auth::AuthError;
 use omc_context::{Discovered, Environment, Locations};
 use omc_providers::Provider;
 use omc_providers::{ChatModel, Message, RemoteModel};
 use omc_tools::{Host, Registry};
 
+use crate::prefix::{Key, Planning, Prefix};
 use crate::settings::Mode;
 use crate::shared::{SessionHost, Shared};
 use crate::toolset::{Inputs, Toolset};
 use crate::translate::translate_all;
+use crate::warmer::Recorder;
 
 /// How a turn ended.
 pub(crate) enum Ended {
@@ -70,11 +72,34 @@ impl Turn {
             provider: self.provider,
             credentials,
             model: self.model.clone(),
+            retention: self.shared.retention(),
         };
         self.run_with(Arc::new(model), job).await
     }
 
-    /// Does `job` with `model` and says how it ended.
+    /// The workstation as it is now; in tests, on the date the conversation pins, when it pins one.
+    fn environment(&self) -> Environment {
+        let environment = Environment::detect(&self.locations, &self.model);
+        #[cfg(test)]
+        let environment = match self
+            .shared
+            .today
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .clone()
+        {
+            Some(date) => Environment {
+                date,
+                ..environment
+            },
+            None => environment,
+        };
+        environment
+    }
+
+    /// Does `job` with `model` and says how it ended; a prompt takes in the prompts the client queued meanwhile at each safe point.
+    ///
+    /// Every request of the turn is sent with the conversation's system prompt and tool list, made by its first turn, so that the provider's prompt cache keeps them: a prompt starts with notices of what changed since, and the tools the mode on now lacks are refused when called. The last request of the main loop is kept warm.
     pub(crate) async fn run_with(mut self, model: Arc<dyn ChatModel>, job: Job) -> Ended {
         let window = omc_providers::context_window(self.provider, &self.model);
         let effort = self.shared.effort_now();
@@ -91,6 +116,8 @@ impl Turn {
             .shared
             .checkpoints()
             .then(|| self.shared.checkpoint.clone());
+        let environment = Arc::new(self.environment());
+        let unnamed = self.shared.title().is_none();
         let toolset = Toolset::build(&Inputs {
             base: &self.base,
             denied: &self.denied,
@@ -100,34 +127,64 @@ impl Turn {
             events: events.clone(),
             effort,
             discovered: self.discovered.clone(),
-            environment: Arc::new(Environment::detect(&self.locations, &self.model)),
+            environment: environment.clone(),
             notebook: self.shared.notebook.clone(),
             checkpoint: checkpoint.clone(),
             jobs: self.shared.jobs.clone(),
-            unnamed: self.shared.title().is_none(),
+            unnamed,
+        });
+        let key = Key {
+            provider: self.provider,
+            model: self.model.clone(),
+            checkpoints: checkpoint.is_some(),
+        };
+        let prefix = self.shared.prefix(&key, || {
+            Prefix::freeze(
+                key.clone(),
+                &toolset,
+                &environment,
+                self.discovered.clone(),
+                unnamed,
+            )
         });
         let shared = self.shared.clone();
-        let refresh = move || toolset.live(shared.mode() == Mode::Plan);
-        let initial: Live = refresh();
+        let planning: Planning = Arc::new(move || shared.mode() == Mode::Plan);
+        let registry = prefix.registry(&toolset, &planning);
+        let _running = self.shared.warmer.running();
+        let recorder = Recorder {
+            inner: model.clone(),
+            shared: self.shared.clone(),
+            provider: self.provider,
+            model: self.model.clone(),
+        };
         let context = Context {
-            model: model.as_ref(),
-            registry: &initial.registry,
+            model: &recorder,
+            registry: &registry,
             approvals: &self.shared.approvals,
-            system: &initial.system,
+            system: &prefix.system,
             effort,
-            refresh: Some(&refresh),
+            refresh: None,
             notebook: Some(&self.shared.notebook),
             window: Some(window),
             checkpoint: checkpoint.as_deref(),
         };
         let result = match job {
             Job::Prompt(prompt) => {
-                run_turn_recorded(
+                let mut told = prefix.notices(
+                    &self.history,
+                    &environment,
+                    &self.discovered,
+                    planning(),
+                    &toolset,
+                );
+                told.push(prompt);
+                run_turn_steered(
                     &context,
                     &mut self.history,
-                    prompt,
+                    told.join("\n\n"),
                     events.as_ref(),
                     self.scribe.as_ref(),
+                    Some(self.shared.as_ref()),
                 )
                 .await
             }
@@ -161,68 +218,101 @@ mod tests {
 
     use super::*;
 
-    /// A model that calls `exit_plan_mode` on its first request, then answers, and keeps what it was offered.
+    /// What one request carried: the system prompt and the tool list as the provider gets them, and the text of the last message when it is the reader's.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Sent {
+        /// The system prompt.
+        system: String,
+        /// Every tool's name, description and schema, in order.
+        tools: Vec<serde_json::Value>,
+        /// The last message, when it is the reader's.
+        prompt: Option<String>,
+    }
+
+    impl Sent {
+        /// What `request` carried.
+        fn of(request: &Request<'_>) -> Self {
+            Self {
+                system: request.system.to_owned(),
+                tools: request
+                    .tools
+                    .iter()
+                    .map(|tool| json!([tool.name, tool.description, tool.schema]))
+                    .collect(),
+                prompt: match request.messages.last() {
+                    Some(Message::User(text)) => Some(text.clone()),
+                    _ => None,
+                },
+            }
+        }
+    }
+
+    /// A model that writes a file in plan mode, then calls `exit_plan_mode`, then writes the file again, then answers, and keeps what it was sent.
     struct Planner {
-        /// The tool names and whether plan mode was in the system prompt, at each request.
-        seen: Mutex<Vec<(Vec<String>, bool)>>,
+        /// What each request carried, with the results it was given.
+        seen: Mutex<Vec<(Sent, Option<Vec<omc_providers::ToolResult>>)>>,
     }
 
     #[async_trait]
     impl ChatModel for Planner {
-        /// Plans first, then says it is done.
+        /// Writes, plans, writes, then says it is done.
         async fn complete(
             &self,
             request: Request<'_>,
             _: &mut dyn Sink,
         ) -> Result<Reply, ProviderError> {
-            let names = request.tools.iter().map(|tool| tool.name.clone()).collect();
+            let results = match request.messages.last() {
+                Some(Message::ToolResults(results)) => Some(results.clone()),
+                _ => None,
+            };
             let mut seen = self.seen.lock().unwrap();
-            seen.push((names, request.system.contains("Plan mode active")));
-            if seen.len() == 1 {
-                return Ok(Reply {
-                    tool_calls: vec![ToolCall {
-                        id: "p".into(),
-                        name: "exit_plan_mode".into(),
-                        arguments: json!({"plan": "# Plan\n1. do it"}),
-                    }],
+            seen.push((Sent::of(&request), results));
+            let write = || calling("write", json!({"path": "made.txt", "content": "x"}));
+            Ok(match seen.len() {
+                1 | 3 => write(),
+                2 => calling("exit_plan_mode", json!({"plan": "# Plan\n1. do it"})),
+                _ => Reply {
+                    text: "implemented".into(),
                     ..Reply::default()
-                });
-            }
-            Ok(Reply {
-                text: "implemented".into(),
-                ..Reply::default()
+                },
             })
         }
     }
 
-    /// Plan mode offers read-only tools; approving the plan switches the mode back, announces it, and the same turn goes on with writing tools.
-    #[tokio::test]
-    async fn approving_a_plan_ends_plan_mode_mid_turn() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../build/tests/omc-session/turn-plan");
-        std::fs::create_dir_all(&dir).unwrap();
-        let (out, mut events) = tokio::sync::mpsc::unbounded_channel();
-        let shared = Shared::new(out);
-        shared.open(Provider::Claude, vec!["m".into()], "m".into(), Mode::Yolo);
-        shared.set_mode(Mode::Plan);
-        assert!(!shared.approvals.yolo());
-        let turn = Turn {
+    /// A turn for `shared` in `dir` with the built-in tools and `history`.
+    fn turn_in(dir: &std::path::Path, shared: &Arc<Shared>, history: Vec<Message>) -> Turn {
+        Turn {
             provider: Provider::Claude,
             model: "m".into(),
-            base: Arc::new(Registry::builtin(&dir).unwrap()),
+            base: Arc::new(Registry::builtin(dir).unwrap()),
             denied: Arc::new(Vec::new()),
             discovered: Arc::new(Discovered::default()),
             locations: Arc::new(Locations {
-                directory: dir,
+                directory: dir.to_path_buf(),
                 root: None,
                 home: None,
                 claude: None,
                 codex: None,
             }),
             shared: shared.clone(),
-            history: Vec::new(),
+            history,
             scribe: None,
-        };
+        }
+    }
+
+    /// Plan mode keeps every tool on the list but refuses the ones that change things; approving the plan switches the mode back, announces it, and the same turn goes on writing, with the same system prompt and tools throughout.
+    #[tokio::test]
+    async fn approving_a_plan_ends_plan_mode_mid_turn() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/turn-plan");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (out, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared::new(out);
+        shared.open(Provider::Claude, vec!["m".into()], "m".into(), Mode::Yolo);
+        shared.set_mode(Mode::Plan);
+        assert!(!shared.approvals.yolo());
+        let turn = turn_in(&dir, &shared, Vec::new());
         let model = Arc::new(Planner {
             seen: Mutex::new(Vec::new()),
         });
@@ -237,11 +327,13 @@ mod tests {
                 None => panic!("no plan was proposed"),
             }
         };
+        assert!(!dir.join("made.txt").exists());
         shared.questions.answer(ticket, Some("allow"));
         let Ended::Done(history) = running.await.unwrap() else {
             panic!("turn failed");
         };
-        assert_eq!(history.len(), 4);
+        assert_eq!(history.len(), 8);
+        assert!(dir.join("made.txt").exists());
         assert_eq!(shared.mode(), Mode::Yolo);
         assert!(shared.approvals.yolo());
         let mut announced = None;
@@ -256,15 +348,165 @@ mod tests {
             "yolo"
         );
         let seen = model.seen.lock().unwrap();
-        assert!(seen[0].1 && !seen[1].1);
+        assert_eq!(seen.len(), 4);
+        for (sent, _) in seen.iter() {
+            assert_eq!(
+                (&sent.system, &sent.tools),
+                (&seen[0].0.system, &seen[0].0.tools)
+            );
+        }
+        let names: Vec<&str> = seen[0]
+            .0
+            .tools
+            .iter()
+            .map(|tool| tool[0].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"write") && names.contains(&"exit_plan_mode"));
+        assert!(!seen[0].0.system.contains("Plan mode active"));
+        let prompt = seen[0].0.prompt.as_deref().unwrap();
+        assert!(prompt.contains("Plan mode is now on") && prompt.ends_with("plan it"));
+        let refused = &seen[1].1.as_ref().unwrap()[0];
+        assert!(refused.is_error && refused.text.contains("not available in plan mode"));
+        let written = &seen[3].1.as_ref().unwrap()[0];
+        assert!(!written.is_error, "{}", written.text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A model that answers every request at once and keeps what each carried.
+    struct Recording {
+        /// What each request carried.
+        seen: Mutex<Vec<Sent>>,
+    }
+
+    #[async_trait]
+    impl ChatModel for Recording {
+        /// Answers with a word.
+        async fn complete(
+            &self,
+            request: Request<'_>,
+            _: &mut dyn Sink,
+        ) -> Result<Reply, ProviderError> {
+            self.seen.lock().unwrap().push(Sent::of(&request));
+            Ok(Reply {
+                text: "ok".into(),
+                ..Reply::default()
+            })
+        }
+    }
+
+    /// The system prompt and tool list sent stay byte for byte the same across plan mode turning on and off and the date changing; each change is told once, at the start of the next prompt.
+    #[tokio::test]
+    async fn the_prefix_survives_plan_mode_and_a_new_day() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/turn-prefix");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (out, _events) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared::new(out);
+        shared.open(Provider::Claude, vec!["m".into()], "m".into(), Mode::Asking);
+        let model = Arc::new(Recording {
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut history = Vec::new();
+        let steps = [
+            ("2026-11-05", Mode::Asking, "one"),
+            ("2026-11-06", Mode::Plan, "two"),
+            ("2026-11-06", Mode::Plan, "three"),
+            ("2026-11-06", Mode::Asking, "four"),
+        ];
+        for (date, mode, prompt) in steps {
+            *shared.today.lock().unwrap() = Some(date.to_owned());
+            shared.set_mode(mode);
+            let turn = turn_in(&dir, &shared, history);
+            let Ended::Done(after) = turn
+                .run_with(model.clone(), Job::Prompt(prompt.into()))
+                .await
+            else {
+                panic!("turn failed");
+            };
+            history = after;
+        }
+        let seen = model.seen.lock().unwrap();
+        assert_eq!(seen.len(), 4);
+        for sent in seen.iter() {
+            assert_eq!(sent.system.as_bytes(), seen[0].system.as_bytes());
+            assert_eq!(
+                serde_json::to_vec(&sent.tools).unwrap(),
+                serde_json::to_vec(&seen[0].tools).unwrap()
+            );
+            assert!(!sent.system.contains("2026-11-0"));
+        }
+        let prompts: Vec<&str> = seen
+            .iter()
+            .map(|sent| sent.prompt.as_deref().unwrap())
+            .collect();
+        assert!(prompts[0].starts_with("<environment>\nToday's date: 2026-11-05."));
+        assert!(!prompts[0].contains("<plan-mode>"));
         assert!(
-            seen[0].0.contains(&"exit_plan_mode".to_owned())
-                && !seen[0].0.contains(&"write".to_owned())
+            prompts[1].contains("Today's date: 2026-11-06.")
+                && prompts[1].contains("Plan mode is now on")
         );
+        assert_eq!(prompts[2], "three");
         assert!(
-            !seen[1].0.contains(&"exit_plan_mode".to_owned())
-                && seen[1].0.contains(&"write".to_owned())
+            prompts[3].starts_with("<plan-mode>\nPlan mode is now off")
+                && prompts[3].ends_with("four")
         );
+    }
+
+    /// After a compaction has summarized away the reminder of the date, the next prompt carries it again.
+    #[tokio::test]
+    async fn the_date_is_told_again_after_compaction() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/turn-dated");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (out, _events) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared::new(out);
+        shared.open(Provider::Claude, vec!["m".into()], "m".into(), Mode::Asking);
+        *shared.today.lock().unwrap() = Some("2026-11-06".to_owned());
+        let model = Arc::new(Recording {
+            seen: Mutex::new(Vec::new()),
+        });
+        let told = format!(
+            "{}\n\nfirst",
+            omc_context::environment_reminder(&Environment {
+                directory: dir.clone(),
+                os: std::env::consts::OS.to_owned(),
+                date: "2026-11-06".into(),
+                branch: None,
+                model: None,
+            })
+        );
+        let reply = Message::Assistant(Reply {
+            text: "ok".into(),
+            ..Reply::default()
+        });
+        let mut history = vec![Message::User(told), reply.clone()];
+        let turn = turn_in(&dir, &shared, history.clone());
+        let Ended::Done(_) = turn
+            .run_with(model.clone(), Job::Prompt("second".into()))
+            .await
+        else {
+            panic!("turn failed");
+        };
+        history.extend([
+            Message::User("more".into()),
+            reply,
+            Message::Compaction(omc_providers::Compaction {
+                summary: "s".into(),
+                first_kept: 2,
+                ..omc_providers::Compaction::default()
+            }),
+        ]);
+        let turn = turn_in(&dir, &shared, history);
+        let Ended::Done(_) = turn
+            .run_with(model.clone(), Job::Prompt("third".into()))
+            .await
+        else {
+            panic!("turn failed");
+        };
+        let seen = model.seen.lock().unwrap();
+        assert_eq!(seen[0].prompt.as_deref(), Some("second"));
+        let third = seen[1].prompt.as_deref().unwrap();
+        assert!(third.starts_with("<environment>") && third.ends_with("third"));
     }
 
     /// Rejecting the plan keeps plan mode on.
@@ -420,6 +662,131 @@ mod tests {
         assert_eq!(done.id, "compact-4");
         assert_eq!(done.output.as_deref(), Some("what happened"));
         assert!(used.is_some_and(|used| used < compaction.tokens_before));
+    }
+
+    /// A model that, on its first request, has the client queue a prompt and reads a file; afterwards it answers, and keeps the last message of each request.
+    struct Interrupted {
+        /// What the conversation shares, whose queue the prompt goes into.
+        shared: Arc<Shared>,
+        /// The last message of each request.
+        last: Mutex<Vec<Message>>,
+    }
+
+    #[async_trait]
+    impl ChatModel for Interrupted {
+        /// Queues a prompt and reads on the first request, then answers.
+        async fn complete(
+            &self,
+            request: Request<'_>,
+            _: &mut dyn Sink,
+        ) -> Result<Reply, ProviderError> {
+            let mut last = self.last.lock().unwrap();
+            last.push(request.messages.last().cloned().unwrap());
+            if last.len() > 1 {
+                return Ok(Reply {
+                    text: "both done".into(),
+                    ..Reply::default()
+                });
+            }
+            self.shared.queue.push(
+                "and the second".into(),
+                Some("t2".into()),
+                "and the second".into(),
+                vec!["b.txt".into()],
+            );
+            Ok(calling("read", json!({ "path": "f.txt" })))
+        }
+    }
+
+    /// A prompt queued while the tools run is put into the turn before the next request, the client is told so, and it is saved as a turn of its own that comes back when the conversation is opened again.
+    #[tokio::test]
+    async fn a_queued_prompt_is_steered_into_the_turn_and_saved() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/turn-steer");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.txt"), "a\n").unwrap();
+        let (journal, _) = omc_agent::Journal::open(&dir.join("c.jsonl"), None).unwrap();
+        journal
+            .mark(
+                0,
+                &omc_agent::Mark {
+                    id: "t1".into(),
+                    text: "read f".into(),
+                    files: Vec::new(),
+                },
+            )
+            .unwrap();
+        let (out, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared::new(out);
+        shared.open(Provider::Claude, vec!["m".into()], "m".into(), Mode::Yolo);
+        shared.attach(Some(journal.clone()));
+        let registry = Arc::new(Registry::builtin(&dir).unwrap());
+        let turn = Turn {
+            provider: Provider::Claude,
+            model: "m".into(),
+            base: registry.clone(),
+            denied: Arc::new(Vec::new()),
+            discovered: Arc::new(Discovered::default()),
+            locations: Arc::new(Locations {
+                directory: dir.clone(),
+                root: None,
+                home: None,
+                claude: None,
+                codex: None,
+            }),
+            shared: shared.clone(),
+            history: Vec::new(),
+            scribe: Some(journal.scribe()),
+        };
+        let model = Arc::new(Interrupted {
+            shared: shared.clone(),
+            last: Mutex::new(Vec::new()),
+        });
+        let Ended::Done(history) = turn
+            .run_with(model.clone(), Job::Prompt("read f".into()))
+            .await
+        else {
+            panic!("turn failed");
+        };
+        assert_eq!(
+            model.last.lock().unwrap()[1],
+            Message::User("and the second".into())
+        );
+        assert_eq!(history.len(), 5);
+        let steered: Vec<omc_wire::Queued> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                Event::Queued(queued) => Some(queued),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steered.len(), 1);
+        assert_eq!(steered[0].state, omc_wire::QueueState::Steered);
+        assert_eq!(steered[0].turn.as_deref(), Some("t2"));
+        assert!(shared.queue.pop().is_none());
+        drop(journal);
+        let saved = omc_agent::Journal::read(&dir.join("c.jsonl")).unwrap();
+        let turns = crate::translate::replay(
+            &saved.history,
+            &saved.marks,
+            &saved.lost,
+            &saved.changes,
+            &registry,
+            None,
+        );
+        let told: Vec<(Option<&str>, &str, &[String])> = turns
+            .iter()
+            .map(|turn| (turn.id.as_deref(), turn.prompt.as_str(), &turn.files[..]))
+            .collect();
+        assert_eq!(
+            told,
+            vec![
+                (Some("t1"), "read f", &[][..]),
+                (Some("t2"), "and the second", &["b.txt".to_owned()][..]),
+            ]
+        );
+        assert!(turns[1].events.contains(&Event::Said("both done".into())));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Reading then editing two lines changes the file and sends a diff; an edit with a stale tag is refused with a message to read again.

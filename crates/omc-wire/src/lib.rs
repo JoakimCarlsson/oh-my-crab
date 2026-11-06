@@ -13,6 +13,7 @@ mod language;
 mod permission;
 mod plan;
 mod provider;
+mod queue;
 mod setting;
 mod tool;
 mod toolserver;
@@ -27,6 +28,7 @@ pub use language::{Diagnostic, LanguageAnswer, LanguageAsk, LanguageRequest, Sev
 pub use permission::{Choice, Permission, Verdict};
 pub use plan::{PlanStep, Progress};
 pub use provider::{KeySource, ProviderInfo, SignIn};
+pub use queue::{QueueState, Queued};
 pub use setting::{Pick, Setting, Slash};
 pub use tool::{Background, Diff, Kind, Tool, ToolInfo, ToolState};
 pub use toolserver::{Reach, ToolServer};

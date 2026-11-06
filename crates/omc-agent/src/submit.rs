@@ -3,10 +3,9 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
+use omc_tools::schema::{fits, violations};
 use omc_tools::{Tool, ToolError, ToolOutput};
 use serde_json::{Value, json};
-
-use crate::schema::{fits, violations};
 
 /// The name the subagent calls the tool by.
 pub(crate) const SUBMIT_RESULT: &str = "submit_result";
@@ -79,6 +78,11 @@ impl Tool for SubmitResult {
             "properties": { "result": self.schema },
             "required": ["result"]
         })
+    }
+
+    /// The result is checked here, so that a result turned away is remembered with its reasons.
+    fn checks_arguments(&self) -> bool {
+        true
     }
 
     /// Submitting changes nothing on disk, so read-only agents may use it.

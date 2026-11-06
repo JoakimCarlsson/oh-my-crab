@@ -10,7 +10,8 @@ use crate::chat::{Blocks, parse_arguments};
 use crate::identity;
 use crate::models::codex_efforts;
 use crate::{
-    Effort, Message, Part, ProviderError, Reply, Request, Sink, Tokens, ToolCall, ToolSpec, sse,
+    Effort, Message, Part, ProviderError, Reply, Request, Sink, Stop, Tokens, ToolCall, ToolSpec,
+    sse,
 };
 
 /// Responses endpoint of the Codex backend.
@@ -119,13 +120,8 @@ pub async fn list_models(credentials: &Credentials) -> Result<Vec<String>, Provi
     let url = format!("{MODELS_URL}?client_version={CLIENT_VERSION}");
     let request = reqwest::Client::new().get(url);
     let response = authorized(request, credentials, "").send().await?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(ProviderError::Status {
-            status: status.to_string(),
-            body,
-        });
+    if !response.status().is_success() {
+        return Err(ProviderError::from_response(response).await);
     }
     let list: ModelList = response.json().await?;
     let mut entries: Vec<ModelEntry> = list
@@ -322,6 +318,10 @@ pub(crate) struct Accumulator {
     blocks: Blocks,
     /// Whether a new summary part began since the last reasoning chunk, so the next one is set apart from the text before it.
     parted: bool,
+    /// Why the model stopped, once the stream said.
+    stop: Stop,
+    /// Whether the stream reached the event that ends the response.
+    ended: bool,
 }
 
 impl Accumulator {
@@ -389,6 +389,14 @@ impl Accumulator {
             }
             "response.completed" | "response.incomplete" => {
                 self.tokens = event.pointer("/response/usage").and_then(tokens_from);
+                if event
+                    .pointer("/response/incomplete_details/reason")
+                    .and_then(Value::as_str)
+                    == Some("max_output_tokens")
+                {
+                    self.stop = Stop::Length;
+                }
+                self.ended = true;
                 return Ok(true);
             }
             _ => {}
@@ -418,14 +426,22 @@ impl Accumulator {
     }
 
     /// Ends the stream and returns the reply it described.
-    pub(crate) fn finish(self) -> Reply {
-        Reply {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Unfinished`] when the stream ended before the event that ends the response, since the reply may then be cut short anywhere.
+    pub(crate) fn finish(self) -> Result<Reply, ProviderError> {
+        if !self.ended {
+            return Err(ProviderError::Unfinished);
+        }
+        Ok(Reply {
             text: self.text,
             thinking: self.thinking,
             tool_calls: self.tool_calls,
             tokens: self.tokens,
             opaque: self.opaque,
-        }
+            stop: self.stop,
+        })
     }
 }
 
@@ -455,7 +471,7 @@ pub async fn complete(
             break;
         }
     }
-    Ok(accumulator.finish())
+    accumulator.finish()
 }
 
 #[cfg(test)]
@@ -654,8 +670,8 @@ mod tests {
         assert_eq!(residency("opaque"), None);
     }
 
-    /// Feeds each of `events` into a fresh accumulator and returns the reply.
-    fn run(events: &[Value], sink: &mut Recorder) -> Reply {
+    /// Feeds each of `events` into a fresh accumulator and returns how the stream ended.
+    fn ended(events: &[Value], sink: &mut Recorder) -> Result<Reply, ProviderError> {
         let mut accumulator = Accumulator::default();
         for event in events {
             if accumulator.feed(&event.to_string(), sink).unwrap() {
@@ -663,6 +679,11 @@ mod tests {
             }
         }
         accumulator.finish()
+    }
+
+    /// Feeds each of `events` into a fresh accumulator and returns the reply.
+    fn run(events: &[Value], sink: &mut Recorder) -> Reply {
+        ended(events, sink).unwrap()
     }
 
     /// Reasoning summary deltas stream to the sink and encrypted items are kept.
@@ -720,5 +741,23 @@ mod tests {
     fn missing_usage_is_none() {
         let events = [json!({ "type": "response.completed", "response": {} })];
         assert_eq!(run(&events, &mut Recorder::default()).tokens, None);
+    }
+
+    /// A response the output limit cut off says so, and one that completes does not.
+    #[test]
+    fn the_output_limit_is_reported() {
+        let cut = [json!({ "type": "response.incomplete", "response": {
+            "incomplete_details": { "reason": "max_output_tokens" } } })];
+        assert_eq!(run(&cut, &mut Recorder::default()).stop, Stop::Length);
+        let whole = [json!({ "type": "response.completed", "response": {} })];
+        assert_eq!(run(&whole, &mut Recorder::default()).stop, Stop::Finished);
+    }
+
+    /// A stream that ends before the response does is unfinished rather than a short reply.
+    #[test]
+    fn a_stream_without_its_end_is_unfinished() {
+        let events = [json!({ "type": "response.output_text.delta", "delta": "half" })];
+        let error = ended(&events, &mut Recorder::default()).unwrap_err();
+        assert!(matches!(error, ProviderError::Unfinished), "{error}");
     }
 }

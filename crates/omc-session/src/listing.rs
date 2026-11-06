@@ -70,7 +70,7 @@ pub fn tools() -> Result<Vec<ToolInfo>, String> {
     });
     let mut listed: Vec<ToolInfo> = Vec::new();
     for plan in [false, true] {
-        for tool in toolset.live(plan).registry.iter() {
+        for tool in toolset.tools(plan).iter() {
             if !listed.iter().any(|known| known.name == tool.name()) {
                 listed.push(ToolInfo {
                     name: tool.name().to_owned(),

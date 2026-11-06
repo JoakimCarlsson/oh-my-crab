@@ -13,10 +13,10 @@ mod xxh64;
 
 pub use chat::{
     ChatModel, Compaction, DeltaSink, Effort, Elided, Elision, Image, Message, Part, Pruning,
-    RemoteModel, Reply, Request, Sink, Tokens, ToolCall, ToolResult, ToolSpec,
+    RemoteModel, Reply, Request, Sink, Stop, Tokens, ToolCall, ToolResult, ToolSpec,
 };
 pub use error::ProviderError;
-pub use models::{context_window, efforts};
+pub use models::{Pricing, Retention, cache_ttl, context_window, efforts, pricing, warmable};
 pub use prompt::PROMPT;
 pub use provider::{Def, Provider, Wire, active_provider, credentials_for, login};
 

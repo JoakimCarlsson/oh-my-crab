@@ -4,21 +4,30 @@ mod agent;
 mod approval;
 mod compaction;
 mod journal;
+mod loop_guard;
 mod pruning;
 mod recall;
-mod schema;
+mod recovery;
+mod steering;
 mod submit;
 mod task;
 
-pub use agent::{AgentError, AgentEvent, Context, Live, compact, run_turn, run_turn_recorded};
+pub use agent::{
+    AgentError, AgentEvent, Context, Live, compact, run_turn, run_turn_recorded, run_turn_steered,
+};
 pub use approval::{ApprovalRequest, Approvals, Decision, Prompter};
 pub use compaction::{COMPACT, context, replayed};
 pub use journal::{INTERRUPTED, Journal, JournalError, Lost, Mark, Marked, STOPPED, Saved, Scribe};
 pub use recall::RECALL;
+pub use steering::Steering;
 pub use task::{EventSink, MAX_CONCURRENT, MAX_TASKS, PromptBuilder, Task, TaskSettings};
 
 #[cfg(test)]
 mod compaction_tests;
+#[cfg(test)]
+mod recovery_tests;
+#[cfg(test)]
+mod steering_tests;
 #[cfg(test)]
 mod task_tests;
 #[cfg(test)]

@@ -1,6 +1,6 @@
 //! The settings a conversation offers: its model, how hard it thinks, and how much it asks before acting.
 
-use omc_providers::Effort;
+use omc_providers::{Effort, Retention};
 use omc_wire::{Pick, Setting};
 
 /// The id of the setting that picks the model.
@@ -20,6 +20,33 @@ pub(crate) const ON: &str = "on";
 
 /// The value of the checkpoints setting that withholds the tools.
 pub(crate) const OFF: &str = "off";
+
+/// The id of the setting that picks how long the provider keeps the prompt cache.
+pub(crate) const CACHE: &str = "cache";
+
+/// The value of the cache setting for the provider's default lifetime.
+pub(crate) const SHORT: &str = "5m";
+
+/// The value of the cache setting for an hour-long lifetime.
+pub(crate) const LONG: &str = "1h";
+
+/// The id of the setting that turns keeping the prompt cache warm on or off; it takes [`ON`] and [`OFF`].
+pub(crate) const WARMING: &str = "cache_warming";
+
+/// The value of the cache setting that stands for `retention`.
+pub(crate) fn retention_value(retention: Retention) -> &'static str {
+    match retention {
+        Retention::Short => SHORT,
+        Retention::Long => LONG,
+    }
+}
+
+/// The lifetime a value of the cache setting stands for.
+pub(crate) fn parse_retention(value: &str) -> Option<Retention> {
+    [Retention::Short, Retention::Long]
+        .into_iter()
+        .find(|retention| retention_value(*retention) == value)
+}
 
 /// The category of the setting that picks how hard the model thinks.
 const THOUGHT_LEVEL: &str = "thought_level";
@@ -67,6 +94,10 @@ pub(crate) struct Offer<'a> {
     pub(crate) effort: Option<Effort>,
     /// Whether the agent has the checkpoint and rewind tools.
     pub(crate) checkpoints: bool,
+    /// The prompt cache lifetime in use, when the provider offers a choice.
+    pub(crate) retention: Option<Retention>,
+    /// Whether the prompt cache is kept warm, when the provider can be warmed.
+    pub(crate) warming: Option<bool>,
 }
 
 /// The effort a model thinks at when the reader has not picked one: medium when it offers it, otherwise its lightest.
@@ -77,7 +108,7 @@ pub(crate) fn default_effort(efforts: &[Effort]) -> Option<Effort> {
         .or_else(|| efforts.first().copied())
 }
 
-/// The settings for `offer`; the effort setting is left out when the model takes none.
+/// The settings for `offer`; the effort setting is left out when the model takes none, and the cache settings when the provider offers no choice.
 pub(crate) fn offered(offer: &Offer<'_>) -> Vec<Setting> {
     let mut names: Vec<&str> = offer.models.iter().map(String::as_str).collect();
     if !names.contains(&offer.model) {
@@ -129,6 +160,42 @@ pub(crate) fn offered(offer: &Offer<'_>) -> Vec<Setting> {
                 .collect(),
         });
     }
+    if let Some(retention) = offer.retention {
+        settings.push(Setting {
+            id: CACHE.to_owned(),
+            category: CACHE.to_owned(),
+            name: "Prompt cache".to_owned(),
+            current: retention_value(retention).to_owned(),
+            picks: vec![
+                pick(
+                    SHORT,
+                    "5 minutes",
+                    "Cached context lives five minutes after each request and costs a quarter more than input to write",
+                ),
+                pick(
+                    LONG,
+                    "1 hour",
+                    "Cached context lives an hour after each request and costs twice the input price to write",
+                ),
+            ],
+        });
+    }
+    if let Some(warming) = offer.warming {
+        settings.push(Setting {
+            id: WARMING.to_owned(),
+            category: WARMING.to_owned(),
+            name: "Keep cache warm".to_owned(),
+            current: if warming { ON } else { OFF }.to_owned(),
+            picks: vec![
+                pick(
+                    ON,
+                    "On",
+                    "Refresh the cached context shortly before it expires while a long tool runs or the conversation waits, when that is expected to cost less than losing it",
+                ),
+                pick(OFF, "Off", "Let the cached context expire"),
+            ],
+        });
+    }
     settings.push(Setting {
         id: CHECKPOINTS.to_owned(),
         category: CHECKPOINTS.to_owned(),
@@ -178,7 +245,32 @@ mod tests {
             efforts,
             effort,
             checkpoints: false,
+            retention: None,
+            warming: None,
         }
+    }
+
+    /// The cache settings come before the checkpoints, only when the provider offers them, and their values round-trip.
+    #[test]
+    fn cache_settings_follow_the_provider() {
+        let models = [];
+        let mut offer = offer(&models, &[], None);
+        offer.retention = Some(Retention::Long);
+        offer.warming = Some(true);
+        let settings = offered(&offer);
+        let ids: Vec<&str> = settings.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["model", "mode", "cache", "cache_warming", "checkpoints"]
+        );
+        assert_eq!(
+            (settings[2].current.as_str(), settings[3].current.as_str()),
+            ("1h", "on")
+        );
+        for retention in [Retention::Short, Retention::Long] {
+            assert_eq!(parse_retention(retention_value(retention)), Some(retention));
+        }
+        assert_eq!(parse_retention("2h"), None);
     }
 
     /// The current model is offered even when the provider did not list it.

@@ -1,4 +1,4 @@
-//! A small JSON Schema checker for the structured results of subagents.
+//! A small JSON Schema checker, for the arguments of tool calls and the structured results of subagents.
 //!
 //! It covers the keywords results are usually described with: `type`, `enum`, `const`, `properties`, `required`, `additionalProperties`, `items`, `minItems`, `maxItems`, `minLength`, `maxLength`, `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `allOf`, `anyOf`, `oneOf` and `not`. Other keywords, such as `$ref`, `pattern` and `format`, are accepted and not checked.
 
@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 /// # Errors
 ///
 /// Returns why the schema cannot be used.
-pub(crate) fn check_schema(schema: &Value) -> Result<(), String> {
+pub fn check_schema(schema: &Value) -> Result<(), String> {
     let rules = match schema {
         Value::Bool(_) => return Ok(()),
         Value::Object(rules) => rules,
@@ -23,14 +23,14 @@ pub(crate) fn check_schema(schema: &Value) -> Result<(), String> {
 }
 
 /// The ways `value` breaks `schema`, each starting with where in `value` it is, counted from `root`; empty when the value fits.
-pub(crate) fn violations(schema: &Value, value: &Value, root: &str) -> Vec<String> {
+pub fn violations(schema: &Value, value: &Value, root: &str) -> Vec<String> {
     let mut found = Vec::new();
     walk(schema, value, root, &mut found);
     found
 }
 
 /// Whether `value` fits `schema`.
-pub(crate) fn fits(schema: &Value, value: &Value) -> bool {
+pub fn fits(schema: &Value, value: &Value) -> bool {
     violations(schema, value, "").is_empty()
 }
 
@@ -90,7 +90,7 @@ fn type_fits(expected: &Value, value: &Value) -> bool {
 }
 
 /// Whether `value` is of the type called `name`; an unknown name fits anything.
-fn is_type(name: &str, value: &Value) -> bool {
+pub(crate) fn is_type(name: &str, value: &Value) -> bool {
     match name {
         "null" => value.is_null(),
         "boolean" => value.is_boolean(),

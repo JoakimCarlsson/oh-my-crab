@@ -2,13 +2,15 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use crate::ToolError;
+use crate::{Spill, ToolError};
 
-/// The directory tools may touch, with the logic to keep them inside it.
+/// The directory tools may touch, with the logic to keep them inside it, and the folder long output is saved in, which tools may read as well.
 #[derive(Debug, Clone)]
 pub struct Sandbox {
     /// The canonical working directory.
     root: PathBuf,
+    /// Where output too long to show is saved.
+    spill: Spill,
 }
 
 impl Sandbox {
@@ -20,12 +22,41 @@ impl Sandbox {
     pub fn new(root: impl AsRef<Path>) -> Result<Self, ToolError> {
         Ok(Self {
             root: root.as_ref().canonicalize()?,
+            spill: Spill::default(),
         })
+    }
+
+    /// The sandbox saving output too long to show in `spill` instead of the process's own folder.
+    pub fn with_spill(mut self, spill: Spill) -> Self {
+        self.spill = spill;
+        self
     }
 
     /// The canonical working directory.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Where output too long to show is saved.
+    pub fn spill(&self) -> &Spill {
+        &self.spill
+    }
+
+    /// Resolves `path` for reading: like [`Sandbox::resolve`], and also letting through a file the sandbox saved long output in, so the model can read the rest of it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::OutsidePath`] when the resolved path is neither
+    /// inside the root nor a saved output file.
+    pub fn resolve_readable(&self, path: &str) -> Result<PathBuf, ToolError> {
+        match self.resolve(path) {
+            Err(ToolError::OutsidePath(_))
+                if let Some(saved) = self.spill.holds(Path::new(path)) =>
+            {
+                Ok(saved)
+            }
+            resolved => resolved,
+        }
     }
 
     /// Resolves `path` against the root and checks that it stays inside.
@@ -152,6 +183,24 @@ mod tests {
         let sandbox = Sandbox::new(&dir).unwrap();
         assert!(matches!(
             sandbox.resolve("link/file.txt"),
+            Err(ToolError::OutsidePath(_))
+        ));
+    }
+
+    /// Saved output outside the root may be read but not written, and nothing else outside the root may be read.
+    #[test]
+    fn reads_saved_output_outside_the_root() {
+        let dir = scratch("sandbox-spill");
+        let saved = scratch("sandbox-spill-saved");
+        let sandbox = Sandbox::new(&dir).unwrap().with_spill(Spill::new(&saved));
+        let path = sandbox.spill().save("bash", b"out").unwrap();
+        let text = path.display().to_string();
+        assert_eq!(sandbox.resolve_readable(&text).unwrap(), path);
+        assert!(sandbox.resolve(&text).is_err());
+        let other = saved.parent().unwrap().join("sandbox-spill-other.txt");
+        std::fs::write(&other, "x").unwrap();
+        assert!(matches!(
+            sandbox.resolve_readable(&other.display().to_string()),
             Err(ToolError::OutsidePath(_))
         ));
     }

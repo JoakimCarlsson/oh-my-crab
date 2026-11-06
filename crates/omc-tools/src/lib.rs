@@ -1,6 +1,7 @@
 //! The tool abstraction, its registry and the built-in tools.
 
 mod checkpoint;
+mod coerce;
 mod error;
 mod host;
 mod jobs;
@@ -8,6 +9,8 @@ mod language;
 mod notebook;
 mod registry;
 mod sandbox;
+pub mod schema;
+mod spill;
 mod tool;
 mod tools;
 
@@ -24,6 +27,7 @@ pub use language::{
 pub use notebook::{NOTEBOOK_LIMIT, Notebook};
 pub use registry::Registry;
 pub use sandbox::Sandbox;
+pub use spill::Spill;
 pub use tool::{FileChange, Image, Tool, ToolOutput, marked_lines, parse_args, sanitize};
 pub use tools::{
     Ask, AstEdit, AstGrep, Bash, CheckpointTool, ContextNotes, Edit, ExitPlanMode, Glob, Grep,

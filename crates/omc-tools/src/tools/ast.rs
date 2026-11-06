@@ -75,7 +75,7 @@ fn language(name: &str) -> Result<SupportLang, ToolError> {
 }
 
 /// The built-in language a file is written in, judged by its extension.
-fn detect(path: &Path) -> Option<SupportLang> {
+pub(super) fn detect(path: &Path) -> Option<SupportLang> {
     SupportLang::from_path(path).filter(|lang| LANGUAGES.iter().any(|(known, _)| known == lang))
 }
 

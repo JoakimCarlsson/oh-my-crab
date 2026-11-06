@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
+use crate::coerce::{coerce, prepare};
 use crate::tools::{AstEdit, AstGrep, Bash, Edit, Glob, Grep, Read, Write};
 use crate::{Jobs, Languages, Sandbox, Tool, ToolError, ToolOutput};
 
@@ -52,7 +53,11 @@ impl Registry {
         jobs: Option<Arc<Jobs>>,
         languages: Languages,
     ) -> Result<Self, ToolError> {
-        let sandbox = Sandbox::new(root)?;
+        Ok(Self::builtin_for(Sandbox::new(root)?, jobs, languages))
+    }
+
+    /// Creates a registry holding every built-in tool, confined to `sandbox` and saving long output where it says, in which `bash` can start background runs in `jobs` when they are given, and `edit` and `write` have the files they write formatted by `languages` and report what it says is wrong with them.
+    pub fn builtin_for(sandbox: Sandbox, jobs: Option<Arc<Jobs>>, languages: Languages) -> Self {
         let mut registry = Self::new();
         registry.register(Read::new(sandbox.clone()));
         registry.register(Grep::new(sandbox.clone()));
@@ -65,7 +70,7 @@ impl Registry {
         registry.register(Edit::with_languages(sandbox.clone(), languages.clone()));
         registry.register(AstEdit::new(sandbox.clone()));
         registry.register(Write::with_languages(sandbox, languages));
-        Ok(registry)
+        registry
     }
 
     /// Adds `tool`, replacing any tool with the same name.
@@ -126,35 +131,50 @@ impl Registry {
         self.tools.values()
     }
 
-    /// Runs the tool called `name` with `args` for the call numbered `id`.
+    /// Runs the tool called `name` with `args` for the call numbered `id`, after putting the arguments right against the tool's schema and checking them.
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Unknown`] when no such tool exists, or whatever the
-    /// tool itself fails with.
+    /// Returns [`ToolError::Unknown`] when no such tool exists,
+    /// [`ToolError::InvalidArguments`] naming every place the arguments break
+    /// the schema, or whatever the tool itself fails with.
     pub async fn call_as(
         &self,
         id: &str,
         name: &str,
         args: Value,
     ) -> Result<ToolOutput, ToolError> {
-        let tool = self
-            .get(name)
-            .ok_or_else(|| ToolError::Unknown(name.to_string()))?;
+        let (tool, args) = self.prepared(name, args)?;
         tool.call_as(id, args).await
     }
 
-    /// Runs the tool called `name` with `args`.
+    /// Runs the tool called `name` with `args`, after putting the arguments right against the tool's schema and checking them.
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Unknown`] when no such tool exists, or whatever the
-    /// tool itself fails with.
+    /// Same as [`Registry::call_as`].
     pub async fn call(&self, name: &str, args: Value) -> Result<ToolOutput, ToolError> {
+        let (tool, args) = self.prepared(name, args)?;
+        tool.call(args).await
+    }
+
+    /// The tool called `name` and `args` put right against its schema: checked as well, unless the tool checks its arguments itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Unknown`] when no such tool exists, and
+    /// [`ToolError::InvalidArguments`] when the arguments break the schema.
+    fn prepared(&self, name: &str, args: Value) -> Result<(&Arc<dyn Tool>, Value), ToolError> {
         let tool = self
             .get(name)
             .ok_or_else(|| ToolError::Unknown(name.to_string()))?;
-        tool.call(args).await
+        let schema = tool.schema();
+        let args = if tool.checks_arguments() {
+            coerce(&schema, args)
+        } else {
+            prepare(&schema, args)?
+        };
+        Ok((tool, args))
     }
 }
 
@@ -214,5 +234,28 @@ mod tests {
         assert_eq!(output.text, "hi");
         let missing = registry.call("nope", json!({})).await;
         assert!(matches!(missing, Err(ToolError::Unknown(_))));
+    }
+
+    /// Arguments a model got slightly wrong are put right before a built-in tool sees them, and ones that cannot be put right are turned away naming what is wrong.
+    #[tokio::test]
+    async fn arguments_are_put_right_or_turned_away() {
+        let dir = crate::testutil::scratch("registry-coerce");
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        let registry = Registry::builtin(&dir).unwrap();
+        let found = registry
+            .call(
+                "grep",
+                json!({ "pattern": "one", "case_insensitive": "true", "limit": "5", "glob": null }),
+            )
+            .await
+            .unwrap();
+        assert!(found.text.contains("a.txt"));
+        let Err(ToolError::InvalidArguments(message)) =
+            registry.call("grep", json!({ "limit": "lots" })).await
+        else {
+            panic!("expected the arguments to be turned away");
+        };
+        assert!(message.contains("args: missing required property `pattern`"));
+        assert!(message.contains("args.limit: expected integer, got string"));
     }
 }

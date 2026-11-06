@@ -2,8 +2,6 @@
 <workstation>
 - Working directory: {{directory}}
 - OS: {{os}}
-- Date: {{date}}
-{{#if branch}}- Git branch: {{branch}}{{/if}}
 {{#if model}}- Model: {{model}}{{/if}}
 </workstation>
 

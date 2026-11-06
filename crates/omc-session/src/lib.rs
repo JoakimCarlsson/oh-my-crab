@@ -8,8 +8,10 @@
 mod bridge;
 mod languages;
 mod listing;
+mod prefix;
 mod prompt;
 mod providers;
+mod queue;
 mod serve;
 mod session;
 mod settings;
@@ -17,6 +19,7 @@ mod shared;
 mod toolset;
 mod translate;
 mod turn;
+mod warmer;
 
 pub use listing::tools;
 pub use providers::{account, key_source, providers, save_key, signed_in};

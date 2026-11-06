@@ -8,7 +8,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::atomic::write_atomic;
-use super::snapshot::tag;
+use super::read::{Fold, folds};
+use super::snapshot::{outline_tag, tag};
 use crate::language::{Languages, Written, settle};
 use crate::tool::{marked_lines, parse_args};
 use crate::{FileChange, Sandbox, Tool, ToolError, ToolOutput};
@@ -111,7 +112,8 @@ impl Tool for Edit {
          grep or edit result for that file, and operations anchored to the line numbers of that \
          snapshot: replace a line or a range, insert before or after a line, delete a line or a \
          range. All line numbers refer to the file as you read it, however many operations \
-         come before. If the file changed since the tag was issued the call is rejected and \
+         come before. With the tag of an outline only the lines it showed can be changed: \
+         read a folded range first. If the file changed since the tag was issued the call is rejected and \
          nothing is written; read the file again. A call either applies to every file or to \
          none. A successful edit returns the new tag and a preview of the changed lines, so you \
          can edit again without reading. The user is asked to approve each edit."
@@ -332,7 +334,12 @@ fn prepare(sandbox: &Sandbox, path: PathBuf, section: &Section) -> Result<Pendin
     let old = String::from_utf8(bytes.clone())
         .map_err(|_| ToolError::Failed(format!("{} is not a UTF-8 text file", section.path)))?;
     let current = tag(&bytes);
-    if !section.tag.trim().eq_ignore_ascii_case(&current) {
+    let cited = section.tag.trim();
+    let outlined =
+        !cited.eq_ignore_ascii_case(&current) && cited.eq_ignore_ascii_case(&outline_tag(&bytes));
+    if outlined {
+        refuse_folded(&path, &old, section)?;
+    } else if !cited.eq_ignore_ascii_case(&current) {
         return Err(ToolError::Failed(format!(
             "{} has changed since it was read (you cited tag {:?}, it is now {current}); \
              read the file again and redo the edit against the new tag and line numbers",
@@ -348,6 +355,43 @@ fn prepare(sandbox: &Sandbox, path: PathBuf, section: &Section) -> Result<Pendin
         new,
         region,
     })
+}
+
+/// Refuses the operations of `section` that act on a line the outline of the
+/// file at `path`, holding `old`, folded away, since the model cited the tag
+/// of that outline and has not seen those lines.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Failed`] naming the first such operation, the folded
+/// range it touches and the selector that reads it.
+fn refuse_folded(path: &std::path::Path, old: &str, section: &Section) -> Result<(), ToolError> {
+    let hidden = folds(path, old).unwrap_or_default();
+    for (index, op) in section.ops.iter().enumerate() {
+        let last = match op.op {
+            Kind::Replace | Kind::Delete => op.end.unwrap_or(op.line).max(op.line),
+            Kind::InsertBefore | Kind::InsertAfter => op.line,
+        };
+        if let Some(fold) = hidden
+            .iter()
+            .find(|fold| fold.first <= last && op.line <= fold.last)
+        {
+            return Err(folded_error(section, index + 1, *fold));
+        }
+    }
+    Ok(())
+}
+
+/// The error for operation `number` of `section`, which touches the lines of
+/// `fold` that the outline the model read left out.
+fn folded_error(section: &Section, number: usize, fold: Fold) -> ToolError {
+    ToolError::Failed(format!(
+        "{path}: operation {number} touches lines {first}-{last}, which the outline you read \
+         folded away; read {path}:{first}-{last} first and edit with the tag that read returns",
+        path = section.path,
+        first = fold.first,
+        last = fold.last,
+    ))
 }
 
 /// A file split into lines, remembering how to join them again.
@@ -847,6 +891,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(get(&dir, "f.txt"), "b\nc\n");
+    }
+
+    /// With the tag of an outline, lines the outline showed can be edited and
+    /// folded lines cannot until a read shows them.
+    #[tokio::test]
+    async fn outline_tags_keep_edits_off_folded_lines() {
+        let (tool, dir) = tool("edit-outline");
+        let mut code = String::from("use std::fmt;\n\n");
+        for index in 0..20 {
+            code.push_str(&format!("pub fn f{index}(x: u32) -> u32 {{\n"));
+            code.push_str(&"    let y = x + 1;\n".repeat(10));
+            code.push_str("    y\n}\n\n");
+        }
+        put(&dir, "a.rs", &code);
+        let read = crate::tools::Read::new(Sandbox::new(&dir).unwrap());
+        let outline = read.call(json!({ "path": "a.rs" })).await.unwrap().text;
+        assert!(outline.contains("… 11 lines folded (4-14)"), "{outline}");
+        let outline_tag = outline[5..9].to_owned();
+        assert_eq!(outline_tag, super::outline_tag(code.as_bytes()));
+        let folded = tool
+            .call(call(
+                "a.rs",
+                &outline_tag,
+                json!([{ "op": "replace", "line": 10, "text": "    let z = 0;" }]),
+            ))
+            .await;
+        assert!(
+            matches!(&folded, Err(ToolError::Failed(m)) if m.contains("lines 4-14") && m.contains("read a.rs:4-14")),
+            "{folded:?}"
+        );
+        let straddling = tool
+            .call(call(
+                "a.rs",
+                &outline_tag,
+                json!([{ "op": "delete", "line": 3, "end": 15 }]),
+            ))
+            .await;
+        assert!(straddling.is_err());
+        assert_eq!(get(&dir, "a.rs"), code);
+        tool.call(call(
+            "a.rs",
+            &outline_tag,
+            json!([{ "op": "replace", "line": 3, "text": "pub fn first(x: u32) -> u32 {" }, { "op": "insert_before", "line": 15, "text": "    .min(9)" }]),
+        ))
+        .await
+        .unwrap();
+        let edited = get(&dir, "a.rs");
+        assert!(
+            edited.contains("pub fn first(x: u32) -> u32 {\n    let y"),
+            "{edited}"
+        );
+        assert!(edited.contains("    y\n    .min(9)\n}\n"), "{edited}");
     }
 
     /// The approval prompt shows the old and new lines.

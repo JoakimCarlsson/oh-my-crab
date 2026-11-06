@@ -5,7 +5,7 @@ use omc_auth::Credentials;
 use serde_json::Value;
 
 use crate::wires::{anthropic_messages, chat_completions, openai_responses};
-use crate::{Provider, ProviderError, Wire};
+use crate::{Provider, ProviderError, Retention, Wire};
 
 /// A tool the model may call, in provider-neutral form.
 #[derive(Debug, Clone)]
@@ -140,6 +140,29 @@ pub struct Reply {
     pub tokens: Option<Tokens>,
     /// Blocks the provider wants sent back with the next request, such as signed thinking; kept as the provider gave them.
     pub opaque: Vec<Value>,
+    /// Why the model stopped.
+    #[serde(skip_serializing_if = "Stop::is_finished")]
+    pub stop: Stop,
+}
+
+/// Why the model stopped writing a reply.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Stop {
+    /// It came to the end of what it meant to say, or of the tool calls it meant to make.
+    #[default]
+    Finished,
+    /// The output limit cut it off, so its last block, a tool call's arguments included, may be incomplete.
+    Length,
+}
+
+impl Stop {
+    /// Whether the model came to the end of what it meant to say.
+    pub fn is_finished(&self) -> bool {
+        *self == Stop::Finished
+    }
 }
 
 /// Everything one request to a model carries.
@@ -298,6 +321,29 @@ pub trait ChatModel: Send + Sync {
         request: Request<'_>,
         sink: &mut dyn Sink,
     ) -> Result<Reply, ProviderError>;
+
+    /// Sends `request` like [`ChatModel::complete`], asking the provider to write nothing to its prompt cache, for a request whose prefix is never sent again, such as a one-off summary; a model that cannot be asked so sends it like [`ChatModel::complete`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`ChatModel::complete`].
+    async fn complete_uncached(
+        &self,
+        request: Request<'_>,
+        sink: &mut dyn Sink,
+    ) -> Result<Reply, ProviderError> {
+        self.complete(request, sink).await
+    }
+
+    /// Sends `request` again asking for no output, so that the provider keeps the prompt cache entries it reads alive, and returns what that cost; nothing, and nothing sent, when the model cannot be warmed so.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError`] when the request fails or the provider answers with a non-success status.
+    async fn warm(&self, request: Request<'_>) -> Result<Option<Tokens>, ProviderError> {
+        let _ = request;
+        Ok(None)
+    }
 }
 
 /// A hosted model reached with a login's credentials.
@@ -308,6 +354,8 @@ pub struct RemoteModel {
     pub credentials: Credentials,
     /// The model id to request.
     pub model: String,
+    /// How long the provider is asked to keep the prompt cache entries requests write.
+    pub retention: Retention,
 }
 
 #[async_trait]
@@ -318,9 +366,46 @@ impl ChatModel for RemoteModel {
         request: Request<'_>,
         sink: &mut dyn Sink,
     ) -> Result<Reply, ProviderError> {
+        self.send(request, sink, Some(self.retention)).await
+    }
+
+    /// Sends the request without cache breakpoints when the provider takes them, and like any other otherwise.
+    async fn complete_uncached(
+        &self,
+        request: Request<'_>,
+        sink: &mut dyn Sink,
+    ) -> Result<Reply, ProviderError> {
+        self.send(request, sink, None).await
+    }
+
+    /// Replays the request with no output on the Anthropic wire, when its thinking settings allow it; the other wires are not warmed.
+    async fn warm(&self, request: Request<'_>) -> Result<Option<Tokens>, ProviderError> {
         match self.provider.wire() {
             Wire::AnthropicMessages => {
-                anthropic_messages::complete(&self.credentials, &self.model, request, sink).await
+                anthropic_messages::warm(&self.credentials, &self.model, request, self.retention)
+                    .await
+            }
+            Wire::OpenAiResponses | Wire::ChatCompletions => Ok(None),
+        }
+    }
+}
+
+impl RemoteModel {
+    /// Dispatches `request` to the provider's streaming implementation, giving `sink` each chunk; on the Anthropic wire `cache` says how long the cache entries it writes live, and nothing asks it to write none.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`ChatModel::complete`].
+    async fn send(
+        &self,
+        request: Request<'_>,
+        sink: &mut dyn Sink,
+        cache: Option<Retention>,
+    ) -> Result<Reply, ProviderError> {
+        match self.provider.wire() {
+            Wire::AnthropicMessages => {
+                anthropic_messages::complete(&self.credentials, &self.model, request, sink, cache)
+                    .await
             }
             Wire::OpenAiResponses => {
                 openai_responses::complete(&self.credentials, &self.model, request, sink).await

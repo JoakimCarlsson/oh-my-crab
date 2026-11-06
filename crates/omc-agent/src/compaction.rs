@@ -360,7 +360,7 @@ pub(crate) async fn summarize(
     })
 }
 
-/// Asks `model` for the summary `prompt` asks for, offering it no tools.
+/// Asks `model` for the summary `prompt` asks for, offering it no tools and writing nothing to the provider's prompt cache, since the request is never sent again.
 ///
 /// # Errors
 ///
@@ -378,7 +378,7 @@ async fn ask(
         effort,
     };
     let reply = model
-        .complete(request, &mut Quiet)
+        .complete_uncached(request, &mut Quiet)
         .await
         .map_err(|error| error.to_string())?;
     if !reply.tool_calls.is_empty() {

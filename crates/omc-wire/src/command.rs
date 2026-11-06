@@ -55,6 +55,8 @@ pub enum Command {
     /// Opens the conversation, which must come before anything else.
     Open(Opening),
     /// Starts a turn with these words and these files.
+    ///
+    /// Sent while a turn is running, the prompt is queued and reported as a [`crate::Event::Queued`]: it is put into the running turn after its current batch of tool calls, or starts a turn of its own when that turn ends first. A `/compact` sent while a turn is running is refused with a [`crate::Event::Failed`].
     Prompt {
         /// What the reader wrote.
         text: String,

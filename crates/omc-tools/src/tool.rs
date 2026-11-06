@@ -78,6 +78,11 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Whether the tool checks its arguments against its schema itself, so that the [`crate::Registry`] only puts them right before a call and leaves turning them away to the tool.
+    fn checks_arguments(&self) -> bool {
+        false
+    }
+
     /// Whether the user must approve a call before it runs.
     fn needs_approval(&self) -> bool {
         false

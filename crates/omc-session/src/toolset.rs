@@ -1,9 +1,9 @@
-//! The tools and system prompts a turn runs with, for each mode.
+//! The tools a turn runs with, for each mode.
 
 use std::sync::Arc;
 
-use omc_agent::{Approvals, EventSink, Live, Task, TaskSettings};
-use omc_context::{Discovered, Environment, PromptInput, build_prompt, build_subagent_prompt};
+use omc_agent::{Approvals, EventSink, Task, TaskSettings};
+use omc_context::{Discovered, Environment, PromptInput, build_subagent_prompt};
 use omc_providers::{ChatModel, Effort};
 use omc_tools::{
     Ask, Checkpoint, CheckpointTool, ContextNotes, ExitPlanMode, Host, Jobs, NewContext, Notebook,
@@ -40,35 +40,31 @@ pub(crate) struct Inputs<'a> {
     pub(crate) jobs: Arc<Jobs>,
 }
 
-/// The tools and system prompt of a turn in each mode.
+/// The tools of a turn in each mode.
 pub(crate) struct Toolset {
     /// What the agent has outside plan mode.
-    full: Live,
+    full: Arc<Registry>,
     /// What the agent has in plan mode.
-    plan: Live,
+    plan: Arc<Registry>,
 }
 
 impl Toolset {
-    /// Builds the tools and prompts from `inputs`.
+    /// Builds the tools from `inputs`.
     pub(crate) fn build(inputs: &Inputs<'_>) -> Self {
         Self {
-            full: assemble(inputs, false),
-            plan: assemble(inputs, true),
+            full: Arc::new(assemble(inputs, false)),
+            plan: Arc::new(assemble(inputs, true)),
         }
     }
 
     /// What the agent has in plan mode when `plan` is set, and otherwise outside it.
-    pub(crate) fn live(&self, plan: bool) -> Live {
-        let chosen = if plan { &self.plan } else { &self.full };
-        Live {
-            registry: chosen.registry.clone(),
-            system: chosen.system.clone(),
-        }
+    pub(crate) fn tools(&self, plan: bool) -> &Arc<Registry> {
+        if plan { &self.plan } else { &self.full }
     }
 }
 
-/// The tools and prompt for plan mode when `plan` is set, and otherwise for the rest.
-fn assemble(inputs: &Inputs<'_>, plan: bool) -> Live {
+/// The tools for plan mode when `plan` is set, and otherwise for the rest.
+fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
     let base = if plan {
         inputs.base.read_only()
     } else {
@@ -118,17 +114,7 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Live {
     for name in inputs.denied {
         registry.remove(name);
     }
-    let system = build_prompt(PromptInput {
-        environment: &inputs.environment,
-        discovered: &inputs.discovered,
-        tools: &registry.names(),
-        plan,
-        unnamed: inputs.unnamed,
-    });
-    Live {
-        registry: Arc::new(registry),
-        system: Arc::from(system),
-    }
+    registry
 }
 
 #[cfg(test)]
@@ -192,13 +178,12 @@ mod tests {
     #[test]
     fn checkpoint_tools_follow_the_setting() {
         for plan in [false, true] {
-            let names = toolset(&[]).live(plan).registry.names();
+            let names = toolset(&[]).tools(plan).names();
             assert!(
                 !names.iter().any(|n| n == "checkpoint") && !names.iter().any(|n| n == "rewind")
             );
             let names = toolset_with(&[], Some(Arc::new(Checkpoint::new())))
-                .live(plan)
-                .registry
+                .tools(plan)
                 .names();
             assert!(names.iter().any(|n| n == "checkpoint") && names.iter().any(|n| n == "rewind"));
         }
@@ -209,7 +194,7 @@ mod tests {
     fn plan_mode_filters_the_tools() {
         let tools = toolset(&[]);
         assert_eq!(
-            tools.live(true).registry.names(),
+            tools.tools(true).names(),
             vec![
                 "ask",
                 "ast_grep",
@@ -226,7 +211,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            tools.live(false).registry.names(),
+            tools.tools(false).names(),
             vec![
                 "ask",
                 "ast_edit",
@@ -245,16 +230,14 @@ mod tests {
                 "write"
             ]
         );
-        assert!(tools.live(true).system.contains("Plan mode active"));
-        assert!(!tools.live(false).system.contains("Plan mode active"));
     }
 
     /// Denied tools are left out of both modes.
     #[test]
     fn denied_tools_are_left_out() {
         let tools = toolset(&["task".to_owned(), "bash".to_owned()]);
-        assert!(tools.live(false).registry.get("task").is_none());
-        assert!(tools.live(false).registry.get("bash").is_none());
-        assert!(tools.live(true).registry.get("task").is_none());
+        assert!(tools.tools(false).get("task").is_none());
+        assert!(tools.tools(false).get("bash").is_none());
+        assert!(tools.tools(true).get("task").is_none());
     }
 }

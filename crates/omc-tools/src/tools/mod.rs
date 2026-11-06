@@ -6,6 +6,7 @@ mod ast_edit;
 mod ast_grep;
 mod atomic;
 mod bash;
+mod capture;
 mod checkpoint;
 mod edit;
 mod exit_plan;

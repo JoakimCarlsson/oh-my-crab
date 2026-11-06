@@ -3,13 +3,16 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use omc_tools::{Tool, ToolError, ToolOutput};
+use omc_tools::{Spill, Tool, ToolError, ToolOutput};
 use serde_json::Value;
 
 use crate::client::{Client, Offered};
 
 /// How long a name a tool may have, which is what the providers take.
 const NAME_LIMIT: usize = 64;
+
+/// Most bytes of a tool's text shown to the model; longer text is cut in the middle and saved whole.
+const OUTPUT_LIMIT: usize = 20 * 1024;
 
 /// A tool a server offers.
 pub(crate) struct McpTool {
@@ -25,11 +28,13 @@ pub(crate) struct McpTool {
     client: Arc<Client>,
     /// The name of the server, for describing a call.
     server: String,
+    /// Where text too long to show is saved whole.
+    spill: Spill,
 }
 
 impl McpTool {
-    /// The tool `offered` by the server called `server` that `client` is connected to.
-    pub(crate) fn new(server: &str, offered: Offered, client: Arc<Client>) -> Self {
+    /// The tool `offered` by the server called `server` that `client` is connected to, saving text too long to show in `spill`.
+    pub(crate) fn new(server: &str, offered: Offered, client: Arc<Client>, spill: Spill) -> Self {
         let name = filed(server, &offered.name);
         Self {
             name: Box::leak(name.into_boxed_str()),
@@ -38,6 +43,7 @@ impl McpTool {
             remote: offered.name,
             client,
             server: server.to_owned(),
+            spill,
         }
     }
 }
@@ -87,13 +93,13 @@ impl Tool for McpTool {
         format!("{}: {} {args}", self.server, self.remote)
     }
 
-    /// Calls the tool on its server.
+    /// Calls the tool on its server, cutting text longer than [`OUTPUT_LIMIT`] in the middle and saving the whole of it.
     async fn call(&self, args: Value) -> Result<ToolOutput, ToolError> {
-        self.client
-            .call(&self.remote, args)
-            .await
-            .map(ToolOutput::new)
-            .map_err(ToolError::Failed)
+        let capped = |text| self.spill.cap("mcp", text, OUTPUT_LIMIT);
+        match self.client.call(&self.remote, args).await {
+            Ok(text) => Ok(ToolOutput::new(capped(text))),
+            Err(text) => Err(ToolError::Failed(capped(text))),
+        }
     }
 }
 

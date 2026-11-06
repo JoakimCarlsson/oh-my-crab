@@ -1,7 +1,7 @@
 //! The system prompt, built from the templates in `prompts/`.
 
 use crate::template::render;
-use crate::{Discovered, Environment};
+use crate::{Discovered, Environment, environment_reminder};
 
 /// The main agent's prompt.
 const SYSTEM: &str = include_str!("prompts/system.md");
@@ -31,8 +31,10 @@ pub struct PromptInput<'a> {
 }
 
 /// The system prompt of the main agent for `input`.
+///
+/// It holds nothing that changes from day to day, so that the provider's prompt cache keeps it; the date and the branch go to the agent in [`crate::environment_reminder`] instead.
 pub fn build_prompt(input: PromptInput<'_>) -> String {
-    let flags = flags(&input);
+    let flags = flags(input.tools);
     let project = project(&input);
     let skills = skills(input.discovered);
     let plan = if input.plan {
@@ -52,10 +54,11 @@ pub fn build_prompt(input: PromptInput<'_>) -> String {
     render(SYSTEM, &vars)
 }
 
-/// The system prompt of a subagent whose role is `role`, for `input`.
+/// The system prompt of a subagent whose role is `role`, for `input`; a subagent lives for one task, so its prompt carries the date and the branch itself.
 pub fn build_subagent_prompt(input: PromptInput<'_>, role: &str) -> String {
-    let flags = flags(&input);
+    let flags = flags(input.tools);
     let project = project(&input);
+    let environment = environment_reminder(input.environment);
     let plan = if input.plan {
         render(PLAN, &flags_ref(&flags))
     } else {
@@ -66,36 +69,42 @@ pub fn build_subagent_prompt(input: PromptInput<'_>, role: &str) -> String {
     vars.extend([
         ("agent", role),
         ("project", project.as_str()),
+        ("environment", environment.as_str()),
         ("plan", plan.as_str()),
         ("tools", tools.as_str()),
     ]);
     render(SUBAGENT, &vars)
 }
 
-/// One `has_<tool>` flag for each tool the prompt knows how to talk about, set when `input` has the tool.
-fn flags(input: &PromptInput<'_>) -> Vec<(String, String)> {
+/// One `has_<tool>` flag for each tool the prompt knows how to talk about, set when `tools` names the tool.
+pub(crate) fn flags(tools: &[String]) -> Vec<(String, String)> {
     [
         "read", "grep", "glob", "bash", "edit", "write", "todo", "ask", "task", "skill",
         "ast_grep", "ast_edit",
     ]
     .iter()
     .map(|tool| {
-        let has = input.tools.iter().any(|name| name == tool);
+        let has = tools.iter().any(|name| name == tool);
         (format!("has_{tool}"), if has { "1" } else { "" }.to_owned())
     })
     .collect()
 }
 
 /// `flags` as the pairs the renderer takes.
-fn flags_ref(flags: &[(String, String)]) -> Vec<(&str, &str)> {
+pub(crate) fn flags_ref(flags: &[(String, String)]) -> Vec<(&str, &str)> {
     flags
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect()
 }
 
+/// The rules of plan mode for an agent that has `tools`.
+pub(crate) fn plan_rules(tools: &[String]) -> String {
+    render(PLAN, &flags_ref(&flags(tools)))
+}
+
 /// The list of tools, one to a line.
-fn inventory(tools: &[String]) -> String {
+pub(crate) fn inventory(tools: &[String]) -> String {
     tools
         .iter()
         .map(|tool| format!("- `{tool}`"))
@@ -136,8 +145,6 @@ fn project(input: &PromptInput<'_>) -> String {
         &[
             ("directory", directory.as_str()),
             ("os", environment.os.as_str()),
-            ("date", environment.date.as_str()),
-            ("branch", environment.branch.as_deref().unwrap_or_default()),
             ("model", environment.model.as_deref().unwrap_or_default()),
             ("rules", rules.as_str()),
         ],
@@ -185,7 +192,8 @@ mod tests {
         assert!(prompt.contains("Use tabs. {{not_a_tag}}"));
         assert!(prompt.contains("Be brief."));
         assert!(prompt.contains("User rule."));
-        assert!(prompt.contains("- Git branch: main"));
+        assert!(!prompt.contains("Git branch") && !prompt.contains(&environment.date));
+        assert!(environment_reminder(&environment).contains("Git branch: main."));
         assert!(prompt.contains("- Model: model-x"));
         assert!(prompt.contains(&format!(
             "- Working directory: {}",
@@ -250,6 +258,7 @@ mod tests {
         );
         assert!(prompt.starts_with("§ Role\nBe a scout."));
         assert!(prompt.contains("<project-context>"));
+        assert!(prompt.contains(&environment_reminder(&environment)));
     }
 
     /// An unnamed conversation is asked to name itself, and a named one is not.

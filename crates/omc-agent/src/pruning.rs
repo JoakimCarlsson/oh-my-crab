@@ -269,6 +269,32 @@ mod tests {
         assert_eq!(stale(&history), None);
     }
 
+    /// A bare read of a code file, which may be an outline with bodies folded,
+    /// and reads of ranges or of the whole text of the same file never make one
+    /// another out of date, in either order; only the same read made again does.
+    #[test]
+    fn outlines_and_ranges_do_not_supersede_each_other() {
+        let history = vec![
+            Message::User("go".into()),
+            call("a", "read", json!({"path": "src/lib.rs:120-180"})),
+            output("a", "read", 500),
+            call("b", "read", json!({"path": "src/lib.rs"})),
+            output("b", "read", 500),
+            call("c", "read", json!({"path": "src/lib.rs:1-"})),
+            output("c", "read", 500),
+            call("d", "read", json!({"path": "src/lib.rs:120-180"})),
+            output("d", "read", 500),
+            answer(),
+        ];
+        let ids: Vec<String> = stale(&history)
+            .expect("the repeated range read is out of date")
+            .elided
+            .into_iter()
+            .map(|elided| elided.call_id)
+            .collect();
+        assert_eq!(ids, ["a"]);
+    }
+
     /// A superseded read far back costs too much of the cache to leave out between prunings.
     #[test]
     fn a_read_far_back_waits_for_the_next_pruning() {

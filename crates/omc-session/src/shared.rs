@@ -5,14 +5,17 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use omc_agent::Approvals;
 use omc_providers::Effort;
-use omc_providers::Provider;
+use omc_providers::{Provider, Retention};
 use omc_tools::{Checkpoint, Host, Jobs, LanguageService, Languages, Notebook};
 use omc_wire::{Event, PlanStep, Question, Reply};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::bridge::Questions;
 use crate::languages::ClientLanguages;
+use crate::prefix::{Key, Prefix};
+use crate::queue::Queue;
 use crate::settings::{Mode, Offer, default_effort, offered};
+use crate::warmer::Warmer;
 
 /// What can be set, and how it stands.
 struct State {
@@ -32,6 +35,10 @@ struct State {
     effort: Option<Effort>,
     /// Whether the agent has the checkpoint and rewind tools.
     checkpoints: bool,
+    /// How long the provider is asked to keep the prompt cache entries requests write.
+    retention: Retention,
+    /// Whether the prompt cache is kept warm while the agent waits.
+    warming: bool,
 }
 
 /// What a conversation's commands, turns and tools share.
@@ -54,12 +61,21 @@ pub(crate) struct Shared {
     pub(crate) client_languages: Arc<ClientLanguages>,
     /// The language services the program running the conversation gave it, which win over the client's and the harness's own.
     pub(crate) given_languages: Option<Arc<dyn LanguageService>>,
+    /// The prompts the client sent while a turn was running.
+    pub(crate) queue: Queue,
     /// The conversation's name and the history it is saved in.
     naming: Mutex<Naming>,
     /// Where the conversation keeps its logins.
     login: Mutex<Login>,
     /// What can be set, and how it stands.
     state: Mutex<State>,
+    /// The system prompt and tool list of the conversation, once a turn made them.
+    prefix: Mutex<Option<Arc<Prefix>>>,
+    /// What keeps the prompt cache warm.
+    pub(crate) warmer: Arc<Warmer>,
+    /// The date turns tell the agent instead of today's, in tests.
+    #[cfg(test)]
+    pub(crate) today: Mutex<Option<String>>,
 }
 
 /// Where the conversation keeps its logins.
@@ -95,6 +111,7 @@ impl Shared {
             languages: Languages::default(),
             client_languages: Arc::new(ClientLanguages::new(out.clone())),
             given_languages: given,
+            queue: Queue::default(),
             out,
             approvals: Arc::new(Approvals::new(questions.clone(), false)),
             questions,
@@ -114,8 +131,25 @@ impl Shared {
                 resume: Mode::Asking,
                 effort: None,
                 checkpoints: false,
+                retention: Retention::Short,
+                warming: true,
             }),
+            prefix: Mutex::new(None),
+            warmer: Arc::new(Warmer::default()),
+            #[cfg(test)]
+            today: Mutex::new(None),
         })
+    }
+
+    /// The prefix made for `key`, made with `freeze` when there is none for it yet; it replaces one made for anything else.
+    pub(crate) fn prefix(&self, key: &Key, freeze: impl FnOnce() -> Prefix) -> Arc<Prefix> {
+        let mut held = self.prefix.lock().unwrap_or_else(|held| held.into_inner());
+        if let Some(prefix) = held.as_ref().filter(|prefix| prefix.key() == key) {
+            return prefix.clone();
+        }
+        let made = Arc::new(freeze());
+        *held = Some(made.clone());
+        made
     }
 
     /// Runs `with` on the state.
@@ -151,6 +185,15 @@ impl Shared {
         let mut naming = self.naming.lock().unwrap_or_else(|held| held.into_inner());
         naming.title = journal.as_ref().and_then(|journal| journal.title());
         naming.journal = journal;
+    }
+
+    /// The history the conversation is saved in, when it is saved.
+    pub(crate) fn journal(&self) -> Option<Arc<omc_agent::Journal>> {
+        self.naming
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .journal
+            .clone()
     }
 
     /// The conversation's name, when it has one.
@@ -214,8 +257,10 @@ impl Shared {
         let _ = self.out.send(event);
     }
 
-    /// Records that the conversation is open with `provider`, `models` and `model`, in the mode `mode`.
+    /// Records that the conversation is open with `provider`, `models` and `model`, in the mode `mode`; the system prompt and tools of a conversation opened before are forgotten and its cache is no longer kept warm.
     pub(crate) fn open(&self, provider: Provider, models: Vec<String>, model: String, mode: Mode) {
+        *self.prefix.lock().unwrap_or_else(|held| held.into_inner()) = None;
+        self.warmer.stop();
         self.state(|state| {
             state.opened = true;
             state.provider = Some(provider);
@@ -239,6 +284,10 @@ impl Shared {
                 efforts: &efforts,
                 effort: state.effort,
                 checkpoints: state.checkpoints,
+                retention: omc_providers::cache_ttl(provider, &state.model, Retention::Long)
+                    .map(|_| state.retention),
+                warming: omc_providers::warmable(provider, &state.model, None)
+                    .then_some(state.warming),
             }))
         });
         if let Some(settings) = settings {
@@ -324,6 +373,29 @@ impl Shared {
     pub(crate) fn set_checkpoints(&self, enabled: bool) {
         self.state(|state| state.checkpoints = enabled);
         self.checkpoint.clear();
+    }
+
+    /// How long the provider is asked to keep the prompt cache entries requests write.
+    pub(crate) fn retention(&self) -> Retention {
+        self.state(|state| state.retention)
+    }
+
+    /// Asks the provider to keep the prompt cache entries of the requests from now on as long as `retention` says.
+    pub(crate) fn set_retention(&self, retention: Retention) {
+        self.state(|state| state.retention = retention);
+    }
+
+    /// Whether the prompt cache is kept warm while the agent waits.
+    pub(crate) fn warming(&self) -> bool {
+        self.state(|state| state.warming)
+    }
+
+    /// Turns keeping the prompt cache warm on or off; turning it off stops it at once.
+    pub(crate) fn set_warming(&self, enabled: bool) {
+        self.state(|state| state.warming = enabled);
+        if !enabled {
+            self.warmer.stop();
+        }
     }
 
     /// The effort the next turn thinks at; nothing when the model takes none.

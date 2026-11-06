@@ -1,18 +1,22 @@
 //! The tool-calling loop.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use futures_util::future::join_all;
 use omc_providers::{
-    ChatModel, Effort, Message, Part, ProviderError, Pruning, Reply, Request, Sink, Tokens,
+    ChatModel, Effort, Message, Part, ProviderError, Pruning, Reply, Request, Sink, Stop, Tokens,
     ToolCall, ToolResult, ToolSpec,
 };
 use omc_tools::{Checkpoint, FileChange, Notebook, Registry, sanitize};
 use thiserror::Error;
 
 use crate::compaction;
+use crate::loop_guard::LoopGuard;
 use crate::pruning;
 use crate::recall::{self, RECALL};
+use crate::recovery::{self, MAX_RECOVERIES, Retry};
+use crate::steering::{self, Steering};
 use crate::{ApprovalRequest, Approvals, Scribe};
 
 /// Something the UI should show while a turn runs.
@@ -80,6 +84,11 @@ pub enum AgentError {
     /// The history could not be compacted, for this reason.
     #[error("compacting the conversation failed: {0}")]
     Compaction(String),
+    /// The model's replies kept running into the output limit before their tool calls were complete, so none of them could be run.
+    #[error(
+        "the model's replies kept running into the output limit before their tool calls were complete"
+    )]
+    OutputLimit,
 }
 
 /// The tools and system prompt to use for the next request, when they can change while a turn runs.
@@ -191,14 +200,28 @@ fn rewind(history: &mut Vec<Message>, length: usize, report: &str, scribe: Optio
 /// without its result. Tool failures are not errors here: they are sent to the
 /// model as results. `events` observes streamed text and tool activity.
 ///
+/// A request that fails in a way that is likely to pass, such as an overloaded
+/// provider or a dropped connection, is sent again after a wait, a few times;
+/// each wait is shown through `events` as a call of the `retry` tool. A reply
+/// that stops short, empty or cut off by the output limit, is answered with a
+/// notice that only the model sees, a few times a turn, and the model carries
+/// on. The calls of a reply the output limit cut off are not run, and nor are
+/// calls whose arguments cannot be read; the model is told why in their
+/// results. When the model keeps making the same calls, or keeps making edits
+/// that change nothing, a notice telling it to change course is added to the
+/// results.
+///
 /// # Errors
 ///
-/// Returns [`AgentError::Provider`] when a model request fails, and
+/// Returns [`AgentError::Provider`] when a model request fails for good,
 /// [`AgentError::Empty`] when the model answers the prompt with neither text
-/// nor tool calls.
+/// nor tool calls even after being nudged, and [`AgentError::OutputLimit`]
+/// when its replies keep running into the output limit before their tool calls
+/// are complete.
 ///
 /// A turn has no request limit: it ends when the model stops calling tools or
-/// when the task running it is aborted.
+/// when the task running it is aborted, which also ends any wait before a
+/// request is sent again.
 pub async fn run_turn(
     context: &Context<'_>,
     history: &mut Vec<Message>,
@@ -222,11 +245,29 @@ pub async fn run_turn_recorded(
     events: &(dyn Fn(AgentEvent) + Send + Sync),
     scribe: Option<&Scribe>,
 ) -> Result<(), AgentError> {
+    run_turn_steered(context, history, prompt, events, scribe, None).await
+}
+
+/// Runs a turn like [`run_turn_recorded`], and puts the messages waiting in `steering`, when there is one, into the conversation at each safe point: after a batch of tool calls and any compaction, before the next model request. Each is added to `history` and recorded as the reader's.
+///
+/// A message that is still waiting when the model answers without calling a tool is left in `steering` for the caller. When the turn fails, the messages put into it are cut back with it.
+///
+/// # Errors
+///
+/// Same as [`run_turn`].
+pub async fn run_turn_steered(
+    context: &Context<'_>,
+    history: &mut Vec<Message>,
+    prompt: String,
+    events: &(dyn Fn(AgentEvent) + Send + Sync),
+    scribe: Option<&Scribe>,
+    steering: Option<&dyn Steering>,
+) -> Result<(), AgentError> {
     let start = history.len();
     let resets = context.notebook.map_or(0, Notebook::resets);
     history.push(Message::User(prompt));
     record(scribe, &history[start]);
-    let result = drive(context, history, events, scribe).await;
+    let result = drive(context, history, events, scribe, steering).await;
     if let Some(checkpoint) = context.checkpoint {
         checkpoint.clear();
     }
@@ -302,12 +343,72 @@ fn is_empty(reply: &Reply) -> bool {
     reply.text.trim().is_empty() && reply.tool_calls.is_empty()
 }
 
-/// Repeats model request and tool execution until no tool is requested, recording each step with `scribe`.
+/// The notice to send along with the next request when `reply` stopped short of anything to act on: empty, or cut off by the output limit before any tool call; `None` when it can be taken as it is.
+fn stopped_short(reply: &Reply) -> Option<&'static str> {
+    let cut = reply.stop == Stop::Length;
+    match (is_empty(reply), cut) {
+        (true, true) => Some(recovery::LENGTH_THINKING),
+        (true, false) => Some(recovery::EMPTY_REPLY),
+        (false, true) if reply.tool_calls.is_empty() => Some(recovery::LENGTH_TEXT),
+        _ => None,
+    }
+}
+
+/// The messages a request is made with: what the model is given of `history`, then `cut`, a reply the output limit cut off that the model is to carry on, and `notice`, when there are, at the end.
+fn request_messages<'h>(
+    history: &'h [Message],
+    cut: Option<&Reply>,
+    notice: Option<&str>,
+) -> Cow<'h, [Message]> {
+    let mut messages = compaction::context(history);
+    if let Some(cut) = cut {
+        messages.to_mut().push(Message::Assistant(cut.clone()));
+    }
+    if let Some(notice) = notice {
+        recovery::add_notice(messages.to_mut(), notice);
+    }
+    messages
+}
+
+/// Answers each of `calls` with the error `text` without running it, and reports each through `events` as started and failed.
+fn refuse(
+    calls: &[ToolCall],
+    text: &str,
+    events: &(dyn Fn(AgentEvent) + Send + Sync),
+) -> Vec<ToolResult> {
+    calls
+        .iter()
+        .map(|call| {
+            events(AgentEvent::ToolStart {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                summary: "cut off by the output limit".to_owned(),
+            });
+            finish(call, text.to_owned(), true, Vec::new(), events)
+        })
+        .collect()
+}
+
+/// Adds `notice` to the end of the last of `results`, where the model reads it with them.
+fn append_notice(results: &mut [ToolResult], notice: &str) {
+    if let Some(last) = results.last_mut() {
+        last.text.push_str("\n\n");
+        last.text.push_str(notice.trim());
+    }
+}
+
+/// Repeats model request and tool execution until no tool is requested, recording each step with `scribe` and putting the messages waiting in `steering` into the history before each request that does not carry on a cut-off reply.
 ///
 /// # Errors
 ///
 /// Same as [`run_turn`], and [`AgentError::Empty`] when the first reply of
-/// the turn is empty.
+/// the turn is empty and stays so after the model was nudged.
+///
+/// A request that fails in a way likely to pass is sent again after a wait that doubles each time, or that the provider asked for, up to [`recovery::MAX_RETRIES`] times; the wait is shown as a `retry` call and ends early when the turn is aborted. Nothing of a failed request reaches the history, so nothing is repeated in it.
+///
+/// A reply that is empty, or that the output limit cut off before any tool call, is not taken: the request is made again with a notice to the model added to its end, which is not kept in the history, up to [`MAX_RECOVERIES`] times a turn. A reply cut off part of the way through its text is carried on by the next one, the two kept as one. The calls of a reply cut off in its tool calls are answered with an error without being run, the last result telling the model to take a smaller step; this counts against the same limit, past which the turn fails.
+///
+/// The batches of calls are watched for circles: the same calls made again and again, or edits that change nothing, earn a notice to the model at the end of the batch's results.
 ///
 /// When the provider refuses a request while the history holds images, the
 /// images are taken out, with a note left in their place, and the request is
@@ -319,6 +420,7 @@ async fn drive(
     history: &mut Vec<Message>,
     events: &(dyn Fn(AgentEvent) + Send + Sync),
     scribe: Option<&Scribe>,
+    steering: Option<&dyn Steering>,
 ) -> Result<(), AgentError> {
     let mut saved = context.notebook.map_or(0, Notebook::revision);
     let mut reminded = false;
@@ -326,6 +428,12 @@ async fn drive(
     let mut stripped = false;
     let mut overflowed = false;
     let mut compaction_failed = false;
+    let mut retries = 0;
+    let mut waits = 0;
+    let mut recoveries = 0;
+    let mut notice: Option<&'static str> = None;
+    let mut cut: Option<Reply> = None;
+    let mut guard = LoopGuard::default();
     loop {
         let live = context.refresh.map(|refresh| refresh());
         let registry = live
@@ -343,13 +451,16 @@ async fn drive(
         {
             compaction_failed = true;
         }
+        if cut.is_none() {
+            steering::inject(steering, history, scribe);
+        }
         let mut specs = tool_specs(registry);
         if recall::offered(history) && registry.get(RECALL).is_none() {
             specs.push(recall::spec());
         }
         let mut chunks = Chunks { events };
         let answered = {
-            let messages = compaction::context(history);
+            let messages = request_messages(history, cut.as_ref(), notice);
             let request = Request {
                 system,
                 messages: &messages,
@@ -376,23 +487,66 @@ async fn drive(
                 stripped = true;
                 continue;
             }
+            Err(error) if let Some(wait) = recovery::retry_wait(&error, retries + 1) => {
+                retries += 1;
+                waits += 1;
+                let retry = Retry {
+                    at: history.len(),
+                    serial: waits,
+                    attempt: retries,
+                    wait,
+                };
+                events(retry.started(&error));
+                tokio::time::sleep(wait).await;
+                events(retry.finished(&error));
+                continue;
+            }
             Err(error) => return Err(error.into()),
         };
-        if std::mem::take(&mut first) && is_empty(&reply) {
+        retries = 0;
+        if let Some(tokens) = reply.tokens {
+            events(AgentEvent::Used(tokens));
+        }
+        let reply = match cut.take() {
+            Some(earlier) => recovery::joined(earlier, reply),
+            None => reply,
+        };
+        notice = None;
+        if recoveries < MAX_RECOVERIES
+            && let Some(next) = stopped_short(&reply)
+        {
+            recoveries += 1;
+            notice = Some(next);
+            if !is_empty(&reply) {
+                cut = Some(reply);
+            }
+            continue;
+        }
+        if first && is_empty(&reply) {
             return Err(AgentError::Empty);
         }
+        first = false;
         let nearly_full = reply
             .tokens
             .zip(context.window)
             .is_some_and(|(tokens, window)| tokens.context() >= window / 100 * REMINDER_PERCENT);
-        if let Some(tokens) = reply.tokens {
-            events(AgentEvent::Used(tokens));
-        }
         let calls = reply.tool_calls.clone();
+        let truncated = reply.stop == Stop::Length;
         history.push(Message::Assistant(reply));
         record(scribe, &history[history.len() - 1]);
         if calls.is_empty() {
             return Ok(());
+        }
+        if truncated {
+            if recoveries >= MAX_RECOVERIES {
+                return Err(AgentError::OutputLimit);
+            }
+            recoveries += 1;
+            let mut results = refuse(&calls, recovery::CUT_CALL, events);
+            append_notice(&mut results, recovery::LENGTH_CALLS);
+            history.push(Message::ToolResults(results));
+            record(scribe, &history[history.len() - 1]);
+            continue;
         }
         let changed: std::sync::Mutex<Vec<(String, Vec<FileChange>)>> =
             std::sync::Mutex::new(Vec::new());
@@ -408,13 +562,16 @@ async fn drive(
             events(event);
         };
         let mut results = run_calls(registry, context.approvals, history, &calls, &capture).await;
-        for (call, files) in changed
+        let changed = changed
             .into_inner()
-            .unwrap_or_else(|held| held.into_inner())
-        {
-            if let Some(Err(error)) = scribe.map(|scribe| scribe.changes(&call, &files)) {
+            .unwrap_or_else(|held| held.into_inner());
+        for (call, files) in &changed {
+            if let Some(Err(error)) = scribe.map(|scribe| scribe.changes(call, files)) {
                 eprintln!("history not saved: {error}");
             }
+        }
+        if let Some(redirect) = guard.observe(&calls, &results, &changed) {
+            append_notice(&mut results, &redirect);
         }
         if nearly_full && !reminded && context.notebook.is_some() {
             reminded = true;
@@ -641,6 +798,9 @@ async fn run_calls(
             }
             None => {
                 let message = format!("unknown tool: {}", call.name);
+                slots[index] = Some(finish(call, message, true, Vec::new(), events));
+            }
+            Some(_) if let Some(message) = recovery::malformed(call) => {
                 slots[index] = Some(finish(call, message, true, Vec::new(), events));
             }
             Some(tool) if let Some(scope) = tool.approval_scope(&call.arguments) => {
@@ -949,6 +1109,7 @@ mod tests {
                 return Err(ProviderError::Status {
                     status: "404 Not Found".into(),
                     body: "No endpoints found that support image input".into(),
+                    retry_after: None,
                 });
             }
             Ok(match results.last() {

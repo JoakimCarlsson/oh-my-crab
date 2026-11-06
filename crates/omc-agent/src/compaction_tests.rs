@@ -103,6 +103,7 @@ fn too_long() -> Result<Reply, ProviderError> {
     Err(ProviderError::Status {
         status: "400 Bad Request".to_owned(),
         body: "prompt is too long: 250000 tokens > 200000 maximum".to_owned(),
+        retry_after: None,
     })
 }
 

@@ -4,6 +4,7 @@ use crate::inquiry::Inquiry;
 use crate::language::LanguageRequest;
 use crate::permission::Permission;
 use crate::plan::PlanStep;
+use crate::queue::Queued;
 use crate::setting::{Setting, Slash};
 use crate::tool::{Background, Tool};
 use crate::usage::Usage;
@@ -100,6 +101,8 @@ pub enum Event {
     Resumed(Conversation),
     /// The agent named the conversation, or named it again.
     Titled(String),
+    /// A prompt sent while a turn was running waits, was put into that turn, started a turn of its own or was dropped; the steered or started prompt is the reader's from then on, as one sent between turns is.
+    Queued(Queued),
 }
 
 /// The kind of a block of the agent's reply.

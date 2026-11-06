@@ -6,7 +6,8 @@ use serde_json::{Value, json};
 
 use crate::chat::{Blocks, parse_arguments};
 use crate::{
-    Message, Part, Provider, ProviderError, Reply, Request, Sink, Tokens, ToolCall, ToolSpec, sse,
+    Message, Part, Provider, ProviderError, Reply, Request, Sink, Stop, Tokens, ToolCall, ToolSpec,
+    sse,
 };
 
 /// Where a request goes and who it is sent as.
@@ -70,13 +71,8 @@ pub(crate) fn model_ids(list: &Value) -> Vec<String> {
 pub(crate) async fn list_models(target: Target<'_>) -> Result<Vec<String>, ProviderError> {
     let request = reqwest::Client::new().get(format!("{}/models", target.base_url));
     let response = authorized(request, &target).send().await?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(ProviderError::Status {
-            status: status.to_string(),
-            body,
-        });
+    if !response.status().is_success() {
+        return Err(ProviderError::from_response(response).await);
     }
     Ok(model_ids(&response.json().await?))
 }
@@ -233,6 +229,8 @@ pub(crate) struct Accumulator {
     blocks: Blocks,
     /// Why the server said the answer ended, when it said.
     finish_reason: Option<String>,
+    /// Whether the stream reached its `[DONE]` line.
+    done: bool,
 }
 
 impl Accumulator {
@@ -245,6 +243,7 @@ impl Accumulator {
     /// Returns [`ProviderError::Stream`] when the server reports an error in the stream.
     pub(crate) fn feed(&mut self, data: &str, sink: &mut dyn Sink) -> Result<bool, ProviderError> {
         if data.trim() == "[DONE]" {
+            self.done = true;
             return Ok(true);
         }
         let Ok(chunk) = serde_json::from_str::<Value>(data) else {
@@ -323,18 +322,26 @@ impl Accumulator {
     ///
     /// Returns [`ProviderError::Stream`] when the server says its content
     /// filter cut the answer, which would otherwise pass for a short or empty
-    /// answer.
+    /// answer, and [`ProviderError::Unfinished`] when the stream ended with
+    /// neither a reason for the end nor its `[DONE]` line.
     pub(crate) fn finish(self) -> Result<Reply, ProviderError> {
         if self.finish_reason.as_deref() == Some("content_filter") {
             return Err(ProviderError::Stream(
                 "the provider's content filter stopped the answer".to_owned(),
             ));
         }
+        if !self.done && self.finish_reason.is_none() {
+            return Err(ProviderError::Unfinished);
+        }
         Ok(self.reply())
     }
 
     /// The reply the chunks so far describe.
     fn reply(self) -> Reply {
+        let stop = match self.finish_reason.as_deref() {
+            Some("length") => Stop::Length,
+            _ => Stop::Finished,
+        };
         let tool_calls = self
             .calls
             .into_iter()
@@ -356,6 +363,7 @@ impl Accumulator {
             tool_calls,
             tokens: self.tokens,
             opaque: Vec::new(),
+            stop,
         }
     }
 }
@@ -575,6 +583,21 @@ mod tests {
         let chunk = json!({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]});
         plain.feed(&chunk.to_string(), &mut sink).unwrap();
         assert_eq!(plain.finish().unwrap().text, "ok");
+    }
+
+    /// An answer cut by the output limit says so, and a stream that ends without saying why is unfinished.
+    #[test]
+    fn length_stops_and_unfinished_streams_are_told_apart() {
+        let mut sink = Recorder::default();
+        let mut cut = Accumulator::default();
+        let chunk = json!({"choices": [{"delta": {"content": "hal"}, "finish_reason": "length"}]});
+        cut.feed(&chunk.to_string(), &mut sink).unwrap();
+        assert_eq!(cut.finish().unwrap().stop, Stop::Length);
+        let mut dropped = Accumulator::default();
+        let chunk = json!({"choices": [{"delta": {"content": "hal"}}]});
+        dropped.feed(&chunk.to_string(), &mut sink).unwrap();
+        let error = dropped.finish().unwrap_err();
+        assert!(matches!(error, ProviderError::Unfinished), "{error}");
     }
 
     /// An error object inside the stream is reported.

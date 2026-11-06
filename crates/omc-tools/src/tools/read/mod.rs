@@ -1,10 +1,11 @@
-//! The `read` tool: numbered lines of a text file, a directory listing, an
-//! image, the text of a PDF, or a web page.
+//! The `read` tool: numbered lines of a text file or an outline of a large
+//! code file, a directory listing, an image, the text of a PDF, or a web page.
 
 mod guard;
 mod lines;
 mod listing;
 mod media;
+mod outline;
 mod selector;
 mod web;
 
@@ -19,6 +20,7 @@ use super::snapshot::tag_file;
 use crate::tool::parse_args;
 use crate::{Sandbox, Tool, ToolError, ToolOutput};
 use media::Media;
+pub(crate) use outline::{Fold, folds};
 use selector::Selector;
 
 /// Bytes at the start of a file inspected to tell text, images, PDFs and other
@@ -29,32 +31,47 @@ const SNIFF_BYTES: usize = 8192;
 pub struct Read {
     /// The directory paths are confined to.
     sandbox: Sandbox,
+    /// Whether a bare read of a large code file gives an outline rather than its text.
+    outline: bool,
 }
 
 impl Read {
-    /// Creates the tool confined to `sandbox`.
+    /// Creates the tool confined to `sandbox`, giving outlines of large code files.
     pub fn new(sandbox: Sandbox) -> Self {
-        Self { sandbox }
+        Self::with_outline(sandbox, true)
+    }
+
+    /// Creates the tool confined to `sandbox`, giving outlines of large code
+    /// files read without a selector when `outline` is set and their text,
+    /// like any other file, when it is not.
+    pub fn with_outline(sandbox: Sandbox, outline: bool) -> Self {
+        Self { sandbox, outline }
     }
 
     /// Resolves the `path` argument to a file inside the sandbox, the name it is
     /// shown by, and the selector after it.
     ///
     /// A file whose whole name exists wins over reading a `:` suffix as a
-    /// selector, so names that contain colons stay readable.
+    /// selector, so names that contain colons stay readable. Files the tools
+    /// saved long output in are readable wherever they are.
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::OutsidePath`] when the path leaves the sandbox.
+    /// Returns [`ToolError::OutsidePath`] when the path leaves the sandbox and
+    /// is not saved output.
     fn locate(&self, raw: &str) -> Result<(PathBuf, String, Selector), ToolError> {
-        let whole = self.sandbox.resolve(raw);
+        let whole = self.sandbox.resolve_readable(raw);
         if let Ok(path) = &whole
             && path.exists()
         {
             return Ok((path.clone(), raw.to_string(), Selector::default()));
         }
         if let Some((name, selector)) = selector::split(raw) {
-            return Ok((self.sandbox.resolve(name)?, name.to_string(), selector));
+            return Ok((
+                self.sandbox.resolve_readable(name)?,
+                name.to_string(),
+                selector,
+            ));
         }
         Ok((whole?, raw.to_string(), Selector::default()))
     }
@@ -101,6 +118,13 @@ impl Tool for Read {
          file:50-200 (inclusive), file:50+150 (150 lines from 50), file:-60 (last 60), \
          file:5-16,960-973 (several ranges). Reads stop at 2000 lines or 50 KB with a note \
          saying how to continue.\n\
+         - Code files of 200 lines or more (Rust, Go, TypeScript, JavaScript, Python, C, C++, \
+         Java, Lua) read without a selector come back as an outline: signatures, types, \
+         imports and comments keep their real line numbers, and each long function body is \
+         folded to one unnumbered line such as `… 30 lines folded (120-149)`. A footer lists \
+         the folded ranges. Never guess what a fold holds: read it, e.g. file:120-149, before \
+         editing inside it; an edit with the outline's tag that touches a folded line is \
+         refused. file:1- reads the file as it is.\n\
          - Directories: entries, directories first and ending in /, honoring .gitignore.\n\
          - Images (PNG, JPEG, GIF, WebP): returned for you to look at.\n\
          - PDFs: extracted text, a [page N] line before each page; line suffixes work.\n\
@@ -144,19 +168,27 @@ impl Tool for Read {
         }
         let (path, label, selector) = self.locate(&args.path)?;
         let selector = selector.windowed(args.offset, args.limit)?;
-        tokio::task::spawn_blocking(move || read_path(&path, &label, &selector))
+        let outline = self.outline;
+        tokio::task::spawn_blocking(move || read_path(&path, &label, &selector, outline))
             .await
             .map_err(|e| ToolError::Failed(e.to_string()))?
     }
 }
 
-/// Reads the file or directory at `path`, shown as `label`, as `selector` asks.
+/// Reads the file or directory at `path`, shown as `label`, as `selector` asks;
+/// a code file read without a selector comes back as an outline when `outline`
+/// is set and the file is large enough for one.
 ///
 /// # Errors
 ///
 /// Returns [`ToolError`] when the path does not exist or cannot be read, holds
 /// binary data `read` cannot show, or the selector does not apply to it.
-fn read_path(path: &Path, label: &str, selector: &Selector) -> Result<ToolOutput, ToolError> {
+fn read_path(
+    path: &Path,
+    label: &str,
+    selector: &Selector,
+    outline: bool,
+) -> Result<ToolOutput, ToolError> {
     if !path.exists() {
         return Err(ToolError::Failed(format!("{label} does not exist")));
     }
@@ -202,6 +234,12 @@ fn read_path(path: &Path, label: &str, selector: &Selector) -> Result<ToolOutput
         }
         None if head.contains(&0) => Err(lines::not_text(label)),
         None => {
+            if outline
+                && !selector.picks_lines()
+                && let Some(text) = outline::read(path, label)?
+            {
+                return Ok(ToolOutput::new(text));
+            }
             let header = format!("[tag {}]\n", tag_file(path)?);
             let numbered = lines::number(
                 || std::fs::File::open(path).map(BufReader::new),
@@ -343,6 +381,39 @@ mod tests {
         let out = text(&tool, "big.txt").await;
         assert!(out.len() < lines::MAX_BYTES + 1000);
         assert!(out.contains("more lines remain; continue with big.txt:"));
+    }
+
+    /// A bare read of a large code file gives an outline under its outline tag;
+    /// a selector, a small file or a tool built without outlines gives the text.
+    #[tokio::test]
+    async fn outlines_large_code_files_read_bare() {
+        let (tool, dir) = tool("read-outline");
+        let code = outline::tests::rust_source(20, 10);
+        std::fs::write(dir.join("a.rs"), &code).unwrap();
+        std::fs::write(dir.join("a.txt"), &code).unwrap();
+        let out = text(&tool, "a.rs").await;
+        let header = format!(
+            "[tag {}]\n[outline of a.rs, 302 lines: 20 function bodies folded, 220 lines hidden]\n",
+            super::super::snapshot::outline_tag(code.as_bytes())
+        );
+        assert!(out.starts_with(&header), "{out}");
+        assert!(
+            out.contains("      \t    … 11 lines folded (5-15)\n"),
+            "{out}"
+        );
+        assert!(out.ends_with("a.rs:1- reads the whole text.]\n"), "{out}");
+        let whole = format!("[tag {}]\n", tag(code.as_bytes()));
+        let ranged = text(&tool, "a.rs:5-6").await;
+        assert_eq!(
+            ranged,
+            format!("{whole}     5\t    let v0 = x + 0;\n     6\t    let v1 = x + 1;\n")
+        );
+        assert!(text(&tool, "a.rs:1-").await.contains("let v3 = x + 3;"));
+        assert!(text(&tool, "a.txt").await.starts_with(&whole));
+        let verbatim = Read::with_outline(Sandbox::new(&dir).unwrap(), false);
+        assert!(text(&verbatim, "a.rs").await.starts_with(&whole));
+        std::fs::write(dir.join("small.rs"), outline::tests::rust_source(3, 10)).unwrap();
+        assert!(!text(&tool, "small.rs").await.contains("[outline"));
     }
 
     /// A directory is listed; line selectors on it are refused.
