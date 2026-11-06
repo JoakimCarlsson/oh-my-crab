@@ -72,12 +72,8 @@ impl Toolset {
     }
 }
 
-/// The tools for plan mode when `plan` is set, and otherwise for the rest.
-///
-/// With memories, the agent can save, search and change them, while its subagents can only search them: what a subagent learns comes back in its result for the main agent to judge before anything is saved.
-///
-/// Subagents get the tools [`subagent_tools`] leaves them. The tools that depend on what else the agent has, such as `script`, are fitted to the tools of the mode, so that a script in plan mode can only call the tools that only look.
-fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
+/// The tools the agent and its subagents share in plan mode when `plan` is set, and otherwise outside it: the built-in ones, or those that only look, with memory search when there are memories, less every tool the client denied.
+fn base_tools(inputs: &Inputs<'_>, plan: bool) -> Registry {
     let mut base = if plan {
         inputs.base.read_only()
     } else {
@@ -86,6 +82,19 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
     if let Some(memories) = &inputs.memories {
         base.register(MemorySearch::new(memories.clone()));
     }
+    for name in inputs.denied {
+        base.remove(name);
+    }
+    base
+}
+
+/// The tools for plan mode when `plan` is set, and otherwise for the rest.
+///
+/// With memories, the agent can save, search and change them, while its subagents can only search them: what a subagent learns comes back in its result for the main agent to judge before anything is saved.
+///
+/// Subagents get the tools [`subagent_tools`] leaves them, never one the client denied. The tools that depend on what else the agent has, such as `script`, are fitted to the tools of the mode, so that a script in plan mode can only call the tools that only look.
+fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
+    let base = base_tools(inputs, plan);
     let sub_base = Arc::new(subagent_tools(&base));
     let mut registry = base;
     if let Some(memories) = &inputs.memories {
@@ -189,6 +198,16 @@ mod tests {
         checkpoint: Option<Arc<Checkpoint>>,
         memories: Option<Arc<Memories>>,
     ) -> Toolset {
+        with_inputs(denied, checkpoint, memories, Toolset::build)
+    }
+
+    /// Hands `use_inputs` the inputs of a toolset for the built-in tools in a scratch folder, denying `denied`, with `checkpoint` and `memories` when they are set, and returns what it made of them.
+    fn with_inputs<T>(
+        denied: &[String],
+        checkpoint: Option<Arc<Checkpoint>>,
+        memories: Option<Arc<Memories>>,
+        use_inputs: impl FnOnce(&Inputs<'_>) -> T,
+    ) -> T {
         let (out, _events) = tokio::sync::mpsc::unbounded_channel();
         let shared = Shared::new(out);
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -204,7 +223,7 @@ mod tests {
             codex: None,
             project: true,
         };
-        Toolset::build(&Inputs {
+        use_inputs(&Inputs {
             base: &base,
             denied,
             host: Arc::new(SessionHost {
@@ -376,5 +395,22 @@ mod tests {
         assert!(tools.tools(false).get("task").is_none());
         assert!(tools.tools(false).get("bash").is_none());
         assert!(tools.tools(true).get("task").is_none());
+    }
+
+    /// A tool the client denied is kept from subagents as well as from the agent, in both modes.
+    #[test]
+    fn denied_tools_are_kept_from_subagents() {
+        with_inputs(
+            &["bash".to_owned(), "write".to_owned()],
+            None,
+            None,
+            |inputs| {
+                for plan in [false, true] {
+                    let sub = subagent_tools(&base_tools(inputs, plan));
+                    assert!(sub.get("bash").is_none() && sub.get("write").is_none());
+                    assert!(sub.get("read").is_some());
+                }
+            },
+        );
     }
 }
