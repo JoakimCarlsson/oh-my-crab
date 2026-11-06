@@ -4,6 +4,7 @@ mod checkpoint;
 mod error;
 mod host;
 mod jobs;
+mod language;
 mod notebook;
 mod registry;
 mod sandbox;
@@ -17,6 +18,9 @@ pub use checkpoint::Checkpoint;
 pub use error::ToolError;
 pub use host::Host;
 pub use jobs::{Finished, Jobs};
+pub use language::{
+    DIAGNOSTICS_WAIT, Diagnostic, FORMAT_WAIT, LanguageService, Languages, Severity,
+};
 pub use notebook::{NOTEBOOK_LIMIT, Notebook};
 pub use registry::Registry;
 pub use sandbox::Sandbox;

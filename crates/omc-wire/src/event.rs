@@ -1,6 +1,7 @@
 //! What the harness tells its client, in the order it happened.
 
 use crate::inquiry::Inquiry;
+use crate::language::LanguageRequest;
 use crate::permission::Permission;
 use crate::plan::PlanStep;
 use crate::setting::{Setting, Slash};
@@ -71,6 +72,8 @@ pub enum Event {
     Ask(Permission),
     /// The agent waits for the answers to this form of questions.
     Inquire(Inquiry),
+    /// The harness asks the client's language services this, and waits for a [`crate::Command::Language`] answer under its ticket; sent only to a client that said, when it opened the conversation, that it answers them.
+    Language(LanguageRequest),
     /// The turn ended, with the reason it failed where it did.
     Finished(Option<String>),
     /// The turn ended because the account needs signing in again.

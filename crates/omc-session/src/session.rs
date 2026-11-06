@@ -8,7 +8,7 @@ use omc_auth::{AuthError, LoginPrompt};
 use omc_context::{Discovered, Locations, discover, expand_skill};
 use omc_providers::Message;
 use omc_providers::Provider;
-use omc_tools::{Registry, Skill};
+use omc_tools::{LanguageService, Registry, Skill};
 use omc_wire::{Command, Event, Opening, Slash};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::AbortHandle;
@@ -54,11 +54,27 @@ struct Session {
     ended: UnboundedSender<(u64, Ended)>,
 }
 
+/// What a conversation is run with besides its commands.
+#[derive(Clone, Default)]
+pub struct Options {
+    /// The language services `edit` and `write` ask, whatever the client offers; when there is none, they ask the client's when it offers them, and otherwise the harness's own servers when it was built with them.
+    pub languages: Option<Arc<dyn LanguageService>>,
+}
+
 /// Runs a conversation: reads `commands` and reports what happens as events on `out`, until the client closes it or hangs up.
-pub async fn run(mut commands: UnboundedReceiver<Command>, out: UnboundedSender<Event>) {
+pub async fn run(commands: UnboundedReceiver<Command>, out: UnboundedSender<Event>) {
+    run_with(commands, out, Options::default()).await;
+}
+
+/// Runs a conversation like [`run`], with what `options` gives it.
+pub async fn run_with(
+    mut commands: UnboundedReceiver<Command>,
+    out: UnboundedSender<Event>,
+    options: Options,
+) {
     let (ended, mut finished) = unbounded_channel();
     let mut session = Session {
-        shared: Shared::new(out),
+        shared: Shared::with_languages(out, options.languages),
         history: Vec::new(),
         journal: None,
         open: None,
@@ -129,6 +145,9 @@ impl Session {
             Command::Cancel => self.cancel(),
             Command::Set { setting, value } => self.set(&setting, &value),
             Command::Login { provider } => self.login(&provider),
+            Command::Language { ticket, answer } => {
+                self.shared.client_languages.answer(ticket, answer);
+            }
             Command::Close => {}
         }
     }
@@ -154,6 +173,7 @@ impl Session {
             keep,
             before,
             defaults,
+            languages,
         } = opening;
         let provider = provider.as_str();
         self.shared.set_home(home);
@@ -169,8 +189,12 @@ impl Session {
             },
             None => None,
         };
-        let mut registry = match Registry::builtin_with(&directory, Some(self.shared.jobs.clone()))
-        {
+        self.shared.languages.set(None);
+        let mut registry = match Registry::builtin_in(
+            &directory,
+            Some(self.shared.jobs.clone()),
+            self.shared.languages.clone(),
+        ) {
             Ok(registry) => registry,
             Err(error) => return self.say(Event::Failed(error.to_string())),
         };
@@ -242,6 +266,10 @@ impl Session {
                 self.apply(id, value);
             }
         }
+        let trusted = self.shared.mode() == Mode::Yolo;
+        self.shared
+            .languages
+            .set(self.languages_for(&directory, languages, trusted));
         self.shared.announce();
         self.shared.save_fact("commands", &commands_value);
         self.say(Event::Commands(commands));
@@ -251,6 +279,23 @@ impl Session {
             }
             self.say_history();
         }
+    }
+
+    /// The language services for a conversation in `directory`: the ones the program running it gave it, the client's when `client_offers` them, or the harness's own servers, started early when the agent is `trusted` with everything.
+    fn languages_for(
+        &self,
+        directory: &Path,
+        client_offers: bool,
+        trusted: bool,
+    ) -> Option<Arc<dyn LanguageService>> {
+        if let Some(given) = &self.shared.given_languages {
+            return Some(given.clone());
+        }
+        if client_offers {
+            let client: Arc<dyn LanguageService> = self.shared.client_languages.clone();
+            return Some(client);
+        }
+        crate::languages::own_servers(directory, trusted)
     }
 
     /// The value saved under `key`, or what `T` is by default when nothing readable is saved there.
@@ -775,6 +820,144 @@ mod tests {
         session.rescan();
         assert!(events.try_recv().is_err());
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A client that offers language services answers over the wire: `write` asks it to format the file and then what is wrong with it, each as a JSON line, and its answers, sent back as commands, end up in the file and in the tool's result.
+    #[tokio::test]
+    async fn a_client_answers_language_requests_over_the_wire() {
+        let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/languages");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let directory = directory.canonicalize().unwrap();
+        let (out, mut events) = unbounded_channel();
+        let (ended, _finished) = unbounded_channel();
+        let mut session = Session {
+            shared: Shared::new(out),
+            history: Vec::new(),
+            journal: None,
+            open: None,
+            running: None,
+            turns: 0,
+            resets_at_start: 0,
+            ended,
+        };
+        session
+            .shared
+            .languages
+            .set(session.languages_for(&directory, true, false));
+        let registry = Arc::new(
+            Registry::builtin_in(&directory, None, session.shared.languages.clone()).unwrap(),
+        );
+        let writing = tokio::spawn({
+            let registry = registry.clone();
+            async move {
+                registry
+                    .call_as(
+                        "c1",
+                        "write",
+                        serde_json::json!({"path": "lib.rs", "content": "fn  x(){}\n"}),
+                    )
+                    .await
+                    .unwrap()
+            }
+        });
+        let file = directory.join("lib.rs");
+        let mut next_request = async || {
+            let event = events.recv().await.unwrap();
+            let line = omc_wire::encode(&event).unwrap();
+            let Event::Language(request) = omc_wire::decode::<Event>(&line).unwrap() else {
+                panic!("not a language request: {line}");
+            };
+            request
+        };
+        let request = next_request().await;
+        assert_eq!(
+            request.ask,
+            omc_wire::LanguageAsk::Format { path: file.clone() }
+        );
+        let answer = Command::Language {
+            ticket: request.ticket,
+            answer: omc_wire::LanguageAnswer::Formatted {
+                text: Some("fn x() {}\n".to_owned()),
+            },
+        };
+        session
+            .handle(omc_wire::decode(&omc_wire::encode(&answer).unwrap()).unwrap())
+            .await;
+        let request = next_request().await;
+        let omc_wire::LanguageAsk::Diagnostics { paths, wait_ms } = request.ask else {
+            panic!("not a diagnostics request");
+        };
+        assert_eq!(paths, std::slice::from_ref(&file));
+        assert_eq!(wait_ms, 3000);
+        let answer = Command::Language {
+            ticket: request.ticket,
+            answer: omc_wire::LanguageAnswer::Diagnostics {
+                diagnostics: vec![omc_wire::Diagnostic {
+                    path: file.clone(),
+                    line: 1,
+                    column: 4,
+                    severity: omc_wire::Severity::Warning,
+                    message: "function `x` is never used".to_owned(),
+                    source: Some("rustc".to_owned()),
+                    code: Some("dead_code".to_owned()),
+                }],
+            },
+        };
+        session
+            .handle(omc_wire::decode(&omc_wire::encode(&answer).unwrap()).unwrap())
+            .await;
+        let output = writing.await.unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "fn x() {}\n");
+        assert_eq!(
+            output.text,
+            format!(
+                "Created lib.rs (10 bytes); formatted by the language server to 10 bytes, tag {}\n\nDiagnostics: 0 error(s), 1 warning(s)\nlib.rs:1:4 warning: function `x` is never used (rustc dead_code)",
+                omc_tools::snapshot_tag(b"fn x() {}\n")
+            )
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// The language services a program gives the conversation win over the client's, and with neither the harness's own servers are used.
+    #[cfg(feature = "lsp")]
+    #[test]
+    fn chooses_the_language_services() {
+        let (out, _events) = unbounded_channel();
+        let (ended, _finished) = unbounded_channel();
+        let given: Arc<dyn LanguageService> = Arc::new(omc_lsp::Servers::new("/w"));
+        let session = Session {
+            shared: Shared::with_languages(out, Some(given.clone())),
+            history: Vec::new(),
+            journal: None,
+            open: None,
+            running: None,
+            turns: 0,
+            resets_at_start: 0,
+            ended,
+        };
+        let chosen = session.languages_for(Path::new("/w"), true, false).unwrap();
+        assert!(Arc::ptr_eq(&chosen, &given));
+        let (out, _events) = unbounded_channel();
+        let (ended, _finished) = unbounded_channel();
+        let session = Session {
+            shared: Shared::new(out),
+            history: Vec::new(),
+            journal: None,
+            open: None,
+            running: None,
+            turns: 0,
+            resets_at_start: 0,
+            ended,
+        };
+        let client: Arc<dyn LanguageService> = session.shared.client_languages.clone();
+        let chosen = session.languages_for(Path::new("/w"), true, false).unwrap();
+        assert!(Arc::ptr_eq(&chosen, &client));
+        let own = session
+            .languages_for(Path::new("/w"), false, false)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&own, &client));
     }
 
     /// Cancelling a running turn leaves no active checkpoint behind.

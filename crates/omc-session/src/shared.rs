@@ -6,11 +6,12 @@ use async_trait::async_trait;
 use omc_agent::Approvals;
 use omc_providers::Effort;
 use omc_providers::Provider;
-use omc_tools::{Checkpoint, Host, Jobs, Notebook};
+use omc_tools::{Checkpoint, Host, Jobs, LanguageService, Languages, Notebook};
 use omc_wire::{Event, PlanStep, Question, Reply};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::bridge::Questions;
+use crate::languages::ClientLanguages;
 use crate::settings::{Mode, Offer, default_effort, offered};
 
 /// What can be set, and how it stands.
@@ -47,6 +48,12 @@ pub(crate) struct Shared {
     pub(crate) checkpoint: Arc<Checkpoint>,
     /// The commands and subagents running in the background.
     pub(crate) jobs: Arc<Jobs>,
+    /// The language services `edit` and `write` ask, chosen when the conversation is opened.
+    pub(crate) languages: Languages,
+    /// The language services of the client, which are used when it says it offers them.
+    pub(crate) client_languages: Arc<ClientLanguages>,
+    /// The language services the program running the conversation gave it, which win over the client's and the harness's own.
+    pub(crate) given_languages: Option<Arc<dyn LanguageService>>,
     /// The conversation's name and the history it is saved in.
     naming: Mutex<Naming>,
     /// Where the conversation keeps its logins.
@@ -74,9 +81,20 @@ struct Naming {
 impl Shared {
     /// The shared state of a conversation that has not been opened.
     pub(crate) fn new(out: UnboundedSender<Event>) -> Arc<Self> {
+        Self::with_languages(out, None)
+    }
+
+    /// The shared state of a conversation that has not been opened, whose tools ask `given` for language services when there is one.
+    pub(crate) fn with_languages(
+        out: UnboundedSender<Event>,
+        given: Option<Arc<dyn LanguageService>>,
+    ) -> Arc<Self> {
         let questions = Arc::new(Questions::new(out.clone()));
         let announce = out.clone();
         Arc::new(Self {
+            languages: Languages::default(),
+            client_languages: Arc::new(ClientLanguages::new(out.clone())),
+            given_languages: given,
             out,
             approvals: Arc::new(Approvals::new(questions.clone(), false)),
             questions,

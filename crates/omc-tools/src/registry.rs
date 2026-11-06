@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::tools::{AstEdit, AstGrep, Bash, Edit, Glob, Grep, Read, Write};
-use crate::{Jobs, Sandbox, Tool, ToolError, ToolOutput};
+use crate::{Jobs, Languages, Sandbox, Tool, ToolError, ToolOutput};
 
 /// A set of tools addressable by name.
 #[derive(Clone, Default)]
@@ -39,6 +39,19 @@ impl Registry {
         root: impl AsRef<std::path::Path>,
         jobs: Option<Arc<Jobs>>,
     ) -> Result<Self, ToolError> {
+        Self::builtin_in(root, jobs, Languages::default())
+    }
+
+    /// Creates a registry holding every built-in tool, confined to `root`, in which `bash` can start background runs in `jobs` when they are given, and `edit` and `write` have the files they write formatted by `languages` and report what it says is wrong with them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Io`] when `root` cannot be canonicalized.
+    pub fn builtin_in(
+        root: impl AsRef<std::path::Path>,
+        jobs: Option<Arc<Jobs>>,
+        languages: Languages,
+    ) -> Result<Self, ToolError> {
         let sandbox = Sandbox::new(root)?;
         let mut registry = Self::new();
         registry.register(Read::new(sandbox.clone()));
@@ -49,9 +62,9 @@ impl Registry {
             Some(jobs) => Bash::with_jobs(sandbox.clone(), jobs),
             None => Bash::new(sandbox.clone()),
         });
-        registry.register(Edit::new(sandbox.clone()));
+        registry.register(Edit::with_languages(sandbox.clone(), languages.clone()));
         registry.register(AstEdit::new(sandbox.clone()));
-        registry.register(Write::new(sandbox));
+        registry.register(Write::with_languages(sandbox, languages));
         Ok(registry)
     }
 

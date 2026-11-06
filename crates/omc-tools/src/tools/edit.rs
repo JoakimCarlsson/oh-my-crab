@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 use super::atomic::write_atomic;
 use super::snapshot::tag;
+use crate::language::{Languages, Written, settle};
 use crate::tool::{marked_lines, parse_args};
 use crate::{FileChange, Sandbox, Tool, ToolError, ToolOutput};
 
@@ -22,12 +23,19 @@ const PREVIEW_LINES: usize = 40;
 pub struct Edit {
     /// The directory paths are confined to.
     sandbox: Sandbox,
+    /// The language service that formats the edited files and says what is wrong with them.
+    languages: Languages,
 }
 
 impl Edit {
-    /// Creates the tool confined to `sandbox`.
+    /// Creates the tool confined to `sandbox`, with no language service.
     pub fn new(sandbox: Sandbox) -> Self {
-        Self { sandbox }
+        Self::with_languages(sandbox, Languages::default())
+    }
+
+    /// Creates the tool confined to `sandbox`, which has the files it edits formatted by `languages` and reports what it says is wrong with them.
+    pub fn with_languages(sandbox: Sandbox, languages: Languages) -> Self {
+        Self { sandbox, languages }
     }
 }
 
@@ -164,13 +172,27 @@ impl Tool for Edit {
             .join("\n\n")
     }
 
-    /// Applies the edits on a blocking thread.
+    /// Applies the edits on a blocking thread, then has the language service format the files and say what is wrong with them.
     async fn call(&self, args: Value) -> Result<ToolOutput, ToolError> {
         let args: Args = parse_args(args)?;
         let sandbox = self.sandbox.clone();
-        tokio::task::spawn_blocking(move || apply(&sandbox, args))
+        let mut pending = tokio::task::spawn_blocking(move || apply(&sandbox, args))
             .await
-            .map_err(|e| ToolError::Failed(e.to_string()))?
+            .map_err(|e| ToolError::Failed(e.to_string()))??;
+        let mut written: Vec<Written> = pending
+            .iter()
+            .map(|item| Written {
+                path: item.path.clone(),
+                shown: item.shown.clone(),
+                text: item.new.clone(),
+                formatted: false,
+            })
+            .collect();
+        let diagnostics = settle(&self.languages, &mut written).await;
+        for (item, file) in pending.iter_mut().zip(&written) {
+            item.new.clone_from(&file.text);
+        }
+        Ok(report(&pending, &written, &diagnostics))
     }
 }
 
@@ -216,7 +238,7 @@ impl Edit {
     }
 }
 
-/// Edits every section in memory and, only when all of them succeed, writes the files.
+/// Edits every section in memory and, only when all of them succeed, writes the files; returns what was written.
 ///
 /// # Errors
 ///
@@ -224,7 +246,7 @@ impl Edit {
 /// stale, a section repeats a file, or an operation is out of range, overlaps
 /// another or lacks its text; [`ToolError::OutsidePath`] for a path outside the
 /// sandbox. Nothing is written in any of these cases.
-fn apply(sandbox: &Sandbox, args: Args) -> Result<ToolOutput, ToolError> {
+fn apply(sandbox: &Sandbox, args: Args) -> Result<Vec<Pending>, ToolError> {
     if args.files.is_empty() {
         return Err(ToolError::Failed("files must not be empty".into()));
     }
@@ -252,11 +274,21 @@ fn apply(sandbox: &Sandbox, args: Args) -> Result<ToolOutput, ToolError> {
         }
     }
     write_all(&pending)?;
+    Ok(pending)
+}
+
+/// The result of an edit that wrote `pending`, whose files are now as `written` says, with the `diagnostics` block after the files when there is one: each file's tag and a preview of the region it changed, noting the files the language service formatted.
+fn report(pending: &[Pending], written: &[Written], diagnostics: &str) -> ToolOutput {
     let mut report = Vec::new();
     let mut changes = Vec::new();
-    for item in &pending {
+    for (item, file) in pending.iter().zip(written) {
+        let formatted = if file.formatted {
+            " (formatted by the language server)"
+        } else {
+            ""
+        };
         report.push(format!(
-            "{}: tag {}\n{}",
+            "{}: tag {}{formatted}\n{}",
             item.shown,
             tag(item.new.as_bytes()),
             preview(&item.new, item.region)
@@ -267,7 +299,10 @@ fn apply(sandbox: &Sandbox, args: Args) -> Result<ToolOutput, ToolError> {
             new: item.new.clone(),
         });
     }
-    Ok(ToolOutput::new(report.join("\n\n")).with_changes(changes))
+    if !diagnostics.is_empty() {
+        report.push(diagnostics.to_owned());
+    }
+    ToolOutput::new(report.join("\n\n")).with_changes(changes)
 }
 
 /// Writes every pending file; when one write fails, puts the files already written back as they were.
@@ -904,5 +939,61 @@ mod tests {
         let pending = vec![item(dir.join("a.txt")), item(dir.join("missing/b.txt"))];
         assert!(write_all(&pending).is_err());
         assert_eq!(get(&dir, "a.txt"), "old\n");
+    }
+
+    /// A language service formats the edited file: the file on disk holds the formatted text, the tag reported is the tag of that text, so the next edit can use it, and what the service says is wrong follows.
+    #[tokio::test]
+    async fn formats_and_reports_diagnostics() {
+        use crate::language::tests::{Fake, diagnostic};
+        use crate::{Languages, Severity};
+        let dir = scratch("edit-languages");
+        let fake = Fake {
+            formats: true,
+            ..Fake::default()
+        };
+        fake.diagnostics.lock().unwrap().push(diagnostic(
+            &dir.join("f.rs"),
+            2,
+            Severity::Error,
+            "cannot find value",
+        ));
+        let tool = Edit::with_languages(
+            Sandbox::new(&dir).unwrap(),
+            Languages::new(Some(std::sync::Arc::new(fake))),
+        );
+        let t = put(&dir, "f.rs", "a\nb\n");
+        let out = tool
+            .call(call(
+                "f.rs",
+                &t,
+                json!([{ "op": "replace", "line": 2, "text": "c" }]),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(get(&dir, "f.rs"), "A\nC\n");
+        let on_disk = tag(get(&dir, "f.rs").as_bytes());
+        assert!(
+            out.text.contains(&format!(
+                "f.rs: tag {on_disk} (formatted by the language server)"
+            )),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.ends_with(
+                "Diagnostics: 1 error(s), 0 warning(s)\nf.rs:2:5 error: cannot find value (rustc)"
+            ),
+            "{}",
+            out.text
+        );
+        assert_eq!(out.changes[0].new, "A\nC\n");
+        tool.call(call(
+            "f.rs",
+            &on_disk,
+            json!([{ "op": "delete", "line": 1 }]),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(get(&dir, "f.rs"), "C\n");
     }
 }

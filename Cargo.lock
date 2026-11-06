@@ -1371,6 +1371,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "omc-lsp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "omc-tools",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "omc-mcp"
 version = "0.1.0"
 dependencies = [
@@ -1412,6 +1422,7 @@ dependencies = [
  "omc-agent",
  "omc-auth",
  "omc-context",
+ "omc-lsp",
  "omc-mcp",
  "omc-providers",
  "omc-tools",
@@ -1431,6 +1442,7 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "bit-set",
+ "futures-util",
  "globset",
  "grep-regex",
  "grep-searcher",

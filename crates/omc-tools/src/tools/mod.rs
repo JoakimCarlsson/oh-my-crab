@@ -23,6 +23,7 @@ mod write;
 pub use ask::Ask;
 pub use ast_edit::AstEdit;
 pub use ast_grep::AstGrep;
+pub(crate) use atomic::write_atomic;
 pub use bash::Bash;
 pub use checkpoint::{CheckpointTool, Rewind};
 pub use edit::Edit;

@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use crate::inquiry::Reply;
+use crate::language::LanguageAnswer;
 use crate::toolserver::ToolServer;
 
 /// How a conversation is opened.
@@ -42,6 +43,9 @@ pub struct Opening {
     /// The id of the turn to go back to before when the saved history is loaded: it and everything after it is cut from the history and from the file. Opening fails when no turn has the id.
     #[serde(default)]
     pub before: Option<String>,
+    /// Whether the client answers [`crate::Event::Language`] requests: it runs language servers of its own, so the harness asks it to format the files it writes and to say what is wrong with them, and starts none itself.
+    #[serde(default)]
+    pub languages: bool,
 }
 
 /// One request from the client, answered by [`crate::Event`]s.
@@ -95,6 +99,13 @@ pub enum Command {
     Login {
         /// The id of the provider.
         provider: String,
+    },
+    /// Answers the language request under `ticket`; a ticket the harness no longer waits on is ignored.
+    Language {
+        /// The request being answered.
+        ticket: u64,
+        /// The answer.
+        answer: LanguageAnswer,
     },
     /// Ends the conversation and the harness.
     Close,
