@@ -251,6 +251,15 @@ pub(crate) fn claude(id: &str) -> Option<Entry> {
     find_in(catalog, "anthropic", id).or_else(|| find_in(catalog, "anthropic", claude_id(id)))
 }
 
+/// The ids the catalog lists for the provider `source`, in the catalog's order.
+pub(crate) fn listed(source: &str) -> Vec<String> {
+    loaded()
+        .providers
+        .get(source)
+        .map(|models| models.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
 /// The models.dev description of one model, of which only what crab uses is read.
 #[derive(Deserialize)]
 struct SourceModel {

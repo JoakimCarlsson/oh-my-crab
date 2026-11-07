@@ -2,6 +2,7 @@
 
 mod catalog;
 mod chat;
+mod cloud;
 mod custom;
 mod error;
 mod identity;
@@ -32,8 +33,9 @@ use wires::{anthropic_messages, chat_completions, openai_responses};
 
 /// Lists the model ids the account can use with `provider`, best first.
 ///
-/// On the Chat Completions wire the provider's default model leads the list, listed
-/// by the server or not, so that a conversation opened without a model picks it.
+/// Everywhere but on the `claude` and `codex` subscriptions the provider's default
+/// model leads the list, listed by the server or not, so that a conversation
+/// opened without a model picks it.
 ///
 /// # Errors
 ///
@@ -44,7 +46,14 @@ pub async fn list_models(
     credentials: &Credentials,
 ) -> Result<Vec<String>, ProviderError> {
     match provider.wire() {
-        Wire::AnthropicMessages => anthropic_messages::list_models(credentials).await,
+        Wire::AnthropicMessages | Wire::Bedrock | Wire::Vertex => {
+            let listed = anthropic_messages::list_models(provider, credentials).await?;
+            Ok(if provider == Provider::Claude {
+                listed
+            } else {
+                default_first(listed, provider.def().default_model)
+            })
+        }
         Wire::OpenAiResponses => openai_responses::list_models(credentials).await,
         Wire::ChatCompletions => {
             let base_url = chat_completions::base_url(provider, credentials);

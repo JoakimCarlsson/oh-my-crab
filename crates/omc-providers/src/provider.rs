@@ -15,6 +15,17 @@ pub enum Wire {
     OpenAiResponses,
     /// The Chat Completions API, which many hosts and local servers copy.
     ChatCompletions,
+    /// The Anthropic Messages API as Amazon Bedrock serves it, through `InvokeModelWithResponseStream`.
+    Bedrock,
+    /// The Anthropic Messages API as Google Vertex AI serves it, through `streamRawPredict`.
+    Vertex,
+}
+
+impl Wire {
+    /// Whether the wire carries the Anthropic Messages API, on Anthropic's own host or a cloud's.
+    pub fn is_anthropic(self) -> bool {
+        matches!(self, Wire::AnthropicMessages | Wire::Bedrock | Wire::Vertex)
+    }
 }
 
 /// Everything that distinguishes one provider from another, kept in one place.
@@ -181,6 +192,9 @@ mod tests {
             "lmstudio",
             "llamacpp",
             "vllm",
+            "anthropic",
+            "bedrock",
+            "vertex",
         ] {
             assert!(ids.contains(&id), "{id} is not registered");
         }

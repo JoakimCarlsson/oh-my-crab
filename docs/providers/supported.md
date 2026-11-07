@@ -30,6 +30,9 @@ These providers are built into the `omc` binary. To add one, see
 | `lmstudio`   | ChatCompletions   | none                                  | `http://localhost:1234/v1`, or `OMC_LMSTUDIO_URL`                              |
 | `llamacpp`   | ChatCompletions   | none                                  | `http://localhost:9931/v1`, or `OMC_LLAMACPP_URL`                              |
 | `vllm`       | ChatCompletions   | none                                  | `http://localhost:8000/v1`, or `OMC_VLLM_URL`                                  |
+| `anthropic`  | AnthropicMessages | `ANTHROPIC_API_KEY`                   | `https://api.anthropic.com`, or `OMC_ANTHROPIC_URL`                            |
+| `bedrock`    | Bedrock           | AWS credentials, or `AWS_BEARER_TOKEN_BEDROCK` | `https://bedrock-runtime.<region>.amazonaws.com`, or `OMC_BEDROCK_URL` |
+| `vertex`     | Vertex            | Google Cloud credentials              | `https://<region>-aiplatform.googleapis.com`, or `OMC_VERTEX_URL`               |
 
 Each API-key provider opens with a default model when none is picked:
 `kimi-for-coding` for `kimi-code`, `kimi-k2.7-code` for `moonshot`, `glm-5.3`
@@ -64,6 +67,70 @@ China platform set `OMC_MOONSHOT_URL=https://api.moonshot.cn/v1`.
 Kimi, Moonshot, Z.ai, MiniMax, DeepSeek and Fireworks are sent the model's
 earlier reasoning back as `reasoning_content`, which their thinking models want
 around tool calls.
+
+### Anthropic API
+
+`anthropic` is Claude with an API key from the Anthropic Console, from
+`ANTHROPIC_API_KEY` or saved by a client. Unlike `claude`, which signs in to
+a Claude subscription and has to present itself as Claude Code, it sends
+nothing of Claude Code's: the key in `x-api-key`, `anthropic-version`,
+`User-Agent: oh-my-crab/<version>`, and only the standard betas
+(interleaved thinking with a thinking budget, the effort beta with an
+effort). Prompt caching, both cache lifetimes, cache warming and thinking
+work as for `claude`. It opens with `claude-sonnet-5-5`, and lists the models
+the key may use.
+
+### Amazon Bedrock
+
+`bedrock` is Claude on Amazon Bedrock. Requests go to
+`InvokeModelWithResponseStream`, which takes the Anthropic Messages body with
+`anthropic_version: bedrock-2023-05-31` and the betas in `anthropic_beta`, so
+cache breakpoints, thinking blocks and their signatures go through as they
+do on Anthropic's own API; the Converse API would translate them into its own
+blocks, losing redacted thinking. The answer is AWS's binary event stream,
+whose chunks each carry one Messages event.
+
+It is authorized with a Bedrock API key when `AWS_BEARER_TOKEN_BEDROCK` is set
+or a client saved one, and otherwise signed with Signature Version 4 using
+the AWS keys found the way the AWS tools find them: `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`, else the profile
+`AWS_PROFILE` names (`default` otherwise) in `~/.aws/credentials` and then
+`~/.aws/config`. A profile may give static keys or a `credential_process`,
+whose keys are used for five minutes before it runs again. SSO and role
+profiles are not run by crab itself; give them
+`credential_process = aws configure export-credentials --profile <name> --format process`.
+The region is `AWS_REGION`, `AWS_DEFAULT_REGION` or the profile's `region`,
+else `us-east-1`. Signing in only checks that keys or a key can be found.
+
+Model ids are Bedrock's, inference profiles included, such as
+`global.anthropic.claude-sonnet-5-5` (the default) or
+`us.anthropic.claude-sonnet-4-5-20250929-v1:0`. The list a client is offered
+is the Claude models the model catalog has for Bedrock: the global profiles,
+then those of the region's geography, then the models themselves; Bedrock is
+not asked, since listing needs permissions inference does not. Caches are
+written with the five-minute lifetime and not kept warm.
+
+### Google Vertex AI
+
+`vertex` is Claude on Google Vertex AI, through `streamRawPredict`, which
+takes the Anthropic Messages body with `anthropic_version: vertex-2023-10-16`
+and the model in the address, and streams the same events as Anthropic's own
+API. The token comes from Google's Application Default Credentials: the file
+`GOOGLE_APPLICATION_CREDENTIALS` names, else
+`application_default_credentials.json` in gcloud's config folder, as
+`gcloud auth application-default login` leaves it. A service account key signs
+a JWT that is traded for a token; a user login trades its refresh token.
+Without either file crab asks `gcloud auth print-access-token`. Tokens are
+reused until a minute before they expire. The project is
+`GOOGLE_CLOUD_PROJECT`, `GCLOUD_PROJECT` or `ANTHROPIC_VERTEX_PROJECT_ID`,
+else the one the credentials file names; the region is
+`GOOGLE_CLOUD_LOCATION` or `CLOUD_ML_REGION`, else `global`. Credentials on a
+Google Cloud machine's metadata server are not read.
+
+Model ids are Vertex's, such as `claude-sonnet-5-5` (the default) or
+`claude-sonnet-4-5@20250929`; the list is the catalog's Claude models on
+Vertex. Gemini on Vertex is not offered; use `gemini`. Caches are written
+with the five-minute lifetime and not kept warm.
 
 Servers crab has no definition for are added in `providers.json`; see
 [custom endpoints](custom-endpoints.md).
@@ -111,9 +178,11 @@ A wire is a protocol. Several providers can share one.
 
 | Wire                | File                                                  | Serves                                                                                       |
 | ------------------- | ----------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `AnthropicMessages` | `crates/omc-providers/src/wires/anthropic_messages.rs` | Anthropic                                                                                    |
+| `AnthropicMessages` | `crates/omc-providers/src/wires/anthropic_messages.rs` | Anthropic, with a subscription (`claude`) or an API key (`anthropic`)                        |
+| `Bedrock`           | `crates/omc-providers/src/wires/anthropic_messages.rs`, `crates/omc-providers/src/cloud/` | Claude on Amazon Bedrock: the Messages body, signed, over AWS's event stream |
+| `Vertex`            | `crates/omc-providers/src/wires/anthropic_messages.rs`, `crates/omc-providers/src/cloud/` | Claude on Google Vertex AI: the Messages body over `streamRawPredict`         |
 | `OpenAiResponses`   | `crates/omc-providers/src/wires/openai_responses.rs`   | the ChatGPT Codex backend                                                                    |
-| `ChatCompletions`   | `crates/omc-providers/src/wires/chat_completions.rs`   | anything that copies OpenAI Chat Completions: every provider above but Claude and Codex, and custom endpoints |
+| `ChatCompletions`   | `crates/omc-providers/src/wires/chat_completions.rs`   | anything that copies OpenAI Chat Completions: every provider above but the Claude ones and Codex, and custom endpoints |
 
 ## Sign-in methods
 
@@ -121,7 +190,8 @@ A wire is a protocol. Several providers can share one.
 | ------------- | ------------------------ | ------------------------------------------------------------------------- |
 | OAuth         | `claude`, `codex`        | Reports the login page as `LoginUrl`, waits for the callback, refreshes the token when it expires. |
 | Device code   | `copilot`                | Reports the page and a short code as `LoginCode`, then polls until approved. |
-| API key       | `openrouter`, `kimi-code` and the other hosted APIs | Reads the key from an environment variable, or from one a client saved with `omc_session::save_key`; the variable wins. |
+| API key       | `anthropic`, `openrouter`, `kimi-code` and the other hosted APIs | Reads the key from an environment variable, or from one a client saved with `omc_session::save_key`; the variable wins. |
+| Cloud         | `bedrock`, `vertex`      | Reads the cloud's credentials where its own tools keep them, on every request; signing in only checks they can be found. `bedrock` also takes a Bedrock API key, and is listed to clients as an API-key provider; `vertex` takes none and is listed as needing no sign-in. |
 | None          | `ollama`, `lmstudio`, `llamacpp`, `vllm` | A local server that needs no credentials.                                 |
 
 crab never opens a browser itself. The client is told what to open with

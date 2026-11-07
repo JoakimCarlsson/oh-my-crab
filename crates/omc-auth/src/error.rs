@@ -17,6 +17,9 @@ pub enum AuthError {
     /// The provider needs an API key and none of its environment variables is set.
     #[error("no API key found; set {0}")]
     MissingKey(String),
+    /// A cloud provider's credentials cannot be found where its own tools look for them; says what to set.
+    #[error("no cloud credentials found: {0}")]
+    NoCredentials(String),
     /// No provider has been logged in yet.
     #[error("not logged in; use /login")]
     NotLoggedIn,

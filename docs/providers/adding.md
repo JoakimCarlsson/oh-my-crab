@@ -49,7 +49,11 @@ This is the common case. Add one file and one line.
    `Provider` variant and `Provider::ALL`; the order of the list is the order
    clients offer the providers in.
 
-The `id` is the name saved to disk, so pick it once and keep it; a test checks
+The `id` is the name saved to disk, so pick it once and keep it. To have its
+models described by the model catalog, map the id to the catalog's name for
+the provider in `sources_of` in `crates/omc-providers/src/catalog.rs`, adding
+that name to `SOURCES` and running `make catalog` when the snapshot lacks it;
+a test checks
 that every id is unique and finds its provider again. Then run `cargo test --workspace`
 and add a row to [supported.md](supported.md).
 
@@ -63,7 +67,7 @@ The fields of a definition:
 | `label`         | The name clients show for the provider, such as `GitHub Copilot`.             |
 | `wire`          | Which `Wire` the provider speaks.                                             |
 | `default_model` | `Some(id)` for a fixed default, which leads the listed models, or `None` to take the first model the server lists. |
-| `auth`          | `Auth::OAuth(&SPEC)`, `Auth::DeviceCode(&DEVICE)`, `Auth::ApiKey { env: &[...] }` or `Auth::None`. |
+| `auth`          | `Auth::OAuth(&SPEC)`, `Auth::DeviceCode(&DEVICE)`, `Auth::ApiKey { env: &[...] }`, `Auth::Cloud { env: &[...], check }` or `Auth::None`. |
 | `base_url`      | The API address, used by wires that serve many hosts.                         |
 | `base_url_env`  | Environment variable that overrides `base_url`, or `None`.                    |
 | `headers`       | Headers sent on every request, such as the client identity a host requires.   |
@@ -86,14 +90,17 @@ Do step 1 as well, then:
 2. Add a `Wire` variant in `crates/omc-providers/src/provider.rs`.
 3. Add its arm to the matches the compiler points at: `RemoteModel::complete`
    in `chat.rs`, `list_models` in `lib.rs`, and `context_window` and `efforts`
-   in `models.rs`.
+   in `models.rs`. A host that serves the Anthropic Messages body behind its
+   own address and authorization, as Bedrock and Vertex do, is a `Host` of
+   `anthropic_messages.rs` rather than a wire module of its own.
 4. Test the request translation and the assembly of a streamed response.
 
 ## 3. It needs a sign-in that `Auth` does not have
 
 `Auth` covers the browser OAuth flow, the device-code flow (a short code the
-user enters on a web page, as Copilot uses), a key from the environment, and no
-credentials. For anything else add an `Auth` variant in `crates/omc-auth/src/method.rs`
+user enters on a web page, as Copilot uses), a key from the environment, a
+cloud's own credentials (`Auth::Cloud`, whose `check` says whether they can be
+found and which the wire reads itself on every request), and no credentials. For anything else add an `Auth` variant in `crates/omc-auth/src/method.rs`
 and handle it in `login` and `credentials_for` in
 `crates/omc-auth/src/session.rs`. Credentials are
 stored as `Credentials`; keep the secret in `access` and set `expires_at_ms` so

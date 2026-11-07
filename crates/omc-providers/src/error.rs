@@ -27,6 +27,9 @@ pub enum ProviderError {
     /// The stream stopped before the provider said the reply was complete, as when the connection drops.
     #[error("the connection closed before the reply was complete")]
     Unfinished,
+    /// A cloud provider's credentials, project or region could not be found or used; says what to set.
+    #[error("cloud credentials: {0}")]
+    Credentials(String),
     /// The provider reported no models for this account.
     #[error("no models available for this account; pick one with /model <id>")]
     NoModels,
@@ -78,7 +81,10 @@ impl ProviderError {
             ProviderError::Status { status, .. } if status.starts_with("429") => return false,
             ProviderError::Status { body, .. } => body.to_lowercase(),
             ProviderError::Stream(message) => message.to_lowercase(),
-            ProviderError::Http(_) | ProviderError::Unfinished | ProviderError::NoModels => {
+            ProviderError::Http(_)
+            | ProviderError::Unfinished
+            | ProviderError::NoModels
+            | ProviderError::Credentials(_) => {
                 return false;
             }
         };
@@ -122,7 +128,7 @@ impl ProviderError {
                     || error.is_decode()
             }
             ProviderError::Unfinished => true,
-            ProviderError::NoModels => false,
+            ProviderError::NoModels | ProviderError::Credentials(_) => false,
         }
     }
 
@@ -148,7 +154,9 @@ impl ProviderError {
 }
 
 /// Phrases, in lower case, of failures that go away on their own: overload, rate limits, server faults and dropped connections.
-const TRANSIENT_PHRASES: [&str; 26] = [
+const TRANSIENT_PHRASES: [&str; 28] = [
+    "throttl",
+    "serviceunavailable",
     "overloaded",
     "rate limit",
     "rate_limit",

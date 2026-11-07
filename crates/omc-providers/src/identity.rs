@@ -1,4 +1,4 @@
-//! The Claude Code identity that subscription OAuth tokens must present.
+//! The Claude Code identity that subscription OAuth tokens must present; requests made with an API key never carry it.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -314,49 +314,29 @@ fn stainless_arch() -> String {
     }
 }
 
-/// The headers of a Messages request, as name and value pairs.
-///
-/// An OAuth `token` gets the full Claude Code fingerprint and a bearer
-/// header; an API key gets only `x-api-key` and the SDK-independent headers.
-pub fn headers(token: &str, betas: &[&str], stream: bool) -> Vec<(String, String)> {
+/// The headers of a Messages request made with the subscription OAuth `token`, as name and value pairs: the full Claude Code fingerprint and a bearer header.
+pub fn headers(token: &str, betas: &[&str]) -> Vec<(String, String)> {
     let mut headers: Vec<(String, String)> = Vec::new();
     let mut put = |name: &str, value: String| headers.push((name.to_string(), value));
-    if is_oauth_token(token) {
-        put("Accept", "application/json".into());
-        put("Content-Type", "application/json".into());
-        put("User-Agent", user_agent());
-        put("X-Claude-Code-Session-Id", session_id().to_string());
-        put("X-Stainless-Arch", stainless_arch());
-        put("X-Stainless-Lang", "js".into());
-        put("X-Stainless-OS", stainless_os());
-        put("X-Stainless-Package-Version", SDK_VERSION.into());
-        put("X-Stainless-Retry-Count", "0".into());
-        put("X-Stainless-Runtime", "node".into());
-        put("X-Stainless-Runtime-Version", "v26.3.0".into());
-        put("X-Stainless-Timeout", "600".into());
-        if !betas.is_empty() {
-            put("anthropic-beta", betas.join(","));
-        }
-        put("anthropic-dangerous-direct-browser-access", "true".into());
-        put("anthropic-version", "2023-06-01".into());
-        put("Authorization", format!("Bearer {token}"));
-        put("x-app", "cli".into());
-    } else {
-        let accept = if stream {
-            "text/event-stream"
-        } else {
-            "application/json"
-        };
-        put("Accept", accept.into());
-        put("Content-Type", "application/json".into());
-        put("anthropic-dangerous-direct-browser-access", "true".into());
-        put("x-app", "cli".into());
-        put("anthropic-version", "2023-06-01".into());
-        if !betas.is_empty() {
-            put("anthropic-beta", betas.join(","));
-        }
-        put("X-Api-Key", token.to_string());
+    put("Accept", "application/json".into());
+    put("Content-Type", "application/json".into());
+    put("User-Agent", user_agent());
+    put("X-Claude-Code-Session-Id", session_id().to_string());
+    put("X-Stainless-Arch", stainless_arch());
+    put("X-Stainless-Lang", "js".into());
+    put("X-Stainless-OS", stainless_os());
+    put("X-Stainless-Package-Version", SDK_VERSION.into());
+    put("X-Stainless-Retry-Count", "0".into());
+    put("X-Stainless-Runtime", "node".into());
+    put("X-Stainless-Runtime-Version", "v26.3.0".into());
+    put("X-Stainless-Timeout", "600".into());
+    if !betas.is_empty() {
+        put("anthropic-beta", betas.join(","));
     }
+    put("anthropic-dangerous-direct-browser-access", "true".into());
+    put("anthropic-version", "2023-06-01".into());
+    put("Authorization", format!("Bearer {token}"));
+    put("x-app", "cli".into());
     headers
 }
 
@@ -376,7 +356,7 @@ mod tests {
     #[test]
     fn oauth_headers_carry_the_fingerprint() {
         let betas = oauth_betas(true);
-        let headers = headers("sk-ant-oat01-abc", &betas, true);
+        let headers = headers("sk-ant-oat01-abc", &betas);
         assert!(
             header(&headers, "user-agent")
                 .unwrap()
@@ -409,17 +389,15 @@ mod tests {
         assert!(!beta.contains("context-1m"));
     }
 
-    /// API keys travel in `x-api-key` and never as a bearer or with OAuth betas.
+    /// API-key requests get only the standard betas.
     #[test]
-    fn api_key_headers_use_x_api_key() {
-        let headers = headers("sk-ant-api03-abc", &api_key_betas(true, false), true);
-        assert_eq!(header(&headers, "x-api-key"), Some("sk-ant-api03-abc"));
-        assert!(header(&headers, "authorization").is_none());
-        assert_eq!(header(&headers, "accept"), Some("text/event-stream"));
+    fn api_key_betas_are_standard() {
         assert_eq!(
-            header(&headers, "anthropic-beta"),
-            Some("interleaved-thinking-2025-05-14")
+            api_key_betas(true, false),
+            ["interleaved-thinking-2025-05-14"]
         );
+        assert_eq!(api_key_betas(false, true), ["effort-2025-11-24"]);
+        assert!(api_key_betas(false, false).is_empty());
     }
 
     /// The tool prefix round-trips and leaves Anthropic's own tools alone.

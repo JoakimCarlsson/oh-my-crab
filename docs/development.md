@@ -25,8 +25,8 @@ Every text file is checked out with LF line endings on every system, as
 | `omc-client`    | A small blocking client for programs that start crab and talk to it.              |
 | `omc-session`   | One conversation: turns, settings, saving, the toolset, translating agent events to wire events. |
 | `omc-agent`     | The agent loop: model requests, tool calls, approvals, hooks, compaction, subagents and their worktrees. |
-| `omc-providers` | The provider definitions, their three wire formats, model lists and custom endpoints. |
-| `omc-auth`      | OAuth, device-code and API-key sign-in, credential storage and token refresh.     |
+| `omc-providers` | The provider definitions, their wire formats (Claude on Bedrock and Vertex among them), the model catalog, model lists and custom endpoints. |
+| `omc-auth`      | OAuth, device-code, API-key and cloud sign-in, credential storage and token refresh. |
 | `omc-tools`     | The tool trait, the registry and the built-in tools.                              |
 | `omc-context`   | The system prompt and what goes into it: instruction files, skills, agents, notices. |
 | `omc-memory`    | Memory across conversations.                                                      |

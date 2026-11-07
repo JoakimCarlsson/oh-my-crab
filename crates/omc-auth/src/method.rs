@@ -83,6 +83,13 @@ pub enum Auth {
         /// Environment variables checked in order.
         env: &'static [&'static str],
     },
+    /// Credentials a cloud's own tools would find, in its environment variables and configuration files, which the provider reads itself on every request; a key from the first of `env` that is set, or one saved with the logins, is used instead when there is one.
+    Cloud {
+        /// Environment variables a key is read from, in order; empty when the cloud takes no key.
+        env: &'static [&'static str],
+        /// Says whether the cloud's credentials can be found, with what to set when they cannot; signing in runs it when there is no key.
+        check: fn() -> Result<(), String>,
+    },
     /// No credentials at all, as for a local server.
     None,
 }

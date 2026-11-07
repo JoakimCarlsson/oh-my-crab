@@ -394,14 +394,22 @@ impl ChatModel for RemoteModel {
         self.send(request, sink, None).await
     }
 
-    /// Replays the request with no output on the Anthropic wire, when its thinking settings allow it; the other wires are not warmed.
+    /// Replays the request with no output on Anthropic's own host, when its thinking settings allow it; the other wires and hosts are not warmed.
     async fn warm(&self, request: Request<'_>) -> Result<Option<Tokens>, ProviderError> {
         match self.provider.wire() {
             Wire::AnthropicMessages => {
-                anthropic_messages::warm(&self.credentials, &self.model, request, self.retention)
-                    .await
+                anthropic_messages::warm(
+                    self.provider,
+                    &self.credentials,
+                    &self.model,
+                    request,
+                    self.retention,
+                )
+                .await
             }
-            Wire::OpenAiResponses | Wire::ChatCompletions => Ok(None),
+            Wire::OpenAiResponses | Wire::ChatCompletions | Wire::Bedrock | Wire::Vertex => {
+                Ok(None)
+            }
         }
     }
 }
@@ -419,9 +427,16 @@ impl RemoteModel {
         cache: Option<Retention>,
     ) -> Result<Reply, ProviderError> {
         match self.provider.wire() {
-            Wire::AnthropicMessages => {
-                anthropic_messages::complete(&self.credentials, &self.model, request, sink, cache)
-                    .await
+            Wire::AnthropicMessages | Wire::Bedrock | Wire::Vertex => {
+                anthropic_messages::complete(
+                    self.provider,
+                    &self.credentials,
+                    &self.model,
+                    request,
+                    sink,
+                    cache,
+                )
+                .await
             }
             Wire::OpenAiResponses => {
                 openai_responses::complete(&self.credentials, &self.model, request, sink).await

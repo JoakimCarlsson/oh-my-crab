@@ -23,7 +23,8 @@ pub fn env_key_named<'a>(names: &[&'a str]) -> Option<(&'a str, String)> {
 /// authorization URL; a device-code provider, or one that also takes a key, is
 /// told the page and the code.
 /// An API-key provider reads its key from the environment, and a provider
-/// without credentials just becomes active.
+/// without credentials just becomes active. A cloud provider becomes active
+/// when it has a key or its `check` finds the cloud's own credentials.
 ///
 /// # Errors
 ///
@@ -43,6 +44,17 @@ pub async fn login(
             env_key(env).ok_or_else(|| AuthError::MissingKey(env.join(" or ")))?,
         ),
         Auth::None => Credentials::static_key(String::new()),
+        Auth::Cloud { env, check } => {
+            let mut file: AuthFile = store::load()?;
+            if env_key(env).is_none() && saved_key(&file, id).is_none() {
+                check().map_err(AuthError::NoCredentials)?;
+            }
+            file.credentials
+                .entry(id.to_string())
+                .or_insert_with(|| Credentials::static_key(String::new()));
+            file.active = Some(id.to_string());
+            return store::save(&file);
+        }
     };
     let mut file: AuthFile = store::load()?;
     file.credentials.insert(id.to_string(), credentials);
@@ -83,6 +95,15 @@ pub async fn credentials_for(id: &str, auth: &'static Auth) -> Result<Credential
             return device_credentials(id, device, AuthError::MissingKey(env.join(" or "))).await;
         }
         Auth::None => return Ok(Credentials::static_key(String::new())),
+        Auth::Cloud { env, .. } => {
+            if let Some(key) = env_key(env) {
+                return Ok(Credentials::static_key(key));
+            }
+            let file = store::load()?;
+            return Ok(
+                saved_key(&file, id).unwrap_or_else(|| Credentials::static_key(String::new()))
+            );
+        }
     };
     let mut file = store::load()?;
     let stored = file
@@ -118,6 +139,14 @@ async fn device_credentials(
     file.credentials.insert(id.to_string(), renewed.clone());
     store::save(&file)?;
     Ok(renewed)
+}
+
+/// The key saved in `file` for the provider `id`, when one is saved and is not empty.
+fn saved_key(file: &AuthFile, id: &str) -> Option<Credentials> {
+    file.credentials
+        .get(id)
+        .filter(|stored| !stored.access.trim().is_empty())
+        .cloned()
 }
 
 /// Returns the id of the provider messages are currently sent to, if any.
@@ -162,4 +191,68 @@ pub fn save_key(
         }
     }
     store::save_in(home, &file)
+}
+
+#[cfg(test)]
+/// Tests for signing in to a cloud provider.
+mod tests {
+    use super::*;
+
+    /// Says the cloud's credentials cannot be found.
+    fn missing() -> Result<(), String> {
+        Err("set CLOUD_THING".to_owned())
+    }
+
+    /// Says the cloud's credentials are there.
+    fn found() -> Result<(), String> {
+        Ok(())
+    }
+
+    /// A cloud whose credentials cannot be found.
+    static ABSENT: Auth = Auth::Cloud {
+        env: &["CRAB_TEST_CLOUD_KEY_NEVER_SET"],
+        check: missing,
+    };
+
+    /// A cloud whose credentials are there.
+    static PRESENT: Auth = Auth::Cloud {
+        env: &["CRAB_TEST_CLOUD_KEY_NEVER_SET"],
+        check: found,
+    };
+
+    /// Signing in fails with what to set when nothing is found, succeeds when the cloud's credentials are there, and a saved key is then used in their place.
+    #[tokio::test]
+    async fn cloud_sign_in_follows_the_check_and_the_saved_key() {
+        let home = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-auth/cloud");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let refused = crate::with_home(Some(home.clone()), login("aws", &ABSENT, |_| {}))
+            .await
+            .unwrap_err();
+        assert!(matches!(&refused, AuthError::NoCredentials(what) if what.contains("CLOUD_THING")));
+        let ambient = crate::with_home(Some(home.clone()), credentials_for("aws", &ABSENT))
+            .await
+            .unwrap();
+        assert!(ambient.access.is_empty());
+        crate::with_home(Some(home.clone()), login("aws", &PRESENT, |_| {}))
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::with_home(Some(home.clone()), async { active_id() })
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("aws")
+        );
+        save_key("aws", Some("bearer-1"), Some(home.clone())).unwrap();
+        let keyed = crate::with_home(Some(home.clone()), credentials_for("aws", &ABSENT))
+            .await
+            .unwrap();
+        assert_eq!(keyed.access, "bearer-1");
+        crate::with_home(Some(home.clone()), login("aws", &ABSENT, |_| {}))
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(home).unwrap();
+    }
 }

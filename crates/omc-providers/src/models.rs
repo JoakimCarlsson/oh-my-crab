@@ -244,7 +244,9 @@ const UNKNOWN_CONTEXT_WINDOW: u64 = 128_000;
 /// The catalog's entry for `model` of `provider`: the provider's own, else, for a Claude model, Anthropic's.
 fn entry(provider: Provider, model: &str) -> Option<Entry> {
     catalog::find(provider, model).or_else(|| {
-        (provider.wire() == Wire::AnthropicMessages)
+        provider
+            .wire()
+            .is_anthropic()
             .then(|| catalog::claude(model))
             .flatten()
     })
@@ -259,13 +261,14 @@ fn entry(provider: Provider, model: &str) -> Option<Entry> {
 /// tokens on a Chat Completions server.
 pub fn context_window(provider: Provider, model: &str) -> u64 {
     if let Some(entry) = entry(provider, model) {
-        return match provider.wire() {
-            Wire::AnthropicMessages => claude_catalog_window(model, &entry),
-            _ => entry.window(),
+        return if provider.wire().is_anthropic() {
+            claude_catalog_window(model, &entry)
+        } else {
+            entry.window()
         };
     }
     match provider.wire() {
-        Wire::AnthropicMessages => claude_context_window(model),
+        Wire::AnthropicMessages | Wire::Bedrock | Wire::Vertex => claude_context_window(model),
         Wire::OpenAiResponses => codex_context_window(model),
         Wire::ChatCompletions => UNKNOWN_CONTEXT_WINDOW,
     }
@@ -276,7 +279,7 @@ pub fn context_window(provider: Provider, model: &str) -> u64 {
 /// A Chat Completions server is offered no effort, since that wire sends none.
 pub fn efforts(provider: Provider, model: &str) -> Vec<Effort> {
     match provider.wire() {
-        Wire::AnthropicMessages => claude_efforts(model),
+        Wire::AnthropicMessages | Wire::Bedrock | Wire::Vertex => claude_efforts(model),
         Wire::OpenAiResponses => codex_efforts(model),
         Wire::ChatCompletions => Vec::new(),
     }
@@ -408,14 +411,14 @@ fn catalog_pricing(cost: Cost, anthropic: bool) -> Pricing {
 /// The catalog's base prices win; prices for long prompts are not modelled.
 /// Codex is priced as its id suggests, being paid by subscription.
 pub fn pricing(provider: Provider, model: &str) -> Option<Pricing> {
-    let anthropic = provider.wire() == Wire::AnthropicMessages;
+    let anthropic = provider.wire().is_anthropic();
     if provider.wire() != Wire::OpenAiResponses
         && let Some(cost) = entry(provider, model).and_then(|entry| entry.cost)
     {
         return Some(catalog_pricing(cost, anthropic));
     }
     match provider.wire() {
-        Wire::AnthropicMessages => claude_pricing(model),
+        Wire::AnthropicMessages | Wire::Bedrock | Wire::Vertex => claude_pricing(model),
         Wire::OpenAiResponses => codex_pricing(model),
         Wire::ChatCompletions => None,
     }
@@ -460,10 +463,12 @@ pub fn model_info(provider: Provider, model: &str) -> Option<ModelInfo> {
 
 /// How long `provider` keeps the prompt cache entries a request to `model` writes when it asks for `retention`; nothing when the provider has no such lifetime or does not say.
 ///
-/// Codex keeps entries for at least five minutes of inactivity and offers no longer lifetime on the wire crab speaks.
+/// Codex keeps entries for at least five minutes of inactivity and offers no longer lifetime on the wire crab speaks. Bedrock and Vertex are asked for the five-minute lifetime only.
 pub fn cache_ttl(provider: Provider, _model: &str, retention: Retention) -> Option<Duration> {
     match (provider.wire(), retention) {
-        (Wire::AnthropicMessages, Retention::Short) => Some(Duration::from_secs(5 * 60)),
+        (Wire::AnthropicMessages | Wire::Bedrock | Wire::Vertex, Retention::Short) => {
+            Some(Duration::from_secs(5 * 60))
+        }
         (Wire::AnthropicMessages, Retention::Long) => Some(Duration::from_secs(60 * 60)),
         (Wire::OpenAiResponses, Retention::Short) => Some(Duration::from_secs(5 * 60)),
         _ => None,
@@ -472,7 +477,7 @@ pub fn cache_ttl(provider: Provider, _model: &str, retention: Retention) -> Opti
 
 /// Whether a request to `model` of `provider` at `effort` can be sent again without asking for output, to keep its cache entries alive, and still read exactly the entries it wrote.
 ///
-/// Only Claude takes such requests. A Claude model that thinks within a token budget cannot: the budget has to stay below the output limit, so a request with no output changes the thinking settings, which the cache is keyed on.
+/// Only Claude on Anthropic's own host takes such requests. A Claude model that thinks within a token budget cannot: the budget has to stay below the output limit, so a request with no output changes the thinking settings, which the cache is keyed on.
 pub fn warmable(provider: Provider, model: &str, effort: Option<Effort>) -> bool {
     provider.wire() == Wire::AnthropicMessages
         && anthropic_messages::thinking_params(model, effort)

@@ -1,5 +1,7 @@
 //! The providers crab knows, one module each; add a provider by adding a module and an entry here.
 
+mod anthropic;
+mod bedrock;
 mod cerebras;
 mod claude;
 mod codex;
@@ -18,6 +20,7 @@ mod ollama;
 mod openai;
 mod openrouter;
 mod together;
+mod vertex;
 mod vllm;
 mod xai;
 mod zai;
@@ -103,4 +106,10 @@ providers! {
     LlamaCpp => llamacpp::DEF,
     /// A local vLLM server.
     Vllm => vllm::DEF,
+    /// The Anthropic API with an API key.
+    Anthropic => anthropic::DEF,
+    /// Claude on Amazon Bedrock, with AWS credentials or a Bedrock API key.
+    Bedrock => bedrock::DEF,
+    /// Claude on Google Vertex AI, with Google Cloud credentials.
+    Vertex => vertex::DEF,
 }

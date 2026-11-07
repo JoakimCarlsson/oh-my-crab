@@ -1,4 +1,4 @@
-//! Streaming messages against the Anthropic Messages API.
+//! Streaming messages against the Anthropic Messages API, on Anthropic's own host or as Amazon Bedrock and Google Vertex AI serve it.
 
 use futures_util::StreamExt;
 use omc_auth::Credentials;
@@ -7,21 +7,76 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 use crate::chat::{Blocks, parse_arguments};
+use crate::cloud::eventstream::Decoder;
+use crate::cloud::{aws, bedrock, google, sigv4, vertex};
 use crate::identity;
 use crate::models::{
     ClaudeModel, ThinkingMode, claude_efforts, claude_max_output, claude_supports_display,
     claude_thinking_mode, parse_claude,
 };
 use crate::{
-    Effort, Message, Part, ProviderError, Reply, Request, Retention, Sink, Stop, Tokens, ToolCall,
-    ToolSpec, sse,
+    Effort, Message, Part, Provider, ProviderError, Reply, Request, Retention, Sink, Stop, Tokens,
+    ToolCall, ToolSpec, Wire, sse,
 };
 
-/// Messages endpoint.
-const URL: &str = "https://api.anthropic.com/v1/messages";
+/// The Messages API version Anthropic's own host is asked for.
+const API_VERSION: &str = "2023-06-01";
 
-/// Model list endpoint.
-const MODELS_URL: &str = "https://api.anthropic.com/v1/models";
+/// Where a Messages request goes, which decides how it is addressed, authorized and framed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Host {
+    /// Anthropic's own API.
+    Anthropic {
+        /// The API's address, such as `https://api.anthropic.com`.
+        base_url: String,
+        /// Whether requests present themselves as Claude Code, as subscription logins must.
+        identity: bool,
+    },
+    /// Amazon Bedrock.
+    Bedrock {
+        /// The AWS region.
+        region: String,
+    },
+    /// Google Vertex AI.
+    Vertex {
+        /// The Google Cloud region, or `global`.
+        region: String,
+    },
+}
+
+impl Host {
+    /// The host requests of `provider` made with `credentials` go to.
+    ///
+    /// Only the `claude` provider with a subscription token presents the Claude Code identity; an API key never does.
+    pub(crate) fn of(provider: Provider, credentials: &Credentials) -> Self {
+        match provider.wire() {
+            Wire::Bedrock => Host::Bedrock {
+                region: aws::region(),
+            },
+            Wire::Vertex => Host::Vertex {
+                region: google::region(),
+            },
+            _ => Host::Anthropic {
+                base_url: provider.def().base_url(),
+                identity: provider == Provider::Claude
+                    && identity::is_oauth_token(&credentials.access),
+            },
+        }
+    }
+
+    /// Whether requests present themselves as Claude Code.
+    fn identity(&self) -> bool {
+        matches!(self, Host::Anthropic { identity: true, .. })
+    }
+
+    /// The lifetime cache entries are asked for when `retention` is wanted: as wanted on Anthropic's own host, and the default lifetime on the clouds, which crab does not ask for longer.
+    fn retention(&self, retention: Retention) -> Retention {
+        match self {
+            Host::Anthropic { .. } => retention,
+            Host::Bedrock { .. } | Host::Vertex { .. } => Retention::Short,
+        }
+    }
+}
 
 /// What the reader is told when the model declined to answer.
 const REFUSAL: &str = "the model declined to answer this request";
@@ -602,17 +657,18 @@ fn first_user_text(messages: &[Message]) -> &str {
         .unwrap_or("")
 }
 
-/// Builds the request body sent in `form`, with the billing placeholder still in place for OAuth.
+/// Builds the request body sent in `form` to `host`, with the billing placeholder still in place for the Claude Code identity.
 ///
-/// Every breakpoint gets the same lifetime, since the API refuses a longer-lived entry after a shorter-lived one.
+/// Every breakpoint gets the same lifetime, since the API refuses a longer-lived entry after a shorter-lived one. Bedrock and Vertex get the body their `anthropic_version` names, Bedrock with its betas in it.
 pub(crate) fn build_body(
     model: &str,
     request: &Request<'_>,
     credentials: &Credentials,
     params: &ThinkingParams,
     form: Form,
+    host: &Host,
 ) -> Value {
-    let oauth = identity::is_oauth_token(&credentials.access);
+    let oauth = host.identity();
     let parsed = parse_claude(model);
     let marker = form.cache.map(breakpoint);
     let mut messages = messages_json(request.messages, oauth, replays_thinking(&parsed, params));
@@ -665,12 +721,19 @@ pub(crate) fn build_body(
     if let Some(effort) = params.effort {
         body["output_config"] = json!({ "effort": effort.as_str() });
     }
+    match host {
+        Host::Anthropic { .. } => {}
+        Host::Bedrock { .. } => bedrock::adapt_body(&mut body, &betas(oauth, params)),
+        Host::Vertex { .. } => vertex::adapt_body(&mut body),
+    }
     body
 }
 
-/// The `anthropic-beta` values for a request to `model` sent with `credentials`.
-fn betas(credentials: &Credentials, params: &ThinkingParams) -> Vec<&'static str> {
-    if identity::is_oauth_token(&credentials.access) {
+/// The `anthropic-beta` values for a request with `params`, with the Claude Code identity's own when `identity` says.
+///
+/// Without the identity only the standard betas are sent: interleaved thinking for a thinking budget, and the effort beta for an effort.
+fn betas(identity: bool, params: &ThinkingParams) -> Vec<&'static str> {
+    if identity {
         identity::oauth_betas(params.thinking.is_some() || params.effort.is_some())
     } else {
         let budget = params
@@ -681,14 +744,43 @@ fn betas(credentials: &Credentials, params: &ThinkingParams) -> Vec<&'static str
     }
 }
 
-/// Adds the identity headers for `credentials` to `request`.
+/// The headers of a request to Anthropic's own API with the API key `key`, as names and values: the key, the API version, `betas`, and crab's own name.
+pub(crate) fn key_headers(key: &str, betas: &[&str], stream: bool) -> Vec<(String, String)> {
+    let accept = if stream {
+        "text/event-stream"
+    } else {
+        "application/json"
+    };
+    let mut headers = vec![
+        ("accept".to_owned(), accept.to_owned()),
+        ("content-type".to_owned(), "application/json".to_owned()),
+        ("anthropic-version".to_owned(), API_VERSION.to_owned()),
+        (
+            "user-agent".to_owned(),
+            concat!("oh-my-crab/", env!("CARGO_PKG_VERSION")).to_owned(),
+        ),
+        ("x-api-key".to_owned(), key.to_owned()),
+    ];
+    if !betas.is_empty() {
+        headers.push(("anthropic-beta".to_owned(), betas.join(",")));
+    }
+    headers
+}
+
+/// Adds the headers of a request to Anthropic's own API to `request`: the Claude Code identity's when `identity` says, else those of an API key.
 fn authorized(
     mut request: reqwest::RequestBuilder,
     credentials: &Credentials,
+    identity: bool,
     betas: &[&str],
     stream: bool,
 ) -> reqwest::RequestBuilder {
-    for (name, value) in identity::headers(&credentials.access, betas, stream) {
+    let headers = if identity {
+        identity::headers(&credentials.access, betas)
+    } else {
+        key_headers(&credentials.access, betas, stream)
+    };
+    for (name, value) in headers {
         request = request.header(name, value);
     }
     request
@@ -708,14 +800,22 @@ struct ModelEntry {
     id: String,
 }
 
-/// Lists the model ids the account can use, newest first.
+/// Lists the model ids `provider` can use with `credentials`: those Anthropic's API lists, newest first, or the Claude models the catalog lists for Bedrock and Vertex.
 ///
 /// # Errors
 ///
 /// Returns [`ProviderError`] on network failure or a non-success status.
-pub async fn list_models(credentials: &Credentials) -> Result<Vec<String>, ProviderError> {
+pub async fn list_models(
+    provider: Provider,
+    credentials: &Credentials,
+) -> Result<Vec<String>, ProviderError> {
+    let (base_url, identity) = match Host::of(provider, credentials) {
+        Host::Bedrock { region } => return Ok(bedrock::models(&region)),
+        Host::Vertex { .. } => return Ok(vertex::models()),
+        Host::Anthropic { base_url, identity } => (base_url, identity),
+    };
     let betas = betas(
-        credentials,
+        identity,
         &ThinkingParams {
             thinking: None,
             effort: None,
@@ -723,8 +823,9 @@ pub async fn list_models(credentials: &Credentials) -> Result<Vec<String>, Provi
         },
     );
     let request = authorized(
-        reqwest::Client::new().get(MODELS_URL),
+        reqwest::Client::new().get(format!("{base_url}/v1/models")),
         credentials,
+        identity,
         &betas,
         false,
     );
@@ -736,50 +837,108 @@ pub async fn list_models(credentials: &Credentials) -> Result<Vec<String>, Provi
     Ok(list.data.into_iter().map(|entry| entry.id).collect())
 }
 
-/// Serializes the request for `model` sent in `form` to the bytes to send, attested for OAuth.
+/// Serializes the request for `model` sent in `form` to `host` to the bytes to send, attested for the Claude Code identity.
 fn encode(
     model: &str,
     request: &Request<'_>,
     credentials: &Credentials,
     params: &ThinkingParams,
     form: Form,
+    host: &Host,
 ) -> Vec<u8> {
-    let body = build_body(model, request, credentials, params, form);
+    let body = build_body(model, request, credentials, params, form, host);
     let mut bytes = serde_json::to_vec(&body).unwrap_or_default();
-    if identity::is_oauth_token(&credentials.access) {
+    if host.identity() {
         identity::attest(&mut bytes);
     }
     bytes
 }
 
-/// Sends the request for `model` in `form` and returns the successful response.
+/// The request carrying `bytes` for `model` to `host`, addressed and authorized as the host wants, streamed unless `form` warms the cache.
+///
+/// # Errors
+///
+/// Returns [`ProviderError::Credentials`] when a cloud's credentials or project cannot be found or used.
+async fn prepare(
+    client: &reqwest::Client,
+    host: &Host,
+    credentials: &Credentials,
+    model: &str,
+    params: &ThinkingParams,
+    form: Form,
+    bytes: Vec<u8>,
+) -> Result<reqwest::RequestBuilder, ProviderError> {
+    let stream = !form.warm;
+    let request = match host {
+        Host::Anthropic { base_url, identity } => {
+            let url = if *identity {
+                format!("{base_url}/v1/messages?beta=true")
+            } else {
+                format!("{base_url}/v1/messages")
+            };
+            authorized(
+                client.post(url),
+                credentials,
+                *identity,
+                &betas(*identity, params),
+                stream,
+            )
+        }
+        Host::Bedrock { region } => {
+            let authorization = bedrock::Authorization::find(&credentials.access)?;
+            let url = bedrock::invoke_url(&bedrock::base_url(region), model, stream);
+            let headers =
+                bedrock::headers(&url, &bytes, stream, region, &authorization, &sigv4::now())?;
+            headers
+                .into_iter()
+                .fold(client.post(url), |request, (name, value)| {
+                    request.header(name, value)
+                })
+        }
+        Host::Vertex { region } => {
+            let project = google::project().map_err(ProviderError::Credentials)?;
+            let token = google::access_token()
+                .await
+                .map_err(ProviderError::Credentials)?;
+            let url =
+                vertex::predict_url(&vertex::base_url(region), &project, region, model, stream);
+            let mut request = client
+                .post(url)
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json");
+            let betas = betas(false, params);
+            if !betas.is_empty() {
+                request = request.header("anthropic-beta", betas.join(","));
+            }
+            request
+        }
+    };
+    Ok(request.body(bytes))
+}
+
+/// Sends the request for `model` in `form` to `host` and returns the successful response.
 ///
 /// A rejection that says the claimed Claude Code version is too old is retried
 /// once with the version it asks for.
 ///
 /// # Errors
 ///
-/// Returns [`ProviderError`] on network failure or a non-success status.
+/// Returns [`ProviderError`] on network failure, a non-success status, or cloud credentials that cannot be found.
 async fn send(
+    host: &Host,
     credentials: &Credentials,
     model: &str,
     request: &Request<'_>,
     params: &ThinkingParams,
     form: Form,
 ) -> Result<reqwest::Response, ProviderError> {
-    let oauth = identity::is_oauth_token(&credentials.access);
-    let betas = betas(credentials, params);
-    let url = if oauth {
-        format!("{URL}?beta=true")
-    } else {
-        URL.to_string()
-    };
+    let oauth = host.identity();
     let client = reqwest::Client::new();
     let mut attempt = 0;
     loop {
-        let bytes = encode(model, request, credentials, params, form);
-        let response = authorized(client.post(&url), credentials, &betas, !form.warm)
-            .body(bytes)
+        let bytes = encode(model, request, credentials, params, form, host);
+        let response = prepare(&client, host, credentials, model, params, form, bytes)
+            .await?
             .send()
             .await?;
         if response.status().is_success() {
@@ -798,32 +957,63 @@ async fn send(
     }
 }
 
-/// Sends the conversation to Claude using `model` and returns its reply,
+/// Sends the conversation to Claude on `provider` using `model` and returns its reply,
 /// streaming text and thinking chunks to `sink`; the cache entries the request
 /// writes live as `cache` says, and it writes none when that is nothing.
 ///
 /// # Errors
 ///
-/// Returns [`ProviderError`] on network failure, a non-success status or an
-/// error event inside the stream.
+/// Returns [`ProviderError`] on network failure, a non-success status, cloud
+/// credentials that cannot be found, or an error event inside the stream.
 pub async fn complete(
+    provider: Provider,
     credentials: &Credentials,
     model: &str,
     request: Request<'_>,
     sink: &mut dyn Sink,
     cache: Option<Retention>,
 ) -> Result<Reply, ProviderError> {
-    let oauth = identity::is_oauth_token(&credentials.access);
+    let host = Host::of(provider, credentials);
     let params = thinking_params(model, request.effort);
-    let response = send(credentials, model, &request, &params, Form::streamed(cache)).await?;
-    let mut events = sse::events(response).await?;
-    let mut accumulator = Accumulator::new(oauth);
-    while let Some(event) = events.next().await {
-        if accumulator.feed(&event?.data, sink)? {
-            break;
+    let form = Form::streamed(cache.map(|retention| host.retention(retention)));
+    let response = send(&host, credentials, model, &request, &params, form).await?;
+    let mut accumulator = Accumulator::new(host.identity());
+    if matches!(host, Host::Bedrock { .. }) {
+        read_event_stream(response, &mut accumulator, sink).await?;
+    } else {
+        let mut events = sse::events(response).await?;
+        while let Some(event) = events.next().await {
+            if accumulator.feed(&event?.data, sink)? {
+                break;
+            }
         }
     }
     accumulator.finish()
+}
+
+/// Feeds the Messages events Bedrock's binary event stream in `response` carries to `accumulator`, until the message is complete or the stream ends.
+///
+/// # Errors
+///
+/// Returns [`ProviderError`] when the connection fails, the stream is damaged, or it carries an exception or an error event.
+async fn read_event_stream(
+    response: reqwest::Response,
+    accumulator: &mut Accumulator,
+    sink: &mut dyn Sink,
+) -> Result<(), ProviderError> {
+    let mut bytes = response.bytes_stream();
+    let mut decoder = Decoder::default();
+    while let Some(chunk) = bytes.next().await {
+        decoder.push(&chunk?);
+        while let Some(message) = decoder.next().map_err(ProviderError::Stream)? {
+            if let Some(data) = bedrock::event_data(&message)?
+                && accumulator.feed(&data, sink)?
+            {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The body of an answer that is not streamed, of which only the usage is read.
@@ -835,17 +1025,22 @@ struct Answered {
 
 /// Sends `request` to `model` again asking for no output and without streaming, which reads the cache entries it wrote and so keeps them alive for another lifetime of `retention`; returns what it cost.
 ///
-/// Nothing is sent, and nothing returned, when the request thinks within a token budget: a request with no output cannot keep that budget, and the cache is keyed on it.
+/// Nothing is sent, and nothing returned, when the request thinks within a token budget: a request with no output cannot keep that budget, and the cache is keyed on it. Nor is anything sent to Bedrock or Vertex, which are not known to take a request with no output.
 ///
 /// # Errors
 ///
 /// Returns [`ProviderError`] on network failure, a non-success status or a body that is not JSON.
 pub async fn warm(
+    provider: Provider,
     credentials: &Credentials,
     model: &str,
     request: Request<'_>,
     retention: Retention,
 ) -> Result<Option<Tokens>, ProviderError> {
+    let host = Host::of(provider, credentials);
+    if !matches!(host, Host::Anthropic { .. }) {
+        return Ok(None);
+    }
     let params = thinking_params(model, request.effort);
     if params
         .thinking
@@ -858,7 +1053,7 @@ pub async fn warm(
         cache: Some(retention),
         warm: true,
     };
-    let response = send(credentials, model, &request, &params, form).await?;
+    let response = send(&host, credentials, model, &request, &params, form).await?;
     let answered: Answered = response.json().await?;
     Ok(Some(tokens_of(answered.usage.unwrap_or_default())))
 }
@@ -903,6 +1098,22 @@ mod tests {
         /// Records a thinking chunk.
         fn thinking(&mut self, chunk: &str) {
             self.thinking.push(chunk.to_string());
+        }
+    }
+
+    /// Anthropic's own host with the Claude Code identity, as a subscription login reaches it.
+    fn subscription() -> Host {
+        Host::Anthropic {
+            base_url: "https://api.anthropic.com".into(),
+            identity: true,
+        }
+    }
+
+    /// Anthropic's own host without the identity, as an API key reaches it.
+    fn api_key() -> Host {
+        Host::Anthropic {
+            base_url: "https://api.anthropic.com".into(),
+            identity: false,
         }
     }
 
@@ -1094,7 +1305,14 @@ mod tests {
         let creds = credentials("sk-ant-oat01-x");
         let params = thinking_params("claude-opus-5-5", request.effort);
         let short = Form::streamed(Some(Retention::Short));
-        let body = build_body("claude-opus-5-5", &request, &creds, &params, short);
+        let body = build_body(
+            "claude-opus-5-5",
+            &request,
+            &creds,
+            &params,
+            short,
+            &subscription(),
+        );
         let system = body["system"].as_array().unwrap();
         assert!(
             system[0]["text"]
@@ -1111,11 +1329,18 @@ mod tests {
         assert_eq!(body["output_config"]["effort"], "high");
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert!(body["context_management"].is_object());
-        let bytes = encode("claude-opus-5-5", &request, &creds, &params, short);
+        let bytes = encode(
+            "claude-opus-5-5",
+            &request,
+            &creds,
+            &params,
+            short,
+            &subscription(),
+        );
         let text = String::from_utf8(bytes).unwrap();
         assert!(!text.contains("cch=00000"));
         assert!(text.contains("cch="));
-        let used = betas(&creds, &params);
+        let used = betas(true, &params);
         assert!(used.contains(&"effort-2025-11-24"));
         assert!(!used.iter().any(|beta| beta.starts_with("context-1m")));
     }
@@ -1138,11 +1363,134 @@ mod tests {
             &creds,
             &params,
             Form::streamed(Some(Retention::Short)),
+            &api_key(),
         );
         assert_eq!(body["system"].as_array().unwrap().len(), 1);
         assert!(body.get("tools").is_none());
         assert!(body.get("metadata").is_none());
         assert!(body.get("thinking").is_none());
+    }
+
+    /// Only the `claude` provider with a subscription token presents the identity; the Anthropic API provider never does, even with such a token, and goes to its own address.
+    #[test]
+    fn hosts_follow_the_provider() {
+        let oauth = credentials("sk-ant-oat01-x");
+        assert!(Host::of(Provider::Claude, &oauth).identity());
+        assert!(!Host::of(Provider::Claude, &credentials("sk-ant-api03-x")).identity());
+        let anthropic = Host::of(Provider::Anthropic, &oauth);
+        assert!(!anthropic.identity());
+        if std::env::var_os("OMC_ANTHROPIC_URL").is_none() {
+            assert_eq!(anthropic, api_key());
+        }
+        assert!(matches!(
+            Host::of(Provider::Bedrock, &oauth),
+            Host::Bedrock { .. }
+        ));
+        assert!(matches!(
+            Host::of(Provider::Vertex, &oauth),
+            Host::Vertex { .. }
+        ));
+        assert_eq!(api_key().retention(Retention::Long), Retention::Long);
+        let vertex = Host::Vertex {
+            region: "global".into(),
+        };
+        assert_eq!(vertex.retention(Retention::Long), Retention::Short);
+    }
+
+    /// An API key goes in `x-api-key` with crab's own name and the standard betas, without any Claude Code header.
+    #[test]
+    fn api_key_headers_carry_no_identity() {
+        let params = thinking_params("claude-sonnet-4-5-20250929", Some(Effort::Medium));
+        let used = betas(false, &params);
+        assert_eq!(used, ["interleaved-thinking-2025-05-14"]);
+        let headers = key_headers("sk-ant-api03-abc", &used, true);
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(header("x-api-key"), Some("sk-ant-api03-abc"));
+        assert_eq!(header("anthropic-version"), Some("2023-06-01"));
+        assert_eq!(header("accept"), Some("text/event-stream"));
+        assert_eq!(
+            header("anthropic-beta"),
+            Some("interleaved-thinking-2025-05-14")
+        );
+        assert!(header("user-agent").unwrap().starts_with("oh-my-crab/"));
+        for absent in [
+            "authorization",
+            "x-app",
+            "anthropic-dangerous-direct-browser-access",
+            "x-claude-code-session-id",
+            "x-stainless-lang",
+        ] {
+            assert_eq!(header(absent), None, "{absent}");
+        }
+        assert!(
+            !used
+                .iter()
+                .any(|beta| beta.starts_with("claude-code") || beta.starts_with("oauth"))
+        );
+    }
+
+    /// Bedrock and Vertex bodies carry the plain Messages body with their API version, cache breakpoints and thinking intact, and no identity.
+    #[test]
+    fn cloud_bodies_keep_caching_and_thinking() {
+        let messages = [Message::User("hi".into())];
+        let tools = [ToolSpec {
+            name: "bash".into(),
+            description: "d".into(),
+            schema: json!({ "type": "object" }),
+        }];
+        let request = Request {
+            system: "be brief",
+            messages: &messages,
+            tools: &tools,
+            effort: Some(Effort::Medium),
+        };
+        let creds = credentials("");
+        let model = "us.anthropic.claude-sonnet-4-5-20250929-v1:0";
+        let params = thinking_params(model, request.effort);
+        let short = Form::streamed(Some(Retention::Short));
+        let bedrock = build_body(
+            model,
+            &request,
+            &creds,
+            &params,
+            short,
+            &Host::Bedrock {
+                region: "us-east-1".into(),
+            },
+        );
+        assert!(bedrock.get("model").is_none() && bedrock.get("stream").is_none());
+        assert_eq!(bedrock["anthropic_version"], "bedrock-2023-05-31");
+        assert_eq!(
+            bedrock["anthropic_beta"],
+            json!(["interleaved-thinking-2025-05-14"])
+        );
+        assert_eq!(bedrock["thinking"]["type"], "enabled");
+        assert_eq!(bedrock["tools"][0]["name"], "bash");
+        assert_eq!(breakpoints(&bedrock).len(), 2);
+        assert!(bedrock.get("metadata").is_none());
+        let vertex_params = thinking_params("claude-opus-5-5", Some(Effort::High));
+        let vertex = build_body(
+            "claude-opus-5-5",
+            &request,
+            &creds,
+            &vertex_params,
+            short,
+            &Host::Vertex {
+                region: "global".into(),
+            },
+        );
+        assert!(vertex.get("model").is_none());
+        assert_eq!(vertex["stream"], true);
+        assert_eq!(vertex["anthropic_version"], "vertex-2023-10-16");
+        assert_eq!(vertex["thinking"]["type"], "adaptive");
+        assert_eq!(vertex["output_config"]["effort"], "high");
+        assert!(vertex.get("anthropic_beta").is_none());
+        assert_eq!(vertex["system"].as_array().unwrap().len(), 1);
     }
 
     /// The `cache_control` values of every block of `body` that carries one, system blocks first.
@@ -1179,7 +1527,16 @@ mod tests {
         };
         let creds = credentials("sk-ant-oat01-x");
         let params = thinking_params("claude-opus-5-5", request.effort);
-        let body = |form| build_body("claude-opus-5-5", &request, &creds, &params, form);
+        let body = |form| {
+            build_body(
+                "claude-opus-5-5",
+                &request,
+                &creds,
+                &params,
+                form,
+                &subscription(),
+            )
+        };
         let short = body(Form::streamed(Some(Retention::Short)));
         assert_eq!(breakpoints(&short), vec![json!({ "type": "ephemeral" }); 3]);
         let long = body(Form::streamed(Some(Retention::Long)));

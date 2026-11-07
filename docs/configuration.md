@@ -64,10 +64,14 @@ An empty `OMC_PROVIDERS_FILE`, `OMC_HOOKS_FILE`, `OMC_TRUST_FILE`,
 A key in the environment wins over one a client saved. Where two key
 variables are listed, the first that is set wins. `claude`, `codex` and
 `copilot` sign in to an account and read no variable. A custom provider reads
-its key from the variables its `api_key_env` names.
+its key from the variables its `api_key_env` names. `bedrock` and `vertex`
+find their cloud's credentials as below.
 
 | Provider     | Key                                   | Address variable     | Default address                                           |
 | ------------ | ------------------------------------- | -------------------- | --------------------------------------------------------- |
+| `anthropic`  | `ANTHROPIC_API_KEY`                   | `OMC_ANTHROPIC_URL`  | `https://api.anthropic.com`                               |
+| `bedrock`    | `AWS_BEARER_TOKEN_BEDROCK`, or AWS credentials | `OMC_BEDROCK_URL` | `https://bedrock-runtime.<region>.amazonaws.com`  |
+| `vertex`     | Google Cloud credentials              | `OMC_VERTEX_URL`     | `https://<region>-aiplatform.googleapis.com`, or `https://aiplatform.googleapis.com` for `global` |
 | `openrouter` | `OPENROUTER_API_KEY`                  | `OMC_OPENROUTER_URL` | `https://openrouter.ai/api/v1`                            |
 | `kimi-code`  | `KIMI_CODE_API_KEY`, `KIMI_API_KEY`, or a Kimi account | `OMC_KIMI_CODE_URL` | `https://api.kimi.ai/coding/v1`                |
 | `moonshot`   | `MOONSHOT_API_KEY`                    | `OMC_MOONSHOT_URL`   | `https://api.moonshot.ai/v1`                              |
@@ -89,6 +93,24 @@ its key from the variables its `api_key_env` names.
 | `vllm`       | none                                  | `OMC_VLLM_URL`       | `http://localhost:8000/v1`                                |
 
 More on each provider is in [Supported providers](providers/supported.md).
+
+### Cloud credentials
+
+`bedrock` and `vertex` read their cloud's credentials where the cloud's own
+tools keep them, on every request, so a refreshed login or rotated key is
+picked up without signing in again.
+
+| Variable                                                   | What it does                                                                                     | Details |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------ | ------- |
+| `AWS_BEARER_TOKEN_BEDROCK`                                 | A Bedrock API key, sent as a bearer token instead of signing; a key a client saved does the same. | [Amazon Bedrock](providers/supported.md#amazon-bedrock) |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | The AWS keys requests are signed with; they win over a profile.                           | [Amazon Bedrock](providers/supported.md#amazon-bedrock) |
+| `AWS_PROFILE`                                              | The profile read from the credentials and config files; `default` when unset.                   | [Amazon Bedrock](providers/supported.md#amazon-bedrock) |
+| `AWS_SHARED_CREDENTIALS_FILE`, `AWS_CONFIG_FILE`           | The credentials and config files; `~/.aws/credentials` and `~/.aws/config` when unset.           | [Amazon Bedrock](providers/supported.md#amazon-bedrock) |
+| `AWS_REGION`, `AWS_DEFAULT_REGION`                         | The region, first set wins, else the profile's `region`, else `us-east-1`.                       | [Amazon Bedrock](providers/supported.md#amazon-bedrock) |
+| `GOOGLE_APPLICATION_CREDENTIALS`                           | A service account key or user login file; else gcloud's `application_default_credentials.json`, else `gcloud auth print-access-token`. | [Google Vertex AI](providers/supported.md#google-vertex-ai) |
+| `CLOUDSDK_CONFIG`                                          | gcloud's config folder, where its default credentials are looked for; `~/.config/gcloud` (`%APPDATA%\gcloud` on Windows) when unset. | [Google Vertex AI](providers/supported.md#google-vertex-ai) |
+| `GOOGLE_CLOUD_PROJECT`, `GCLOUD_PROJECT`, `ANTHROPIC_VERTEX_PROJECT_ID` | The project, first set wins, else the one the credentials file names.               | [Google Vertex AI](providers/supported.md#google-vertex-ai) |
+| `GOOGLE_CLOUD_LOCATION`, `CLOUD_ML_REGION`                 | The region, first set wins, else `global`.                                                       | [Google Vertex AI](providers/supported.md#google-vertex-ai) |
 
 ### Search and GitHub
 
@@ -129,7 +151,7 @@ Crab does not read these; it sets them for the hook commands it runs.
 
 | Path                                                          | What                                                                                                    | Written by                          | Details                                           |
 | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- | ----------------------------------- | ------------------------------------------------- |
-| `<config>/auth.json`                                          | Logins, saved API keys and the provider last signed in to. A client can keep it elsewhere by opening the conversation with a `home` folder: then it is `<home>/auth.json`. | crab, when signing in or saving a key | [Providers](providers/overview.md)            |
+| `<config>/auth.json`                                          | Logins, saved API keys and the provider last signed in to; for `bedrock` and `vertex` an empty entry marks them signed in, their credentials staying with the cloud's own tools. A client can keep it elsewhere by opening the conversation with a `home` folder: then it is `<home>/auth.json`. | crab, when signing in or saving a key | [Providers](providers/overview.md)            |
 | `<config>/providers.json`                                     | Custom providers. Read once, when the providers are first listed. Moved by `OMC_PROVIDERS_FILE`, not by `home`. | the user                     | [Custom endpoints](providers/custom-endpoints.md) |
 | `<config>/hooks.json`                                         | The user's own hooks. Moved by `OMC_HOOKS_FILE`.                                                         | the user                            | [Hooks](extending/hooks.md)                       |
 | `<config>/mcp.json`                                           | The user's own tool servers, in the shape of `.mcp.json`. Read when a conversation opens. Moved by `OMC_MCP_FILE`. | the user                  | [Tool servers](extending/mcp.md)                  |
@@ -159,6 +181,8 @@ Always read, trusted or not. `~/.claude` is `CLAUDE_CONFIG_DIR` when set, and
 | `~/.claude/skills/<name>/SKILL.md`, `~/.codex/skills/<name>/SKILL.md`, `~/.agents/skills/<name>/SKILL.md` | Skills.                  | [Skills and agents](extending/skills-and-agents.md) |
 | `~/.claude/agents/<name>.md`, `~/.codex/agents/<name>.toml` | Agent definitions.                                                   | [Skills and agents](extending/skills-and-agents.md) |
 | `~/.claude/settings.json`                                  | Hooks, the plugins `enabledPlugins` switches on or off, and permission rules. | [Hooks](extending/hooks.md), [permission rules](extending/permissions.md) |
+| `~/.aws/credentials`, `~/.aws/config`                      | AWS keys, `credential_process` and region of the profile in use, for `bedrock`. Moved by `AWS_SHARED_CREDENTIALS_FILE` and `AWS_CONFIG_FILE`. | [Amazon Bedrock](providers/supported.md#amazon-bedrock) |
+| `~/.config/gcloud/application_default_credentials.json`    | Google's Application Default Credentials, for `vertex`. `GOOGLE_APPLICATION_CREDENTIALS` names another file. | [Google Vertex AI](providers/supported.md#google-vertex-ai) |
 | `~/.claude/plugins/installed_plugins.json`                 | The installed Claude Code plugins, whose skills, agents and `hooks/hooks.json` are read. | [Claude Code plugins](extending/skills-and-agents.md#claude-code-plugins) |
 | `~/.claude.json`                                           | Only with `OMC_MCP_CLAUDE=1`: the tool servers under `mcpServers`, and under `projects` for the working folder or repository root. | [Tool servers](extending/mcp.md) |
 

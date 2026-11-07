@@ -6,20 +6,21 @@ use omc_auth::Auth;
 use omc_providers::Provider;
 use omc_wire::{KeySource, ProviderInfo, SignIn};
 
-/// How `auth` is signed in to, as a client is told.
+/// How `auth` is signed in to, as a client is told: a cloud provider that takes a key is offered as one, and one that takes none as needing no sign-in, since its credentials are found where the cloud's own tools keep them.
 fn sign_in(auth: &Auth) -> SignIn {
     match auth {
         Auth::OAuth(_) => SignIn::Browser,
         Auth::DeviceCode(_) | Auth::DeviceCodeOrKey { .. } => SignIn::DeviceCode,
         Auth::ApiKey { .. } => SignIn::ApiKey,
-        Auth::None => SignIn::None,
+        Auth::Cloud { env, .. } if !env.is_empty() => SignIn::ApiKey,
+        Auth::Cloud { .. } | Auth::None => SignIn::None,
     }
 }
 
-/// The environment variables `auth` reads an API key from, or none when it takes no key; a provider that signs in with a device code and also takes a key lists them too.
+/// The environment variables `auth` reads an API key from, or none when it takes no key; a provider that signs in with a device code or a cloud's credentials and also takes a key lists them too.
 fn key_env(auth: &Auth) -> &'static [&'static str] {
     match auth {
-        Auth::ApiKey { env } | Auth::DeviceCodeOrKey { env, .. } => env,
+        Auth::ApiKey { env } | Auth::DeviceCodeOrKey { env, .. } | Auth::Cloud { env, .. } => env,
         _ => &[],
     }
 }
@@ -59,7 +60,7 @@ pub fn signed_in(id: &str, home: Option<PathBuf>) -> bool {
 
 /// Where the API key of the provider `id` comes from, with the logins kept in `home` or in the harness's own folder when there is none: the environment wins over a saved key.
 ///
-/// Nothing is returned when the provider is unknown, takes no key, or has none; a login kept for a provider that also signs in to an account is not a key.
+/// Nothing is returned when the provider is unknown, takes no key, or has none; a login kept for a provider that also signs in to an account is not a key, and neither is the empty entry a cloud provider is signed in with.
 pub fn key_source(id: &str, home: Option<PathBuf>) -> Option<KeySource> {
     let env = key_env(&Provider::from_id(id)?.def().auth);
     if env.is_empty() {
@@ -73,7 +74,7 @@ pub fn key_source(id: &str, home: Option<PathBuf>) -> Option<KeySource> {
     omc_auth::stored(id, home)
         .ok()
         .flatten()
-        .filter(|stored| !stored.is_login())
+        .filter(|stored| !stored.is_login() && !stored.access.trim().is_empty())
         .map(|_| KeySource::Saved)
 }
 
@@ -119,6 +120,16 @@ mod tests {
         let openrouter = listed.iter().find(|info| info.id == "openrouter").unwrap();
         assert_eq!(openrouter.key_env, ["OPENROUTER_API_KEY"]);
         assert!(listed.iter().all(|info| !info.name.is_empty()));
+        let anthropic = listed.iter().find(|info| info.id == "anthropic").unwrap();
+        assert_eq!(anthropic.sign_in, SignIn::ApiKey);
+        assert_eq!(anthropic.key_env, ["ANTHROPIC_API_KEY"]);
+        let bedrock = listed.iter().find(|info| info.id == "bedrock").unwrap();
+        assert_eq!(bedrock.name, "Amazon Bedrock");
+        assert_eq!(bedrock.sign_in, SignIn::ApiKey);
+        assert_eq!(bedrock.key_env, ["AWS_BEARER_TOKEN_BEDROCK"]);
+        let vertex = listed.iter().find(|info| info.id == "vertex").unwrap();
+        assert_eq!(vertex.sign_in, SignIn::None);
+        assert!(vertex.key_env.is_empty());
     }
 
     /// The account is read from the logins in the folder given, a login without a name still counts as signed in, and an unknown provider or empty folder has none.
