@@ -169,16 +169,9 @@ fn runs(program: &Path, arguments: &[String]) -> bool {
     works
 }
 
-/// The path of the program `name`: `name` itself when it names a file, otherwise the first file of that name in a folder of the `PATH`.
+/// The path of the program `name`, as [`omc_tools::find_program`] finds it.
 fn find_program(name: &str) -> Option<PathBuf> {
-    let direct = Path::new(name);
-    if direct.components().count() > 1 {
-        return direct.is_file().then(|| direct.to_path_buf());
-    }
-    let folders = std::env::var_os("PATH")?;
-    std::env::split_paths(&folders)
-        .map(|folder| folder.join(name))
-        .find(|candidate| candidate.is_file())
+    omc_tools::find_program(name)
 }
 
 #[cfg(test)]

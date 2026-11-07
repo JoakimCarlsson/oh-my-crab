@@ -7,6 +7,7 @@ mod host;
 mod jobs;
 mod language;
 mod notebook;
+mod program;
 mod registry;
 mod sandbox;
 pub mod schema;
@@ -25,6 +26,7 @@ pub use language::{
     DIAGNOSTICS_WAIT, Diagnostic, FORMAT_WAIT, LanguageService, Languages, Severity,
 };
 pub use notebook::{NOTEBOOK_LIMIT, Notebook};
+pub use program::find_program;
 pub use registry::Registry;
 pub use sandbox::Sandbox;
 pub use spill::Spill;

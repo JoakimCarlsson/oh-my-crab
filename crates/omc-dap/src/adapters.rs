@@ -334,17 +334,13 @@ pub(crate) fn normalize_language(language: &str) -> String {
     }
 }
 
-/// The path of the program `name`: taken relative to `root` when it holds a `/`, otherwise the first file of that name in a folder of the `PATH`.
+/// The path of the program `name`: taken relative to `root` when it holds a `/`, otherwise found on the `PATH` as [`omc_tools::find_program`] does, extensions and all on Windows.
 fn find_program(name: &str, root: &Path) -> Option<PathBuf> {
     let direct = Path::new(name);
     if direct.components().count() > 1 {
-        let path = root.join(direct);
-        return path.is_file().then_some(path);
+        return omc_tools::find_program(&root.join(direct).to_string_lossy());
     }
-    let folders = std::env::var_os("PATH")?;
-    std::env::split_paths(&folders)
-        .map(|folder| folder.join(name))
-        .find(|candidate| candidate.is_file())
+    omc_tools::find_program(name)
 }
 
 /// Whether the Python interpreter `python` can import `module`.

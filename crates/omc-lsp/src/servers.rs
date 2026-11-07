@@ -168,8 +168,8 @@ impl LanguageService for Servers {
     }
 }
 
-#[cfg(test)]
-/// Tests for starting servers.
+#[cfg(all(test, unix))]
+/// Tests for starting servers, whose stand-in server is a POSIX shell script.
 mod tests {
     use super::*;
 
