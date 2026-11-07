@@ -42,8 +42,19 @@ Opening the same id again brings it back as it was, in a `Resumed` event, and
 the model carries on from the whole conversation. The history is one JSON
 lines file, `<id>.jsonl`, under `oh-my-crab/conversations` in the user's data
 folder, or in the folder `history` names. `keep` opens only the latest turns,
-and `before` cuts the conversation back to before a turn, for a client that
-lets the reader go back and try again. Without an id nothing is saved.
+and `before` goes back to before a turn, for a client that lets the reader go
+back and try again. Without an id nothing is saved.
+
+## Branches
+
+Going back does not throw the later turns away. A saved conversation is a
+tree: going back to before a turn starts a new branch from that point, and
+the turns left behind stay saved on the branch they were on. `Resumed` lists
+every branch with the turns it holds and where it went back from, and
+`Switch` moves the conversation to another branch at its tip, so the reader
+can return to an earlier line of work and carry on from it. `crab fork`
+copies a branch, up to a turn, into a conversation of its own. See
+[branches](wire-protocol.md#branches).
 
 The agent names an unnamed conversation itself with `set_title`, and the
 client hears it as `Titled`. A name the client sends with `Rename` always
@@ -55,10 +66,10 @@ conversations from a shell; see [commands](usage.md) and
 
 The client sends commands and `crab` sends events, one JSON message per line.
 Commands are few: `Open`, `Prompt`, `Cancel`, `Set`, `Rename`, `Login`,
-`Close`, and the answers `Choose`, `Answer`, `Trust` and `Language`. Events
-report what happens as it happens: the reply streamed in `Said` and `Thought`
-chunks, tool calls as `Tool` events that are updated as they run, questions
-that wait for an answer, and the end of each turn.
+`Switch`, `Close`, and the answers `Choose`, `Answer`, `Trust` and
+`Language`. Events report what happens as it happens: the reply streamed in
+`Said` and `Thought` chunks, tool calls as `Tool` events that are updated as
+they run, questions that wait for an answer, and the end of each turn.
 
 A question carries a ticket, and its answer names that ticket. Approvals are
 `Ask` events answered with `Choose`, the `ask` tool's forms are `Inquire`

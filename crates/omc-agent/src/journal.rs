@@ -63,6 +63,93 @@ pub struct Saved {
     pub changes: std::collections::HashMap<String, Vec<FileChange>>,
     /// What the harness last found out and saved under each key, such as the settings it offers; the latest value of each, oldest first.
     pub facts: Vec<(String, serde_json::Value)>,
+    /// The id of the branch the messages, marks and lost turns are of.
+    pub branch: String,
+    /// Every branch of the conversation, in the order they were made, the first one first; the one named by `branch` is among them.
+    pub branches: Vec<Branch>,
+}
+
+/// The id of the branch a conversation starts on, which is also the only branch of a history saved before branches were recorded.
+pub const FIRST_BRANCH: &str = "1";
+
+/// One line of a conversation: the turns from its start to its tip. Going back to before a turn starts a new branch from that point, and the turns left behind stay on the branch they were on.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Branch {
+    /// The branch's id, given by the journal: [`FIRST_BRANCH`] for the first, and counting up from there.
+    pub id: String,
+    /// The branch it went back from, or nothing for the first.
+    pub parent: Option<String>,
+    /// The id of the turn of `parent` it went back to before, or nothing for the first.
+    pub before: Option<String>,
+    /// The marks of its turns, with the position of the message each starts at.
+    pub marks: Vec<Marked>,
+    /// Its turns that were stopped or failed, oldest first.
+    pub lost: Vec<Lost>,
+}
+
+/// A branch and the messages on it, as a history file is replayed.
+#[derive(Clone, Debug, Default)]
+struct Line {
+    /// The branch, with its marks and lost turns.
+    branch: Branch,
+    /// The messages on it.
+    history: Vec<Message>,
+    /// Whether a turn was started or a message added on it since it was made, which a branch made by going back and left as it was has not.
+    grown: bool,
+}
+
+impl Line {
+    /// The first branch, empty.
+    fn first() -> Self {
+        Self {
+            branch: Branch {
+                id: FIRST_BRANCH.to_owned(),
+                ..Branch::default()
+            },
+            ..Self::default()
+        }
+    }
+
+    /// A new branch called `forked.id` that goes back from this one to before the turn `forked.before`, holding everything this one holds until it is cut back.
+    fn branched(&self, forked: &Forked) -> Self {
+        Self {
+            branch: Branch {
+                id: forked.id.clone(),
+                parent: Some(self.branch.id.clone()),
+                before: Some(forked.before.clone()),
+                marks: self.branch.marks.clone(),
+                lost: self.branch.lost.clone(),
+            },
+            history: self.history.clone(),
+            grown: false,
+        }
+    }
+
+    /// Whether going back on this branch should move its starting point instead of making another branch: it was made by going back and no turn was started on it since.
+    fn bare(&self) -> bool {
+        self.branch.parent.is_some() && !self.grown
+    }
+
+    /// Where the turn `id` starts on this branch: the length of the history before it, and the index of the lost turn when it is one that was lost; nothing when no turn of the branch has the id.
+    fn find(&self, id: &str) -> Option<(usize, Option<usize>)> {
+        if let Some((at, _)) = self.branch.marks.iter().find(|(_, mark)| mark.id == id) {
+            return Some((*at, None));
+        }
+        self.branch
+            .lost
+            .iter()
+            .position(|held| held.mark.id == id)
+            .map(|index| (self.branch.lost[index].at, Some(index)))
+    }
+}
+
+/// That a new branch starts: written before the cut-back that takes it back to before a turn.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct Forked {
+    /// The id of the new branch, or of the branch the conversation is on when that branch only moves its starting point.
+    id: String,
+    /// The id of the turn the branch goes back to before.
+    before: String,
 }
 
 /// A turn that was stopped or failed, which is no part of the history the model is given but is part of the conversation the client shows.
@@ -128,6 +215,10 @@ enum Written<'a> {
     Changes(&'a str, &'a [FileChange]),
     /// The value saved under this key is now this.
     Fact(&'a str, &'a serde_json::Value),
+    /// A new branch starts from the branch the conversation is on, and the records after this are of it.
+    Branch(&'a Forked),
+    /// The records after this are of the branch with this id.
+    Switch(&'a str),
 }
 
 /// One line of a history file, as it is read.
@@ -154,6 +245,10 @@ enum Record {
     Changes(String, Vec<FileChange>),
     /// The value saved under this key is now this.
     Fact(String, serde_json::Value),
+    /// A new branch starts from the branch the conversation is on, and the records after this are of it.
+    Branch(Forked),
+    /// The records after this are of the branch with this id.
+    Switch(String),
 }
 
 /// The file a conversation's history is appended to.
@@ -188,6 +283,10 @@ struct State {
     changes: std::collections::HashMap<String, Vec<FileChange>>,
     /// The latest value saved under each key, oldest first.
     facts: Vec<(String, serde_json::Value)>,
+    /// Every branch, in the order they were made; the marks and lost turns of the one the conversation is on are kept in `marks` and `lost` instead.
+    branches: Vec<Branch>,
+    /// The index in `branches` of the branch the conversation is on.
+    current: usize,
 }
 
 impl State {
@@ -265,7 +364,9 @@ impl Journal {
         Self::open_before(path, keep, None)
     }
 
-    /// Opens the history like [`Journal::open`], and when `before` names the id of a turn, cuts the history back to before that turn as well, whichever of that and `keep` leaves less.
+    /// Opens the history like [`Journal::open`], and when `before` names the id of a turn, goes back to before that turn as well, whichever of that and `keep` leaves less.
+    ///
+    /// Going back starts a new branch from that point, and the turns left behind stay in the file on the branch they were on; see [`Journal::open_branch`].
     ///
     /// # Errors
     ///
@@ -273,6 +374,22 @@ impl Journal {
     pub fn open_before(
         path: &Path,
         keep: Option<usize>,
+        before: Option<&str>,
+    ) -> Result<(Arc<Self>, Vec<Message>), JournalError> {
+        Self::open_branch(path, keep, None, before)
+    }
+
+    /// Opens the history like [`Journal::open`] on the branch `branch` when that is given, at its tip, and then, when `before` names the id of a turn of that branch, goes back to before it.
+    ///
+    /// Going back starts a new branch that holds the turns up to that point, and the conversation goes on there; the turns left behind stay on the branch they were on, which [`Journal::open_branch`] can open again. A branch that was made by going back and has had no turn since is moved back instead of being branched again, so that going back several times in a row leaves one branch. `keep` applies to the branch that is opened, after any going back.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Journal::open`] does, and [`JournalError::Io`] when no branch has the id `branch` or no turn of it has the id `before`; the file is left as it was then.
+    pub fn open_branch(
+        path: &Path,
+        keep: Option<usize>,
+        branch: Option<&str>,
         before: Option<&str>,
     ) -> Result<(Arc<Self>, Vec<Message>), JournalError> {
         let io_error = |source| JournalError::Io {
@@ -294,38 +411,81 @@ impl Journal {
             .iter()
             .rposition(|&byte| byte == b'\n')
             .map_or(0, |end| end + 1);
-        let Saved {
-            mut history,
-            mut marks,
-            mut lost,
+        let Replayed {
+            mut lines,
+            mut current,
             title,
             settings,
             notes,
             changes,
             facts,
         } = replay(path, &bytes[..complete])?;
-        let saved = history.len();
+        let switched = match branch {
+            Some(id) if id != lines[current].branch.id => {
+                current = lines
+                    .iter()
+                    .position(|line| line.branch.id == id)
+                    .ok_or_else(|| {
+                        io_error(io::Error::other(format!("no branch has the id {id}")))
+                    })?;
+                Some(id)
+            }
+            _ => None,
+        };
+        let mut forked: Option<Forked> = None;
+        let mut target: Option<(usize, Option<usize>)> = None;
+        if let Some(id) = before {
+            let Some(found) = lines[current].find(id) else {
+                return Err(io_error(io::Error::other(format!(
+                    "no turn has the id {id}"
+                ))));
+            };
+            target = Some(found);
+            if lines[current].bare() {
+                lines[current].branch.before = Some(id.to_owned());
+                forked = Some(Forked {
+                    id: lines[current].branch.id.clone(),
+                    before: id.to_owned(),
+                });
+            } else {
+                let made = Forked {
+                    id: (lines.len() + 1).to_string(),
+                    before: id.to_owned(),
+                };
+                let line = lines[current].branched(&made);
+                lines.push(line);
+                current = lines.len() - 1;
+                forked = Some(made);
+            }
+        }
         if complete < bytes.len() {
             file.set_len(complete as u64).map_err(io_error)?;
         }
         file.seek(SeekFrom::End(0)).map_err(io_error)?;
+        let Line {
+            branch: opened,
+            mut history,
+            ..
+        } = std::mem::take(&mut lines[current]);
+        let Branch {
+            mut marks,
+            mut lost,
+            ..
+        } = opened.clone();
+        let saved = history.len();
         if let Some(turns) = keep {
             history.truncate(end_of_turns(&history, turns));
             lost.retain(|held| held.at <= history.len());
         }
-        let mut forgotten: Option<String> = None;
-        if let Some(id) = before {
-            if let Some((at, _)) = marks.iter().find(|(_, mark)| mark.id == id) {
-                history.truncate(history.len().min(*at));
-                lost.retain(|held| held.at <= history.len());
-            } else if let Some(index) = lost.iter().position(|held| held.mark.id == id) {
-                history.truncate(history.len().min(lost[index].at));
-                lost.truncate(index);
-                forgotten = Some(id.to_owned());
-            } else {
-                return Err(io_error(io::Error::other(format!(
-                    "no turn has the id {id}"
-                ))));
+        let mut forgotten: Option<&str> = None;
+        if let Some((at, lost_index)) = target {
+            history.truncate(history.len().min(at));
+            match lost_index {
+                Some(index) => {
+                    lost.truncate(index);
+                    forgotten = before;
+                }
+                None => lost.retain(|held| held.at <= history.len()),
             }
         }
         let intended = history.len();
@@ -343,18 +503,37 @@ impl Journal {
                 reason: INTERRUPTED.to_owned(),
             })
             .collect();
-        if let Some(id) = &forgotten {
+        let mut wrote = false;
+        if let Some(id) = switched {
+            write_record(&mut file, &Written::Switch(id)).map_err(io_error)?;
+            wrote = true;
+        }
+        if let Some(made) = &forked {
+            write_record(&mut file, &Written::Branch(made)).map_err(io_error)?;
+            wrote = true;
+        }
+        if let Some(id) = forgotten {
             write_record(&mut file, &Written::Forget(id)).map_err(io_error)?;
+            wrote = true;
         }
         if history.len() < saved {
             write_record(&mut file, &Written::Cut(history.len())).map_err(io_error)?;
             for turn in &interrupted {
                 write_record(&mut file, &Written::Lost(turn)).map_err(io_error)?;
             }
+            wrote = true;
+        }
+        if wrote {
             file.sync_data().map_err(io_error)?;
         }
         lost.extend(interrupted);
         marks.retain(|(at, _)| *at < history.len());
+        let mut branches: Vec<Branch> = lines.into_iter().map(|line| line.branch).collect();
+        branches[current] = Branch {
+            marks: Vec::new(),
+            lost: Vec::new(),
+            ..opened
+        };
         let journal = Arc::new(Self {
             path: path.to_path_buf(),
             notes,
@@ -369,9 +548,85 @@ impl Journal {
                 settings,
                 changes,
                 facts,
+                branches,
+                current,
             }),
         });
         Ok((journal, history))
+    }
+
+    /// Copies the branch the conversation saved at `source` is on, up to the turn `before` when that is given or whole otherwise, to `destination` as a conversation of its own: its messages and turns, its lost turns, its name, its settings, its notebook, the files its tool calls changed and the facts saved with it. The copy has one branch; `source` is only read, so it may be open elsewhere.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::Io`] when `source` cannot be read, no turn of its branch has the id `before`, `destination` cannot be opened or written or already holds a history, and [`JournalError::Corrupt`] when `source` is not a history.
+    pub fn fork(
+        source: &Path,
+        destination: &Path,
+        before: Option<&str>,
+    ) -> Result<(), JournalError> {
+        let saved = Self::read(source)?;
+        let mut line = Line {
+            branch: Branch {
+                marks: saved.marks,
+                lost: saved.lost,
+                ..Branch::default()
+            },
+            history: saved.history,
+            grown: true,
+        };
+        let failed = |error: io::Error| JournalError::Io {
+            path: destination.to_path_buf(),
+            source: error,
+        };
+        if let Some(id) = before {
+            let Some((at, lost_index)) = line.find(id) else {
+                return Err(JournalError::Io {
+                    path: source.to_path_buf(),
+                    source: io::Error::other(format!("no turn has the id {id}")),
+                });
+            };
+            line.history.truncate(at);
+            if let Some(index) = lost_index {
+                line.branch.lost.truncate(index);
+            }
+        }
+        let length = line.history.len();
+        line.branch.lost.retain(|held| held.at <= length);
+        line.branch.marks.retain(|(at, _)| *at < length);
+        let (journal, existing) = Self::open(destination, None)?;
+        if !existing.is_empty() || !journal.marks().is_empty() || !journal.lost().is_empty() {
+            return Err(failed(io::Error::other(
+                "the conversation already has a history",
+            )));
+        }
+        let mut state = journal.lock();
+        let file = &mut state.file;
+        for (at, message) in line.history.iter().enumerate() {
+            if let Some((_, mark)) = line.branch.marks.iter().find(|(start, _)| *start == at) {
+                write_record(file, &Written::Turn(mark)).map_err(failed)?;
+            }
+            write_record(file, &Written::Message(message)).map_err(failed)?;
+        }
+        for turn in &line.branch.lost {
+            write_record(file, &Written::Lost(turn)).map_err(failed)?;
+        }
+        if !saved.notes.is_empty() {
+            write_record(file, &Written::Notes(&saved.notes)).map_err(failed)?;
+        }
+        if let Some(title) = &saved.title {
+            write_record(file, &Written::Title(title)).map_err(failed)?;
+        }
+        for (id, value) in &saved.settings {
+            write_record(file, &Written::Setting(id, value)).map_err(failed)?;
+        }
+        for (call, files) in &saved.changes {
+            write_record(file, &Written::Changes(call, files)).map_err(failed)?;
+        }
+        for (key, value) in &saved.facts {
+            write_record(file, &Written::Fact(key, value)).map_err(failed)?;
+        }
+        file.sync_data().map_err(failed)
     }
 
     /// Reads the history in the file at `path` without opening it for writing or locking it, so that a conversation that is open elsewhere can be read; an incomplete last line is left out.
@@ -388,7 +643,7 @@ impl Journal {
             .iter()
             .rposition(|&byte| byte == b'\n')
             .map_or(0, |end| end + 1);
-        replay(path, &bytes[..complete])
+        replay(path, &bytes[..complete]).map(Replayed::into_saved)
     }
 
     /// Names the conversation saved at `path` `title`, which works on a conversation nobody has open; a turn that was left unanswered is cut back, as it is whenever the history is opened.
@@ -499,6 +754,21 @@ impl Journal {
     /// The marks of the turns in the history now, in order.
     pub fn marks(&self) -> Vec<Marked> {
         self.lock().marks.clone()
+    }
+
+    /// The id of the branch the conversation is on, and every branch, in the order they were made, the one it is on with its turns as they are now.
+    pub fn branches(&self) -> (String, Vec<Branch>) {
+        let state = self.lock();
+        let mut branches = state.branches.clone();
+        let id = match branches.get_mut(state.current) {
+            Some(branch) => {
+                branch.marks.clone_from(&state.marks);
+                branch.lost.clone_from(&state.lost);
+                branch.id.clone()
+            }
+            None => FIRST_BRANCH.to_owned(),
+        };
+        (id, branches)
     }
 
     /// Records that the turn that starts with the next message, which will be message number `at`, is the one `mark` describes.
@@ -767,18 +1037,73 @@ fn write_record(file: &mut File, record: &Written<'_>) -> io::Result<()> {
     file.write_all(&line)
 }
 
-/// Builds the saved conversation the complete lines in `bytes` add up to.
+/// What replaying a history file gives: every branch with its messages, the one the conversation is on, and what the conversation holds besides.
+struct Replayed {
+    /// Every branch, in the order they were made.
+    lines: Vec<Line>,
+    /// The index in `lines` of the branch the conversation is on.
+    current: usize,
+    /// The conversation's name.
+    title: Option<String>,
+    /// The latest value of each chosen setting, oldest choice first.
+    settings: Vec<(String, String)>,
+    /// The notebook.
+    notes: String,
+    /// The files each tool call changed, by the id of the call.
+    changes: std::collections::HashMap<String, Vec<FileChange>>,
+    /// The latest value saved under each key, oldest first.
+    facts: Vec<(String, serde_json::Value)>,
+}
+
+impl Replayed {
+    /// The saved conversation this is, on the branch it is on.
+    fn into_saved(self) -> Saved {
+        let Self {
+            lines,
+            current,
+            title,
+            settings,
+            notes,
+            changes,
+            facts,
+        } = self;
+        let mut branches = Vec::with_capacity(lines.len());
+        let mut history = Vec::new();
+        for (index, line) in lines.into_iter().enumerate() {
+            if index == current {
+                history = line.history;
+            }
+            branches.push(line.branch);
+        }
+        let on = branches[current].clone();
+        Saved {
+            history,
+            marks: on.marks,
+            lost: on.lost,
+            title,
+            settings,
+            notes,
+            changes,
+            facts,
+            branch: on.id,
+            branches,
+        }
+    }
+}
+
+/// Builds the saved conversation the complete lines in `bytes` add up to, with every branch it holds.
+///
+/// A history written before branches were recorded has none of their records, and replays as the one branch [`FIRST_BRANCH`].
 ///
 /// # Errors
 ///
-/// Returns [`JournalError::Corrupt`] for a line that is not a record, or a cut-back past the start or past the end.
-fn replay(path: &Path, bytes: &[u8]) -> Result<Saved, JournalError> {
-    let mut history = Vec::new();
+/// Returns [`JournalError::Corrupt`] for a line that is not a record, a cut-back past the start or past the end, or a switch to a branch that was never made.
+fn replay(path: &Path, bytes: &[u8]) -> Result<Replayed, JournalError> {
+    let mut lines = vec![Line::first()];
+    let mut current = 0;
     let mut notes = String::new();
     let mut title = None;
     let mut settings: Vec<(String, String)> = Vec::new();
-    let mut marks: Vec<Marked> = Vec::new();
-    let mut lost: Vec<Lost> = Vec::new();
     let mut changes: std::collections::HashMap<String, Vec<FileChange>> =
         std::collections::HashMap::new();
     let mut facts: Vec<(String, serde_json::Value)> = Vec::new();
@@ -789,15 +1114,21 @@ fn replay(path: &Path, bytes: &[u8]) -> Result<Saved, JournalError> {
             line: index + 1,
             reason,
         };
-        match serde_json::from_slice(line).map_err(|error| corrupt(error.to_string()))? {
-            Record::Turn(mark) => waiting = Some(mark),
+        let record = serde_json::from_slice(line).map_err(|error| corrupt(error.to_string()))?;
+        let on = &mut lines[current];
+        match record {
+            Record::Turn(mark) => {
+                on.grown = true;
+                waiting = Some(mark);
+            }
             Record::Message(message) => {
                 if matches!(message, Message::User(_))
                     && let Some(mark) = waiting.take()
                 {
-                    marks.push((history.len(), mark));
+                    on.branch.marks.push((on.history.len(), mark));
                 }
-                history.push(message);
+                on.grown = true;
+                on.history.push(message);
             }
             Record::Notes(text) => notes = text,
             Record::Title(text) => title = Some(text),
@@ -805,7 +1136,7 @@ fn replay(path: &Path, bytes: &[u8]) -> Result<Saved, JournalError> {
                 settings.retain(|(held, _)| *held != id);
                 settings.push((id, value));
             }
-            Record::Lost(turn) => lost.push(turn),
+            Record::Lost(turn) => on.branch.lost.push(turn),
             Record::Changes(call, files) => {
                 changes.insert(call, files);
             }
@@ -814,28 +1145,47 @@ fn replay(path: &Path, bytes: &[u8]) -> Result<Saved, JournalError> {
                 facts.push((key, value));
             }
             Record::Forget(id) => {
-                if let Some(index) = lost.iter().position(|held| held.mark.id == id) {
-                    lost.truncate(index);
+                if let Some(index) = on.branch.lost.iter().position(|held| held.mark.id == id) {
+                    on.branch.lost.truncate(index);
                 }
             }
-            Record::Cut(length) if length <= history.len() => {
-                history.truncate(length);
-                marks.retain(|(at, _)| *at < length);
-                lost.retain(|held| held.at <= length);
+            Record::Cut(length) if length <= on.history.len() => {
+                on.history.truncate(length);
+                on.branch.marks.retain(|(at, _)| *at < length);
+                on.branch.lost.retain(|held| held.at <= length);
                 waiting = None;
             }
             Record::Cut(length) => {
                 return Err(corrupt(format!(
                     "cut back to {length} of {} messages",
-                    history.len()
+                    on.history.len()
                 )));
+            }
+            Record::Branch(forked) if forked.id == on.branch.id => {
+                on.branch.before = Some(forked.before);
+                waiting = None;
+            }
+            Record::Branch(forked) => {
+                let made = on.branched(&forked);
+                if lines.iter().any(|line| line.branch.id == forked.id) {
+                    return Err(corrupt(format!("branch {} is made twice", forked.id)));
+                }
+                lines.push(made);
+                current = lines.len() - 1;
+                waiting = None;
+            }
+            Record::Switch(id) => {
+                current = lines
+                    .iter()
+                    .position(|line| line.branch.id == id)
+                    .ok_or_else(|| corrupt(format!("no branch has the id {id}")))?;
+                waiting = None;
             }
         }
     }
-    Ok(Saved {
-        history,
-        marks,
-        lost,
+    Ok(Replayed {
+        lines,
+        current,
         title,
         settings,
         notes,
@@ -1293,5 +1643,156 @@ mod tests {
         assert_eq!(saved.changes["c1"][0].new, "y\n");
         assert_eq!(saved.window(), Some(2000));
         assert_eq!(saved.facts.len(), 1);
+    }
+
+    /// Saves turns with the ids `ids`, each a prompt and an answer, on the branch `journal` is on, which holds `at` messages so far.
+    fn turns(journal: &Arc<Journal>, at: usize, ids: &[&str]) {
+        let scribe = journal.scribe();
+        for (index, id) in ids.iter().enumerate() {
+            journal
+                .mark(
+                    at + 2 * index,
+                    &Mark {
+                        id: (*id).into(),
+                        text: format!("prompt {id}"),
+                        files: Vec::new(),
+                    },
+                )
+                .unwrap();
+            scribe.append(&Message::User(format!("u{id}"))).unwrap();
+            scribe.append(&said(&format!("a{id}"))).unwrap();
+        }
+    }
+
+    /// The ids of the turns `branch` holds, in order.
+    fn ids(branch: &Branch) -> Vec<&str> {
+        branch
+            .marks
+            .iter()
+            .map(|(_, mark)| mark.id.as_str())
+            .collect()
+    }
+
+    /// Going back to before a turn starts a new branch there; the turns left behind stay in the file on the first branch, which can be opened again at its tip, and each branch keeps the turns added to it.
+    #[test]
+    fn going_back_branches_and_keeps_the_turns_left_behind() {
+        let path = scratch("branches.jsonl");
+        let (journal, _) = Journal::open(&path, None).unwrap();
+        turns(&journal, 0, &["a", "b", "c"]);
+        assert_eq!(journal.branches().0, FIRST_BRANCH);
+        drop(journal);
+        let (journal, history) = Journal::open_before(&path, None, Some("b")).unwrap();
+        assert_eq!(history.len(), 2);
+        let (on, branches) = journal.branches();
+        assert_eq!(on, "2");
+        assert_eq!(branches.len(), 2);
+        assert_eq!(ids(&branches[0]), ["a", "b", "c"]);
+        assert_eq!(
+            (branches[1].parent.as_deref(), branches[1].before.as_deref()),
+            (Some(FIRST_BRANCH), Some("b"))
+        );
+        turns(&journal, 2, &["d"]);
+        assert_eq!(ids(&journal.branches().1[1]), ["a", "d"]);
+        drop(journal);
+        let saved = Journal::read(&path).unwrap();
+        assert_eq!(saved.branch, "2");
+        assert_eq!(saved.history.len(), 4);
+        let (journal, history) =
+            Journal::open_branch(&path, None, Some(FIRST_BRANCH), None).unwrap();
+        assert_eq!(history, answered(&["a", "b", "c"]));
+        assert_eq!(journal.marks().len(), 3);
+        assert_eq!(ids(&journal.branches().1[1]), ["a", "d"]);
+        turns(&journal, 6, &["e"]);
+        drop(journal);
+        let (journal, history) = Journal::open_branch(&path, None, Some("2"), None).unwrap();
+        assert_eq!(history, answered(&["a", "d"]));
+        assert_eq!(ids(&journal.branches().1[0]), ["a", "b", "c", "e"]);
+        drop(journal);
+        assert_eq!(Journal::read(&path).unwrap().branch, "2");
+    }
+
+    /// The prompts and answers `turns` saves for the ids `ids`.
+    fn answered(ids: &[&str]) -> Vec<Message> {
+        ids.iter()
+            .flat_map(|id| [Message::User(format!("u{id}")), said(&format!("a{id}"))])
+            .collect()
+    }
+
+    /// Going back again before any turn was added moves the branch made by the first going back, instead of making another one, while a branch that had messages added, even without a turn id, is branched again; a branch or turn nobody has fails without touching the file.
+    #[test]
+    fn going_back_twice_in_a_row_makes_one_branch() {
+        let path = scratch("twice.jsonl");
+        let (journal, _) = Journal::open(&path, None).unwrap();
+        turns(&journal, 0, &["a", "b", "c"]);
+        drop(journal);
+        drop(Journal::open_before(&path, None, Some("c")).unwrap());
+        let (journal, history) = Journal::open_before(&path, None, Some("b")).unwrap();
+        assert_eq!(history.len(), 2);
+        let (on, branches) = journal.branches();
+        assert_eq!((on.as_str(), branches.len()), ("2", 2));
+        assert_eq!(branches[1].before.as_deref(), Some("b"));
+        drop(journal);
+        let (journal, _) = Journal::open_branch(&path, None, None, None).unwrap();
+        append_all(&journal, &[Message::User("unmarked".into()), said("ok")]);
+        drop(journal);
+        let (journal, _) = Journal::open_before(&path, None, Some("a")).unwrap();
+        assert_eq!(journal.branches().0, "3");
+        drop(journal);
+        let (journal, history) = Journal::open_branch(&path, None, Some("2"), None).unwrap();
+        assert_eq!(history.len(), 4);
+        drop(journal);
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(Journal::open_branch(&path, None, Some("9"), None).is_err());
+        assert!(Journal::open_branch(&path, None, Some(FIRST_BRANCH), Some("zzz")).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
+        let saved = Journal::read(&path).unwrap();
+        assert_eq!(saved.branches.len(), 3);
+        assert_eq!(ids(&saved.branches[0]), ["a", "b", "c"]);
+        assert_eq!(saved.branches[1].before.as_deref(), Some("b"));
+        assert_eq!(saved.branches[2].parent.as_deref(), Some("2"));
+    }
+
+    /// A history saved before branches were recorded loads as the one first branch.
+    #[test]
+    fn a_history_without_branches_is_one_branch() {
+        let path = scratch("linear.jsonl");
+        std::fs::write(
+            &path,
+            "{\"turn\":{\"id\":\"t\",\"text\":\"q\"}}\n{\"message\":{\"User\":\"q\"}}\n{\"message\":{\"Assistant\":{\"text\":\"a\"}}}\n",
+        )
+        .unwrap();
+        let saved = Journal::read(&path).unwrap();
+        assert_eq!(saved.branch, FIRST_BRANCH);
+        assert_eq!(saved.branches.len(), 1);
+        assert_eq!(ids(&saved.branches[0]), ["t"]);
+        assert_eq!(saved.branches[0].parent, None);
+        let (journal, history) = Journal::open(&path, None).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(journal.branches().0, FIRST_BRANCH);
+    }
+
+    /// Forking copies the branch the conversation is on up to a turn into a conversation of its own, with its name and settings, leaving the original as it was; a destination with a history is refused.
+    #[test]
+    fn forking_copies_the_branch_up_to_a_turn() {
+        let path = scratch("fork-source.jsonl");
+        let copy = scratch("fork-copy.jsonl");
+        let (journal, _) = Journal::open(&path, None).unwrap();
+        turns(&journal, 0, &["a", "b", "c"]);
+        journal.save_title("Source").unwrap();
+        journal.save_setting("mode", "yolo").unwrap();
+        journal.save_notes("notebook").unwrap();
+        Journal::fork(&path, &copy, Some("c")).unwrap();
+        assert_eq!(journal.marks().len(), 3);
+        drop(journal);
+        let saved = Journal::read(&copy).unwrap();
+        assert_eq!(saved.history, answered(&["a", "b"]));
+        assert_eq!(saved.marks.len(), 2);
+        assert_eq!(saved.title.as_deref(), Some("Source"));
+        assert_eq!(saved.settings, [("mode".to_owned(), "yolo".to_owned())]);
+        assert_eq!(saved.notes, "notebook");
+        assert_eq!(saved.branches.len(), 1);
+        assert!(Journal::fork(&path, &copy, None).is_err());
+        assert!(Journal::fork(&path, &scratch("fork-none.jsonl"), Some("zzz")).is_err());
+        assert_eq!(Journal::read(&path).unwrap().history.len(), 6);
     }
 }

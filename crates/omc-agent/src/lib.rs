@@ -25,7 +25,10 @@ pub use compaction::{COMPACT, context, replayed};
 pub use hooks::{
     CompactTrigger, Compacting, Gate, Hooks, MAX_STOP_IN_A_ROW, MAX_STOP_PER_TURN, Screened,
 };
-pub use journal::{INTERRUPTED, Journal, JournalError, Lost, Mark, Marked, STOPPED, Saved, Scribe};
+pub use journal::{
+    Branch, FIRST_BRANCH, INTERRUPTED, Journal, JournalError, Lost, Mark, Marked, STOPPED, Saved,
+    Scribe,
+};
 pub use recall::{RECALL, spec as recall_spec};
 pub use steering::Steering;
 pub use task::{EventSink, MAX_CONCURRENT, MAX_TASKS, PromptBuilder, Task, TaskSettings};

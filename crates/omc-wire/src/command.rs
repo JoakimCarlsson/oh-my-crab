@@ -41,7 +41,7 @@ pub struct Opening {
     /// The values to give settings the saved conversation has no choice for, as setting ids and values; a choice that was saved wins over these.
     #[serde(default)]
     pub defaults: Vec<(String, String)>,
-    /// The id of the turn to go back to before when the saved history is loaded: it and everything after it is cut from the history and from the file. Opening fails when no turn has the id.
+    /// The id of the turn to go back to before when the saved history is loaded: the conversation goes on from before it on a new branch, and it and the turns after it stay saved on the branch they were on, which [`Command::Switch`] goes back to. Opening fails when no turn has the id.
     #[serde(default)]
     pub before: Option<String>,
     /// Whether the client answers [`crate::Event::Language`] requests: it runs language servers of its own, so the harness asks it to format the files it writes and to say what is wrong with them, and starts none itself.
@@ -118,6 +118,11 @@ pub enum Command {
         ticket: u64,
         /// The reader's decision.
         verdict: Verdict,
+    },
+    /// Switches the saved conversation to the branch `branch`, at its tip, and tells the client the turns it holds with a [`crate::Event::Resumed`]; a running turn is cancelled first, as [`Command::Cancel`] does. Fails with a [`crate::Event::Failed`] when the conversation is not saved or has no branch with that id.
+    Switch {
+        /// The id of the branch, as [`crate::Branch::id`] gives it.
+        branch: String,
     },
     /// Ends the conversation and the harness.
     Close,

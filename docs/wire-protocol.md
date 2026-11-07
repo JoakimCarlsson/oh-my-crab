@@ -71,7 +71,7 @@ out is refused as a bad command.
    exactly one `Finished`, or with `SignedOut` when the account needs signing
    in again.
 4. Between turns, and during them, the client may send `Set`, `Rename`,
-   `Login` and more prompts. A prompt sent during a turn is queued (see
+   `Login`, `Switch` and more prompts. A prompt sent during a turn is queued (see
    [Queued prompts](#queued-prompts)).
 5. `Cancel` stops the running turn: crab sends `Halted` and then
    `Finished` with `null`.
@@ -225,9 +225,62 @@ turn differs from the live one in a few ways:
   before them.
 - A compaction shows as a finished `compact` call whose output is its summary.
 
-`keep` limits how many turns are loaded. `before` cuts the history back to
-before the turn with that id, in memory and in the file; crab sends `Resumed`
-again with what is left. A `before` id that names no turn fails the `Open`.
+`keep` limits how many turns are loaded. `before` goes back to before the
+turn with that id: the conversation goes on from there on a new branch, and
+`Resumed` carries the turns before it. A `before` id that names no turn of the
+branch fails the `Open`.
+
+### Branches
+
+A saved conversation is a tree of branches. Going back with `before` does not
+delete anything: the turn named and the turns after it stay in the file, on
+the branch they were on, and the conversation goes on on a new branch that
+holds the turns before that point. Its first prompt starts the new line.
+
+- Crab names branches itself: `1` is the branch a conversation starts on, and
+  each new branch takes the next number. A history saved before crab
+  recorded branches loads as branch `1`.
+- `Resumed` says which branch its `turns` are of in `branch`, and lists every
+  branch in `branches`, each with the branch it went back from (`parent`), the
+  turn of that branch it went back to before (`before`) and all its turns,
+  the ones it shares with its parent included. That is enough to draw the
+  tree: two branches share their turns up to `before`.
+- `Switch` moves the conversation to another branch, at its tip, and crab
+  answers with `Resumed` for that branch. The model carries on from that
+  branch's turns. The branch a conversation is on is saved, so opening it
+  again later comes back on the same branch.
+- Going back again before any prompt was sent on a branch made by going back
+  moves that branch's starting point instead of making another branch, so
+  that stepping back several turns one at a time leaves one branch.
+- `crab history` prints the branches too, and `crab fork` copies the branch a
+  conversation is on, up to a turn, into a new conversation of its own; see
+  [commands](usage.md).
+
+From a real run: three turns (`t-1` to `t-3`) were saved, then the
+conversation was opened again with `"before":"t-2"`, prompted on the new
+branch, opened again, and switched back to branch `1` (lines shortened):
+
+```json
+{"Open":{"directory":"/home/me/project","provider":"claude","model":"claude-haiku-5-5","yolo":true,"conversation":"br-1","before":"t-2"}}
+{"Resumed":{"title":null,...,"turns":[{"id":"t-1","prompt":"Remember the colour red. Reply with only: ok",...}],...,"branch":"2","branches":[{"id":"1","parent":null,"before":null,"turns":[{"id":"t-1",...},{"id":"t-2",...},{"id":"t-3",...}]},{"id":"2","parent":"1","before":"t-2","turns":[{"id":"t-1",...}]}]}}
+{"Prompt":{"text":"Now also remember blue. Which colours did I ask you to remember? One line.","files":[],"turn":"t-4"}}
+{"Said":"Red and blue."}
+{"Finished":null}
+"Close"
+{"Open":{"directory":"/home/me/project","provider":"claude","model":"claude-haiku-5-5","yolo":true,"conversation":"br-1"}}
+{"Resumed":{...,"branch":"2",...}}
+{"Switch":{"branch":"1"}}
+{"Resumed":{...,"turns":[{"id":"t-1",...},{"id":"t-2",...},{"id":"t-3",...}],...,"branch":"1",...}}
+{"Prompt":{"text":"Which colours did I ask you to remember? One line.","files":[],"turn":"t-5"}}
+{"Said":"Red and green."}
+{"Finished":null}
+{"Switch":{"branch":"7"}}
+{"Failed":"no branch has the id 7"}
+```
+
+In the file, going back is a `branch` record followed by the cut-back, and
+switching is a `switch` record; the turns of every branch stay where they
+were written.
 
 ### Tool events are updates
 
@@ -283,7 +336,7 @@ Opens the conversation; it must come before anything else. Carries an
 | `history`      | path                       | optional | The folder the history files are kept in.                                                                                    |
 | `keep`         | integer                    | optional | How many of the saved turns to load; all when `null`.                                                                        |
 | `defaults`     | list of pairs              | default  | `[setting id, value]` pairs for settings the saved conversation has no choice for.                                           |
-| `before`       | string                     | optional | A turn id: that turn and everything after it is cut from the history and its file.                                           |
+| `before`       | string                     | optional | A turn id: the conversation goes back to before that turn, on a new branch; the turns left behind stay saved. See [Branches](#branches). |
 | `languages`    | bool                       | default  | Whether the client answers `Language` requests; crab then starts no language servers of its own.                             |
 
 The shortest valid `Open`:
@@ -476,6 +529,23 @@ a trusted project brings is used from the next turn on. See
 
 ```json
 {"Trust":{"ticket":1,"verdict":"Always"}}
+```
+
+### `Switch`
+
+Moves a saved conversation to another branch, at its tip. A running turn is
+cancelled first, as `Cancel` does, and the prompts waiting for it are dropped;
+background runs and debugging sessions go on. Crab answers with `Resumed` for
+the branch. A conversation opened without an id, or a branch id the
+conversation does not have, gets a `Failed` event, and the conversation stays
+where it was. See [Branches](#branches).
+
+| Field    | Type   | Presence | Meaning                                     |
+| -------- | ------ | -------- | ------------------------------------------- |
+| `branch` | string | required | The branch's `id`, as `Resumed` lists it.   |
+
+```json
+{"Switch":{"branch":"1"}}
 ```
 
 ### `Close`
@@ -835,13 +905,13 @@ From a real run:
 
 ```json
 {"Failed":"the conversation is not open"}
-{"Failed":"bad command: unknown variant `Nope`, expected one of `Open`, `Prompt`, `Choose`, `Answer`, `Rename`, `Cancel`, `Set`, `Login`, `Language`, `Trust`, `Close` at line 1 column 7"}
+{"Failed":"bad command: unknown variant `Nope`, expected one of `Open`, `Prompt`, `Choose`, `Answer`, `Rename`, `Cancel`, `Set`, `Login`, `Language`, `Trust`, `Switch`, `Close` at line 1 column 7"}
 ```
 
 ### `Resumed`
 
 The conversation as it was saved, sent when a conversation with an id is
-opened and again when `before` cuts it back. See
+opened, when `before` goes back to before a turn, and after `Switch`. See
 [History replay](#history-replay). Carries a `Conversation`:
 
 | Field      | Type               | Presence | Meaning                                                      |
@@ -852,6 +922,8 @@ opened and again when `before` cuts it back. See
 | `offered`  | list of `Setting`  | default  | What could be set when it was last offered.                  |
 | `commands` | list of `Slash`    | default  | The slash commands last offered.                             |
 | `window`   | integer            | optional | The context window of the model last used, in tokens.        |
+| `branch`   | string             | optional | The id of the branch `turns` are of; see [Branches](#branches). |
+| `branches` | list of `Branch`   | default  | Every branch, in the order they were made, the first first.  |
 
 A `PastTurn`:
 
@@ -866,6 +938,27 @@ From a real run (lines shortened):
 
 ```json
 {"Resumed":{"title":null,"settings":[],"turns":[{"id":"t-1","prompt":"Read calc.py and fix the bug in add. Be brief.","files":[],"events":[{"Tool":{"id":"toolu_01BJncUS5JG4uPGyhLqWQqzL","title":"read","kind":"Read","state":"Running","target":"calc.py","diff":null,"output":null,"parent":null,"agent":null,"worktree":null}},{"Used":{"used":22927,"size":1000000}},...,{"Started":"Text"},{"Said":"Fixed `add` in `calc.py`: it returned `a - b`, and now returns `a + b`."},{"Used":{"used":23141,"size":1000000}}]}],"offered":[...],"commands":[...],"window":1000000}}
+```
+
+A `Branch`:
+
+| Field    | Type                 | Presence | Meaning                                                                 |
+| -------- | -------------------- | -------- | ----------------------------------------------------------------------- |
+| `id`     | string               | required | What `Switch` names it by: `1` for the first, counting up.              |
+| `parent` | string               | optional | The branch it went back from; `null` for the first.                     |
+| `before` | string               | optional | The turn of `parent` it went back to before; `null` for the first.      |
+| `turns`  | list of `BranchTurn` | default  | Its turns that have an id, oldest first, shared ones included.          |
+
+A `BranchTurn`:
+
+| Field    | Type   | Presence | Meaning                                                                     |
+| -------- | ------ | -------- | --------------------------------------------------------------------------- |
+| `id`     | string | required | The `turn` id the client gave the prompt.                                   |
+| `prompt` | string | required | What the reader prompted with.                                              |
+| `ended`  | string | optional | How a turn without an answer ended: `stopped`, `interrupted`, or the failure; `null` for one that answered. |
+
+```json
+{"Resumed":{"title":null,"settings":[],"turns":[],"offered":[],"commands":[],"window":200000,"branch":"2","branches":[{"id":"1","parent":null,"before":null,"turns":[{"id":"t-1","prompt":"Say only the word: red","ended":null},{"id":"t-2","prompt":"Say only the word: green","ended":"stopped"}]},{"id":"2","parent":"1","before":"t-1","turns":[]}]}}
 ```
 
 `crab history <id> [folder]` prints the same `Conversation` without opening

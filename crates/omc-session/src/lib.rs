@@ -30,4 +30,4 @@ pub use memory::memory;
 pub use providers::{account, key_source, providers, save_key, signed_in};
 pub use serve::serve;
 pub use session::{Options, run, run_with};
-pub use session::{history, import, rename};
+pub use session::{fork, history, import, rename};

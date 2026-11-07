@@ -4,6 +4,7 @@
 //! per line. This crate holds only the shapes of those messages and how they
 //! are framed, so both ends can depend on it without depending on each other.
 
+mod branch;
 mod command;
 mod event;
 mod frame;
@@ -21,6 +22,7 @@ mod toolserver;
 mod trust;
 mod usage;
 
+pub use branch::{Branch, BranchTurn};
 pub use command::{Command, Opening};
 pub use event::{Conversation, Event, Part, PastTurn};
 pub use frame::{decode, encode};

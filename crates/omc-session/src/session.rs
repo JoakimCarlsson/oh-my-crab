@@ -242,6 +242,7 @@ impl Session {
                 self.shared.client_languages.answer(ticket, answer);
             }
             Command::Trust { ticket, verdict } => self.trust(ticket, verdict),
+            Command::Switch { branch } => self.switch(&branch),
             Command::Close => {}
         }
     }
@@ -421,6 +422,48 @@ impl Session {
         self.tell_trust();
     }
 
+    /// Switches the saved conversation to the branch `branch`, at its tip, and tells the client the turns it holds; a running turn is cancelled first, and the prompts queued for it are dropped. Background runs and debugging sessions go on, since the conversation is the same.
+    ///
+    /// The client is told why with [`Event::Failed`] when the conversation is not saved, has no such branch, or its file cannot be opened again; the conversation then stays where it was when it can.
+    fn switch(&mut self, branch: &str) {
+        let Some(journal) = self.journal.clone() else {
+            return self.say(Event::Failed(
+                "the conversation is not saved, so it has no branches".to_owned(),
+            ));
+        };
+        if !journal.branches().1.iter().any(|held| held.id == branch) {
+            return self.say(Event::Failed(format!("no branch has the id {branch}")));
+        }
+        self.cancel();
+        self.shared.warmer.stop();
+        let path = journal.path().to_path_buf();
+        drop(journal);
+        self.journal = None;
+        self.shared.attach(None);
+        let (journal, history) = match Journal::open_branch(&path, None, Some(branch), None) {
+            Ok(opened) => opened,
+            Err(error) => {
+                self.say(Event::Failed(format!(
+                    "cannot switch to branch {branch}: {error}"
+                )));
+                match Journal::open(&path, None) {
+                    Ok(opened) => opened,
+                    Err(error) => {
+                        return self.say(Event::Failed(format!(
+                            "cannot open the conversation again: {error}"
+                        )));
+                    }
+                }
+            }
+        };
+        self.shared.notebook.load(journal.notes());
+        self.shared.checkpoint.clear();
+        self.history = history;
+        self.journal = Some(journal);
+        self.shared.attach(self.journal.clone());
+        self.say_history();
+    }
+
     /// Answers the trust request under `ticket` with the reader's `verdict`: trusts the project for good, recording it for every worktree of its repository, for this conversation only, or records that it is not trusted; then reads what the project brings again, so the next turn uses it. A ticket that is not the one waiting is ignored.
     fn trust(&mut self, ticket: u64, verdict: omc_wire::Verdict) {
         let Some(open) = &mut self.open else {
@@ -520,6 +563,13 @@ impl Session {
             return;
         };
         let window = omc_providers::context_window(provider, &model);
+        let (branch, branches) = self
+            .journal
+            .as_ref()
+            .map(|journal| journal.branches())
+            .map_or((None, Vec::new()), |(on, all)| {
+                (Some(on), crate::translate::branches(&all))
+            });
         let marks = self
             .journal
             .as_ref()
@@ -552,6 +602,8 @@ impl Session {
             offered: self.fact("settings"),
             commands: self.fact("commands"),
             window: Some(window),
+            branch,
+            branches,
         }));
     }
 
@@ -1042,7 +1094,31 @@ pub fn history(id: &str, folder: Option<PathBuf>) -> Result<omc_wire::Conversati
         offered,
         commands,
         window,
+        branch: Some(saved.branch),
+        branches: crate::translate::branches(&saved.branches),
     })
+}
+
+/// Copies the branch the saved conversation `id` in `folder` is on, up to the turn `before` when that is given or whole otherwise, to the new saved conversation `copy` in the same folder, which a client can then open as a conversation of its own. It works while `id` is open elsewhere.
+///
+/// # Errors
+///
+/// Returns what to tell the client when either id is not usable, `id` cannot be read or has no turn `before`, or `copy` already holds a history, is open elsewhere or cannot be written.
+pub fn fork(
+    id: &str,
+    copy: &str,
+    folder: Option<PathBuf>,
+    before: Option<&str>,
+) -> Result<(), String> {
+    let source = history_file(id, folder.clone())?;
+    let destination = history_file(copy, folder)?;
+    if source == destination {
+        return Err("a conversation cannot be forked into itself".to_owned());
+    }
+    if !source.exists() {
+        return Err(format!("no conversation is saved as {id}"));
+    }
+    Journal::fork(&source, &destination, before).map_err(|error| error.to_string())
 }
 
 /// Names the saved conversation `id` in `folder` `title`, which works on a conversation nobody has open.
@@ -2028,5 +2104,67 @@ mod tests {
                 .contains(&omc_wire::Event::Said("second answer".into()))
         );
         assert!(import("old", Some(folder), &imported).is_err());
+    }
+
+    /// Going back keeps the turns left behind on their branch: `Switch` brings that branch back at its tip and tells the client its turns and every branch, an unknown branch or an unsaved conversation fails, and the branch can be forked into a conversation of its own.
+    #[tokio::test]
+    async fn switching_branches_brings_back_the_turns_left_behind() {
+        let folder = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/branches");
+        let _ = std::fs::remove_dir_all(&folder);
+        let turn = |id: &str| omc_wire::ImportedTurn {
+            id: id.into(),
+            prompt: format!("prompt {id}"),
+            files: Vec::new(),
+            said: format!("answer {id}"),
+            end: None,
+        };
+        let imported = omc_wire::Imported {
+            turns: vec![turn("1"), turn("2"), turn("3")],
+            ..omc_wire::Imported::default()
+        };
+        import("br", Some(folder.clone()), &imported).unwrap();
+        let (journal, messages) =
+            load_history("br", Some(folder.clone()), None, Some("2")).unwrap();
+        assert_eq!(messages.len(), 2);
+        let (mut session, mut events) = busy_session("switch");
+        if let Some((_, task)) = session.running.take() {
+            task.abort();
+        }
+        session.history = messages;
+        session.journal = Some(journal);
+        session.shared.attach(session.journal.clone());
+        session.handle(Command::Switch { branch: "1".into() }).await;
+        let mut resumed = None;
+        while let Ok(event) = events.try_recv() {
+            if let Event::Resumed(conversation) = event {
+                resumed = Some(conversation);
+            }
+        }
+        let resumed = resumed.expect("no Resumed after switching");
+        assert_eq!(resumed.branch.as_deref(), Some("1"));
+        assert_eq!(resumed.turns.len(), 3);
+        assert_eq!(resumed.branches.len(), 2);
+        assert_eq!(resumed.branches[1].before.as_deref(), Some("2"));
+        assert_eq!(resumed.branches[1].turns.len(), 1);
+        assert_eq!(session.history.len(), 6);
+        session.handle(Command::Switch { branch: "9".into() }).await;
+        assert!(matches!(events.try_recv(), Ok(Event::Failed(_))));
+        assert_eq!(session.history.len(), 6);
+        session.journal = None;
+        session.shared.attach(None);
+        let saved = history("br", Some(folder.clone())).unwrap();
+        assert_eq!(saved.branch.as_deref(), Some("1"));
+        assert_eq!(saved.branches.len(), 2);
+        fork("br", "br-copy", Some(folder.clone()), Some("3")).unwrap();
+        let copy = history("br-copy", Some(folder.clone())).unwrap();
+        assert_eq!(copy.turns.len(), 2);
+        assert!(fork("br", "br", Some(folder.clone()), None).is_err());
+        assert!(fork("none", "other", Some(folder), None).is_err());
+        let mut unsaved = bare_session();
+        let (out, mut told) = unbounded_channel();
+        unsaved.shared = Shared::new(out);
+        unsaved.handle(Command::Switch { branch: "1".into() }).await;
+        assert!(matches!(told.try_recv(), Ok(Event::Failed(_))));
     }
 }

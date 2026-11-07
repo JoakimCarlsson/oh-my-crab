@@ -5,9 +5,10 @@ crab serve                      hold a conversation over standard input and outp
 crab tools                      print the tools the agent can have, as a JSON list
 crab providers                  print the providers, as a JSON list of id, name and sign-in
 crab account <p> [folder]       print who provider <p> is signed in as, or nothing
-crab history <id> [folder]      print a saved conversation: title, settings and turns
+crab history <id> [folder]      print a saved conversation: title, settings, turns and branches
 crab rename <id> <folder> <t>   name a saved conversation nobody has open
 crab import <id> <folder>       save a conversation a client kept itself, read as JSON
+crab fork <id> <copy> <folder> [turn]  copy a conversation's branch, up to before a turn, to a new one
 crab memory [folder]            print the memories a conversation in the folder starts with, as JSON
 crab hooks [folder]             print the hooks a conversation in the folder would find and its project's trust, as JSON
 crab trust <folder> [on|off]    print whether the folder's project is trusted, or record that it is or is not
@@ -37,12 +38,20 @@ one prints it as an error.
   nothing when there is none.
 - **`history`** prints the conversation saved under `id`, in the history
   `folder` or the default one, as the events a live conversation would have
-  sent. It works while the conversation is open elsewhere.
+  sent, with the branch those turns are of and every branch of the
+  conversation (see [branches](wire-protocol.md#branches)). It works while the
+  conversation is open elsewhere.
 - **`rename`** names a saved conversation, and fails while another process
   has it open. A client with the conversation open sends `Rename` instead.
 - **`import`** reads a conversation a client kept itself as JSON on standard
   input and saves it under `id`, so that `crab` can open it from then on. It
   refuses a conversation that already has a history.
+- **`fork`** copies the branch the conversation `id` in `folder` is on, up to
+  before the turn `turn` or whole, to the new conversation `copy` in the same
+  folder: its turns, name, settings, notebook and what was saved with it. The
+  copy has one branch, and a client opens it with `Open` like any other. It
+  works while `id` is open elsewhere, and refuses a `copy` that already has a
+  history.
 - **`memory`** prints what a conversation in the folder would start with. See
   [memory](memory.md).
 - **`hooks`** prints every hook found, whether it runs, and what an

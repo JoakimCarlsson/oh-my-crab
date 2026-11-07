@@ -117,6 +117,45 @@ fn lost_turn(lost: &omc_agent::Lost) -> PastTurn {
     }
 }
 
+/// The branches of a saved conversation as the client is told them: each with the turns it holds, in the order they happened, a lost turn before the turn that started where it would have.
+pub(crate) fn branches(saved: &[omc_agent::Branch]) -> Vec<omc_wire::Branch> {
+    saved
+        .iter()
+        .map(|branch| {
+            let mut turns = Vec::with_capacity(branch.marks.len() + branch.lost.len());
+            let mut ended = 0;
+            for (at, mark) in &branch.marks {
+                while ended < branch.lost.len() && branch.lost[ended].at <= *at {
+                    turns.push(branch_turn(
+                        &branch.lost[ended].mark,
+                        Some(&branch.lost[ended].reason),
+                    ));
+                    ended += 1;
+                }
+                turns.push(branch_turn(mark, None));
+            }
+            for lost in &branch.lost[ended..] {
+                turns.push(branch_turn(&lost.mark, Some(&lost.reason)));
+            }
+            omc_wire::Branch {
+                id: branch.id.clone(),
+                parent: branch.parent.clone(),
+                before: branch.before.clone(),
+                turns,
+            }
+        })
+        .collect()
+}
+
+/// The turn `mark` describes, as a branch lists it, which ended for `reason` when it has no answer.
+fn branch_turn(mark: &omc_agent::Mark, reason: Option<&str>) -> omc_wire::BranchTurn {
+    omc_wire::BranchTurn {
+        id: mark.id.clone(),
+        prompt: mark.text.clone(),
+        ended: reason.map(str::to_owned),
+    }
+}
+
 /// The turns a saved `history` tells, as the events a live conversation would have sent for them, with the context size measured against `window`.
 ///
 /// A turn starts at each message the reader wrote. The target of a call is taken from its tool in `registry` when it is still there. The files a call changed come back as its diff when they were saved with it. A compaction shows as a finished `compact` call whose output is its summary, followed by how full the context was after it, as it did live: in a turn of its own when the reader asked for it, which its mark says, and otherwise in the turn it happened in. A pruning shows only as how full the context was after it.
@@ -815,5 +854,49 @@ mod tests {
             })
             .collect();
         assert_eq!(diffs, vec![Some("a.rs"), Some("b.rs")]);
+    }
+
+    /// A branch lists its answered and lost turns in the order they happened, with where it went back from.
+    #[test]
+    fn branches_list_their_turns_in_order() {
+        let mark = |id: &str| omc_agent::Mark {
+            id: id.into(),
+            text: format!("p{id}"),
+            files: Vec::new(),
+        };
+        let listed = branches(&[omc_agent::Branch {
+            id: "2".into(),
+            parent: Some("1".into()),
+            before: Some("x".into()),
+            marks: vec![(0, mark("a")), (2, mark("c"))],
+            lost: vec![
+                omc_agent::Lost {
+                    at: 2,
+                    mark: mark("b"),
+                    reason: omc_agent::STOPPED.into(),
+                },
+                omc_agent::Lost {
+                    at: 4,
+                    mark: mark("d"),
+                    reason: "boom".into(),
+                },
+            ],
+        }]);
+        let turns: Vec<(&str, Option<&str>)> = listed[0]
+            .turns
+            .iter()
+            .map(|turn| (turn.id.as_str(), turn.ended.as_deref()))
+            .collect();
+        assert_eq!(
+            turns,
+            [
+                ("a", None),
+                ("b", Some("stopped")),
+                ("c", None),
+                ("d", Some("boom"))
+            ]
+        );
+        assert_eq!(listed[0].parent.as_deref(), Some("1"));
+        assert_eq!(listed[0].turns[0].prompt, "pa");
     }
 }

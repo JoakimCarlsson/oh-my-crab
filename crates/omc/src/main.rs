@@ -1,7 +1,7 @@
 //! The `crab` binary: the harness, served to another program over standard input and output.
 
 /// Usage text printed for `--help` and after a bad argument.
-const USAGE: &str = "usage: crab <serve|tools|providers|account|history|rename|import|memory|hooks|trust>\n\n  serve                    hold a conversation: read commands from standard input, write events to standard output\n  tools                    print the tools the agent can have, as a JSON list of name and description\n  providers                print the providers a conversation can be opened with, as a JSON list of id, name and sign-in\n  account <provider> [folder]  print who <provider> is signed in as with the logins in [folder], or in crab's own folder, or nothing\n  history <id> [folder]    print the saved conversation <id> as JSON: its title, saved settings and turns, which works while it is open elsewhere\n  rename <id> <folder> <title>  name the saved conversation <id>, which fails while it is open elsewhere\n  import <id> <folder>          save the conversation a client kept, read as JSON from standard input, as the conversation <id>\n  memory [folder]          print the memories a conversation in [folder], or in the current folder, starts with, as JSON: its project's, which every worktree of the repository shares, and the user's\n  hooks [folder]           print the hooks a conversation in [folder], or in the current folder, would find, whether each runs, and its project's trust, as JSON\n  trust <folder> [on|off]  print whether the project <folder> belongs to is trusted, as JSON, or record that it is (on) or is not (off), for every worktree of its repository";
+const USAGE: &str = "usage: crab <serve|tools|providers|account|history|rename|import|fork|memory|hooks|trust>\n\n  serve                    hold a conversation: read commands from standard input, write events to standard output\n  tools                    print the tools the agent can have, as a JSON list of name and description\n  providers                print the providers a conversation can be opened with, as a JSON list of id, name and sign-in\n  account <provider> [folder]  print who <provider> is signed in as with the logins in [folder], or in crab's own folder, or nothing\n  history <id> [folder]    print the saved conversation <id> as JSON: its title, saved settings and turns, which works while it is open elsewhere\n  rename <id> <folder> <title>  name the saved conversation <id>, which fails while it is open elsewhere\n  import <id> <folder>          save the conversation a client kept, read as JSON from standard input, as the conversation <id>\n  fork <id> <copy> <folder> [turn]  copy the branch the saved conversation <id> is on, up to before [turn] or whole, to the new conversation <copy>\n  memory [folder]          print the memories a conversation in [folder], or in the current folder, starts with, as JSON: its project's, which every worktree of the repository shares, and the user's\n  hooks [folder]           print the hooks a conversation in [folder], or in the current folder, would find, whether each runs, and its project's trust, as JSON\n  trust <folder> [on|off]  print whether the project <folder> belongs to is trusted, as JSON, or record that it is (on) or is not (off), for every worktree of its repository";
 
 /// Runs the conversation the command line asks for.
 ///
@@ -70,6 +70,24 @@ async fn main() -> anyhow::Result<()> {
             let imported: omc_wire::Imported = serde_json::from_reader(std::io::stdin().lock())?;
             omc_session::import(&id, Some(std::path::PathBuf::from(folder)), &imported)
                 .map_err(|reason| anyhow::anyhow!(reason))
+        }
+        Some("fork") => {
+            let mut arguments = std::env::args().skip(2);
+            let (Some(id), Some(copy), Some(folder)) =
+                (arguments.next(), arguments.next(), arguments.next())
+            else {
+                return Err(anyhow::anyhow!(
+                    "fork needs a conversation id, the id of the copy and a folder"
+                ));
+            };
+            let before = arguments.next();
+            omc_session::fork(
+                &id,
+                &copy,
+                Some(std::path::PathBuf::from(folder)),
+                before.as_deref(),
+            )
+            .map_err(|reason| anyhow::anyhow!(reason))
         }
         Some("memory") => {
             let folder = std::env::args().nth(2).map(std::path::PathBuf::from);

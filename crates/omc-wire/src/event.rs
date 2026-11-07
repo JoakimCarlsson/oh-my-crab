@@ -1,5 +1,6 @@
 //! What the harness tells its client, in the order it happened.
 
+use crate::branch::Branch;
 use crate::inquiry::Inquiry;
 use crate::language::LanguageRequest;
 use crate::permission::Permission;
@@ -45,6 +46,12 @@ pub struct Conversation {
     /// The context window of the model the conversation last used, in tokens.
     #[serde(default)]
     pub window: Option<u64>,
+    /// The id of the branch `turns` are of, or nothing for a conversation that has none saved.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Every branch of the conversation, in the order they were made, the first one first.
+    #[serde(default)]
+    pub branches: Vec<Branch>,
 }
 
 /// What the agent did, in the order it did it.
@@ -98,7 +105,7 @@ pub enum Event {
     },
     /// The harness could not start or went on, for this reason.
     Failed(String),
-    /// The conversation as it was saved: each turn the reader prompted and what the agent did in it, oldest first, sent when a saved conversation is opened and again when it is cut back.
+    /// The conversation as it was saved: each turn the reader prompted and what the agent did in it, oldest first, sent when a saved conversation is opened, again when it goes back to before a turn, and when it switches to another branch.
     Resumed(Conversation),
     /// The agent named the conversation, or named it again.
     Titled(String),
