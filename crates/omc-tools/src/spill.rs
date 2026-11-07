@@ -266,10 +266,21 @@ mod tests {
         assert_eq!(mode(&dir.join("out")), 0o700);
     }
 
-    /// Sets when `path`, a file or folder, was last written to `days` days ago.
+    /// Sets when `path`, a file or folder, was last written to `days` days ago; on Windows a folder is opened with backup semantics and the right to change its times, the only way it opens at all.
     fn age(path: &Path, days: u64) {
         let then = SystemTime::now() - Duration::from_secs(days * 24 * 60 * 60);
-        File::open(path).unwrap().set_modified(then).unwrap();
+        let mut options = std::fs::OpenOptions::new();
+        if path.is_dir() {
+            options.read(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt as _;
+                options.custom_flags(0x0200_0000).access_mode(0x0100);
+            }
+        } else {
+            options.write(true);
+        }
+        options.open(path).unwrap().set_modified(then).unwrap();
     }
 
     /// Folders go when nothing in them was written for the age; a folder
