@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::coerce::{coerce, prepare};
-use crate::tools::{AstEdit, AstGrep, Bash, Edit, Glob, Grep, Read, WebSearch, Write};
+use crate::tools::{AstEdit, AstGrep, Bash, Edit, Glob, Grep, Lsp, Read, WebSearch, Write};
 use crate::{Jobs, Languages, Sandbox, Tool, ToolError, ToolOutput};
 
 /// A set of tools addressable by name.
@@ -69,6 +69,7 @@ impl Registry {
         });
         registry.register(Edit::with_languages(sandbox.clone(), languages.clone()));
         registry.register(AstEdit::new(sandbox.clone()));
+        registry.register(Lsp::new(sandbox.clone(), languages.clone()));
         registry.register(Write::with_languages(sandbox, languages));
         registry.register(WebSearch::new());
         registry
@@ -123,9 +124,21 @@ impl Registry {
         }
     }
 
-    /// A registry with only the tools that never change anything.
+    /// A registry with only the tools that never change anything, and the copies that only look of the tools that change something in some calls only.
     pub fn read_only(&self) -> Self {
-        self.filtered(|tool| tool.read_only())
+        Self {
+            tools: self
+                .tools
+                .iter()
+                .filter_map(|(name, tool)| {
+                    if tool.read_only() {
+                        Some((*name, tool.clone()))
+                    } else {
+                        tool.looking().map(|looking| (*name, looking))
+                    }
+                })
+                .collect(),
+        }
     }
 
     /// The names of the registered tools, in name order.
@@ -231,9 +244,11 @@ mod tests {
         let registry = Registry::builtin(crate::testutil::scratch("registry-read-only")).unwrap();
         assert_eq!(
             registry.read_only().names(),
-            vec!["ast_grep", "glob", "grep", "read", "web_search"]
+            vec!["ast_grep", "glob", "grep", "lsp", "read", "web_search"]
         );
-        assert_eq!(registry.names().len(), 9);
+        assert!(registry.read_only().get("lsp").unwrap().read_only());
+        assert!(!registry.get("lsp").unwrap().read_only());
+        assert_eq!(registry.names().len(), 10);
     }
 
     /// A registered tool runs by name and an unknown name is an error.

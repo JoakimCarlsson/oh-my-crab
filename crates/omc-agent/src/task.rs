@@ -1257,6 +1257,7 @@ mod tests {
                 "edit",
                 "glob",
                 "grep",
+                "lsp",
                 "read",
                 "task",
                 "web_search",

@@ -1,6 +1,6 @@
 //! One running language server, spoken to over its standard input and output.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -15,13 +15,28 @@ use tokio::sync::{Notify, oneshot};
 use tokio::time::Instant;
 
 use crate::spec::Spec;
-use crate::text::{column, file_uri, offset};
+use crate::text::{column, file_uri, offset, path_of};
 
 /// How long a server may take to answer the request that starts it.
 const INITIALIZE_WAIT: Duration = Duration::from_secs(30);
 
 /// How long a server that has settled must stay quiet before what it said is taken as its answer, since one that has just been told a file was saved may begin checking the project a moment after saying what it found without checking.
 const QUIET: Duration = Duration::from_millis(400);
+
+/// How many times a question is asked again when the server says the project changed while it worked on it.
+const MODIFIED_RETRIES: u32 = 3;
+
+/// How long to wait before asking again a question the server gave up on because the project changed.
+const MODIFIED_PAUSE: Duration = Duration::from_millis(300);
+
+/// How long after it started a server that has begun no work is waited for to begin some, such as loading the project, before a question is put to it.
+const BEGIN_WAIT: Duration = Duration::from_millis(1500);
+
+/// How long a server that has finished its work must stay quiet, the first time it is waited for, before it is taken to have loaded the project.
+const IDLE: Duration = Duration::from_millis(700);
+
+/// The token the work a server reports through its status, as rust-analyzer does, is kept under among the work reported as progress.
+const STATUS_TOKEN: &str = "experimental/serverStatus";
 
 /// What a server last said is wrong with one file.
 #[derive(Clone, Debug, Default)]
@@ -53,8 +68,8 @@ struct Heard {
     generation: AtomicU64,
     /// The generation at which the server last began some work, such as loading the project or checking it.
     began: AtomicU64,
-    /// The work the server has begun and not yet ended, by the token it reports progress under.
-    working: Mutex<HashSet<String>>,
+    /// The work the server has begun and not yet ended, by the token it reports progress under, each with the title the server gave it.
+    working: Mutex<HashMap<String, String>>,
     /// Woken each time the server says what is wrong with a file.
     news: Notify,
     /// Whether the server has stopped talking, having exited or closed its output.
@@ -73,6 +88,12 @@ pub(crate) struct Client {
     documents: Mutex<HashMap<String, Document>>,
     /// Whether the server formats whole files.
     formats: bool,
+    /// What the server said it can do when it started, as it said it.
+    capabilities: Value,
+    /// When the server was started.
+    started: Instant,
+    /// Whether the server has once been seen with no work to do for a while, which it is when it has loaded the project.
+    loaded: AtomicBool,
     /// The server's process, which is killed when the client is dropped.
     _child: Child,
 }
@@ -107,6 +128,9 @@ impl Client {
             next: AtomicI64::new(1),
             documents: Mutex::new(HashMap::new()),
             formats: false,
+            capabilities: Value::Null,
+            started: Instant::now(),
+            loaded: AtomicBool::new(false),
             _child: child,
         };
         let answer = client
@@ -114,6 +138,7 @@ impl Client {
             .await?;
         let provider = &answer["capabilities"]["documentFormattingProvider"];
         client.formats = provider.as_bool().unwrap_or(provider.is_object());
+        client.capabilities = answer["capabilities"].clone();
         client.notify("initialized", json!({})).await?;
         Ok(client)
     }
@@ -171,7 +196,7 @@ impl Client {
         .await
     }
 
-    /// Tells the server that the file at `path`, in the language `language`, now holds `text`, opening it on the server the first time and saving it, so that servers that check on save check it too.
+    /// Tells the server that the file at `path`, in the language `language`, now holds `text`, opening it on the server the first time and, when `save` is set, saving it, so that servers that check on save check it too.
     ///
     /// Returns the file's address and version, whether the text differs from what the server was last told, and how many times the server had said what is wrong with a file by then.
     ///
@@ -183,6 +208,7 @@ impl Client {
         path: &Path,
         language: &str,
         text: &str,
+        save: bool,
     ) -> Result<(String, i64, bool, u64), String> {
         let uri = file_uri(path);
         let generation = self.heard.generation.load(Ordering::SeqCst);
@@ -232,11 +258,13 @@ impl Client {
             return Ok((uri, version, false, generation));
         };
         self.notify(method, params).await?;
-        self.notify(
-            "textDocument/didSave",
-            json!({"textDocument": {"uri": uri}}),
-        )
-        .await?;
+        if save {
+            self.notify(
+                "textDocument/didSave",
+                json!({"textDocument": {"uri": uri}}),
+            )
+            .await?;
+        }
         Ok((uri, version, true, generation))
     }
 
@@ -251,7 +279,7 @@ impl Client {
         if !self.formats {
             return None;
         }
-        let (uri, ..) = self.sync(path, language, text).await.ok()?;
+        let (uri, ..) = self.sync(path, language, text, true).await.ok()?;
         let edits = self
             .request(
                 "textDocument/formatting",
@@ -280,7 +308,7 @@ impl Client {
         text: &str,
         deadline: Instant,
     ) -> Vec<Diagnostic> {
-        let Ok((uri, version, changed, since)) = self.sync(path, language, text).await else {
+        let Ok((uri, version, changed, since)) = self.sync(path, language, text, true).await else {
             return Vec::new();
         };
         let fresh = |published: &Published| {
@@ -315,6 +343,115 @@ impl Client {
         }
     }
 
+    /// Whether the server said, when it started, that it can do `capability`, such as `referencesProvider`: true, or a description of how.
+    pub(crate) fn can(&self, capability: &str) -> bool {
+        let said = &self.capabilities[capability];
+        said.as_bool().unwrap_or(said.is_object())
+    }
+
+    /// Sends the server the request `method` with `params` and waits up to `wait` for its answer, asking again a few times when the server says the project changed while it worked on it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::request`].
+    pub(crate) async fn ask(
+        &self,
+        method: &str,
+        params: Value,
+        wait: Duration,
+    ) -> Result<Value, String> {
+        let mut tries = 0;
+        loop {
+            match self.request(method, params.clone(), wait).await {
+                Err(reason) if tries < MODIFIED_RETRIES && is_modified(&reason) => {
+                    tries += 1;
+                    tokio::time::sleep(MODIFIED_PAUSE).await;
+                }
+                answer => return answer,
+            }
+        }
+    }
+
+    /// Tells the server that the file at `path`, in the language `language`, holds `text`, without saving it, so that a question about it is answered for that text; returns its address.
+    ///
+    /// # Errors
+    ///
+    /// Returns why when the server cannot be told.
+    pub(crate) async fn open(
+        &self,
+        path: &Path,
+        language: &str,
+        text: &str,
+    ) -> Result<String, String> {
+        self.sync(path, language, text, false)
+            .await
+            .map(|(uri, ..)| uri)
+    }
+
+    /// Tells the server the text on disk now of every file it was told about whose text has changed since, so that it does not answer for text that is gone.
+    pub(crate) async fn refresh(&self) {
+        let told: Vec<(String, String)> = lock(&self.documents)
+            .iter()
+            .map(|(uri, document)| (uri.clone(), document.text.clone()))
+            .collect();
+        for (uri, text) in told {
+            let Some(path) = path_of(&uri) else {
+                continue;
+            };
+            let Ok(now) = tokio::fs::read_to_string(&path).await else {
+                continue;
+            };
+            if now != text {
+                let _ = self.sync(&path, "", &now, false).await;
+            }
+        }
+    }
+
+    /// Waits until `deadline` at most for the server to finish the work it has begun, such as loading or indexing the project, leaving out checking it when `checks` is not set.
+    ///
+    /// A server that has begun nothing yet is given a moment after it started to begin, and the first time the server is waited for it must also stay quiet for [`IDLE`] once its work is done, since a server loading a project may pass from one stage of the work to the next with a moment of nothing between them.
+    pub(crate) async fn settle(&self, deadline: Instant, checks: bool) {
+        let begin_by = self.started + BEGIN_WAIT;
+        loop {
+            let news = self.heard.news.notified();
+            tokio::pin!(news);
+            news.as_mut().enable();
+            let busy = lock(&self.heard.working)
+                .values()
+                .any(|title| checks || !is_check(title));
+            let may_begin =
+                self.heard.began.load(Ordering::SeqCst) == 0 && Instant::now() < begin_by;
+            if !self.is_running() || Instant::now() >= deadline {
+                return;
+            }
+            if !busy && !may_begin {
+                if self.loaded.load(Ordering::SeqCst) {
+                    return;
+                }
+                let quiet_until = deadline.min(Instant::now() + IDLE);
+                if tokio::time::timeout_at(quiet_until, news).await.is_err() {
+                    self.loaded.store(true, Ordering::SeqCst);
+                    return;
+                }
+                continue;
+            }
+            let until = if busy {
+                deadline
+            } else {
+                deadline.min(begin_by)
+            };
+            let _ = tokio::time::timeout_at(until, news).await;
+        }
+    }
+
+    /// Everything the server has said is wrong with any file, by the file's address, as it said it.
+    pub(crate) fn published(&self) -> Vec<(String, Vec<Value>)> {
+        lock(&self.heard.published)
+            .iter()
+            .map(|(uri, published)| (uri.clone(), published.diagnostics.clone()))
+            .collect()
+    }
+
     /// Whether `published` is the server's last word for now: it is not working on anything, and said `published` after it last began some work, so that what it said while loading or before checking is not taken for what it finds once done.
     fn is_settled(&self, published: &Published) -> bool {
         is_last_word(
@@ -326,8 +463,20 @@ impl Client {
 }
 
 /// Whether `published` is a server's last word for now, given the work it is still doing, `working`, and the generation at which it last `began` some: it is doing nothing, and said `published` after it began its last work.
-fn is_last_word(published: &Published, working: &HashSet<String>, began: u64) -> bool {
+fn is_last_word(published: &Published, working: &HashMap<String, String>, began: u64) -> bool {
     working.is_empty() && published.generation > began
+}
+
+/// Whether `reason`, the error a server answered with, says the project changed while it worked on the request, so that asking again may succeed.
+fn is_modified(reason: &str) -> bool {
+    let reason = reason.to_lowercase();
+    reason.contains("content modified") || reason.contains("contentmodified")
+}
+
+/// Whether work the server reported under `title` is checking the project, as a build or a linter does, rather than loading or indexing it, which questions about code must wait for.
+fn is_check(title: &str) -> bool {
+    let title = title.to_lowercase();
+    title.contains("check") || title.contains("clippy") || title.contains("lint")
 }
 
 /// The parameters of the request that starts a server on the project at `root`: who the client is and what it understands.
@@ -349,9 +498,22 @@ fn initialize_params(root: &Path) -> Value {
                 "synchronization": {"didSave": true, "dynamicRegistration": false},
                 "publishDiagnostics": {"versionSupport": true, "relatedInformation": false},
                 "formatting": {"dynamicRegistration": false},
+                "definition": {"dynamicRegistration": false, "linkSupport": true},
+                "typeDefinition": {"dynamicRegistration": false, "linkSupport": true},
+                "implementation": {"dynamicRegistration": false, "linkSupport": true},
+                "references": {"dynamicRegistration": false},
+                "hover": {"dynamicRegistration": false, "contentFormat": ["markdown", "plaintext"]},
+                "documentSymbol": {"dynamicRegistration": false, "hierarchicalDocumentSymbolSupport": true},
+                "rename": {"dynamicRegistration": false, "prepareSupport": false},
             },
-            "workspace": {"workspaceFolders": true, "configuration": true},
+            "workspace": {
+                "workspaceFolders": true,
+                "configuration": true,
+                "symbol": {"dynamicRegistration": false},
+                "workspaceEdit": {"documentChanges": true},
+            },
             "window": {"workDoneProgress": true},
+            "experimental": {"serverStatusNotification": true},
         },
     })
 }
@@ -398,6 +560,22 @@ async fn listen(
                 lock(&heard.published).insert(uri.to_owned(), published);
                 heard.news.notify_waiters();
             }
+            (Some("experimental/serverStatus"), None) => {
+                if message["params"]["quiescent"].as_bool() == Some(false) {
+                    let fresh = lock(&heard.working)
+                        .insert(STATUS_TOKEN.to_owned(), "Loading".to_owned())
+                        .is_none();
+                    if fresh {
+                        heard.began.store(
+                            heard.generation.fetch_add(1, Ordering::SeqCst) + 1,
+                            Ordering::SeqCst,
+                        );
+                    }
+                } else {
+                    lock(&heard.working).remove(STATUS_TOKEN);
+                }
+                heard.news.notify_waiters();
+            }
             (Some("$/progress"), None) => {
                 let params = &message["params"];
                 let token = match &params["token"] {
@@ -406,7 +584,8 @@ async fn listen(
                 };
                 match params["value"]["kind"].as_str() {
                     Some("begin") => {
-                        lock(&heard.working).insert(token);
+                        let title = params["value"]["title"].as_str().unwrap_or_default();
+                        lock(&heard.working).insert(token, title.to_owned());
                         heard.began.store(
                             heard.generation.fetch_add(1, Ordering::SeqCst) + 1,
                             Ordering::SeqCst,
@@ -487,7 +666,7 @@ async fn send(writer: &tokio::sync::Mutex<ChildStdin>, message: &Value) -> Resul
 }
 
 /// `text` with the server's text edits `edits` made to it, each placed by where it falls in `text`; nothing when one of them is not an edit or two overlap.
-fn apply_edits(text: &str, edits: &[Value]) -> Option<String> {
+pub(crate) fn apply_edits(text: &str, edits: &[Value]) -> Option<String> {
     let mut placed = Vec::with_capacity(edits.len());
     for edit in edits {
         let range = &edit["range"];
@@ -517,7 +696,7 @@ fn apply_edits(text: &str, edits: &[Value]) -> Option<String> {
 }
 
 /// The diagnostic the server said as `raw` about the file at `path`, which holds `text`; nothing when `raw` is not one.
-fn diagnostic(raw: &Value, path: &Path, text: &str) -> Option<Diagnostic> {
+pub(crate) fn diagnostic(raw: &Value, path: &Path, text: &str) -> Option<Diagnostic> {
     let start = &raw["range"]["start"];
     let line = u32::try_from(start["line"].as_u64()?).ok()?;
     let character = u32::try_from(start["character"].as_u64()?).ok()?;
@@ -580,11 +759,11 @@ mod tests {
             generation,
             ..Published::default()
         };
-        let indexing = HashSet::from(["indexing".to_owned()]);
+        let indexing = HashMap::from([("indexing".to_owned(), "Indexing".to_owned())]);
         assert!(!is_last_word(&said_at(3), &indexing, 2));
-        assert!(!is_last_word(&said_at(3), &HashSet::new(), 4));
-        assert!(is_last_word(&said_at(5), &HashSet::new(), 4));
-        assert!(is_last_word(&said_at(1), &HashSet::new(), 0));
+        assert!(!is_last_word(&said_at(3), &HashMap::new(), 4));
+        assert!(is_last_word(&said_at(5), &HashMap::new(), 4));
+        assert!(is_last_word(&said_at(1), &HashMap::new(), 0));
     }
 
     /// A diagnostic is placed by line and character, both counted from one, with its severity, code and source.

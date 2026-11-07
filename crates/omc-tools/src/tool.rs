@@ -119,6 +119,13 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// A copy of the tool that only looks, refusing the calls that would change something, for a tool that is not [`Tool::read_only`] although most of its calls only look; nothing for the rest.
+    ///
+    /// [`crate::Registry::read_only`] keeps this copy, so that plan mode and read-only agents can still make the calls that only look.
+    fn looking(&self) -> Option<std::sync::Arc<dyn Tool>> {
+        None
+    }
+
     /// Runs the tool with `args`.
     ///
     /// # Errors

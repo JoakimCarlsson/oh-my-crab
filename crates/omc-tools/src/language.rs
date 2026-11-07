@@ -10,6 +10,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 pub use omc_wire::{Diagnostic, Severity};
 
+use crate::navigation::{LanguageError, Location, Lookup, Renamed, Spot, Symbol, cannot_navigate};
 use crate::tools::write_atomic;
 
 /// How long a write waits for fresh diagnostics of the files it changed.
@@ -19,7 +20,7 @@ pub const DIAGNOSTICS_WAIT: Duration = Duration::from_secs(3);
 pub const FORMAT_WAIT: Duration = Duration::from_secs(3);
 
 /// How much longer than it was asked to wait a service is given to answer before it is given up on.
-const GRACE: Duration = Duration::from_millis(500);
+pub(crate) const GRACE: Duration = Duration::from_millis(500);
 
 /// The most diagnostics a tool result shows.
 const MAX_SHOWN: usize = 20;
@@ -39,6 +40,73 @@ pub trait LanguageService: Send + Sync {
     /// How long to wait for the diagnostics of the files at `paths`: [`DIAGNOSTICS_WAIT`], unless a service whose servers are still loading the project, and so would say nothing that soon, asks for longer.
     fn patience(&self, _paths: &[PathBuf]) -> Duration {
         DIAGNOSTICS_WAIT
+    }
+
+    /// Whether a language server reads the file at `path`, so that a question about it can be answered at all; by default every file is taken to have one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LanguageError::NoServer`], saying why, when no server reads such files, or the one that would is not installed or could not be started.
+    async fn serves(&self, _path: &Path) -> Result<(), LanguageError> {
+        Ok(())
+    }
+
+    /// The places `lookup` finds from the symbol at `at`, as the files are on disk now; empty when there are none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LanguageError::NoServer`] when no server reads the file, [`LanguageError::Unsupported`] when its server or these services do not answer such questions, and [`LanguageError::Failed`] when the server fails. A service that does not navigate code fails this way by default.
+    async fn locate(&self, _lookup: Lookup, _at: &Spot) -> Result<Vec<Location>, LanguageError> {
+        Err(cannot_navigate())
+    }
+
+    /// What the symbol at `at` is, its type and documentation, as plain text or Markdown; nothing when the server has nothing to say about it.
+    ///
+    /// # Errors
+    ///
+    /// As [`LanguageService::locate`].
+    async fn hover(&self, _at: &Spot) -> Result<Option<String>, LanguageError> {
+        Err(cannot_navigate())
+    }
+
+    /// The symbols of the file at `path`, outermost first and each followed by those inside it.
+    ///
+    /// # Errors
+    ///
+    /// As [`LanguageService::locate`].
+    async fn document_symbols(&self, _path: &Path) -> Result<Vec<Symbol>, LanguageError> {
+        Err(cannot_navigate())
+    }
+
+    /// The symbols of the project whose names match `query`, as the servers of its languages find them, or only the server of the file at `near` when it is given.
+    ///
+    /// # Errors
+    ///
+    /// As [`LanguageService::locate`]; [`LanguageError::NoServer`] when no server of the project runs.
+    async fn workspace_symbols(
+        &self,
+        _query: &str,
+        _near: Option<&Path>,
+    ) -> Result<Vec<Symbol>, LanguageError> {
+        Err(cannot_navigate())
+    }
+
+    /// The files renaming the symbol at `at` to `new_name` changes, each with its whole new text, as the files are on disk now; nothing is written.
+    ///
+    /// # Errors
+    ///
+    /// As [`LanguageService::locate`]; [`LanguageError::Failed`] as well when the server refuses the rename or it would create, move or delete files.
+    async fn rename(&self, _at: &Spot, _new_name: &str) -> Result<Vec<Renamed>, LanguageError> {
+        Err(cannot_navigate())
+    }
+
+    /// Everything the servers of the project have said is wrong with any of its files, having waited up to `wait` for servers still loading or checking it.
+    ///
+    /// # Errors
+    ///
+    /// As [`LanguageService::workspace_symbols`].
+    async fn all_diagnostics(&self, _wait: Duration) -> Result<Vec<Diagnostic>, LanguageError> {
+        Err(cannot_navigate())
     }
 }
 
@@ -176,7 +244,7 @@ fn report(files: &[Written], found: Vec<Diagnostic>) -> String {
 }
 
 /// The first line of `diagnostic`'s message, cut to [`MAX_MESSAGE`] bytes, followed by its code and what said it when those are known.
-fn message(diagnostic: &Diagnostic) -> String {
+pub(crate) fn message(diagnostic: &Diagnostic) -> String {
     let mut text = diagnostic
         .message
         .lines()

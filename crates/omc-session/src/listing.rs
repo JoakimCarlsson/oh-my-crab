@@ -127,6 +127,7 @@ mod tests {
                 "exit_plan_mode",
                 "glob",
                 "grep",
+                "lsp",
                 "new_context",
                 "read",
                 "script",

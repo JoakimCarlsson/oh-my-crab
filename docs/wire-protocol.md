@@ -671,7 +671,8 @@ The agent started using a tool, or said more about one it is using. Carries a
 
 `Kind` is one of `Read`, `Edit`, `Search`, `Execute`, `Fetch` and `Other`.
 `read` of a web address is `Fetch`; `debug` is `Execute` when it launches,
-attaches, continues or steps the program, and `Other` otherwise.
+attaches, continues or steps the program, and `Other` otherwise; `lsp` is
+`Edit` when it renames (not as a dry run), and `Search` otherwise.
 
 `ToolState` is one of `Running`, `Done` and `Failed`.
 
@@ -834,6 +835,12 @@ Crab asks the client's language services something, and waits for a
 
 A request not answered in time gets no formatting or no diagnostics, and the
 tool goes on.
+
+Only these two are asked. The `lsp` tool's `diagnostics` of a file go to the
+client as a `diagnostics` request; its other actions (definitions,
+references, hovers, symbols, renames and the diagnostics of the whole project)
+are not sent to the client, and the tool tells the model they cannot be
+answered in this conversation.
 
 ```json
 {"Language":{"ticket":4,"ask":{"format":{"path":"/home/me/project/src/main.rs"}}}}

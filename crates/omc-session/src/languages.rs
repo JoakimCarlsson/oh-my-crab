@@ -7,7 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use omc_tools::{Diagnostic, FORMAT_WAIT, LanguageService};
+use omc_tools::{
+    Diagnostic, FORMAT_WAIT, LanguageError, LanguageService, Location, Lookup, Renamed, Spot,
+    Symbol,
+};
 use omc_wire::{Event, LanguageAnswer, LanguageAsk, LanguageRequest};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
@@ -99,6 +102,48 @@ impl LanguageService for ClientLanguages {
             _ => Vec::new(),
         }
     }
+
+    /// Refuses, since the client is asked only to format files and say what is wrong with them.
+    async fn locate(&self, _lookup: Lookup, _at: &Spot) -> Result<Vec<Location>, LanguageError> {
+        Err(client_cannot_navigate())
+    }
+
+    /// Refuses, since the client is asked only to format files and say what is wrong with them.
+    async fn hover(&self, _at: &Spot) -> Result<Option<String>, LanguageError> {
+        Err(client_cannot_navigate())
+    }
+
+    /// Refuses, since the client is asked only to format files and say what is wrong with them.
+    async fn document_symbols(&self, _path: &Path) -> Result<Vec<Symbol>, LanguageError> {
+        Err(client_cannot_navigate())
+    }
+
+    /// Refuses, since the client is asked only to format files and say what is wrong with them.
+    async fn workspace_symbols(
+        &self,
+        _query: &str,
+        _near: Option<&Path>,
+    ) -> Result<Vec<Symbol>, LanguageError> {
+        Err(client_cannot_navigate())
+    }
+
+    /// Refuses, since the client is asked only to format files and say what is wrong with them.
+    async fn rename(&self, _at: &Spot, _new_name: &str) -> Result<Vec<Renamed>, LanguageError> {
+        Err(client_cannot_navigate())
+    }
+
+    /// Refuses, since the client is asked about the files named only.
+    async fn all_diagnostics(&self, _wait: Duration) -> Result<Vec<Diagnostic>, LanguageError> {
+        Err(client_cannot_navigate())
+    }
+}
+
+/// What the model is told when it asks the client's language services about code: the wire carries only formatting and the diagnostics of named files, so only those can be asked.
+fn client_cannot_navigate() -> LanguageError {
+    LanguageError::Unsupported(
+        "the client runs this conversation's language servers and is asked only to format files and report the diagnostics of named files, so it cannot answer this; `lsp` with action diagnostics and a file path still works"
+            .to_owned(),
+    )
 }
 
 /// The language servers the harness runs itself for the project in `directory`, when it was built with them.
@@ -161,6 +206,35 @@ mod tests {
         client.await.unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].message, "bad");
+    }
+
+    /// Questions about code are refused at once without asking the client, since the wire does not carry them, saying that the diagnostics of a file still work.
+    #[tokio::test]
+    async fn navigation_is_refused_without_asking_the_client() {
+        let (out, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let languages = ClientLanguages::new(out);
+        let at = Spot {
+            path: PathBuf::from("/w/a.rs"),
+            line: 1,
+            column: 1,
+        };
+        let Err(LanguageError::Unsupported(reason)) =
+            languages.locate(Lookup::References, &at).await
+        else {
+            panic!("navigation was not refused");
+        };
+        assert!(
+            reason.contains("diagnostics and a file path still works"),
+            "{reason}"
+        );
+        assert!(languages.rename(&at, "b").await.is_err());
+        assert!(
+            languages
+                .all_diagnostics(Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        assert!(events.try_recv().is_err());
     }
 
     /// A client that does not answer in time is given up on, with no diagnostics and no formatting, and a late answer is dropped.

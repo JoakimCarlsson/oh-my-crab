@@ -30,3 +30,60 @@ one set of language servers runs:
 
 With none of these, `edit` and `write` behave as they would without language
 services.
+
+## The `lsp` tool
+
+The agent can also ask the language servers about code itself, with the `lsp`
+tool. Each call names an `action`:
+
+| Action            | Needs                                    | Answers                                                                 |
+| ----------------- | ---------------------------------------- | ----------------------------------------------------------------------- |
+| `definition`      | a place                                  | where the symbol is defined                                             |
+| `type_definition` | a place                                  | where the symbol's type is defined                                      |
+| `implementation`  | a place                                  | where the trait, interface or method is implemented                     |
+| `references`      | a place                                  | every use of the symbol, its declaration included                       |
+| `hover`           | a place                                  | the symbol's signature and documentation                                |
+| `symbols`         | `path`, or `query`                       | the outline of a file, or the project's symbols whose names match        |
+| `diagnostics`     | `path` (a file or a folder), or nothing  | the errors, warnings and hints of the file, the folder or the project   |
+| `rename`          | a place and `new_name`                   | renames the symbol in every file that uses it                           |
+
+A place is a file (`path`) and the symbol in it (`symbol`), written as it is
+in the code, best with the `line` it is on, counted from one. The tool finds
+the character the symbol starts at on that line (`occurrence` picks one when
+it appears more than once), points a qualified name such as `Config::load` at
+its last part, and looks a few lines either side when the line is a little
+off, saying so in the result. Without a line it takes the symbol's first
+whole-word occurrence in the file. `line` and `column` can be given instead of
+`symbol`.
+
+Results are short: places grouped by file, each as `line:column` and the line
+quoted, at most 100 of them; outlines with each symbol's line, kind and
+detail. Before asking, the server of the file is started if it is not running
+and, the first time, given time to load the project, and every file it was
+told about is brought up to date with what is on disk. A server that does not
+offer an action (it did not say so when it started) is reported as not
+answering it, and a file no installed server reads gets a message naming the
+missing server; the model is told to fall back to `grep` or `ast_grep`.
+
+`rename` asks the server for the edits, refuses them when they reach outside
+the working directory or would create, move or delete files, and otherwise
+writes every changed file or none. The written files then go through the same
+steps as an `edit`: they are formatted, their diagnostics are added to the
+result, and each file's new snapshot tag is given. Outside yolo mode a rename
+asks first, under the scope `lsp rename`; `dry_run: true` shows the changed
+lines without writing or asking. Every other action only looks: plan mode and
+subagents in plan mode have a copy of the tool that refuses renames other than
+dry runs.
+
+Where the answers come from follows the language services above:
+
+- With the harness's own servers, every action works for the languages whose
+  servers are installed. `symbols` with a `query` and `diagnostics` for the
+  whole project ask every server already running and those of the languages
+  the project root names, starting them.
+- With a client that runs the language servers (`languages` in `Open`), the
+  wire carries only formatting and the diagnostics of named files, so `lsp`
+  answers `diagnostics` for a file through the client and refuses the other
+  actions with a message saying so.
+- A program embedding the crates answers whatever its `LanguageService`
+  implements; the navigation methods of that trait refuse by default.

@@ -42,6 +42,7 @@ MUST use specialized tool over shell equivalent:
 {{#if has_grep}}- Regex/literal search: `grep`, NEVER shell `grep`/`rg`/`awk`.{{/if}}
 {{#if has_glob}}- File structure/names: `glob`, NEVER `ls **/*.ext`/`fd`.{{/if}}
 {{#if has_ast_grep}}- Code-shape search (calls, definitions, patterns that span lines or ignore formatting): `ast_grep`.{{/if}}
+{{#if has_lsp}}- Where a symbol is defined or used, what it is, a file's outline, compiler diagnostics, or renaming a symbol across files: `lsp` (definition, references, hover, symbols, diagnostics, rename) rather than grepping and editing by hand; if it says no server handles the file, fall back to `grep`.{{/if}}
 {{#if has_ast_edit}}- Same structural change at many sites (codemods, renaming a call shape): `ast_edit`; `dry_run` first when unsure.{{/if}}
 {{#if has_bash}}- `bash`: real binaries/short fact pipelines (counts, frequencies, set differences, checksums), NEVER specialized-tool work or paging/moving/trimming fetchable bytes.{{/if}}
 {{#if has_edit}}

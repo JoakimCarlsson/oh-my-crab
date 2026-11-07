@@ -1,6 +1,6 @@
 //! Converting between the forms the language server protocol uses and the ones the harness does: file addresses, and places counted in UTF-16 code units and in characters.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The `file://` address of `path`, with every byte that is not plainly safe in an address percent-encoded.
 pub(crate) fn file_uri(path: &Path) -> String {
@@ -13,6 +13,52 @@ pub(crate) fn file_uri(path: &Path) -> String {
         }
     }
     uri
+}
+
+/// The path a `file://` address names, with its percent-encoding undone; nothing for an address of another kind or one that does not decode to text.
+pub(crate) fn path_of(uri: &str) -> Option<PathBuf> {
+    let encoded = uri.strip_prefix("file://")?;
+    let encoded = encoded
+        .strip_prefix("localhost")
+        .filter(|rest| rest.starts_with('/'))
+        .unwrap_or(encoded);
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let hex = bytes
+            .get(index + 1..index + 3)
+            .and_then(|digits| std::str::from_utf8(digits).ok())
+            .and_then(|digits| u8::from_str_radix(digits, 16).ok());
+        match (bytes[index], hex) {
+            (b'%', Some(byte)) => {
+                decoded.push(byte);
+                index += 3;
+            }
+            (byte, _) => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    let text = String::from_utf8(decoded).ok()?;
+    let drive = text.as_bytes();
+    if cfg!(windows) && drive.len() > 2 && drive[0] == b'/' && drive[2] == b':' {
+        return Some(PathBuf::from(&text[1..]));
+    }
+    Some(PathBuf::from(text))
+}
+
+/// The UTF-16 code units into line `line` (counted from nought) of `text` at which its character `column` (counted from one) starts; a column past the end of the line is the end of the line.
+pub(crate) fn character(text: &str, line: u32, column: u32) -> u32 {
+    let content = text
+        .split('\n')
+        .nth(usize::try_from(line).unwrap_or(usize::MAX))
+        .unwrap_or_default();
+    let content = content.strip_suffix('\r').unwrap_or(content);
+    let before = usize::try_from(column.saturating_sub(1)).unwrap_or(usize::MAX);
+    let units: usize = content.chars().take(before).map(char::len_utf16).sum();
+    u32::try_from(units).unwrap_or(u32::MAX)
 }
 
 /// The byte offset in `text` of the place `character` UTF-16 code units into line `line`, both counted from nought; a place past the end of its line is the end of the line, and a line past the end of the text is the end of the text.
@@ -54,6 +100,28 @@ mod tests {
     fn paths_are_encoded_in_addresses() {
         let uri = file_uri(Path::new("/w/my project/ünï.rs"));
         assert_eq!(uri, "file:///w/my%20project/%C3%BCn%C3%AF.rs");
+    }
+
+    /// An address reads back as the path it was made from.
+    #[test]
+    fn addresses_read_back_as_paths() {
+        let path = Path::new("/w/my project/ünï.rs");
+        assert_eq!(path_of(&file_uri(path)).as_deref(), Some(path));
+        assert_eq!(
+            path_of("file://localhost/w/a.rs").as_deref(),
+            Some(Path::new("/w/a.rs"))
+        );
+        assert_eq!(path_of("untitled:Untitled-1"), None);
+    }
+
+    /// A character counted from one becomes the UTF-16 code units before it on its line.
+    #[test]
+    fn characters_become_utf16_units() {
+        let text = "ab\n🦀x = 1\r\nlast";
+        assert_eq!(character(text, 0, 2), 1);
+        assert_eq!(character(text, 1, 2), 2);
+        assert_eq!(character(text, 1, 99), 7);
+        assert_eq!(character(text, 5, 3), 0);
     }
 
     /// Places count UTF-16 code units, so a character outside the basic plane counts twice.

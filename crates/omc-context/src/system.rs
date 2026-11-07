@@ -94,6 +94,7 @@ pub(crate) fn flags(tools: &[String]) -> Vec<(String, String)> {
         "skill",
         "ast_grep",
         "ast_edit",
+        "lsp",
         "remember",
         "memory_search",
         "memory_edit",

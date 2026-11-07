@@ -6,6 +6,7 @@ mod error;
 mod host;
 mod jobs;
 mod language;
+mod navigation;
 mod notebook;
 mod program;
 mod registry;
@@ -25,6 +26,7 @@ pub use jobs::{Finished, Jobs};
 pub use language::{
     DIAGNOSTICS_WAIT, Diagnostic, FORMAT_WAIT, LanguageService, Languages, Severity,
 };
+pub use navigation::{LanguageError, Location, Lookup, Renamed, Spot, Symbol};
 pub use notebook::{NOTEBOOK_LIMIT, Notebook};
 pub use program::find_program;
 pub use registry::Registry;
@@ -34,7 +36,7 @@ pub use tool::{
     Caller, FileChange, Image, NoCaller, Tool, ToolOutput, marked_lines, parse_args, sanitize,
 };
 pub use tools::{
-    Ask, AstEdit, AstGrep, Bash, CheckpointTool, ContextNotes, Edit, ExitPlanMode, Glob, Grep,
+    Ask, AstEdit, AstGrep, Bash, CheckpointTool, ContextNotes, Edit, ExitPlanMode, Glob, Grep, Lsp,
     MemoryEdit, MemorySearch, NewContext, Read, Remember, Rewind, SetTitle, Skill, Todo, Wait,
     WebSearch, Write, snapshot_tag,
 };

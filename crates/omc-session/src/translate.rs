@@ -8,11 +8,14 @@ use omc_wire::{Diff, Event, Kind, PastTurn, Tool, ToolState, Usage};
 /// shown as `target`: a `read` whose target is a web address, as a URL or a
 /// GitHub path shows, fetches rather than reads, and a `debug` call runs a
 /// command when it starts or runs the program, and is something else when it
-/// only looks at it or sets breakpoints.
+/// only looks at it or sets breakpoints. An `lsp` call edits when it renames
+/// and is not a dry run, and searches otherwise.
 fn kind_of(name: &str, target: &str) -> Kind {
     match name {
         "read" if is_web(target) => Kind::Fetch,
         "debug" if runs_program(target) => Kind::Execute,
+        "lsp" if target.starts_with("rename") && !target.ends_with("[dry run]") => Kind::Edit,
+        "lsp" => Kind::Search,
         "read" | "skill" => Kind::Read,
         "edit" | "write" | "ast_edit" => Kind::Edit,
         "grep" | "glob" | "ast_grep" | "web_search" => Kind::Search,
@@ -388,6 +391,15 @@ mod tests {
         assert_eq!(kind_of("bash", "https://x"), Kind::Execute);
         assert_eq!(kind_of("debug", "launch build/app -v"), Kind::Execute);
         assert_eq!(kind_of("debug", "continue [dbg-1]"), Kind::Execute);
+        assert_eq!(
+            kind_of("lsp", "rename `a` in src/a.rs:3 to `b`"),
+            Kind::Edit
+        );
+        assert_eq!(
+            kind_of("lsp", "rename `a` in src/a.rs:3 to `b` [dry run]"),
+            Kind::Search
+        );
+        assert_eq!(kind_of("lsp", "references `a` in src/a.rs:3"), Kind::Search);
         assert_eq!(kind_of("debug", "variables frame 0"), Kind::Other);
         assert_eq!(kind_of("debug", "break a.c:3"), Kind::Other);
     }

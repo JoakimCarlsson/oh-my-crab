@@ -335,10 +335,12 @@ mod tests {
         }
     }
 
-    /// Plan mode keeps the read-only tools and the plan tool; the rest of the time the plan tool is absent and writing is possible.
+    /// Plan mode keeps the read-only tools, the copies that only look of tools such as `lsp`, and the plan tool; the rest of the time the plan tool is absent and writing is possible.
     #[test]
     fn plan_mode_filters_the_tools() {
         let tools = toolset(&[]);
+        assert!(tools.tools(true).get("lsp").unwrap().read_only());
+        assert!(!tools.tools(false).get("lsp").unwrap().read_only());
         assert_eq!(
             tools.tools(true).names(),
             vec![
@@ -348,6 +350,7 @@ mod tests {
                 "exit_plan_mode",
                 "glob",
                 "grep",
+                "lsp",
                 "new_context",
                 "read",
                 "script",
@@ -369,6 +372,7 @@ mod tests {
                 "edit",
                 "glob",
                 "grep",
+                "lsp",
                 "new_context",
                 "read",
                 "script",

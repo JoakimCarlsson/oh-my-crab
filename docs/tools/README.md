@@ -35,6 +35,12 @@ to the result; see [language services](../language-services.md).
 | `glob`     | Finds files by glob pattern                                          | no   | yes  |
 | `ast_grep` | Searches code by syntax tree, ignoring formatting and comments       | no   | yes  |
 
+## Code intelligence
+
+| Tool  | What it does                                                                                                   | Asks                                 | Plan                           | Detail                                                  |
+| ----- | -------------------------------------------------------------------------------------------------------------- | ------------------------------------ | ------------------------------ | ------------------------------------------------------- |
+| `lsp` | Asks a file's language server for definitions, references, implementations, hovers, symbols and diagnostics, and renames a symbol across files | for renames, all renames (`lsp rename`) | yes, but renames only as dry runs | [language services](../language-services.md#the-lsp-tool) |
+
 ## Shell
 
 | Tool   | What it does                                                                                       | Asks          | Plan | Detail             |
@@ -118,7 +124,8 @@ They get a `task` tool of their own, which cannot start background runs, only
 above the deepest level of subagents allowed (see
 [nesting](subagents.md#nesting)). Their `bash` cannot start background runs. A
 kind whose definition lists tools gets only those. In plan mode subagents get
-only the tools plan mode allows.
+only the tools plan mode allows. Subagents and scripts do get `lsp`; in plan
+mode it is the copy that refuses renames.
 
 **Scripts** never get `script` itself, `task`, `ask`, `exit_plan_mode`,
 `todo`, `context_notes`, `new_context`, `checkpoint`, `rewind`, `wait`,

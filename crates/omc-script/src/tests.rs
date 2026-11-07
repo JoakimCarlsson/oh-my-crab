@@ -410,7 +410,7 @@ fn fitting_lists_the_tools_and_withholds_some() {
     assert!(!script.description().contains("tools.bash("));
     assert_eq!(
         Script::with_tools(Spill::disabled(), &tools.read_only()).exposed(),
-        ["ast_grep", "glob", "grep", "read", "web_search"]
+        ["ast_grep", "glob", "grep", "lsp", "read", "web_search"]
     );
 }
 
