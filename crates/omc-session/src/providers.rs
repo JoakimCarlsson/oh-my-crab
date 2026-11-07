@@ -25,6 +25,14 @@ fn key_env(auth: &Auth) -> &'static [&'static str] {
     }
 }
 
+/// What the cloud credentials `auth` reads are, as a client shows them; nothing for a provider that is not reached through a cloud's own credentials.
+fn credentials(auth: &Auth) -> Option<String> {
+    match auth {
+        Auth::Cloud { credentials, .. } => Some((*credentials).to_owned()),
+        _ => None,
+    }
+}
+
 /// Every provider a conversation can be opened with, in the order a client should offer them: the built-in ones, then those the user defined in `providers.json`.
 pub fn providers() -> Vec<ProviderInfo> {
     Provider::all()
@@ -39,6 +47,7 @@ pub fn providers() -> Vec<ProviderInfo> {
                     .iter()
                     .map(|name| (*name).to_owned())
                     .collect(),
+                credentials: credentials(&def.auth),
             }
         })
         .collect()
@@ -130,6 +139,20 @@ mod tests {
         let vertex = listed.iter().find(|info| info.id == "vertex").unwrap();
         assert_eq!(vertex.sign_in, SignIn::None);
         assert!(vertex.key_env.is_empty());
+        assert!(
+            vertex
+                .credentials
+                .as_deref()
+                .is_some_and(|credentials| credentials.starts_with("Google Cloud credentials"))
+        );
+        assert!(
+            bedrock
+                .credentials
+                .as_deref()
+                .is_some_and(|credentials| credentials.starts_with("AWS credentials"))
+        );
+        assert_eq!(lmstudio.credentials, None);
+        assert_eq!(anthropic.credentials, None);
     }
 
     /// The account is read from the logins in the folder given, a login without a name still counts as signed in, and an unknown provider or empty folder has none.

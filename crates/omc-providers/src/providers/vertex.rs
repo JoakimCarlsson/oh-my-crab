@@ -16,6 +16,7 @@ pub(super) static DEF: Def = Def {
     auth: Auth::Cloud {
         env: &[],
         check: google::check,
+        credentials: "Google Cloud credentials (gcloud or Application Default Credentials)",
     },
     base_url: "https://{region}-aiplatform.googleapis.com",
     base_url_env: Some("OMC_VERTEX_URL"),

@@ -16,6 +16,7 @@ pub(super) static DEF: Def = Def {
     auth: Auth::Cloud {
         env: &["AWS_BEARER_TOKEN_BEDROCK"],
         check: aws::check,
+        credentials: "AWS credentials (the AWS CLI's profiles, SSO or environment)",
     },
     base_url: "https://bedrock-runtime.{region}.amazonaws.com",
     base_url_env: Some("OMC_BEDROCK_URL"),

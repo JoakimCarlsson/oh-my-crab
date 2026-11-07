@@ -44,7 +44,7 @@ pub async fn login(
             env_key(env).ok_or_else(|| AuthError::MissingKey(env.join(" or ")))?,
         ),
         Auth::None => Credentials::static_key(String::new()),
-        Auth::Cloud { env, check } => {
+        Auth::Cloud { env, check, .. } => {
             let mut file: AuthFile = store::load()?;
             if env_key(env).is_none() && saved_key(&file, id).is_none() {
                 check().map_err(AuthError::NoCredentials)?;
@@ -212,12 +212,14 @@ mod tests {
     static ABSENT: Auth = Auth::Cloud {
         env: &["CRAB_TEST_CLOUD_KEY_NEVER_SET"],
         check: missing,
+        credentials: "test cloud credentials",
     };
 
     /// A cloud whose credentials are there.
     static PRESENT: Auth = Auth::Cloud {
         env: &["CRAB_TEST_CLOUD_KEY_NEVER_SET"],
         check: found,
+        credentials: "test cloud credentials",
     };
 
     /// Signing in fails with what to set when nothing is found, succeeds when the cloud's credentials are there, and a saved key is then used in their place.

@@ -89,6 +89,8 @@ pub enum Auth {
         env: &'static [&'static str],
         /// Says whether the cloud's credentials can be found, with what to set when they cannot; signing in runs it when there is no key.
         check: fn() -> Result<(), String>,
+        /// What the cloud's credentials are and where they come from, as a client shows it, such as `Google Cloud credentials (gcloud or Application Default Credentials)`.
+        credentials: &'static str,
     },
     /// No credentials at all, as for a local server.
     None,

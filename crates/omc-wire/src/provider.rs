@@ -10,7 +10,7 @@ pub enum SignIn {
     DeviceCode,
     /// A key read from an environment variable; signing in fails when it is not set.
     ApiKey,
-    /// Nothing: the provider needs no credentials, as for a local server.
+    /// Nothing to sign in to here: the provider needs no credentials, as for a local server, or reads the ones a cloud's own tools keep, which [`ProviderInfo::credentials`] then names.
     None,
 }
 
@@ -33,6 +33,9 @@ pub struct ProviderInfo {
     /// The environment variables an API key is read from, first first; empty when the provider takes no key. A provider that signs in with a browser or a device code and lists these also takes a key instead, from one of them or saved with the logins.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub key_env: Vec<String>,
+    /// What credentials the provider is reached with besides any sign-in or key, and where they come from, as a client shows them, such as `Google Cloud credentials (gcloud or Application Default Credentials)`; nothing for a provider whose sign-in says it all. A provider that signs in as [`SignIn::None`] and names these is not a local server: it reads the credentials a cloud's own tools keep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<String>,
 }
 
 /// Where the API key a provider is signed in with comes from.

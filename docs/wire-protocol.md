@@ -50,8 +50,8 @@ below.
   leave them out, which is the same as `null`.
 - **Defaulted fields** (marked "default") may be left out when sent to crab:
   a list defaults to `[]`, a string to `""`, a boolean to `false`. Crab still
-  writes them in what it sends, except `key_env` in `ProviderInfo`, which is
-  left out when empty.
+  writes them in what it sends, except `key_env` and `credentials` in
+  `ProviderInfo`, which are left out when empty.
 - **Unknown fields** in a message sent to crab are ignored, so a client may
   set a field a newer crab reads, such as `navigation` in `Open`, and an
   older crab goes on as if it were not there.
@@ -1179,9 +1179,16 @@ too.
 | `name`    | string         | required | What a client shows.                                                                         |
 | `sign_in` | `SignIn`       | required | `browser` (answered by `LoginUrl`), `device_code` (by `LoginCode`), `api_key` or `none`.     |
 | `key_env` | list of string | default  | The environment variables an API key is read from; left out of the output when empty.        |
+| `credentials` | string     | optional | The cloud credentials the provider is reached with and where they come from, as a client shows them; left out of the output when there are none. A provider with `sign_in` `none` that names them is not a local server: it reads the credentials the cloud's own tools keep. |
 
 ```json
 [{"id":"claude","name":"Claude","sign_in":"browser"},{"id":"ollama","name":"Ollama","sign_in":"none"},{"id":"openrouter","name":"OpenRouter","sign_in":"api_key","key_env":["OPENROUTER_API_KEY"]},{"id":"copilot","name":"GitHub Copilot","sign_in":"device_code"},...]
+```
+
+The cloud providers name their credentials:
+
+```json
+[{"id":"bedrock","name":"Amazon Bedrock","sign_in":"api_key","key_env":["AWS_BEARER_TOKEN_BEDROCK"],"credentials":"AWS credentials (the AWS CLI's profiles, SSO or environment)"},{"id":"vertex","name":"Google Vertex AI","sign_in":"none","credentials":"Google Cloud credentials (gcloud or Application Default Credentials)"}]
 ```
 
 `KeySource` says where a provider's API key comes from, for a program
