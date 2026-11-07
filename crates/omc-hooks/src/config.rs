@@ -24,16 +24,34 @@ pub enum HookEvent {
     Stop,
     /// When a subagent is about to end its work.
     SubagentStop,
+    /// When a conversation opens or is resumed, and after a compaction.
+    SessionStart,
+    /// When a conversation is closed or another one is opened in its place.
+    SessionEnd,
+    /// Before the conversation is compacted.
+    PreCompact,
+    /// When crab waits on the reader: a permission question, a form of questions, or nothing to do for a while after a turn.
+    Notification,
+    /// After a tool call failed.
+    PostToolUseFailure,
+    /// When a subagent is about to start.
+    SubagentStart,
 }
 
 impl HookEvent {
     /// Every event, in the order they are listed.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 11] = [
         Self::PreToolUse,
         Self::PostToolUse,
         Self::UserPromptSubmit,
         Self::Stop,
         Self::SubagentStop,
+        Self::SessionStart,
+        Self::SessionEnd,
+        Self::PreCompact,
+        Self::Notification,
+        Self::PostToolUseFailure,
+        Self::SubagentStart,
     ];
 
     /// The event's name, as files spell it and hooks are told it.
@@ -44,6 +62,12 @@ impl HookEvent {
             Self::UserPromptSubmit => "UserPromptSubmit",
             Self::Stop => "Stop",
             Self::SubagentStop => "SubagentStop",
+            Self::SessionStart => "SessionStart",
+            Self::SessionEnd => "SessionEnd",
+            Self::PreCompact => "PreCompact",
+            Self::Notification => "Notification",
+            Self::PostToolUseFailure => "PostToolUseFailure",
+            Self::SubagentStart => "SubagentStart",
         }
     }
 
@@ -52,17 +76,34 @@ impl HookEvent {
         Self::ALL.into_iter().find(|event| event.name() == name)
     }
 
-    /// How long a hook of this event may run when its definition gives no timeout.
+    /// How long a hook of this event may run when its definition gives no timeout: 30 seconds for `UserPromptSubmit`, a second and a half for `SessionEnd`, which holds up closing, and 60 seconds for the rest.
     pub fn default_timeout(self) -> Duration {
         match self {
             Self::UserPromptSubmit => Duration::from_secs(30),
+            Self::SessionEnd => Duration::from_millis(1500),
             _ => Duration::from_secs(60),
         }
     }
 
-    /// Whether the event's matcher names tools, rather than kinds of subagent or nothing.
+    /// The longest a hook of this event may run whatever its definition says: a minute for `SessionEnd`, a day for the rest.
+    pub fn longest_timeout(self) -> Duration {
+        match self {
+            Self::SessionEnd => Duration::from_secs(60),
+            _ => Duration::from_secs(86_400),
+        }
+    }
+
+    /// Whether the event's matcher names tools, rather than kinds of subagent, why a conversation started or ended, what started a compaction, the kind of notification, or nothing.
     pub fn matches_tools(self) -> bool {
-        matches!(self, Self::PreToolUse | Self::PostToolUse)
+        matches!(
+            self,
+            Self::PreToolUse | Self::PostToolUse | Self::PostToolUseFailure
+        )
+    }
+
+    /// Whether the event takes no matcher, so every hook of it runs whatever its matcher says.
+    pub fn ignores_matcher(self) -> bool {
+        matches!(self, Self::UserPromptSubmit | Self::Stop)
     }
 }
 
@@ -93,7 +134,7 @@ impl HookOrigin {
 pub struct Hook {
     /// When it runs.
     pub event: HookEvent,
-    /// Which tools, or kinds of subagent, it runs for, as written; empty for all.
+    /// Which tools, kinds of subagent, sources, reasons, triggers or kinds of notification it runs for, as written; empty for all.
     pub matcher: String,
     /// The shell command line.
     pub command: String,
@@ -110,9 +151,11 @@ pub struct Hook {
 }
 
 impl Hook {
-    /// How long it may run.
+    /// How long it may run: its own timeout or its event's default, at most the longest its event allows.
     pub fn limit(&self) -> Duration {
-        self.timeout.unwrap_or_else(|| self.event.default_timeout())
+        self.timeout
+            .unwrap_or_else(|| self.event.default_timeout())
+            .min(self.event.longest_timeout())
     }
 
     /// The hook in a few words, for a reader: its event, matcher and command.
@@ -280,7 +323,7 @@ mod tests {
     use super::*;
     use crate::testutil::{put, scratch};
 
-    /// Claude Code's format is read: events, matchers, commands and timeouts, with other events and hook types skipped and bad entries reported.
+    /// Claude Code's format is read: events, matchers, commands and timeouts, with events crab does not run and other hook types skipped, bad entries reported, and `SessionEnd` hooks kept short.
     #[test]
     fn reads_the_claude_code_format() {
         let settings: Value = serde_json::from_str(
@@ -295,7 +338,9 @@ mod tests {
                         {"matcher": "Edit|Write", "hooks": [{"type": "command", "command": "  fmt  "}]}
                     ],
                     "PostToolUse": [{"hooks": [{"type": "command", "command": "echo done"}]}],
-                    "Notification": [{"hooks": [{"type": "command", "command": "notify-send hi"}]}],
+                    "PreModelSwitch": [{"hooks": [{"type": "command", "command": "notify-send hi"}]}],
+                    "SessionEnd": [{"matcher": "clear", "hooks": [{"type": "command", "command": "save", "timeout": 600}]}],
+                    "Notification": [{"matcher": "idle_prompt", "hooks": [{"type": "command", "command": "beep"}]}],
                     "Stop": [{"matcher": "", "hooks": [{"type": "command"}]}],
                     "UserPromptSubmit": "nonsense"
                 }
@@ -328,6 +373,13 @@ mod tests {
                 ),
                 (HookEvent::PreToolUse, "Edit|Write", "fmt", None),
                 (HookEvent::PostToolUse, "", "echo done", None),
+                (
+                    HookEvent::SessionEnd,
+                    "clear",
+                    "save",
+                    Some(Duration::from_secs(600))
+                ),
+                (HookEvent::Notification, "idle_prompt", "beep", None),
             ]
         );
         assert!(
@@ -348,6 +400,11 @@ mod tests {
         assert_eq!(by("./guard.sh").limit(), Duration::from_secs(5));
         assert_eq!(by("echo done").label(), "PostToolUse: echo done");
         assert_eq!(by("echo done").limit(), Duration::from_secs(60));
+        assert_eq!(by("save").limit(), Duration::from_secs(60));
+        assert_eq!(by("beep").label(), "Notification idle_prompt: beep");
+        let mut quick = by("save").clone();
+        quick.timeout = None;
+        assert_eq!(quick.limit(), Duration::from_millis(1500));
     }
 
     /// The user's file, Claude Code's user settings, an installed plugin's hooks and the project's files are all read, in that order, and the project's only while its folders are read.

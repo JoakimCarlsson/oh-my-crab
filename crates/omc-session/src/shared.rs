@@ -12,6 +12,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::bridge::Questions;
 use crate::languages::ClientLanguages;
+use crate::lifecycle::Lifecycle;
 use crate::prefix::{Key, Prefix};
 use crate::queue::Queue;
 use crate::settings::{Mode, Offer, default_effort, offered};
@@ -51,6 +52,8 @@ pub(crate) struct Shared {
     pub(crate) out: UnboundedSender<Event>,
     /// The questions waiting for the client.
     pub(crate) questions: Arc<Questions>,
+    /// The hooks that run around the conversation, and the context of its last start the model has not been told yet.
+    pub(crate) lifecycle: Arc<Lifecycle>,
     /// What is allowed without asking.
     pub(crate) approvals: Arc<Approvals>,
     /// The notes the agent keeps, and its request for a fresh context window.
@@ -113,7 +116,8 @@ impl Shared {
         out: UnboundedSender<Event>,
         given: Option<Arc<dyn LanguageService>>,
     ) -> Arc<Self> {
-        let questions = Arc::new(Questions::new(out.clone()));
+        let lifecycle = Arc::new(Lifecycle::default());
+        let questions = Arc::new(Questions::new(out.clone()).heeded_by(lifecycle.clone()));
         let announce = out.clone();
         Arc::new(Self {
             languages: Languages::default(),
@@ -123,6 +127,7 @@ impl Shared {
             out,
             approvals: Arc::new(Approvals::new(questions.clone(), false)),
             questions,
+            lifecycle,
             notebook: Arc::new(Notebook::new()),
             checkpoint: Arc::new(Checkpoint::new()),
             jobs: Arc::new(Jobs::new(move |run| {

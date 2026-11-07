@@ -288,6 +288,17 @@ fn pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
+/// `opening`, the first message of a subagent, with the `context` the hooks gave when it started placed before it, in a `<subagent-start-hook>` block; `opening` as it is when they gave none.
+fn with_start_context(context: Option<String>, opening: String) -> String {
+    match context {
+        Some(context) => format!(
+            "<subagent-start-hook>\n{}\n</subagent-start-hook>\n\n{opening}",
+            context.trim()
+        ),
+        None => opening,
+    }
+}
+
 /// The failure of a `kind` subagent whose turn failed with `error`.
 fn failed(kind: &str, error: &AgentError) -> ToolError {
     ToolError::Failed(format!("the {kind} agent failed: {error}"))
@@ -413,6 +424,10 @@ impl Run {
                 render(STRUCTURED, &[("schema", pretty(&wanted.schema).as_str())])
             ),
             None => subagent_assignment(&assignment),
+        };
+        let opening = match &hooks {
+            Some(hooks) => with_start_context(hooks.subagent_start().await, opening),
+            None => opening,
         };
         run_turn(&context, &mut history, opening, &report)
             .await

@@ -1,8 +1,9 @@
-//! Checks the user defines around the loop: before and after each tool call, and when a turn is about to end.
+//! Checks the user defines around the loop: before and after each tool call, when a subagent starts, before the conversation is compacted, and when a turn is about to end.
 //!
 //! The loop only asks; what is checked and how is up to the [`Hooks`] it is given, such as commands the user configured.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use omc_providers::ToolCall;
@@ -31,6 +32,41 @@ pub struct Screened {
     pub note: Option<String>,
 }
 
+/// What started a compaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompactTrigger {
+    /// The reader asked for it, with `/compact`.
+    Manual,
+    /// The context neared the model's window, or the provider refused a request as too long.
+    Auto,
+}
+
+impl CompactTrigger {
+    /// The trigger's name as Claude Code's hooks are told it and match it: `manual` or `auto`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+/// What the checks before a compaction came to.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Compacting {
+    /// The compaction goes on, giving the summary these instructions besides the reader's focus, when there are any.
+    Go(Option<String>),
+    /// The compaction does not happen, for this reason.
+    Blocked(String),
+}
+
+impl Default for Compacting {
+    /// The compaction goes on with no instructions added.
+    fn default() -> Self {
+        Self::Go(None)
+    }
+}
+
 /// Checks run around the agent loop.
 #[async_trait]
 pub trait Hooks: Send + Sync {
@@ -40,8 +76,29 @@ pub trait Hooks: Send + Sync {
     /// A note for the model to read with the result of `call`, which ran with `arguments` and succeeded with `output`; nothing when there is none.
     async fn after_tool(&self, call: &ToolCall, arguments: &Value, output: &str) -> Option<String>;
 
+    /// A note for the model to read with the failure of `call`, which ran with `arguments` for `took` and failed with `error`; nothing when there is none, as by default.
+    async fn after_tool_failed(
+        &self,
+        _call: &ToolCall,
+        _arguments: &Value,
+        _error: &str,
+        _took: Duration,
+    ) -> Option<String> {
+        None
+    }
+
     /// Why the agent should go on instead of ending its turn with `answer`, or nothing to let it end; `again` says the turn already went on because of such a check since the model last called a tool.
     async fn stop(&self, answer: &str, again: bool) -> Option<String>;
+
+    /// Whether a compaction started by `trigger`, whose summary the reader asked to give particular attention to `focus`, goes on and with what instructions; by default it goes on as it is.
+    async fn before_compact(&self, _trigger: CompactTrigger, _focus: Option<&str>) -> Compacting {
+        Compacting::default()
+    }
+
+    /// Context for a subagent that is about to start, which its assignment begins with; nothing when there is none, as by default and for the main agent.
+    async fn subagent_start(&self) -> Option<String> {
+        None
+    }
 
     /// The same checks, for the subagent `id` of the kind `kind`.
     fn for_subagent(&self, id: &str, kind: &str) -> Arc<dyn Hooks>;

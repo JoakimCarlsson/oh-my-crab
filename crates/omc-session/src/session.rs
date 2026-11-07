@@ -19,6 +19,7 @@ use omc_wire::{Command, Event, Opening, QueueState, Slash};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::AbortHandle;
 
+use crate::lifecycle::IDLE_AFTER;
 use crate::prompt::compose;
 use crate::settings::{
     CACHE, CHECKPOINTS, EFFORT, MEMORY, MODE, MODEL, Mode, OFF, ON, WARMING, parse_retention,
@@ -117,6 +118,8 @@ struct Session {
     ended: UnboundedSender<(u64, Ended)>,
     /// The number the last trust request was sent under.
     trust_tickets: u64,
+    /// The wait after the last turn ended before the hooks are told crab is idle, while it runs.
+    idle: Option<AbortHandle>,
 }
 
 /// What a conversation is run with besides its commands.
@@ -150,23 +153,43 @@ pub async fn run_with(
         resets_at_start: 0,
         ended,
         trust_tickets: 0,
+        idle: None,
     };
-    loop {
+    let reason = loop {
         tokio::select! {
             command = commands.recv() => match command {
-                None | Some(Command::Close) => break,
+                None => break END_OTHER,
+                Some(Command::Close) if session.running.is_none() => break END_EXIT,
+                Some(Command::Close) => break END_OTHER,
                 Some(command) => session.handle(command).await,
             },
             Some((number, how)) = finished.recv() => session.finish(number, how),
         }
-    }
+    };
+    session.calm();
     session.shared.debuggers.close().await;
     session.stop();
+    if session.open.is_some() {
+        session.shared.lifecycle.end(reason).await;
+    }
 }
 
+/// Why a conversation ended, as `SessionEnd` hooks are told it, when the client closed it while no turn ran.
+const END_EXIT: &str = "prompt_input_exit";
+
+/// Why a conversation ended, as `SessionEnd` hooks are told it, when the client hung up or closed it while a turn ran.
+const END_OTHER: &str = "other";
+
+/// Why a conversation ended, as `SessionEnd` hooks are told it, when another saved conversation was opened in its place.
+const END_RESUME: &str = "resume";
+
+/// Why a conversation ended, as `SessionEnd` hooks are told it, when a new conversation was opened in its place.
+const END_CLEAR: &str = "clear";
+
 impl Session {
-    /// Carries out one command.
+    /// Carries out one command; any command means the reader is there, so crab is no longer waiting to tell the hooks it is idle.
     async fn handle(&mut self, command: Command) {
+        self.calm();
         match command {
             Command::Open(opening) => self.open(opening).await,
             Command::Prompt {
@@ -230,7 +253,7 @@ impl Session {
 
     /// Opens the conversation: finds the provider, the tools, the skills and the agents, and says what can be set.
     ///
-    /// A turn of the conversation open before is cancelled first, and the prompts queued for it are dropped, so that nothing of it reaches the conversation opened now; its background runs are stopped and its debugging sessions disconnected.
+    /// A turn of the conversation open before is cancelled first, and the prompts queued for it are dropped, so that nothing of it reaches the conversation opened now; its background runs are stopped, its debugging sessions disconnected, and its `SessionEnd` hooks run. Once open, the `SessionStart` hooks start, for a resumed conversation when it was saved, and their context is told to the model with the first prompt.
     async fn open(&mut self, opening: Opening) {
         let Opening {
             directory,
@@ -257,6 +280,16 @@ impl Session {
         self.journal = None;
         self.shared.jobs.stop_all();
         self.shared.debuggers.close().await;
+        if self.open.is_some() {
+            let reason = if conversation.is_some() {
+                END_RESUME
+            } else {
+                END_CLEAR
+            };
+            self.shared.lifecycle.end(reason).await;
+        }
+        self.shared.lifecycle.set_engine(None);
+        self.shared.lifecycle.forget_start();
         let saved = match &conversation {
             Some(id) => match load_history(id, history, keep, before.as_deref()) {
                 Ok(saved) => Some(saved),
@@ -334,6 +367,7 @@ impl Session {
         self.history = messages.unwrap_or_default();
         self.journal = journal;
         self.shared.attach(self.journal.clone());
+        self.shared.lifecycle.set_engine(hooks.clone());
         self.open = Some(Open {
             provider,
             base: Arc::new(registry),
@@ -377,6 +411,13 @@ impl Session {
             }
             self.say_history();
         }
+        let source = if self.journal.is_some() {
+            START_RESUME
+        } else {
+            START_NEW
+        };
+        let model = self.shared.model().map(|(_, model)| model);
+        self.shared.lifecycle.begin(source, model);
         self.tell_trust();
     }
 
@@ -594,6 +635,7 @@ impl Session {
         };
         let assessment = open.trust.assess(&open.locations, &open.disabled);
         open.hooks = engine_for(&assessment, (open.trust.setting)());
+        self.shared.lifecycle.set_engine(open.hooks.clone());
         open.locations = Arc::new(assessment.locations.clone());
         open.trust.assessment = Arc::new(assessment);
         let found = discover(&open.locations, &open.disabled);
@@ -612,7 +654,7 @@ impl Session {
 
     /// Takes in the end of turn `number`; a turn that was cancelled meanwhile is ignored.
     ///
-    /// A turn that answered is followed by a turn for the prompt that has waited longest for it, when one still waits; the others wait for that turn. When the turn failed or needs signing in again, the prompts waiting are dropped instead, and its last request, which a failed turn's history no longer ends with, is no longer kept warm.
+    /// A turn that answered is followed by a turn for the prompt that has waited longest for it, when one still waits; the others wait for that turn. When the turn failed or needs signing in again, the prompts waiting are dropped instead, and its last request, which a failed turn's history no longer ends with, is no longer kept warm. When no turn follows, crab starts waiting to tell the hooks it is idle.
     fn finish(&mut self, number: u64, how: Ended) {
         if self.running.as_ref().map(|(running, _)| *running) != Some(number) {
             return;
@@ -639,6 +681,27 @@ impl Session {
                 self.say(Event::Finished(Some(reason)));
                 self.drop_queue();
             }
+        }
+        if self.running.is_none() {
+            self.wait_idle();
+        }
+    }
+
+    /// Starts the wait after which the `Notification` hooks are told crab is idle, in place of any wait already running; they are told only when no command comes within [`IDLE_AFTER`].
+    fn wait_idle(&mut self) {
+        self.calm();
+        let lifecycle = self.shared.lifecycle.clone();
+        let waiting = tokio::spawn(async move {
+            tokio::time::sleep(IDLE_AFTER).await;
+            lifecycle.notify(IDLE, "", "crab is waiting for your input");
+        });
+        self.idle = Some(waiting.abort_handle());
+    }
+
+    /// Stops the wait to tell the hooks crab is idle, when one runs.
+    fn calm(&mut self) {
+        if let Some(waiting) = self.idle.take() {
+            waiting.abort();
         }
     }
 
@@ -794,6 +857,15 @@ impl Session {
         });
     }
 }
+
+/// How a conversation started, as `SessionStart` hooks are told it, when it is new.
+const START_NEW: &str = "startup";
+
+/// How a conversation started, as `SessionStart` hooks are told it, when it was saved and is opened again.
+const START_RESUME: &str = "resume";
+
+/// The kind of notification the hooks are told when crab has waited [`IDLE_AFTER`] for the reader after a turn.
+const IDLE: &str = "idle_prompt";
 
 /// What a conversation for `locations` may use as its project's trust stands, with the reader's own hooks file `own` and the trust recorded in `store`, `vouched` when the reader trusted it for the conversation, leaving out what `disabled` names; what cannot be read is reported on standard error.
 fn assessed(
@@ -1224,6 +1296,7 @@ mod tests {
             resets_at_start: 0,
             ended,
             trust_tickets: 0,
+            idle: None,
         };
         session.rescan();
         assert!(events.try_recv().is_err());
@@ -1261,6 +1334,7 @@ mod tests {
             resets_at_start: 0,
             ended,
             trust_tickets: 0,
+            idle: None,
         };
         session
             .shared
@@ -1357,6 +1431,7 @@ mod tests {
             resets_at_start: 0,
             ended,
             trust_tickets: 0,
+            idle: None,
         };
         let chosen = session.languages_for(Path::new("/w"), true, false).unwrap();
         assert!(Arc::ptr_eq(&chosen, &given));
@@ -1372,6 +1447,7 @@ mod tests {
             resets_at_start: 0,
             ended,
             trust_tickets: 0,
+            idle: None,
         };
         let client: Arc<dyn LanguageService> = session.shared.client_languages.clone();
         let chosen = session.languages_for(Path::new("/w"), true, false).unwrap();
@@ -1556,6 +1632,7 @@ mod tests {
             resets_at_start: 0,
             ended,
             trust_tickets: 0,
+            idle: None,
         };
         let task = tokio::spawn(std::future::pending::<()>());
         session.running = Some((1, task.abort_handle()));
@@ -1580,6 +1657,7 @@ mod tests {
             resets_at_start: 0,
             ended,
             trust_tickets: 0,
+            idle: None,
         }
     }
 
@@ -1641,6 +1719,7 @@ mod tests {
             resets_at_start: 0,
             ended,
             trust_tickets: 0,
+            idle: None,
         };
         let task = tokio::spawn(std::future::pending::<()>());
         session.running = Some((1, task.abort_handle()));

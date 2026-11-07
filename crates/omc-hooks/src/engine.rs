@@ -2,10 +2,11 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::future::join_all;
-use omc_agent::{Hooks, Screened};
+use omc_agent::{CompactTrigger, Compacting, Hooks, Screened};
 use omc_providers::ToolCall;
 use serde_json::{Map, Value, json};
 
@@ -74,12 +75,60 @@ impl Engine {
         answer::prompt(&given)
     }
 
+    /// Runs the `SessionStart` hooks whose matcher takes `source`, how the conversation started (`startup`, `resume` or `compact`), telling them the `model` when there is one, and returns the context they add: their plain text and `additionalContext`, in order.
+    pub async fn session_start(&self, source: &str, model: Option<&str>) -> Option<String> {
+        let chosen = self.chosen(HookEvent::SessionStart, &[source]);
+        if chosen.is_empty() {
+            return None;
+        }
+        let mut specific = json!({ "source": source });
+        if let Some(model) = model {
+            specific["model"] = json!(model);
+        }
+        let given = self
+            .fire(HookEvent::SessionStart, &chosen, |_| specific.clone())
+            .await;
+        answer::started(&given, true)
+    }
+
+    /// Runs the `SessionEnd` hooks whose matcher takes `reason`, why the conversation ended (`prompt_input_exit`, `clear`, `resume` or `other`), and waits for them to end; they cannot keep it open.
+    pub async fn session_end(&self, reason: &str) {
+        let chosen = self.chosen(HookEvent::SessionEnd, &[reason]);
+        if chosen.is_empty() {
+            return;
+        }
+        let given = self
+            .fire(
+                HookEvent::SessionEnd,
+                &chosen,
+                |_| json!({ "reason": reason }),
+            )
+            .await;
+        answer::heard(&given);
+    }
+
+    /// Runs the `Notification` hooks whose matcher takes `kind`, the kind of notification (`permission_prompt`, `elicitation_dialog` or `idle_prompt`), telling them `message` and `title`, and waits for them to end; what they answer changes nothing.
+    pub async fn notification(&self, kind: &str, title: &str, message: &str) {
+        let chosen = self.chosen(HookEvent::Notification, &[kind]);
+        if chosen.is_empty() {
+            return;
+        }
+        let given = self
+            .fire(
+                HookEvent::Notification,
+                &chosen,
+                |_| json!({ "message": message, "title": title, "notification_type": kind }),
+            )
+            .await;
+        answer::heard(&given);
+    }
+
     /// The hooks of `event` whose matcher takes one of `names`, each command once; at events whose matcher names nothing, every hook of the event.
     fn chosen(&self, event: HookEvent, names: &[&str]) -> Vec<&Hook> {
         let mut chosen: Vec<&Hook> = Vec::new();
         for hook in self.hooks.iter().filter(|hook| hook.event == event) {
             let takes = match event {
-                HookEvent::UserPromptSubmit | HookEvent::Stop => true,
+                _ if event.ignores_matcher() => true,
                 _ => match Matcher::parse(&hook.matcher) {
                     Ok(matcher) => matcher.matches(names),
                     Err(reason) => {
@@ -254,6 +303,60 @@ impl Hooks for Engine {
             })
             .await;
         answer::after_tool(&given)
+    }
+
+    /// Runs the `PostToolUseFailure` hooks that match the tool, giving them its `error`, how long it ran and that it was not interrupted, and returns the note they add.
+    async fn after_tool_failed(
+        &self,
+        call: &ToolCall,
+        arguments: &Value,
+        error: &str,
+        took: Duration,
+    ) -> Option<String> {
+        let chosen = self.chosen(HookEvent::PostToolUseFailure, &Self::names(&call.name));
+        if chosen.is_empty() {
+            return None;
+        }
+        let millis = u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
+        let given = self
+            .fire(HookEvent::PostToolUseFailure, &chosen, |hook| {
+                let mut about = self.about_call(hook, call, arguments);
+                about.insert("error".into(), json!(error));
+                about.insert("is_interrupt".into(), json!(false));
+                about.insert("duration_ms".into(), json!(millis));
+                Value::Object(about)
+            })
+            .await;
+        answer::after_tool(&given)
+    }
+
+    /// Runs the `PreCompact` hooks whose matcher takes the trigger's name, telling them the reader's `focus` as `custom_instructions`, and says whether the compaction goes on and with what instructions.
+    async fn before_compact(&self, trigger: CompactTrigger, focus: Option<&str>) -> Compacting {
+        let chosen = self.chosen(HookEvent::PreCompact, &[trigger.name()]);
+        if chosen.is_empty() {
+            return Compacting::default();
+        }
+        let given = self
+            .fire(
+                HookEvent::PreCompact,
+                &chosen,
+                |_| json!({ "trigger": trigger.name(), "custom_instructions": focus }),
+            )
+            .await;
+        answer::compacting(&given)
+    }
+
+    /// Runs the `SubagentStart` hooks that match the kind of the subagent these hooks run for, and returns the `additionalContext` they add; nothing for the main agent.
+    async fn subagent_start(&self) -> Option<String> {
+        let (_, kind) = self.agent.as_ref()?;
+        let chosen = self.chosen(HookEvent::SubagentStart, &[kind.as_str()]);
+        if chosen.is_empty() {
+            return None;
+        }
+        let given = self
+            .fire(HookEvent::SubagentStart, &chosen, |_| json!({}))
+            .await;
+        answer::started(&given, false)
     }
 
     /// Runs the `Stop` hooks, or the `SubagentStop` hooks that match a subagent's kind, and returns why the agent should go on.
@@ -475,6 +578,187 @@ mod tests {
             std::fs::read_to_string(folder.join("ran.txt")).unwrap(),
             "on branch main\n"
         );
+    }
+
+    /// The payload a hook wrote to `file` in `folder`, as JSON.
+    fn written(folder: &Path, file: &str) -> Value {
+        serde_json::from_str(&std::fs::read_to_string(folder.join(file)).unwrap()).unwrap()
+    }
+
+    /// `SessionStart` runs only the hooks whose matcher takes the source, tells them the source and model, and hands back their plain text and `additionalContext`.
+    #[tokio::test]
+    async fn a_session_starts() {
+        let folder = scratch("engine-start");
+        let hooks = engine(
+            &folder,
+            vec![
+                hook(
+                    HookEvent::SessionStart,
+                    "startup|resume",
+                    "cat > start.json; echo the secret is kiwi",
+                    true,
+                ),
+                hook(
+                    HookEvent::SessionStart,
+                    "compact",
+                    r#"echo '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"compacted"}}'"#,
+                    true,
+                ),
+            ],
+        );
+        assert_eq!(
+            hooks.session_start("startup", Some("m-1")).await.as_deref(),
+            Some("the secret is kiwi")
+        );
+        let payload = written(&folder, "start.json");
+        assert_eq!(payload["hook_event_name"], "SessionStart");
+        assert_eq!(payload["source"], "startup");
+        assert_eq!(payload["model"], "m-1");
+        assert_eq!(
+            hooks.session_start("compact", None).await.as_deref(),
+            Some("compacted")
+        );
+        assert_eq!(hooks.session_start("clear", None).await, None);
+    }
+
+    /// `SessionEnd` and `Notification` hooks are told the reason and the notification, by matcher, and a blocking exit changes nothing.
+    #[tokio::test]
+    async fn an_end_and_a_notification() {
+        let folder = scratch("engine-end");
+        let hooks = engine(
+            &folder,
+            vec![
+                hook(
+                    HookEvent::SessionEnd,
+                    "",
+                    "cat > end.json; echo bye >&2; exit 2",
+                    false,
+                ),
+                hook(
+                    HookEvent::Notification,
+                    "permission_prompt",
+                    "cat > asked.json",
+                    false,
+                ),
+                hook(
+                    HookEvent::Notification,
+                    "idle_prompt",
+                    "cat > idle.json",
+                    false,
+                ),
+            ],
+        );
+        hooks.session_end("prompt_input_exit").await;
+        assert_eq!(written(&folder, "end.json")["reason"], "prompt_input_exit");
+        hooks
+            .notification(
+                "permission_prompt",
+                "Permission needed",
+                "crab needs your permission to use bash",
+            )
+            .await;
+        let asked = written(&folder, "asked.json");
+        assert_eq!(asked["hook_event_name"], "Notification");
+        assert_eq!(asked["notification_type"], "permission_prompt");
+        assert_eq!(asked["title"], "Permission needed");
+        assert_eq!(asked["message"], "crab needs your permission to use bash");
+        assert!(!folder.join("idle.json").exists());
+    }
+
+    /// `PostToolUseFailure` hooks see the error and how long the call ran, and their context becomes the note; `PreCompact` hooks see the trigger and the focus, and their plain text becomes instructions or exit code 2 blocks.
+    #[tokio::test]
+    async fn a_failure_and_a_compaction() {
+        let folder = scratch("engine-failure");
+        let hooks = engine(
+            &folder,
+            vec![
+                hook(
+                    HookEvent::PostToolUseFailure,
+                    "Bash",
+                    r#"cat > failed.json; echo '{"hookSpecificOutput":{"hookEventName":"PostToolUseFailure","additionalContext":"try make"}}'"#,
+                    true,
+                ),
+                hook(
+                    HookEvent::PreCompact,
+                    "manual",
+                    "cat > compact.json; echo keep the todo list",
+                    false,
+                ),
+                hook(
+                    HookEvent::PreCompact,
+                    "auto",
+                    "echo saving first >&2; exit 2",
+                    false,
+                ),
+            ],
+        );
+        let arguments = json!({"command": "false"});
+        let note = hooks
+            .after_tool_failed(
+                &call("bash", arguments.clone()),
+                &arguments,
+                "exit code 1",
+                Duration::from_millis(42),
+            )
+            .await;
+        assert_eq!(note.as_deref(), Some("try make"));
+        let failed = written(&folder, "failed.json");
+        assert_eq!(failed["hook_event_name"], "PostToolUseFailure");
+        assert_eq!(failed["tool_name"], "Bash");
+        assert_eq!(failed["error"], "exit code 1");
+        assert_eq!(failed["is_interrupt"], false);
+        assert_eq!(failed["duration_ms"], 42);
+        assert_eq!(
+            hooks
+                .after_tool(&call("bash", arguments.clone()), &arguments, "ok")
+                .await,
+            None
+        );
+        assert_eq!(
+            hooks
+                .before_compact(CompactTrigger::Manual, Some("the API"))
+                .await,
+            Compacting::Go(Some("keep the todo list".into()))
+        );
+        let compact = written(&folder, "compact.json");
+        assert_eq!(compact["trigger"], "manual");
+        assert_eq!(compact["custom_instructions"], "the API");
+        assert_eq!(
+            hooks.before_compact(CompactTrigger::Auto, None).await,
+            Compacting::Blocked("saving first".into())
+        );
+    }
+
+    /// `SubagentStart` runs for a subagent of a kind its matcher takes, with the subagent's identity, and hands back `additionalContext`; the main agent runs none.
+    #[tokio::test]
+    async fn a_subagent_starts() {
+        let folder = scratch("engine-subagent");
+        let hooks = engine(
+            &folder,
+            vec![hook(
+                HookEvent::SubagentStart,
+                "scout",
+                r#"cat > sub.json; echo '{"hookSpecificOutput":{"hookEventName":"SubagentStart","additionalContext":"stay read-only"}}'"#,
+                false,
+            )],
+        );
+        assert_eq!(hooks.subagent_start().await, None);
+        assert_eq!(
+            hooks.for_subagent("t1", "reviewer").subagent_start().await,
+            None
+        );
+        assert_eq!(
+            hooks
+                .for_subagent("t2", "scout")
+                .subagent_start()
+                .await
+                .as_deref(),
+            Some("stay read-only")
+        );
+        let payload = written(&folder, "sub.json");
+        assert_eq!(payload["hook_event_name"], "SubagentStart");
+        assert_eq!(payload["agent_id"], "t2");
+        assert_eq!(payload["agent_type"], "scout");
     }
 
     /// A slow hook before a call times out and the call is denied, without the turn waiting past the timeout.

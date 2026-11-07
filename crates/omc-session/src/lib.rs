@@ -8,6 +8,7 @@
 mod bridge;
 mod hooks;
 mod languages;
+mod lifecycle;
 mod listing;
 mod memory;
 mod prefix;

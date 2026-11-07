@@ -22,7 +22,8 @@ the window less 15% of it; on a window over 65,536 tokens it is at least 16,384
 tokens below the window. When a provider still refuses a request as too long,
 `crab` compacts and sends the request again, once a turn. Sending `/compact`,
 optionally followed by what the summary should keep in particular, compacts on
-demand; it takes no files.
+demand; it takes no files. `PreCompact` [hooks](extending/hooks.md) run before
+every summary, and may block it or add to what it should keep.
 
 A compaction deletes nothing. It is recorded at the point it happened, the
 summary goes to the model in place of the older messages, and the whole
@@ -62,6 +63,9 @@ the next prompt instead:
   at tools the agent is offered;
 - the digest of the memories earlier conversations saved, on the first prompt
   and again after a compaction or a fresh context window has dropped it.
+- what the `SessionStart` [hooks](extending/hooks.md) said when the
+  conversation opened or resumed, on the first prompt, and what they say after
+  each compaction, on the prompt after it.
 
 The `skill` tool is on the list even when no skill exists yet, so that a skill
 added later can be loaded without changing the list; until then a call to it

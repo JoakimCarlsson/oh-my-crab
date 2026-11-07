@@ -1,14 +1,16 @@
 //! Questions the agent puts to the client, and the answers that come back.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use omc_agent::{ApprovalRequest, Decision, Prompter};
 use omc_wire::{Choice, Event, Inquiry, Permission, Question, Reply, Verdict};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
+
+use crate::lifecycle::Lifecycle;
 
 /// The id of the choice that lets a call run this once.
 const ALLOW: &str = "allow";
@@ -18,6 +20,12 @@ const ALWAYS: &str = "always";
 
 /// The id of the choice that refuses a call.
 const REJECT: &str = "reject";
+
+/// The kind of notification the hooks are told when crab asks the reader to allow something.
+const PERMISSION: &str = "permission_prompt";
+
+/// The kind of notification the hooks are told when crab puts a form of questions to the reader.
+const ELICITATION: &str = "elicitation_dialog";
 
 /// A [`Prompter`] that sends each question to the client and waits for its answer.
 pub(crate) struct Questions {
@@ -29,6 +37,8 @@ pub(crate) struct Questions {
     forms: Mutex<HashMap<u64, oneshot::Sender<Vec<Reply>>>>,
     /// The ticket the next question is put under.
     next: AtomicU64,
+    /// The hooks told that crab waits on the reader whenever a question is put, when there are any.
+    lifecycle: Option<Arc<Lifecycle>>,
 }
 
 impl Questions {
@@ -39,6 +49,22 @@ impl Questions {
             pending: Mutex::new(HashMap::new()),
             forms: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
+            lifecycle: None,
+        }
+    }
+
+    /// The same questions, telling the `Notification` hooks of `lifecycle` whenever one is put to the client.
+    pub(crate) fn heeded_by(self, lifecycle: Arc<Lifecycle>) -> Self {
+        Self {
+            lifecycle: Some(lifecycle),
+            ..self
+        }
+    }
+
+    /// Tells the `Notification` hooks, when there are any, that crab waits on the reader: `kind` is the kind of notification, `title` and `message` what it says.
+    fn notify(&self, kind: &'static str, title: &str, message: &str) {
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle.notify(kind, title, message);
         }
     }
 
@@ -70,6 +96,11 @@ impl Questions {
         self.out
             .send(Event::Inquire(Inquiry { ticket, questions }))
             .ok()?;
+        self.notify(
+            ELICITATION,
+            "Question for you",
+            "crab has questions for you",
+        );
         answer.await.ok()
     }
 
@@ -94,6 +125,11 @@ impl Questions {
         if self.out.send(asked).is_err() {
             return false;
         }
+        self.notify(
+            PERMISSION,
+            "Plan ready for review",
+            "crab has a plan ready for your review",
+        );
         matches!(
             answer.await,
             Ok(Decision::AllowOnce | Decision::AllowAlways)
@@ -132,6 +168,11 @@ impl Prompter for Questions {
         if self.out.send(asked).is_err() {
             return Decision::Deny;
         }
+        self.notify(
+            PERMISSION,
+            "Permission needed",
+            &format!("crab needs your permission to use {}", request.tool),
+        );
         answer.await.unwrap_or(Decision::Deny)
     }
 }
@@ -286,5 +327,62 @@ mod tests {
             questions.answer(asked.ticket, Some(option));
             assert_eq!(asking.await.unwrap(), approved);
         }
+    }
+
+    /// A permission question tells the `Notification` hooks that crab needs the reader's permission, naming the tool.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_question_notifies_the_hooks() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/bridge-notify");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lifecycle = Arc::new(Lifecycle::default());
+        lifecycle.set_engine(Some(Arc::new(omc_hooks::Engine::new(
+            vec![omc_hooks::Hook {
+                event: omc_hooks::HookEvent::Notification,
+                matcher: PERMISSION.to_owned(),
+                command: "cat > note.json".to_owned(),
+                timeout: None,
+                file: dir.join("hooks.json"),
+                origin: omc_hooks::HookOrigin::User,
+                claude: false,
+                plugin: None,
+            }],
+            omc_hooks::Setting {
+                session: None,
+                folder: dir.clone(),
+                mode: Arc::new(|| "default"),
+            },
+        ))));
+        let (out, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let questions = Arc::new(Questions::new(out).heeded_by(lifecycle));
+        let asking = {
+            let questions = questions.clone();
+            tokio::spawn(async move {
+                questions
+                    .ask(&ApprovalRequest {
+                        tool: "bash".into(),
+                        scope: "bash".into(),
+                        summary: "ls".into(),
+                    })
+                    .await
+            })
+        };
+        let Some(Event::Ask(asked)) = seen.recv().await else {
+            panic!("no question");
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut note = String::new();
+        while !note.ends_with('}') && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            note = std::fs::read_to_string(dir.join("note.json")).unwrap_or_default();
+        }
+        let note: serde_json::Value = serde_json::from_str(&note).unwrap();
+        assert_eq!(note["notification_type"], "permission_prompt");
+        assert_eq!(note["message"], "crab needs your permission to use bash");
+        questions.answer(asked.ticket, Some(REJECT));
+        assert_eq!(asking.await.unwrap(), Decision::Deny);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

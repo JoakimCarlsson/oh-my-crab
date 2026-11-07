@@ -75,8 +75,9 @@ out is refused as a bad command.
    [Queued prompts](#queued-prompts)).
 5. `Cancel` stops the running turn: crab sends `Halted` and then
    `Finished` with `null`.
-6. `Close` ends the conversation, and the `crab` process exits at once with
-   status 0. Closing standard input does the same. A turn still running is
+6. `Close` ends the conversation, and the `crab` process exits with status 0
+   as soon as the conversation's `SessionEnd` [hooks](extending/hooks.md), if
+   any, have ended. Closing standard input does the same. A turn still running is
    stopped without a `Halted` or `Finished`; background commands and debugging
    sessions are stopped too. Events already queued for output may still be
    written before the process exits.

@@ -18,7 +18,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::compaction;
-use crate::hooks::{Gate, Hooks, StopBound, with_note};
+use crate::hooks::{CompactTrigger, Compacting, Gate, Hooks, StopBound, with_note};
 use crate::loop_guard::LoopGuard;
 use crate::pruning;
 use crate::recall::{self, RECALL};
@@ -734,7 +734,16 @@ pub async fn compact(
 ) -> Result<(), AgentError> {
     let live = context.refresh.map(|refresh| refresh());
     let system = live.as_ref().map_or(context.system, |live| &*live.system);
-    let result = match compact_history(context, history, system, focus, events, scribe).await {
+    let result = match compact_history(
+        context,
+        history,
+        system,
+        (CompactTrigger::Manual, focus),
+        events,
+        scribe,
+    )
+    .await
+    {
         Ok(true) => Ok(()),
         Ok(false) => Err(AgentError::Compaction(
             "there is nothing to compact yet: the conversation is no longer than the recent messages a compaction keeps".to_owned(),
@@ -794,7 +803,16 @@ async fn make_room(
     if shaken && !overflowed && !over_threshold(context, history, system) {
         return Ok(true);
     }
-    Ok(compact_history(context, history, system, None, events, scribe).await? || pruned || shaken)
+    let compacted = compact_history(
+        context,
+        history,
+        system,
+        (CompactTrigger::Auto, None),
+        events,
+        scribe,
+    )
+    .await?;
+    Ok(compacted || pruned || shaken)
 }
 
 /// Appends `pruning` to `history` and to `scribe`'s journal, with how full the context of `history`, sent with the system prompt `system`, is after it, and shows that through `events`.
@@ -818,29 +836,50 @@ fn prune_history(
     }));
 }
 
-/// Summarizes the older part of `history`, whose context is sent with the system prompt `system`, and appends the compaction to it and to `scribe`'s journal; `focus` is what the summary should give particular attention to.
+/// Summarizes the older part of `history`, whose context is sent with the system prompt `system`, and appends the compaction to it and to `scribe`'s journal; `asked` says what started it and what the summary should give particular attention to.
 ///
-/// The compaction is shown through `events` as a call of the `compact` tool, followed by how full the context is after it. Returns whether the history was compacted: it is not when nothing is old enough to summarize.
+/// The hooks of `context` are asked first, once there is something to summarize: they may block the compaction or add instructions for the summary. The compaction is shown through `events` as a call of the `compact` tool, followed by how full the context is after it. Returns whether the history was compacted: it is not when nothing is old enough to summarize.
 ///
 /// # Errors
 ///
-/// Returns why, for the reader, when the summary could not be made; the history is then left as it was.
+/// Returns why, for the reader, when a hook blocked the compaction or the summary could not be made; the history is then left as it was.
 async fn compact_history(
     context: &Context<'_>,
     history: &mut Vec<Message>,
     system: &str,
-    focus: Option<&str>,
+    asked: (CompactTrigger, Option<&str>),
     events: &(dyn Fn(AgentEvent) + Send + Sync),
     scribe: Option<&Scribe>,
 ) -> Result<bool, String> {
+    let (trigger, focus) = asked;
     let tokens = compaction::context_tokens(history, system);
     let Some(plan) = compaction::plan(history, compaction::keep_recent(context.window), tokens)
     else {
         return Ok(false);
     };
+    let focus = match context.hooks {
+        Some(hooks) => match hooks.before_compact(trigger, focus).await {
+            Compacting::Go(added) => joined_focus(focus, added),
+            Compacting::Blocked(reason) => {
+                return Err(format!(
+                    "a PreCompact hook blocked the compaction: {}",
+                    reason.trim()
+                ));
+            }
+        },
+        None => focus.map(str::to_owned),
+    };
     let at = history.len();
     events(compaction::started(at, tokens));
-    match compaction::summarize(context.model, context.effort, history, &plan, focus).await {
+    match compaction::summarize(
+        context.model,
+        context.effort,
+        history,
+        &plan,
+        focus.as_deref(),
+    )
+    .await
+    {
         Ok(done) => {
             let summary = done.summary.clone();
             history.push(Message::Compaction(done));
@@ -860,6 +899,18 @@ async fn compact_history(
             events(compaction::finished(at, reason.clone(), true));
             Err(reason)
         }
+    }
+}
+
+/// What the summary of a compaction should give particular attention to: the reader's `focus` and the instructions hooks `added`, one after the other, or nothing when there is neither.
+fn joined_focus(focus: Option<&str>, added: Option<String>) -> Option<String> {
+    match (
+        focus.map(str::trim).filter(|focus| !focus.is_empty()),
+        added,
+    ) {
+        (Some(focus), Some(added)) => Some(format!("{focus}\n\n{}", added.trim())),
+        (Some(focus), None) => Some(focus.to_owned()),
+        (None, added) => added.map(|added| added.trim().to_owned()),
     }
 }
 
@@ -1115,7 +1166,7 @@ struct Performed {
     data: Option<Value>,
 }
 
-/// Runs `call`, admitted as `ready`, with `caller` for the tools it runs, and adds the note from the hooks that screened it and what `hooks` say after a call that succeeded to its text.
+/// Runs `call`, admitted as `ready`, with `caller` for the tools it runs, and adds the note from the hooks that screened it and what `hooks` say after the call, whether it succeeded or failed, to its text.
 async fn perform(
     call: &ToolCall,
     ready: Ready<'_>,
@@ -1129,6 +1180,7 @@ async fn perform(
         ..
     } = ready;
     let shown = hooks.map(|_| arguments.clone());
+    let began = Instant::now();
     let mut done = match tool.call_through(&call.id, arguments, caller).await {
         Ok(output) => Performed {
             text: output.text,
@@ -1149,11 +1201,18 @@ async fn perform(
         done.text = with_note(done.text, &note);
         done.data = None;
     }
-    if let (Some(hooks), Some(arguments), false) = (hooks, &shown, done.is_error)
-        && let Some(note) = hooks.after_tool(call, arguments, &done.text).await
-    {
-        done.text = with_note(done.text, &note);
-        done.data = None;
+    if let (Some(hooks), Some(arguments)) = (hooks, &shown) {
+        let note = if done.is_error {
+            hooks
+                .after_tool_failed(call, arguments, &done.text, began.elapsed())
+                .await
+        } else {
+            hooks.after_tool(call, arguments, &done.text).await
+        };
+        if let Some(note) = note {
+            done.text = with_note(done.text, &note);
+            done.data = None;
+        }
     }
     done
 }

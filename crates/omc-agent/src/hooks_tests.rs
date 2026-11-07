@@ -24,6 +24,10 @@ struct Scripted {
     before: Vec<(&'static str, Screened)>,
     /// The note added after every successful call, when there is one.
     after: Option<&'static str>,
+    /// The note added after every failed call, when there is one.
+    failed: Option<&'static str>,
+    /// The context a subagent starts with, when there is some.
+    start: Option<&'static str>,
     /// Why the turn should go on, when it should every time.
     stop: Option<&'static str>,
     /// Who the checks are for: nothing for the main agent, the subagent's id and kind otherwise.
@@ -66,6 +70,25 @@ impl Hooks for Scripted {
         self.after.map(str::to_owned)
     }
 
+    /// Adds the scripted note to a failure, recording the error.
+    async fn after_tool_failed(
+        &self,
+        call: &ToolCall,
+        _arguments: &Value,
+        error: &str,
+        _took: std::time::Duration,
+    ) -> Option<String> {
+        self.saw("failed", &format!("{}: {error}", call.name));
+        self.failed.map(str::to_owned)
+    }
+
+    /// The scripted context, for a subagent only.
+    async fn subagent_start(&self) -> Option<String> {
+        self.agent.as_ref()?;
+        self.saw("start", "");
+        self.start.map(str::to_owned)
+    }
+
     /// Asks to go on with the scripted reason, whenever there is one.
     async fn stop(&self, answer: &str, again: bool) -> Option<String> {
         self.saw(if again { "stop-again" } else { "stop" }, answer);
@@ -77,6 +100,8 @@ impl Hooks for Scripted {
         Arc::new(Scripted {
             before: self.before.clone(),
             after: self.after,
+            failed: self.failed,
+            start: self.start,
             stop: self.stop,
             agent: Some((id.to_owned(), kind.to_owned())),
             seen: self.seen.clone(),
@@ -275,7 +300,7 @@ async fn a_stop_hook_is_bounded() {
     assert!(matches!(history.last(), Some(Message::Assistant(_))));
 }
 
-/// A subagent runs the same tool hooks, under its own id and kind.
+/// A subagent runs the same hooks, from its start on, under its own id and kind.
 #[tokio::test]
 async fn subagents_run_the_hooks_as_themselves() {
     let dir = scratch("hooks-subagent");
@@ -307,6 +332,7 @@ async fn subagents_run_the_hooks_as_themselves() {
     assert_eq!(
         seen,
         vec![
+            (Some("scout#t1".to_owned()), "start", String::new()),
             (Some("scout#t1".to_owned()), "before", "read".to_owned()),
             (Some("scout#t1".to_owned()), "after", "read".to_owned()),
             (
@@ -316,4 +342,67 @@ async fn subagents_run_the_hooks_as_themselves() {
             ),
         ]
     );
+}
+
+/// A note the hooks give after a call that failed is added to the failure, which the model reads, and the hooks after a success are not asked.
+#[tokio::test]
+async fn a_note_after_a_failure_reaches_the_model() {
+    let dir = scratch("hooks-failed");
+    let hooks = Scripted {
+        after: Some("never"),
+        failed: Some("create the file first"),
+        ..Scripted::default()
+    };
+    let model = Router::new(|seen| match seen.messages {
+        1 => call("r", "read", read_args("missing.txt")),
+        _ => say("done"),
+    });
+    let history = drive(&model, &dir, &hooks).await;
+    let (text, failed) = result(&history, 2);
+    assert!(failed, "{text}");
+    assert!(
+        text.ends_with("<hook-note>\ncreate the file first\n</hook-note>"),
+        "{text}"
+    );
+    let seen = hooks.seen.lock().unwrap();
+    assert!(
+        seen.iter()
+            .any(|(_, event, what)| *event == "failed" && what.starts_with("read: "))
+    );
+    assert!(!seen.iter().any(|(_, event, _)| *event == "after"));
+}
+
+/// The context the hooks give when a subagent starts comes before its assignment, in the first message it is sent.
+#[tokio::test]
+async fn a_subagent_starts_with_the_hooks_context() {
+    let dir = scratch("hooks-subagent-start");
+    let hooks = Arc::new(Scripted {
+        start: Some("stay read-only"),
+        ..Scripted::default()
+    });
+    let model = Router::new(|_| say("ok"));
+    let events: Arc<EventSink> = Arc::new(|_| {});
+    let task = Task::new(TaskSettings {
+        model: model.clone(),
+        registry: Arc::new(Registry::builtin(&dir).unwrap()),
+        approvals: deny_all(),
+        events,
+        agents: builtin_agents(),
+        effort: None,
+        prompt: Arc::new(|agent, _, _| format!("SUB:{}", agent.name)),
+        jobs: Arc::new(Jobs::new(|_| {})),
+        isolation: None,
+        hooks: Some(hooks.clone()),
+    });
+    task.call_as("t1", json!({"agent": "scout", "task": "find alpha"}))
+        .await
+        .unwrap();
+    let seen = model.seen.lock().unwrap();
+    let first = seen[0].last_user.as_deref().unwrap();
+    assert!(
+        first.starts_with("<subagent-start-hook>\nstay read-only\n</subagent-start-hook>\n\n"),
+        "{first}"
+    );
+    assert!(first.contains("find alpha"));
+    assert_eq!(hooks.seen.lock().unwrap()[0].1, "start");
 }

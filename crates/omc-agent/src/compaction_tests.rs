@@ -572,3 +572,131 @@ async fn an_old_code_block_is_shaken_out_before_a_summary() {
     assert_eq!(reopened, history);
     assert_eq!(context(&reopened), context(&history));
 }
+
+/// Checks that answer every compaction as scripted and keep what they were asked.
+struct Guarding {
+    /// What every compaction comes to.
+    answer: crate::Compacting,
+    /// What each compaction was started by and the reader's focus.
+    asked: Mutex<Vec<(crate::CompactTrigger, Option<String>)>>,
+}
+
+impl Guarding {
+    /// Checks that answer every compaction with `answer`.
+    fn new(answer: crate::Compacting) -> Self {
+        Self {
+            answer,
+            asked: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl crate::Hooks for Guarding {
+    /// Lets every call pass.
+    async fn before_tool(
+        &self,
+        _call: &omc_providers::ToolCall,
+        _arguments: &serde_json::Value,
+    ) -> crate::Screened {
+        crate::Screened::default()
+    }
+
+    /// Adds no note.
+    async fn after_tool(
+        &self,
+        _call: &omc_providers::ToolCall,
+        _arguments: &serde_json::Value,
+        _output: &str,
+    ) -> Option<String> {
+        None
+    }
+
+    /// Lets the turn end.
+    async fn stop(&self, _answer: &str, _again: bool) -> Option<String> {
+        None
+    }
+
+    /// Records what started the compaction and answers as scripted.
+    async fn before_compact(
+        &self,
+        trigger: crate::CompactTrigger,
+        focus: Option<&str>,
+    ) -> crate::Compacting {
+        self.asked
+            .lock()
+            .unwrap()
+            .push((trigger, focus.map(str::to_owned)));
+        self.answer.clone()
+    }
+
+    /// The same checks.
+    fn for_subagent(&self, _id: &str, _kind: &str) -> std::sync::Arc<dyn crate::Hooks> {
+        std::sync::Arc::new(Self::new(self.answer.clone()))
+    }
+}
+
+/// A compaction on request asks the hooks with the reader's focus, and the instructions they add reach the summary after the focus; a hook that blocks it leaves the history as it was and says why.
+#[tokio::test]
+async fn hooks_shape_or_block_a_compaction_on_request() {
+    let model = Script::new(Vec::new(), Vec::new());
+    let registry = Registry::new();
+    let approvals = deny_all();
+    let adding = Guarding::new(crate::Compacting::Go(Some("keep the todo list".into())));
+    let context = Context {
+        hooks: Some(&adding),
+        ..context_on(&model, &registry, &approvals, Some(1_000))
+    };
+    let mut history = earlier_turns(500, 10);
+    compact(&context, &mut history, Some("the API"), &|_| {}, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        *adding.asked.lock().unwrap(),
+        vec![(crate::CompactTrigger::Manual, Some("the API".to_owned()))]
+    );
+    let summary = first_text(&model.seen.lock().unwrap()[0].1).to_owned();
+    assert!(
+        summary.contains("Give particular attention to: the API\n\nkeep the todo list"),
+        "{summary}"
+    );
+    let blocking = Guarding::new(crate::Compacting::Blocked("saving first".into()));
+    let context = Context {
+        hooks: Some(&blocking),
+        ..context_on(&model, &registry, &approvals, Some(1_000))
+    };
+    let mut history = earlier_turns(500, 10);
+    let error = compact(&context, &mut history, None, &|_| {}, None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("saving first"), "{error}");
+    assert_eq!(history.len(), 4);
+    assert_eq!(model.summary_requests(), 1);
+}
+
+/// A compaction past the threshold asks the hooks as an automatic one; when they block it, the turn goes on uncompacted and they are not asked again in that turn.
+#[tokio::test]
+async fn a_blocked_automatic_compaction_lets_the_turn_go_on() {
+    let model = Script::new(vec![say("answered")], Vec::new());
+    let registry = Registry::new();
+    let approvals = deny_all();
+    let blocking = Guarding::new(crate::Compacting::Blocked("not now".into()));
+    let context = Context {
+        hooks: Some(&blocking),
+        ..context_on(&model, &registry, &approvals, Some(1_000))
+    };
+    let mut history = earlier_turns(500, 900);
+    run_turn(&context, &mut history, "next".into(), &|_| {})
+        .await
+        .unwrap();
+    assert_eq!(model.summary_requests(), 0);
+    assert_eq!(
+        *blocking.asked.lock().unwrap(),
+        vec![(crate::CompactTrigger::Auto, None)]
+    );
+    assert!(
+        !history
+            .iter()
+            .any(|message| matches!(message, Message::Compaction(_)))
+    );
+}

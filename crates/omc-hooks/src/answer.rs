@@ -2,7 +2,7 @@
 //!
 //! Exit code 0 is an answer: standard output holding a JSON object is read for its fields, and other text is context for a prompt and ignored elsewhere. Exit code 2 blocks, with standard error as the reason. Any other exit code is a failure that lets things go on. A hook that timed out or could not start gave no answer: before a tool call that denies the call, since the check never happened, and everywhere else it lets things go on.
 
-use omc_agent::{Gate, Screened};
+use omc_agent::{Compacting, Gate, Screened};
 use serde_json::Value;
 
 use crate::config::Hook;
@@ -252,6 +252,65 @@ pub(crate) fn stop(given: &[Given<'_>]) -> Option<String> {
     joined(reasons)
 }
 
+/// Reports on standard error what a hook that cannot block wrote to standard error when it exited 2, since the reader is shown it and the model is not.
+fn shown_to_reader(one: &Given<'_>, said: &str) {
+    if !said.is_empty() {
+        eprintln!(
+            "hook error: {} ({}): {said}",
+            one.hook.label(),
+            one.hook.file.display()
+        );
+    }
+}
+
+/// The context the hooks of a conversation or a subagent starting add: each one's `additionalContext`, and, when `plain` is set, as for `SessionStart`, the plain text it printed, in order; nothing when there is none. These hooks cannot block: exit code 2 shows standard error to the reader only.
+pub(crate) fn started(given: &[Given<'_>], plain: bool) -> Option<String> {
+    let mut added = Vec::new();
+    for one in given {
+        match one.said() {
+            Said::Json(json) => added.extend(context(&json)),
+            Said::Text(text) if plain && !text.is_empty() => added.push(text),
+            Said::Blocked(said) => shown_to_reader(one, &said),
+            Said::Text(_) | Said::Nothing => {}
+        }
+    }
+    joined(added)
+}
+
+/// What the hooks before a compaction came to: blocked when any blocked, by exit code 2 or `decision: "block"`; otherwise going on, with the plain text they printed as instructions for the summary, in order.
+pub(crate) fn compacting(given: &[Given<'_>]) -> Compacting {
+    let mut blocks = Vec::new();
+    let mut instructions = Vec::new();
+    for one in given {
+        match one.said() {
+            Said::Blocked(reason) => blocks.push(or_default(reason, one.hook)),
+            Said::Json(json) => {
+                if json.get("decision").and_then(Value::as_str) == Some("block") {
+                    blocks.push(or_default(
+                        text(&json, "reason").unwrap_or_default(),
+                        one.hook,
+                    ));
+                }
+            }
+            Said::Text(text) if !text.is_empty() => instructions.push(text),
+            Said::Text(_) | Said::Nothing => {}
+        }
+    }
+    if !blocks.is_empty() {
+        return Compacting::Blocked(blocks.join("\n"));
+    }
+    Compacting::Go(joined(instructions))
+}
+
+/// Reads what the hooks of an event that has no decision to make answered, such as `SessionEnd` and `Notification`, only to report on standard error the ones that failed or wrote to standard error with exit code 2.
+pub(crate) fn heard(given: &[Given<'_>]) {
+    for one in given {
+        if let Said::Blocked(said) = one.said() {
+            shown_to_reader(one, &said);
+        }
+    }
+}
+
 #[cfg(test)]
 /// Tests for reading what hooks answered.
 mod tests {
@@ -416,6 +475,59 @@ mod tests {
         assert_eq!(
             given(Outcome::TimedOut(Duration::from_secs(30))),
             Submitted::Go
+        );
+    }
+
+    /// A conversation starting: plain text and `additionalContext` are added when plain text counts, only `additionalContext` otherwise, and exit code 2 adds nothing.
+    #[test]
+    fn a_start() {
+        let check = hook(HookEvent::SessionStart, "check");
+        let one = |outcome, plain| {
+            started(
+                &[Given {
+                    hook: &check,
+                    outcome,
+                }],
+                plain,
+            )
+        };
+        assert_eq!(
+            one(exited(0, "the secret is kiwi\n", ""), true),
+            Some("the secret is kiwi".into())
+        );
+        assert_eq!(one(exited(0, "the secret is kiwi\n", ""), false), None);
+        let json = r#"{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"on main"}}"#;
+        assert_eq!(one(exited(0, json, ""), false), Some("on main".into()));
+        assert_eq!(one(exited(2, "", "nope"), true), None);
+        assert_eq!(one(Outcome::TimedOut(Duration::from_secs(1)), true), None);
+    }
+
+    /// Before a compaction: exit code 2 and `decision: "block"` block it, plain text becomes instructions, and a failure lets it go on.
+    #[test]
+    fn before_a_compaction() {
+        let check = hook(HookEvent::PreCompact, "check");
+        let one = |outcome| {
+            compacting(&[Given {
+                hook: &check,
+                outcome,
+            }])
+        };
+        assert_eq!(
+            one(exited(2, "", "not now")),
+            Compacting::Blocked("not now".into())
+        );
+        assert_eq!(
+            one(exited(0, r#"{"decision":"block","reason":"saving"}"#, "")),
+            Compacting::Blocked("saving".into())
+        );
+        assert_eq!(
+            one(exited(0, "keep the API notes\n", "")),
+            Compacting::Go(Some("keep the API notes".into()))
+        );
+        assert_eq!(one(exited(1, "", "boom")), Compacting::Go(None));
+        assert_eq!(
+            one(Outcome::TimedOut(Duration::from_secs(1))),
+            Compacting::Go(None)
         );
     }
 

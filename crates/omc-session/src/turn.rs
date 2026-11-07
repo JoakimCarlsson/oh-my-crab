@@ -10,6 +10,7 @@ use omc_providers::Provider;
 use omc_providers::{ChatModel, Message, RemoteModel};
 use omc_tools::{Host, Registry};
 
+use crate::lifecycle::{context_of, start_notice};
 use crate::prefix::{Key, Planning, Prefix};
 use crate::settings::Mode;
 use crate::shared::{SessionHost, Shared};
@@ -104,12 +105,17 @@ impl Turn {
 
     /// Does `job` with `model` and says how it ended; a prompt takes in the prompts the client queued meanwhile at each safe point.
     ///
-    /// Every request of the turn is sent with the conversation's system prompt and tool list, made by its first turn, so that the provider's prompt cache keeps them: a prompt starts with notices of what changed since, and the tools the mode on now lacks are refused when called. The last request of the main loop is kept warm.
+    /// Every request of the turn is sent with the conversation's system prompt and tool list, made by its first turn, so that the provider's prompt cache keeps them: a prompt starts with notices of what changed since, among them the context the `SessionStart` hooks gave when the conversation opened or was last compacted, and the tools the mode on now lacks are refused when called. A compaction starts the `SessionStart` hooks again. The last request of the main loop is kept warm.
     pub(crate) async fn run_with(mut self, model: Arc<dyn ChatModel>, job: Job) -> Ended {
         let window = omc_providers::context_window(self.provider, &self.model);
         let effort = self.shared.effort_now();
         let out = self.shared.out.clone();
+        let lifecycle = self.shared.lifecycle.clone();
+        let named = self.model.clone();
         let events: Arc<EventSink> = Arc::new(move |event| {
+            if compacted(&event) {
+                lifecycle.begin(START_COMPACT, Some(named.clone()));
+            }
             for event in translate_all(event, window) {
                 let _ = out.send(event);
             }
@@ -196,6 +202,12 @@ impl Turn {
                     planning(),
                     &toolset,
                 );
+                let starting = self.shared.lifecycle.pending();
+                if let Some(starting) = &starting
+                    && let Some(context) = context_of(starting.clone()).await
+                {
+                    told.push(start_notice(&context));
+                }
                 if let Some(memories) = memories.filter(|_| prefix.wants_memory(&self.history)) {
                     let digest = digest(memories, prompt.clone()).await;
                     told.push(prefix.memory_notice(&digest));
@@ -211,7 +223,7 @@ impl Turn {
                 } else {
                     Some(self.shared.as_ref())
                 };
-                run_turn_steered(
+                let result = run_turn_steered(
                     &context,
                     &mut self.history,
                     told.join("\n\n"),
@@ -219,7 +231,11 @@ impl Turn {
                     self.scribe.as_ref(),
                     steering,
                 )
-                .await
+                .await;
+                if let (Ok(()), Some(starting)) = (&result, &starting) {
+                    self.shared.lifecycle.settle(starting);
+                }
+                result
             }
             Job::Compact(focus) => {
                 compact(
@@ -264,6 +280,17 @@ impl Turn {
             }
         }
     }
+}
+
+/// How a conversation started, as `SessionStart` hooks are told it, when it was just compacted.
+const START_COMPACT: &str = "compact";
+
+/// Whether `event` says the main agent's conversation was compacted.
+fn compacted(event: &omc_agent::AgentEvent) -> bool {
+    matches!(
+        event,
+        omc_agent::AgentEvent::ToolDone { name, is_error: false, .. } if name == omc_agent::COMPACT
+    )
 }
 
 /// The digest of `memories` a conversation whose prompt is `prompt` starts with, read on a thread for blocking work; empty when there are none or they cannot be read, which the agent is then told as there being none.
@@ -960,6 +987,94 @@ mod tests {
             ),
             "{prompt}"
         );
+    }
+
+    /// The context `SessionStart` hooks give is told once, as a notice at the start of the first prompt, without changing the system prompt or tool list; a compaction runs the hooks again for `compact` and the next prompt carries their new context.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_start_context_is_a_notice() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/turn-session-start");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (out, _events) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared::new(out);
+        shared.open(Provider::Claude, vec!["m".into()], "m".into(), Mode::Asking);
+        shared.lifecycle.set_engine(Some(Arc::new(Engine::new(
+            vec![omc_hooks::Hook {
+                event: HookEvent::SessionStart,
+                matcher: String::new(),
+                command: r#"echo "started by $(grep -o '"source":"[a-z]*"' | cut -d'"' -f4)""#
+                    .to_owned(),
+                timeout: None,
+                file: dir.join("hooks.json"),
+                origin: omc_hooks::HookOrigin::User,
+                claude: false,
+                plugin: None,
+            }],
+            omc_hooks::Setting {
+                session: None,
+                folder: dir.clone(),
+                mode: Arc::new(|| "default"),
+            },
+        ))));
+        shared.lifecycle.begin("startup", Some("m".into()));
+        let model = Arc::new(Recording {
+            seen: Mutex::new(Vec::new()),
+        });
+        let reply = Message::Assistant(omc_providers::Reply {
+            text: "ok".into(),
+            ..omc_providers::Reply::default()
+        });
+        let mut history = vec![
+            Message::User("x".repeat(200_000)),
+            reply.clone(),
+            Message::User("y".repeat(200_000)),
+            reply,
+        ];
+        let jobs = [
+            Job::Prompt("one".into()),
+            Job::Prompt("two".into()),
+            Job::Compact(None),
+            Job::Prompt("three".into()),
+        ];
+        for job in jobs {
+            let turn = turn_in(&dir, &shared, history);
+            history = match turn.run_with(model.clone(), job).await {
+                Ended::Done(after) => after,
+                Ended::Failed(reason) | Ended::SignedOut(reason) => panic!("turn failed: {reason}"),
+            };
+        }
+        assert!(shared.lifecycle.pending().is_none());
+        let seen = model.seen.lock().unwrap();
+        let turns: Vec<&Sent> = seen
+            .iter()
+            .filter(|sent| !sent.system.contains("checkpoint summaries"))
+            .collect();
+        assert_eq!(turns.len(), 3);
+        for sent in &turns {
+            assert_eq!(sent.system.as_bytes(), turns[0].system.as_bytes());
+            assert_eq!(sent.tools, turns[0].tools);
+            assert!(!sent.system.contains("started by"));
+        }
+        let prompts: Vec<&str> = turns
+            .iter()
+            .map(|sent| sent.prompt.as_deref().unwrap())
+            .collect();
+        assert!(
+            prompts[0].contains("<session-start-hook>\nstarted by startup\n</session-start-hook>")
+                && prompts[0].ends_with("one"),
+            "{}",
+            prompts[0]
+        );
+        assert_eq!(prompts[1], "two");
+        assert!(
+            prompts[2].contains("<session-start-hook>\nstarted by compact\n</session-start-hook>")
+                && prompts[2].ends_with("three"),
+            "{}",
+            prompts[2]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Rejecting the plan keeps plan mode on.
