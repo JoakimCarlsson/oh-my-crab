@@ -38,6 +38,8 @@ fn git(directory: &Path, arguments: &[&str]) -> String {
             "user.email=test@localhost",
             "-c",
             "commit.gpgsign=false",
+            "-c",
+            "core.autocrlf=false",
         ])
         .args(arguments)
         .env_remove("GIT_DIR")

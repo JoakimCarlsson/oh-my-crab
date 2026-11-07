@@ -215,6 +215,32 @@ pub struct Scribe {
     epoch: u64,
 }
 
+/// How long opening a conversation keeps trying for its lock before saying it is open elsewhere.
+const LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Takes the lock on the conversation file `file`, trying again for up to [`LOCK_PATIENCE`].
+///
+/// A process another thread is starting holds a copy of every open file until it runs its program, and the lock with it, so a lock let go a moment ago can look held for that moment; a conversation open in another process stays held throughout.
+///
+/// # Errors
+///
+/// Returns an error saying the conversation is open elsewhere when the lock stays held, and the error of the file system when locking fails otherwise.
+fn lock(file: &File) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + LOCK_PATIENCE;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::other("the conversation is open elsewhere"));
+            }
+        }
+    }
+}
+
 impl Journal {
     /// Opens the history at `path`, creating the file when it is not there, and returns it with the messages it holds.
     ///
@@ -251,14 +277,7 @@ impl Journal {
         if !file.metadata().map_err(io_error)?.is_file() {
             return Err(io_error(io::Error::other("not a regular file")));
         }
-        file.try_lock().map_err(|error| {
-            io_error(match error {
-                std::fs::TryLockError::WouldBlock => {
-                    io::Error::other("the conversation is open elsewhere")
-                }
-                std::fs::TryLockError::Error(error) => error,
-            })
-        })?;
+        lock(&file).map_err(io_error)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).map_err(io_error)?;
         let complete = bytes

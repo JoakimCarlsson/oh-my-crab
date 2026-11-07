@@ -153,6 +153,9 @@ pub(crate) struct Handback {
     taken: Result<(Vec<u8>, Vec<String>), String>,
 }
 
+/// The settings every git run of the worktrees is given, so that files travel between the main agent's working tree and a subagent's byte for byte: git's own conversion of line endings, which `core.autocrlf` turns on for many Windows installs, is off.
+const BYTE_FOR_BYTE: [&str; 2] = ["-c", "core.autocrlf=false"];
+
 /// Runs git in `directory` with `arguments`, `environment` set and `input` on its standard input, and returns what it printed.
 ///
 /// # Errors
@@ -166,6 +169,7 @@ async fn git_with(
 ) -> Result<Vec<u8>, String> {
     let mut command = tokio::process::Command::new("git");
     command
+        .args(BYTE_FOR_BYTE)
         .arg("-C")
         .arg(directory)
         .args(arguments)
@@ -218,6 +222,7 @@ async fn git(directory: &Path, arguments: &[&str]) -> Result<String, String> {
 fn git_now(directory: &Path, arguments: &[&str]) -> bool {
     let mut command = std::process::Command::new("git");
     command
+        .args(BYTE_FOR_BYTE)
         .arg("-C")
         .arg(directory)
         .args(arguments)
