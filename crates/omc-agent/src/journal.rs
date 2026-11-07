@@ -170,6 +170,8 @@ pub struct Journal {
 struct State {
     /// The file, open for appending.
     file: File,
+    /// The lock file beside it, held locked while the journal is open.
+    _held: File,
     /// How many cut-backs were asked for; a [`Scribe`] from before the last one is out of date.
     epoch: u64,
     /// A cut-back that could not be written yet, which is tried again before anything else is written so that a failed turn never comes back.
@@ -218,7 +220,14 @@ pub struct Scribe {
 /// How long opening a conversation keeps trying for its lock before saying it is open elsewhere.
 const LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Takes the lock on the conversation file `file`, trying again for up to [`LOCK_PATIENCE`].
+/// The file beside the conversation file `path` that is locked while the conversation is open: the conversation file itself is not locked, since Windows lets nobody read a locked file, and a conversation open elsewhere must stay readable.
+fn lock_path(path: &Path) -> PathBuf {
+    let mut named = path.as_os_str().to_owned();
+    named.push(".lock");
+    PathBuf::from(named)
+}
+
+/// Takes the lock on the lock file `file` of a conversation, trying again for up to [`LOCK_PATIENCE`].
 ///
 /// A process another thread is starting holds a copy of every open file until it runs its program, and the lock with it, so a lock let go a moment ago can look held for that moment; a conversation open in another process stays held throughout.
 ///
@@ -273,11 +282,12 @@ impl Journal {
         if let Some(folder) = path.parent() {
             create_folder(folder).map_err(io_error)?;
         }
+        let held = open_private(&lock_path(path)).map_err(io_error)?;
+        lock(&held).map_err(io_error)?;
         let mut file = open_private(path).map_err(io_error)?;
         if !file.metadata().map_err(io_error)?.is_file() {
             return Err(io_error(io::Error::other("not a regular file")));
         }
-        lock(&file).map_err(io_error)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).map_err(io_error)?;
         let complete = bytes
@@ -350,6 +360,7 @@ impl Journal {
             notes,
             state: Mutex::new(State {
                 file,
+                _held: held,
                 epoch: 0,
                 pending: None,
                 marks,
@@ -1044,7 +1055,7 @@ mod tests {
         std::fs::remove_dir(&path).unwrap();
     }
 
-    /// A history open in one conversation cannot be opened in another until the first lets go of it.
+    /// A history open in one conversation cannot be opened in another until the first lets go of it. The history file stays readable meanwhile, since the lock is on a file beside it.
     #[test]
     fn a_history_opens_once_at_a_time() {
         let path = scratch("locked.jsonl");
@@ -1053,6 +1064,12 @@ mod tests {
             Journal::open(&path, None),
             Err(JournalError::Io { .. })
         ));
+        assert!(Journal::read(&path).is_ok());
+        assert!(
+            lock_path(&path)
+                .to_string_lossy()
+                .ends_with("locked.jsonl.lock")
+        );
         drop(journal);
         assert!(Journal::open(&path, None).is_ok());
     }
