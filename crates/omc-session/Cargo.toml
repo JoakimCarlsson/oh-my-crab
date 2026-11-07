@@ -3,6 +3,9 @@ name = "omc-session"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "One crab conversation, driven by commands and reported as events"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 async-trait = "0.1.92"

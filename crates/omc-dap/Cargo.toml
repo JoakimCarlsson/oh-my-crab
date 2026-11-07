@@ -3,6 +3,9 @@ name = "omc-dap"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "The debug tool of crab, driving debuggers through the Debug Adapter Protocol"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 async-trait = "0.1.92"

@@ -3,6 +3,9 @@ name = "omc-auth"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Sign-in for crab: OAuth, device-code and API-key credentials, stored and refreshed"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 base64 = "0.23.1"

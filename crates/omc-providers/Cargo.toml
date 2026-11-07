@@ -3,6 +3,9 @@ name = "omc-providers"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Model providers for crab: streaming chat over three wire formats, model lists and custom endpoints"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 async-trait = "0.1.92"

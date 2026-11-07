@@ -3,6 +3,9 @@ name = "omc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "crab, a coding-agent harness that talks to its client in JSON lines over standard input and output"
+repository.workspace = true
+homepage.workspace = true
 
 [[bin]]
 name = "crab"

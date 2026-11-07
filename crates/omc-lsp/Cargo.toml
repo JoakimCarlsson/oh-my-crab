@@ -3,6 +3,9 @@ name = "omc-lsp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Language servers crab starts itself"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 async-trait = "0.1.92"

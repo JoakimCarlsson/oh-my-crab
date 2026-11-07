@@ -66,3 +66,23 @@ one fails, document what you added.
   and `read_only` or `approval_scope` as it needs), register it where the
   session builds its registry in `omc-session`, and add it to
   [tools](tools/README.md).
+
+## Releasing
+
+A release is a git tag `v<version>` matching `version` in the root
+`Cargo.toml`, such as `v0.1.0`, or `v0.2.0-rc.1` for a release candidate:
+
+1. Set the version in `[workspace.package]` and in the `omc-*` entries of
+   `[workspace.dependencies]` and of each crate's `Cargo.toml`, then commit.
+2. Tag the commit and push the tag: `git tag v0.1.0 && git push origin v0.1.0`.
+
+The release workflow checks that the tag matches the version, runs fmt,
+clippy and the tests, builds `crab` for Linux (x86-64 and ARM), macOS (Intel
+and Apple silicon) and Windows, and publishes a GitHub release with the
+archives and generated notes. A tag with a `-` in it, such as `-rc.1`, is
+published as a pre-release.
+
+pandemonium depends on crab's crates by git tag, so a pandemonium release
+names the crab tag it was built with. Every crate is ready for crates.io too
+(`cargo package --workspace` succeeds); publishing there is not part of the
+release yet.

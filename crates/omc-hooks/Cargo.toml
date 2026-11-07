@@ -3,6 +3,9 @@ name = "omc-hooks"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Hooks and project trust for crab"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 async-trait = "0.1.92"

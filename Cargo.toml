@@ -6,14 +6,17 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/JoakimCarlsson/oh-my-crab"
+homepage = "https://github.com/JoakimCarlsson/oh-my-crab"
+readme = "README.md"
 
 [workspace.dependencies]
-omc-agent = { path = "crates/omc-agent" }
-omc-auth = { path = "crates/omc-auth" }
-omc-providers = { path = "crates/omc-providers" }
-omc-script = { path = "crates/omc-script" }
-omc-tools = { path = "crates/omc-tools" }
-omc-wire = { path = "crates/omc-wire" }
-omc-mcp = { path = "crates/omc-mcp" }
-omc-session = { path = "crates/omc-session" }
-omc-client = { path = "crates/omc-client" }
+omc-agent = { version = "0.1.0", path = "crates/omc-agent" }
+omc-auth = { version = "0.1.0", path = "crates/omc-auth" }
+omc-providers = { version = "0.1.0", path = "crates/omc-providers" }
+omc-script = { version = "0.1.0", path = "crates/omc-script" }
+omc-tools = { version = "0.1.0", path = "crates/omc-tools" }
+omc-wire = { version = "0.1.0", path = "crates/omc-wire" }
+omc-mcp = { version = "0.1.0", path = "crates/omc-mcp" }
+omc-session = { version = "0.1.0", path = "crates/omc-session" }
+omc-client = { version = "0.1.0", path = "crates/omc-client" }

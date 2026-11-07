@@ -3,6 +3,9 @@ name = "omc-memory"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Memory that lasts across crab conversations"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 omc-context = { version = "0.1.0", path = "../omc-context" }

@@ -3,6 +3,9 @@ name = "omc-context"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "What crab tells the model: the system prompt, instruction files, skills, agents and notices"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 ignore = "0.4.34"

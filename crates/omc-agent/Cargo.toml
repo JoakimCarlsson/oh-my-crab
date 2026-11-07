@@ -3,6 +3,9 @@ name = "omc-agent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "The agent loop of crab: model requests, tool calls, approvals, hooks, compaction and subagents"
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 omc-providers.workspace = true
