@@ -62,6 +62,8 @@ pub(crate) struct Shared {
     pub(crate) checkpoint: Arc<Checkpoint>,
     /// The commands and subagents running in the background.
     pub(crate) jobs: Arc<Jobs>,
+    /// The seats subagents take to run, shared by every level of subagents and every turn, so that only so many run at once.
+    pub(crate) throttle: Arc<omc_agent::Throttle>,
     /// The debugging sessions the `debug` tool keeps across calls.
     pub(crate) debuggers: Arc<omc_dap::Sessions>,
     /// The language services `edit` and `write` ask, chosen when the conversation is opened.
@@ -133,6 +135,7 @@ impl Shared {
             jobs: Arc::new(Jobs::new(move |run| {
                 let _ = announce.send(Event::Background(run));
             })),
+            throttle: Arc::new(omc_agent::Throttle::default()),
             debuggers: Arc::new(omc_dap::Sessions::new()),
             naming: Mutex::new(Naming::default()),
             login: Mutex::new(Login::default()),
@@ -381,6 +384,11 @@ impl Shared {
                 .provider
                 .map(|provider| (provider, state.model.clone()))
         })
+    }
+
+    /// The models the provider listed when the conversation was opened, best first.
+    pub(crate) fn models_listed(&self) -> Vec<String> {
+        self.state(|state| state.models.clone())
     }
 
     /// Switches to `model`; an effort the new model does not take is dropped.

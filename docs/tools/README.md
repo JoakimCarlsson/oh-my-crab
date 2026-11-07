@@ -110,11 +110,13 @@ plan mode refuses them.
 A client can deny any tool by name in `Open`; a denied tool is given to no
 one, subagents and scripts included.
 
-**Subagents** never get `task`, `exit_plan_mode`, `ask`, `todo`,
-`context_notes`, `new_context`, `checkpoint`, `rewind`, `wait`, `debug`,
-`set_title`, `remember` or `memory_edit`: the tools that start subagents,
-talk to the reader, steer the conversation, change memory, or hold state that
-belongs to the conversation. Their `bash` cannot start background runs. A
+**Subagents** never get `exit_plan_mode`, `ask`, `todo`, `context_notes`,
+`new_context`, `checkpoint`, `rewind`, `wait`, `debug`, `set_title`,
+`remember` or `memory_edit`: the tools that talk to the reader, steer the
+conversation, change memory, or hold state that belongs to the conversation.
+They get a `task` tool of their own, which cannot start background runs, only
+above the deepest level of subagents allowed (see
+[nesting](subagents.md#nesting)). Their `bash` cannot start background runs. A
 kind whose definition lists tools gets only those. In plan mode subagents get
 only the tools plan mode allows.
 

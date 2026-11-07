@@ -40,13 +40,15 @@ fn task_tool(
     let sink = log.clone();
     let events: Arc<EventSink> = Arc::new(move |event| sink.lock().unwrap().push(event));
     let task = Task::new(TaskSettings {
+        models: crate::Models::default(),
+        nesting: crate::Nesting::default(),
         model,
         registry: Arc::new(Registry::builtin(&dir).unwrap()),
         approvals: deny_all(),
         events,
         agents,
         effort: None,
-        prompt: Arc::new(|agent, _, _| format!("SUB:{}", agent.name)),
+        prompt: Arc::new(|agent, _, _, _| format!("SUB:{}", agent.name)),
         hooks: None,
         jobs,
         isolation: None,
@@ -336,6 +338,7 @@ async fn a_definition_can_declare_the_schema() {
         prompt: "Count.".into(),
         output_schema: Some(counting()),
         isolated: false,
+        model: None,
         path: None,
         origin: Origin::User,
     });

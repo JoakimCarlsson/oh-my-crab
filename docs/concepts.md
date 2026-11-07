@@ -182,13 +182,16 @@ Subagents cannot start background runs. See
 The `task` tool hands self-contained assignments to subagents, each running
 a loop of its own and handing back its final message, or JSON checked
 against a schema. The kinds are `task`, `scout` and `reviewer`, plus the
-agent definitions found on disk. One call runs up to 16, eight at a time, and
-each can work in a git worktree of its own whose changes are applied back as
-a patch when it ends. Their tool calls reach the client as `Tool` events whose
-`parent` is the `task` call.
+agent definitions found on disk. One call runs up to 16, eight running at once
+across the conversation, and each can work in a git worktree of its own whose
+changes are applied back as a patch when it ends. A subagent asks the main
+agent's model unless its definition or the call names another, such as
+`haiku`. Their tool calls reach the client as `Tool` events whose `parent` is
+the `task` call.
 
-Subagents get the main agent's tools less the ones that talk to the reader,
-steer the conversation or start more subagents. See
+Subagents get the main agent's tools less the ones that talk to the reader or
+steer the conversation. A subagent may start subagents of its own, two levels
+below the main agent by default. See
 [subagents](tools/subagents.md) and
 [agent definitions](extending/skills-and-agents.md#agent-definitions).
 

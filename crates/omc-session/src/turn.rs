@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use omc_agent::{Context, EventSink, Hooks, Scribe, compact, run_turn_steered};
+use omc_agent::{Context, EventSink, Hooks, Models, Scribe, compact, run_turn_steered};
 use omc_auth::AuthError;
 use omc_context::{Discovered, Environment, Locations};
 use omc_hooks::{Engine, HookEvent, Submitted};
@@ -11,6 +11,7 @@ use omc_providers::{ChatModel, Message, RemoteModel};
 use omc_tools::{Host, Registry};
 
 use crate::lifecycle::{context_of, start_notice};
+use crate::picker::SessionPicker;
 use crate::prefix::{Key, Planning, Prefix};
 use crate::settings::Mode;
 use crate::shared::{SessionHost, Shared};
@@ -136,6 +137,15 @@ impl Turn {
             denied: &self.denied,
             host,
             model: model.clone(),
+            models: Models {
+                current: self.model.clone(),
+                picker: Some(Arc::new(SessionPicker {
+                    shared: self.shared.clone(),
+                    provider: self.provider,
+                    effort,
+                })),
+            },
+            throttle: self.shared.throttle.clone(),
             approvals: self.shared.approvals.clone(),
             events: events.clone(),
             effort,

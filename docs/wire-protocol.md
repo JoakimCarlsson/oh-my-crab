@@ -297,7 +297,8 @@ keeping the fields that are `null` in the update.
 - The work of a subagent is reported as `Tool` events whose `id` is the
   subagent call's id, a `:` and the inner call's id, with `parent` set to the
   subagent call's id and `agent` to the subagent's kind. Nested subagents
-  chain the ids: `a:b:c` has the parent `a:b`.
+  chain the ids: `a:b:c` has the parent `a:b`. A subagent's own `task` call
+  is reported the same way, its `agent` saying what kind it starts.
 
 ### Other rules
 

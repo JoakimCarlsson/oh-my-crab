@@ -135,12 +135,20 @@ Look for `unsafe` blocks in the files named and explain each.
   checked JSON. A value that is not a JSON object is ignored.
 - `isolated`: `true`, `yes` or `on` runs the subagent in a git worktree of its
   own unless the call says otherwise.
+- `model`: the model the subagent asks, as Claude Code writes it: an alias
+  (`haiku`, `sonnet`, `opus`), a model id, or `inherit`, the same as leaving it
+  out, for the model of the agent that starts it. A provider and a model id as
+  `provider/model` picks a model of another signed-in provider. A call's own
+  `model` wins over it. See [Subagents](../tools/subagents.md#models) for how
+  the name is looked up.
+- `tools` decides whether the subagent may start subagents of its own: it may
+  when the list is missing or holds `task` (or Claude Code's `agent`), and the
+  levels allowed are not used up.
 
-Other keys, `model` among them, are ignored: a subagent runs on the
-conversation's model. A TOML definition reads the top-level strings `name`,
+Other keys are ignored. A TOML definition reads the top-level strings `name`,
 `description`, `developer_instructions` (or `instructions`, which it must have
-one of), `output_schema` and `isolated`, stopping at the first table; it cannot
-limit tools.
+one of), `output_schema`, `isolated` and `model`, stopping at the first table;
+it cannot limit tools.
 
 ## Claude Code plugins
 

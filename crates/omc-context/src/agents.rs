@@ -35,6 +35,8 @@ pub struct AgentDefinition {
     pub output_schema: Option<serde_json::Value>,
     /// Whether it works in a git worktree of its own unless a call says otherwise, its changes handed back to the main agent's working tree as a patch when it ends.
     pub isolated: bool,
+    /// The model it asks, as the definition names it: an alias such as `haiku`, `sonnet` or `opus`, a model id, or a provider and a model id as `provider/model`; nothing, which `inherit` also says, for the model of the agent that starts it.
+    pub model: Option<String>,
     /// Where the definition is, or nothing for a built-in one.
     pub path: Option<PathBuf>,
     /// Where the definition came from.
@@ -148,6 +150,7 @@ fn from_markdown(
         prompt,
         output_schema: schema_of(parsed.get("output_schema")),
         isolated: flag(parsed.get("isolated")),
+        model: model_of(parsed.get("model")),
         path,
         origin,
     })
@@ -157,6 +160,12 @@ fn from_markdown(
 fn flag(text: Option<&str>) -> bool {
     text.map(|text| text.trim().trim_matches(['"', '\'']).to_ascii_lowercase())
         .is_some_and(|text| matches!(text.as_str(), "true" | "yes" | "on"))
+}
+
+/// The model `text`, the value of a definition's `model` key, names, unquoted and trimmed; nothing when it is missing, empty or `inherit`, in any case, which all mean the model of the agent that starts it.
+fn model_of(text: Option<&str>) -> Option<String> {
+    let text = text?.trim().trim_matches(['"', '\'']).trim();
+    (!text.is_empty() && !text.eq_ignore_ascii_case("inherit")).then(|| text.to_owned())
 }
 
 /// The JSON Schema `text` holds, when it holds a JSON object; anything else declares none.
@@ -189,6 +198,7 @@ fn from_toml(
         tools: None,
         output_schema: schema_of(get("output_schema").as_deref()),
         isolated: flag(get("isolated").as_deref()),
+        model: model_of(get("model").as_deref()),
         prompt,
         path: Some(path.to_path_buf()),
         origin,
@@ -320,5 +330,37 @@ mod tests {
         assert!(!isolated("isolated: false"));
         assert!(!isolated("description: d"));
         assert!(builtin_agents().iter().all(|agent| !agent.isolated));
+    }
+
+    /// A definition may name its model, in markdown or TOML; `inherit`, an empty value or none leaves the model of the agent that starts it.
+    #[test]
+    fn reads_the_model() {
+        let model = |front: &str| {
+            from_markdown(
+                &format!("---\n{front}\n---\nWork."),
+                "a",
+                None,
+                Origin::User,
+            )
+            .unwrap()
+            .model
+        };
+        assert_eq!(model("model: haiku"), Some("haiku".to_owned()));
+        assert_eq!(
+            model("model: \"claude-sonnet-4-5\""),
+            Some("claude-sonnet-4-5".to_owned())
+        );
+        assert_eq!(model("model: Inherit"), None);
+        assert_eq!(model("model:"), None);
+        assert_eq!(model("description: d"), None);
+        let toml = from_toml(
+            "model = \"gpt-5-mini\"\ndeveloper_instructions = \"Go.\"\n",
+            "t",
+            std::path::Path::new("t.toml"),
+            Origin::Project,
+        )
+        .unwrap();
+        assert_eq!(toml.model, Some("gpt-5-mini".to_owned()));
+        assert!(builtin_agents().iter().all(|agent| agent.model.is_none()));
     }
 }

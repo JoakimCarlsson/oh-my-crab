@@ -304,7 +304,7 @@ fn plan_of(arguments: &serde_json::Value) -> Option<Vec<omc_wire::PlanStep>> {
     )
 }
 
-/// The event that says what `event` says, given a context window of `window` tokens; nothing when it says nothing the client shows.
+/// The event that says what `event` says, given a context window of `window` tokens; nothing when it says nothing the client shows. Work nested under a subagent keeps the kind of the innermost subagent it names: the one that made the call, or the one a nested `task` call starts.
 pub(crate) fn translate(event: AgentEvent, window: u64) -> Option<Event> {
     Some(match event {
         AgentEvent::Started(Part::Thinking) => Event::Started(omc_wire::Part::Thinking),
@@ -338,7 +338,7 @@ pub(crate) fn translate(event: AgentEvent, window: u64) -> Option<Event> {
             output: Some(text),
             ..bare(id)
         }),
-        AgentEvent::Spawned { id, agent } => Event::Tool(Tool {
+        AgentEvent::Spawned { id, agent, .. } => Event::Tool(Tool {
             agent: Some(agent),
             ..bare(id)
         }),
@@ -360,7 +360,7 @@ pub(crate) fn translate(event: AgentEvent, window: u64) -> Option<Event> {
                     Some(inner) => format!("{parent}:{inner}"),
                     None => parent,
                 }),
-                agent: Some(agent),
+                agent: tool.agent.or(Some(agent)),
                 ..tool
             }),
             _ => return None,
@@ -447,6 +447,7 @@ mod tests {
             AgentEvent::Spawned {
                 id: "c1".into(),
                 agent: "scout".into(),
+                model: Some("claude-haiku-4-5".into()),
             },
             1,
         ) else {
@@ -486,6 +487,49 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// A subagent starting one of its own reports the call under its own, with the kind of the one it starts; the work of that one is filed under both calls, as its own.
+    #[test]
+    fn nested_subagents_chain_their_calls() {
+        let Some(Event::Tool(started)) = translate(
+            AgentEvent::Nested {
+                parent: "c1".into(),
+                agent: "task".into(),
+                event: Box::new(AgentEvent::Spawned {
+                    id: "s1".into(),
+                    agent: "scout".into(),
+                    model: Some("claude-haiku-4-5".into()),
+                }),
+            },
+            1,
+        ) else {
+            panic!()
+        };
+        assert_eq!(started.id, "c1:s1");
+        assert_eq!(started.parent.as_deref(), Some("c1"));
+        assert_eq!(started.agent.as_deref(), Some("scout"));
+        let Some(Event::Tool(deep)) = translate(
+            AgentEvent::Nested {
+                parent: "c1".into(),
+                agent: "task".into(),
+                event: Box::new(AgentEvent::Nested {
+                    parent: "s1".into(),
+                    agent: "scout".into(),
+                    event: Box::new(AgentEvent::ToolStart {
+                        id: "g".into(),
+                        name: "grep".into(),
+                        summary: "x".into(),
+                    }),
+                }),
+            },
+            1,
+        ) else {
+            panic!()
+        };
+        assert_eq!(deep.id, "c1:s1:g");
+        assert_eq!(deep.parent.as_deref(), Some("c1:s1"));
+        assert_eq!(deep.agent.as_deref(), Some("scout"));
     }
 
     /// The worktree of an isolated subagent is reported on its call, or on its step of a call, with what became of its changes once it ended.

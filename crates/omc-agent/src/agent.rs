@@ -55,6 +55,8 @@ pub enum AgentEvent {
         id: String,
         /// The kind of subagent.
         agent: String,
+        /// What the model it asks is called, when that is known.
+        model: Option<String>,
     },
     /// Something a subagent did, as the `task` call `parent` ran it.
     ///

@@ -1,18 +1,69 @@
 # Subagents
 
 The `task` tool hands self-contained assignments to subagents, each running a
-loop of its own with the main agent's tools, less the ones that start
-subagents or talk to the reader, and less `debug`, whose sessions belong to
-the conversation and would be steered by several subagents at once. The kinds come with the harness (`task`,
+loop of its own with the main agent's tools, less the ones that talk to the
+reader, and less `debug`, whose sessions belong to the conversation and would
+be steered by several subagents at once. The kinds come with the harness (`task`,
 `scout` and `reviewer`) or from agent definitions in the project's and the
 user's agent folders and in installed Claude Code plugins (see
 [Skills, agents and instruction files](../extending/skills-and-agents.md)). One call runs one assignment, or up to 16 given as
-`tasks`, eight at a time, and their results come back under a heading each; one
-failing leaves the others be. With `background` the call returns a handle per
-subagent at once and `wait` returns each result as it ends. A call or a
+`tasks`, and their results come back under a heading each; one failing leaves
+the others be. Eight subagents run at once across the whole conversation,
+whatever call or level started them (see [Nesting](#nesting)). With
+`background` the call returns a handle per subagent at once and `wait` returns
+each result as it ends; only the main agent can start subagents in the
+background. A call or a
 definition can give an `output_schema`: the subagent then hands its result to
 `submit_result`, which checks it against the schema, and the main agent gets
 the checked JSON instead of prose.
+
+## Models
+
+A subagent asks the model of the agent that starts it, unless its definition
+names a `model` or the call gives one, for the single assignment or for an
+item of `tasks`; the call's wins, and a call saying `inherit` keeps the model
+of the agent starting it whatever the definition says. A name is looked up
+among the models the conversation's provider listed when it opened:
+
+- an id equal to the name, in any case;
+- otherwise the first listed id holding the name, so that an alias such as
+  `haiku`, `sonnet` or `opus` picks the provider's best model of that family,
+  the provider listing its best models first;
+- otherwise, when the name starts with the id of a provider and a `/`, such
+  as `codex/gpt-5`, the model is looked up the same way among that provider's
+  models, listed for it then. The reader must be signed in to it.
+
+When the provider listed no models, the name is used as it is. A name that
+matches nothing fails the call before any subagent starts, and the error the
+model reads lists some of the models there are. The subagent then thinks at
+the conversation's effort when its model takes that level, and otherwise at
+its model's default: medium when it offers that, else its lightest.
+
+A subagent's system prompt names the model it asks. Its own model requests do
+not count towards the conversation's context use: its `Used` events are not
+sent, whichever model it asks.
+
+## Nesting
+
+A subagent may start subagents of its own with a `task` tool of its own, two
+levels below the main agent by default: the main agent's subagents can start
+subagents, and those cannot. `OMC_SUBAGENT_DEPTH` sets how many levels may run
+below the main agent (`1` lets no subagent start subagents; at most 8). A
+subagent at the deepest level, or whose definition lists tools without `task`,
+gets no `task` tool, and the `task` tool's description tells each agent whether
+its children may start more. A nested subagent asks its parent's model unless
+its definition or the call names another, draws its tools from its parent's,
+and its work is reported under its parent's call, the ids chained as in
+[Tool events are updates](../wire-protocol.md#tool-events-are-updates).
+
+All subagents of a conversation share eight seats, however deep they are: a
+subagent takes a seat to run and holds it until it ends, and the rest wait.
+A subagent waiting for its own subagents gives its seat up while they run and
+takes one again once they ended, so a tree of subagents waiting on each other
+can never hold every seat and stall. Approvals are shared with the main agent
+at every level, as are the hooks, which see each subagent under its own id.
+
+## Worktrees
 
 A subagent can work in a git worktree of its own, so that subagents editing at
 once never trample each other's files or the main agent's. The call sets
@@ -53,3 +104,11 @@ conversations' worktrees made more than a day before are removed then too.
 Isolation needs `git` and a git working tree; a call asking for it anywhere
 else is refused with the reason and starts nothing, rather than running the
 subagents unisolated.
+
+Isolation composes with nesting. A subagent working in a worktree of its own
+that starts an isolated subagent has that subagent's worktree made from its
+own worktree, as it is then, its changes so far included, and what that
+subagent changed is applied to its parent's worktree when it ends. The parent
+hands both its own changes and its children's back when it ends in turn. A
+nested subagent that is not isolated works in its parent's folder, whatever
+that is.

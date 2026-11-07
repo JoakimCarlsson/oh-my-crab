@@ -326,13 +326,15 @@ async fn subagents_script_with_their_own_tools() {
     let base = tools(&dir);
     let mut registry = base.clone();
     registry.register(Task::new(TaskSettings {
+        models: crate::Models::default(),
+        nesting: crate::Nesting::default(),
         model: model.clone(),
         registry: Arc::new(base),
         approvals: deny_all(),
         events,
         agents: builtin_agents(),
         effort: None,
-        prompt: Arc::new(|agent, _, _| format!("SUB:{}", agent.name)),
+        prompt: Arc::new(|agent, _, _, _| format!("SUB:{}", agent.name)),
         hooks: None,
         isolation: None,
         jobs: Arc::new(Jobs::new(|_| {})),

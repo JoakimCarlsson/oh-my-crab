@@ -11,6 +11,7 @@ mod languages;
 mod lifecycle;
 mod listing;
 mod memory;
+mod picker;
 mod prefix;
 mod prompt;
 mod providers;

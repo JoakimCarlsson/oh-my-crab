@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use omc_agent::{Approvals, EventSink, Hooks, Isolation, Task, TaskSettings};
+use omc_agent::{
+    Approvals, EventSink, Hooks, Isolation, Models, Nesting, Task, TaskSettings, Throttle,
+};
 use omc_context::{Discovered, Environment, PromptInput, build_subagent_prompt};
 use omc_memory::Memories;
 use omc_providers::{ChatModel, Effort};
@@ -19,8 +21,12 @@ pub(crate) struct Inputs<'a> {
     pub(crate) denied: &'a [String],
     /// The reader the tools report to.
     pub(crate) host: Arc<dyn Host>,
-    /// The model subagents ask.
+    /// The model subagents ask unless another is named.
     pub(crate) model: Arc<dyn ChatModel>,
+    /// What that model is called, and how subagents find another by name.
+    pub(crate) models: Models,
+    /// The seats subagents take to run, shared by all of them.
+    pub(crate) throttle: Arc<Throttle>,
     /// What is allowed without asking.
     pub(crate) approvals: Arc<Approvals>,
     /// Where the work of subagents is reported.
@@ -122,20 +128,17 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
     let tree = inputs.tree.clone();
     registry.register(Task::new(TaskSettings {
         model: inputs.model.clone(),
+        models: inputs.models.clone(),
         registry: sub_base,
         approvals: inputs.approvals.clone(),
         events: inputs.events.clone(),
         agents: discovered.agents.clone(),
         effort: inputs.effort,
-        prompt: Arc::new(move |agent, tools, apart| {
-            let moved = apart.map(|directory| Environment {
-                directory: directory.to_path_buf(),
-                branch: None,
-                ..(*environment).clone()
-            });
+        prompt: Arc::new(move |agent, tools, apart, model| {
+            let own = subagent_environment(&environment, apart, model);
             build_subagent_prompt(
                 PromptInput {
-                    environment: moved.as_ref().unwrap_or(&environment),
+                    environment: own.as_ref().unwrap_or(&environment),
                     discovered: &discovered,
                     tools,
                     plan: false,
@@ -148,11 +151,33 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
         jobs: inputs.jobs.clone(),
         isolation: inputs.isolation.clone(),
         hooks: inputs.hooks.clone(),
+        nesting: Nesting::new(omc_agent::max_depth(), inputs.throttle.clone()),
     }));
     for name in inputs.denied {
         registry.remove(name);
     }
     registry.fitted()
+}
+
+/// The environment a subagent's prompt tells of, when it differs from the main agent's `environment`: the folder `apart` it works in when it works in a worktree of its own, with no branch, and the `model` it asks when that is known and another.
+fn subagent_environment(
+    environment: &Environment,
+    apart: Option<&std::path::Path>,
+    model: &str,
+) -> Option<Environment> {
+    let renamed = !model.is_empty() && environment.model.as_deref() != Some(model);
+    if apart.is_none() && !renamed {
+        return None;
+    }
+    let mut own = environment.clone();
+    if let Some(directory) = apart {
+        own.directory = directory.to_path_buf();
+        own.branch = None;
+    }
+    if renamed {
+        own.model = Some(model.to_owned());
+    }
+    Some(own)
 }
 
 /// The tools subagents get from `base`: the same, with copies that cannot start background runs, and without `debug`.
@@ -230,6 +255,8 @@ mod tests {
                 shared: shared.clone(),
             }),
             model: Arc::new(Silent),
+            models: Models::default(),
+            throttle: shared.throttle.clone(),
             approvals: shared.approvals.clone(),
             events: Arc::new(|_| {}),
             effort: None,
@@ -244,6 +271,26 @@ mod tests {
             memories,
             hooks: None,
         })
+    }
+
+    /// A subagent's prompt tells of the model it asks and of the worktree it works in, and is the main agent's environment when neither differs.
+    #[test]
+    fn subagents_are_told_their_own_model_and_folder() {
+        let main = Environment {
+            directory: "/work".into(),
+            os: "linux".into(),
+            date: "2026-01-01".into(),
+            branch: Some("main".into()),
+            model: Some("big".into()),
+        };
+        assert_eq!(subagent_environment(&main, None, ""), None);
+        assert_eq!(subagent_environment(&main, None, "big"), None);
+        let renamed = subagent_environment(&main, None, "small").unwrap();
+        assert_eq!(renamed.model.as_deref(), Some("small"));
+        assert_eq!(renamed.branch.as_deref(), Some("main"));
+        let moved = subagent_environment(&main, Some(std::path::Path::new("/wt")), "").unwrap();
+        assert_eq!(moved.directory, std::path::PathBuf::from("/wt"));
+        assert_eq!((moved.branch, moved.model.as_deref()), (None, Some("big")));
     }
 
     /// With memories, both modes have the three memory tools; without, neither has any.

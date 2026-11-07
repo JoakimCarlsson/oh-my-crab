@@ -6,6 +6,8 @@ mod compaction;
 mod hooks;
 mod journal;
 mod loop_guard;
+mod nesting;
+mod picker;
 mod pruning;
 mod recall;
 mod recovery;
@@ -29,6 +31,8 @@ pub use journal::{
     Branch, FIRST_BRANCH, INTERRUPTED, Journal, JournalError, Lost, Mark, Marked, STOPPED, Saved,
     Scribe,
 };
+pub use nesting::{DEFAULT_DEPTH, DEPTH_VARIABLE, MOST_DEPTH, Nesting, Throttle, max_depth};
+pub use picker::{ModelPicker, Models, Picked};
 pub use recall::{RECALL, spec as recall_spec};
 pub use steering::Steering;
 pub use task::{EventSink, MAX_CONCURRENT, MAX_TASKS, PromptBuilder, Task, TaskSettings};
@@ -38,6 +42,8 @@ pub use worktree::{Isolation, LOCK_REASON, Merge, ToolsFor, prune as prune_workt
 mod compaction_tests;
 #[cfg(test)]
 mod hooks_tests;
+#[cfg(test)]
+mod nesting_tests;
 #[cfg(test)]
 mod recovery_tests;
 #[cfg(test)]

@@ -312,13 +312,15 @@ async fn subagents_run_the_hooks_as_themselves() {
     });
     let events: Arc<EventSink> = Arc::new(|_| {});
     let task = Task::new(TaskSettings {
+        models: crate::Models::default(),
+        nesting: crate::Nesting::default(),
         model,
         registry: Arc::new(Registry::builtin(&dir).unwrap()),
         approvals: deny_all(),
         events,
         agents: builtin_agents(),
         effort: None,
-        prompt: Arc::new(|agent, _, _| format!("SUB:{}", agent.name)),
+        prompt: Arc::new(|agent, _, _, _| format!("SUB:{}", agent.name)),
         jobs: Arc::new(Jobs::new(|_| {})),
         isolation: None,
         hooks: Some(hooks.clone()),
@@ -389,7 +391,9 @@ async fn a_subagent_starts_with_the_hooks_context() {
         events,
         agents: builtin_agents(),
         effort: None,
-        prompt: Arc::new(|agent, _, _| format!("SUB:{}", agent.name)),
+        models: crate::Models::default(),
+        nesting: crate::Nesting::default(),
+        prompt: Arc::new(|agent, _, _, _| format!("SUB:{}", agent.name)),
         jobs: Arc::new(Jobs::new(|_| {})),
         isolation: None,
         hooks: Some(hooks.clone()),

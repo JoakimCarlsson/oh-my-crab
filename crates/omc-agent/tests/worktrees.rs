@@ -121,13 +121,15 @@ fn task_tool(
     let sink = log.clone();
     let events: Arc<EventSink> = Arc::new(move |event| sink.lock().unwrap().push(event));
     let task = Task::new(TaskSettings {
+        models: omc_agent::Models::default(),
+        nesting: omc_agent::Nesting::default(),
         model,
         registry: Arc::new(Registry::builtin(directory).unwrap()),
         approvals: Arc::new(Approvals::new(Arc::new(DenyAll), true)),
         events,
         agents,
         effort: None,
-        prompt: Arc::new(|agent, _, apart| match apart {
+        prompt: Arc::new(|agent, _, apart, _| match apart {
             Some(folder) => format!("SUB:{} in {}", agent.name, folder.display()),
             None => format!("SUB:{}", agent.name),
         }),
@@ -146,13 +148,15 @@ fn task_tool_with(
     jobs: Arc<Jobs>,
 ) -> Task {
     Task::new(TaskSettings {
+        models: omc_agent::Models::default(),
+        nesting: omc_agent::Nesting::default(),
         model,
         registry: Arc::new(Registry::builtin(directory).unwrap()),
         approvals: Arc::new(Approvals::new(Arc::new(DenyAll), true)),
         events: Arc::new(|_| {}),
         agents: builtin_agents(),
         effort: None,
-        prompt: Arc::new(|agent, _, _| format!("SUB:{}", agent.name)),
+        prompt: Arc::new(|agent, _, _, _| format!("SUB:{}", agent.name)),
         hooks: None,
         jobs,
         isolation: Some(isolation),
@@ -374,6 +378,7 @@ async fn isolation_outside_a_repository_is_refused() {
         prompt: "Fix.".into(),
         output_schema: None,
         isolated: true,
+        model: None,
         path: None,
         origin: Origin::User,
     });
@@ -571,5 +576,74 @@ async fn a_background_subagent_hands_back_typed_results_and_edits() {
         std::fs::read_to_string(bench.linked.join("new.txt")).unwrap(),
         "made\n"
     );
+    assert!(!listed(&bench.main).contains(LOCK_REASON));
+}
+
+/// An isolated subagent's own isolated subagent starts from its parent's worktree, sees what the parent changed there, and hands its edits back to that worktree; the parent then hands both its own edits and its child's back to the main agent's working tree.
+#[tokio::test]
+async fn a_nested_isolated_subagent_merges_into_its_parents_worktree() {
+    let bench = bench("isolated-nested");
+    let model = Router::new(|seen: &RequestSeen| {
+        let child = told(seen).contains("child work");
+        match (child, seen.messages) {
+            (false, 1) => calls(&[("write", json!({"path": "parent.txt", "content": "p\n"}))]),
+            (false, 3) => calls(&[("task", json!({"task": "child work", "isolated": true}))]),
+            (false, _) => say("parent done"),
+            (true, 1) => calls(&[
+                ("read", json!({"path": "parent.txt"})),
+                ("write", json!({"path": "child.txt", "content": "c\n"})),
+            ]),
+            (true, _) => say("child done"),
+        }
+    });
+    let (task, log) = task_tool(
+        &bench.linked,
+        model.clone(),
+        builtin_agents(),
+        Some(isolation(&bench.linked, &bench)),
+    );
+    let done = task
+        .call_as("t1", json!({"task": "parent job", "isolated": true}))
+        .await
+        .unwrap();
+    assert!(done.text.starts_with("parent done"), "{}", done.text);
+    assert_eq!(
+        std::fs::read_to_string(bench.linked.join("parent.txt")).unwrap(),
+        "p\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(bench.linked.join("child.txt")).unwrap(),
+        "c\n"
+    );
+    assert!(!bench.main.join("child.txt").exists());
+    let events = worktree_events(&log);
+    assert_eq!(events.len(), 4, "{events:?}");
+    let parent_path = &events[0].1;
+    let child_path = &events[1].1;
+    assert!(child_path.starts_with(&bench.store) && child_path != parent_path);
+    assert_eq!(events[2].2, Some(Merge::Applied(vec!["child.txt".into()])));
+    assert_eq!(
+        events[3].2,
+        Some(Merge::Applied(vec![
+            "child.txt".into(),
+            "parent.txt".into()
+        ]))
+    );
+    let read_by_child = log
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::Nested { event, .. } => match event.as_ref() {
+                AgentEvent::Nested { event, .. } => match event.as_ref() {
+                    AgentEvent::ToolDone { name, text, .. } if name == "read" => Some(text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap();
+    assert!(read_by_child.contains('p'), "{read_by_child}");
     assert!(!listed(&bench.main).contains(LOCK_REASON));
 }

@@ -1,6 +1,8 @@
 //! The `task` tool: runs subagents, alone or several at once, each in a loop of its own, and returns what they said last or the structured result they handed back.
 //!
 //! A subagent may work apart from the main agent, in a git worktree of its own; what it changed is applied to the main agent's working tree when it ends, as [`crate::worktree`] tells.
+//!
+//! A subagent asks the model of the agent that starts it unless its definition or the call names another, which [`crate::picker`] finds. A subagent above the deepest level allowed gets a `task` tool of its own, and every subagent at every level takes a seat of one shared throttle to run, as [`crate::nesting`] tells.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,13 +15,14 @@ use omc_tools::schema::check_schema;
 use omc_tools::{Jobs, Registry, Tool, ToolError, ToolOutput, parse_args};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::Semaphore;
 
-use crate::submit::{Slot, SubmitResult};
+use crate::nesting::{Nesting, Seat};
+use crate::picker::Models;
+use crate::submit::{SUBMIT_RESULT, Slot, SubmitResult};
 use crate::worktree::{self, Handback, Isolation, Lease, Merge};
 use crate::{AgentError, AgentEvent, Approvals, Context, Hooks, run_turn};
 
-/// The tools a subagent never gets: starting subagents of its own, and the ones that talk to the reader about the main agent's work.
+/// The tools a subagent never gets from the agent that starts it: that agent's own `task` tool, since a subagent that may start subagents gets one of its own, and the ones that talk to the reader about the main agent's work.
 const WITHHELD: &[&str] = &[
     "task",
     "exit_plan_mode",
@@ -38,8 +41,11 @@ const DEFAULT_AGENT: &str = "task";
 /// The most subagents one call may start.
 pub const MAX_TASKS: usize = 16;
 
-/// How many subagents of one call run at once; the rest wait for one of them to end.
+/// How many subagents run at once by default, across every call and level of a conversation; the rest wait for one of them to end or to wait for subagents of its own.
 pub const MAX_CONCURRENT: usize = 8;
+
+/// The names under which an agent definition's tool list lets its subagents start subagents of their own: crab's `task`, and `agent`, as Claude Code calls its tool.
+const NESTING_TOOLS: &[&str] = &["task", "agent"];
 
 /// What a subagent asked for a structured result is told about handing it back.
 const STRUCTURED: &str = include_str!("prompts/structured.md");
@@ -50,16 +56,19 @@ const NUDGE: &str = include_str!("prompts/submit_nudge.md");
 /// What an isolated subagent is told about the worktree it works in.
 const ISOLATED: &str = include_str!("prompts/isolated.md");
 
-/// How the prompt of a subagent is built from its role, the names of its tools and, for one working in a worktree of its own, the folder it works in.
-pub type PromptBuilder = dyn Fn(&AgentDefinition, &[String], Option<&Path>) -> String + Send + Sync;
+/// How the prompt of a subagent is built from its role, the names of its tools, the folder it works in when it works in a worktree of its own, and what the model it asks is called, empty when that is not known.
+pub type PromptBuilder =
+    dyn Fn(&AgentDefinition, &[String], Option<&Path>, &str) -> String + Send + Sync;
 
 /// Where the events of a run go.
 pub type EventSink = dyn Fn(AgentEvent) + Send + Sync;
 
 /// What the `task` tool needs to run subagents.
 pub struct TaskSettings {
-    /// The model the subagents ask.
+    /// The model the subagents ask when neither their definition nor the call names another.
     pub model: Arc<dyn ChatModel>,
+    /// What that model is called, and how other models are found by name.
+    pub models: Models,
     /// The tools subagents may draw from.
     pub registry: Arc<Registry>,
     /// What is allowed without asking, shared with the main agent.
@@ -78,6 +87,8 @@ pub struct TaskSettings {
     pub isolation: Option<Arc<Isolation>>,
     /// The checks the user set up around tool calls and the end of a turn, which subagents run as the main agent does, each under its own id and kind.
     pub hooks: Option<Arc<dyn Hooks>>,
+    /// The level the subagents run at, how deep they may go, and the seats they take to run.
+    pub nesting: Nesting,
 }
 
 /// Arguments of a `task` call.
@@ -98,6 +109,8 @@ struct Args {
     background: bool,
     /// Whether the subagents work in git worktrees of their own, for the single assignment or the items of `tasks` that do not say; their kind's definition decides when nothing does.
     isolated: Option<bool>,
+    /// The model the subagents ask, for the single assignment or the items of `tasks` that name none; their kind's definition decides when nothing does.
+    model: Option<String>,
 }
 
 /// One assignment of a `task` call.
@@ -113,10 +126,12 @@ struct Item {
     output_schema: Option<Value>,
     /// Whether it works in a git worktree of its own.
     isolated: Option<bool>,
+    /// The model it asks.
+    model: Option<String>,
 }
 
 impl Args {
-    /// The assignments the call asks for: the single `task`, or the items of `tasks` with the call's `agent`, `output_schema` and `isolated` filled in where they give none.
+    /// The assignments the call asks for: the single `task`, or the items of `tasks` with the call's `agent`, `output_schema`, `isolated` and `model` filled in where they give none.
     ///
     /// # Errors
     ///
@@ -129,6 +144,7 @@ impl Args {
             output_schema,
             tasks,
             isolated,
+            model,
             ..
         } = self;
         let invalid = |reason: String| Err(ToolError::InvalidArguments(reason));
@@ -141,6 +157,7 @@ impl Args {
                 description,
                 output_schema,
                 isolated,
+                model,
             }]),
             (None, Some(list)) if list.is_empty() => invalid("`tasks` is empty".to_owned()),
             (None, Some(list)) if list.len() > MAX_TASKS => invalid(format!(
@@ -153,6 +170,7 @@ impl Args {
                     agent: item.agent.or_else(|| agent.clone()),
                     output_schema: item.output_schema.or_else(|| output_schema.clone()),
                     isolated: item.isolated.or(isolated),
+                    model: item.model.or_else(|| model.clone()),
                     ..item
                 })
                 .collect()),
@@ -171,15 +189,18 @@ struct Lane {
     kind: String,
     /// What it is doing, in a few words.
     label: String,
+    /// What the model it asks is called; empty when it is not known.
+    model: String,
 }
 
 impl Lane {
-    /// The event announcing the subagent: the call itself starting it when it is alone, or a step of the call when it is one of several.
+    /// The event announcing the subagent: the call itself starting it, with the model it asks when that is known, when it is alone, or a step of the call when it is one of several.
     fn opened(&self) -> AgentEvent {
         match self.place {
             None => AgentEvent::Spawned {
                 id: self.call.clone(),
                 agent: self.kind.clone(),
+                model: Some(self.model.clone()).filter(|model| !model.is_empty()),
             },
             Some(place) => self.under_call(AgentEvent::ToolStart {
                 id: place.to_string(),
@@ -332,10 +353,16 @@ struct Run {
     lease: Option<Lease>,
     /// The checks the user set up, as they apply to this subagent.
     hooks: Option<Arc<dyn Hooks>>,
+    /// Its id among the subagents of the conversation, which its hooks and the subagents it starts are known by.
+    id: String,
+    /// Whether it gets a `task` tool of its own.
+    nests: bool,
+    /// The seat it holds while it runs.
+    seat: Arc<Seat>,
 }
 
 impl Run {
-    /// Has the subagent work in the worktree `lease`, made from `snapshot`: its tools that touch files are replaced by ones built by `isolation` for the worktree, its prompt is built by `prompt` for it, and its assignment says where it works.
+    /// Has the subagent work in the worktree `lease`, made from `snapshot`: its tools that touch files are replaced by ones built by `isolation` for the worktree, and its assignment says where it works.
     ///
     /// # Errors
     ///
@@ -345,7 +372,6 @@ impl Run {
         lease: Lease,
         snapshot: &worktree::Snapshot,
         isolation: &Isolation,
-        prompt: &PromptBuilder,
     ) -> Result<(), ToolError> {
         let directory = lease.directory();
         let own = (isolation.tools)(&directory)?;
@@ -354,7 +380,6 @@ impl Run {
                 self.registry.register_shared(tool.clone());
             }
         }
-        self.system = prompt(&self.definition, &self.registry.names(), Some(&directory));
         let shown = directory.display().to_string();
         let submodules = snapshot.submodules.join(", ");
         self.assignment = format!(
@@ -462,11 +487,14 @@ struct Ended {
     handback: Option<Handback>,
 }
 
-/// Runs `run`, takes what it changed from its worktree when it has one, reports the end of its step through `events` when it is one of several, and says how it ended.
-async fn finish(mut run: Run, events: Arc<EventSink>) -> Ended {
+/// Runs `run` once it took a seat of `nesting`'s throttle, which it holds until it ends, takes what it changed from its worktree when it has one, reports the end of its step through `events` when it is one of several, and says how it ended.
+async fn finish(mut run: Run, events: Arc<EventSink>, nesting: Nesting) -> Ended {
     let lane = run.lane.clone();
     let lease = run.lease.take();
+    let seat = run.seat.clone();
+    seat.fill(nesting.throttle.take().await);
     let outcome = run.go().await;
+    seat.vacate();
     let handback = match lease {
         Some(lease) => Some(lease.hand_back().await),
         None => None,
@@ -545,8 +573,13 @@ impl Task {
                     ""
                 };
                 let isolated = if agent.isolated { " (isolated)" } else { "" };
+                let model = agent
+                    .model
+                    .as_ref()
+                    .map(|model| format!(" (model: {model})"))
+                    .unwrap_or_default();
                 format!(
-                    "- `{}`{only_looks}{structured}{isolated}: {}",
+                    "- `{}`{only_looks}{structured}{isolated}{model}: {}",
                     agent.name, agent.description
                 )
             })
@@ -558,6 +591,7 @@ impl Task {
                 ("agents", agents.as_str()),
                 ("most", MAX_TASKS.to_string().as_str()),
                 ("parallel", MAX_CONCURRENT.to_string().as_str()),
+                ("nesting", nesting_note(&settings.nesting).as_str()),
             ],
         );
         Self {
@@ -578,6 +612,16 @@ impl Task {
                         .is_none_or(|listed| listed.iter().any(|name| name == tool.name()))
             })
             .fitted()
+    }
+
+    /// Whether a subagent of the kind `agent` started by this tool gets a `task` tool of its own: it runs above the deepest level allowed, and its definition lists no tools or lists `task` or `agent` among them.
+    fn nests(&self, agent: &AgentDefinition) -> bool {
+        self.settings.nesting.nests()
+            && agent.tools.as_ref().is_none_or(|listed| {
+                listed
+                    .iter()
+                    .any(|name| NESTING_TOOLS.contains(&name.as_str()))
+            })
     }
 
     /// The definition of the subagent kind `kind`.
@@ -604,14 +648,59 @@ impl Task {
             })
     }
 
-    /// The subagent for `item`, reporting under the call `call` at `place` in its list when it is one of several.
-    ///
-    /// A subagent asked for a structured result, by the item or by its kind's definition, gets the `submit_result` tool for it.
+    /// The model a subagent of the kind `agent` asks, what it is called and how hard it thinks: the one `wanted` by the call names, else the one its definition names, else the one of the agent starting it.
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Failed`] for an unknown kind and [`ToolError::InvalidArguments`] for a schema that is not one.
-    fn prepare(&self, call: &str, place: Option<usize>, item: Item) -> Result<Run, ToolError> {
+    /// Returns [`ToolError::Failed`], saying who named it and why it cannot be used, when the model named is not one there is, or no other model can be picked here.
+    async fn model_for(
+        &self,
+        agent: &AgentDefinition,
+        wanted: Option<&str>,
+    ) -> Result<(Arc<dyn ChatModel>, String, Option<Effort>), ToolError> {
+        let named = wanted
+            .map(|name| (name, "the call"))
+            .or_else(|| agent.model.as_deref().map(|name| (name, "its definition")))
+            .map(|(name, by)| (name.trim(), by))
+            .filter(|(name, _)| !name.is_empty() && !name.eq_ignore_ascii_case("inherit"));
+        let inherited = || {
+            (
+                self.settings.model.clone(),
+                self.settings.models.current.clone(),
+                self.settings.effort,
+            )
+        };
+        let Some((name, by)) = named else {
+            return Ok(inherited());
+        };
+        let Some(picker) = &self.settings.models.picker else {
+            return Err(ToolError::Failed(format!(
+                "{by} names the model {name} for the {} agent, but subagents cannot be given a model of their own here; leave out `model`",
+                agent.name
+            )));
+        };
+        let picked = picker.pick(name).await.map_err(|why| {
+            ToolError::Failed(format!(
+                "{by} names the model {name} for the {} agent, which cannot be used: {why}",
+                agent.name
+            ))
+        })?;
+        Ok((picked.model, picked.name, picked.effort))
+    }
+
+    /// The subagent for `item`, reporting under the call `call` at `place` in its list when it is one of several.
+    ///
+    /// A subagent asked for a structured result, by the item or by its kind's definition, gets the `submit_result` tool for it. Its system prompt, and the `task` tool of its own when it gets one, are only made by [`Task::arm`], once it is known where it works.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Failed`] for an unknown kind or a model that cannot be used, and [`ToolError::InvalidArguments`] for a schema that is not one.
+    async fn prepare(
+        &self,
+        call: &str,
+        place: Option<usize>,
+        item: Item,
+    ) -> Result<Run, ToolError> {
         let agent = self.agent(item.agent.as_deref().unwrap_or(DEFAULT_AGENT))?;
         let schema = item.output_schema.or_else(|| agent.output_schema.clone());
         if let Some(schema) = &schema {
@@ -619,24 +708,21 @@ impl Task {
                 ToolError::InvalidArguments(format!("output_schema: {reason}"))
             })?;
         }
+        let (model, model_name, effort) = self.model_for(agent, item.model.as_deref()).await?;
         let mut registry = self.tools_for(agent);
         let structured = schema.map(|schema| {
             let slot = Slot::default();
             registry.register(SubmitResult::new(schema.clone(), slot.clone()));
             Structured { schema, slot }
         });
-        let system = (self.settings.prompt)(agent, &registry.names(), None);
-        let id = match place {
-            Some(place) => format!("{call}/{place}"),
-            None => call.to_owned(),
-        };
+        let id = self.settings.nesting.id_of(call, place);
         let hooks = self
             .settings
             .hooks
             .as_ref()
             .map(|hooks| hooks.for_subagent(&id, &agent.name));
         Ok(Run {
-            model: self.settings.model.clone(),
+            model,
             registry,
             approvals: self.settings.approvals.clone(),
             events: self.settings.events.clone(),
@@ -645,19 +731,23 @@ impl Task {
                 place,
                 kind: agent.name.clone(),
                 label: headline(item.description.as_deref(), &item.task),
+                model: model_name,
             },
-            system,
-            effort: self.settings.effort,
+            system: String::new(),
+            effort,
             assignment: item.task,
             structured,
             isolated: item.isolated.unwrap_or(agent.isolated),
             definition: agent.clone(),
             lease: None,
             hooks,
+            id,
+            nests: self.nests(agent),
+            seat: Arc::new(Seat::default()),
         })
     }
 
-    /// `runs`, with a worktree of its own given to each that is to work in one, all made from one snapshot of the main agent's working tree.
+    /// `runs`, with a worktree of its own given to each that is to work in one, all made from one snapshot of the working tree of the agent starting them.
     ///
     /// # Errors
     ///
@@ -681,21 +771,67 @@ impl Task {
                 let lease = worktree::lease(isolation, &snapshot)
                     .await
                     .map_err(ToolError::Failed)?;
-                run.enter(lease, &snapshot, isolation, self.settings.prompt.as_ref())?;
+                run.enter(lease, &snapshot, isolation)?;
             }
             given.push(run);
         }
         Ok(given)
     }
 
-    /// Runs `runs` together, at most [`MAX_CONCURRENT`] at a time, then applies what those in worktrees of their own changed in the order given, and returns each one's lane and outcome in that order.
+    /// Readies `run` to start, now that it is known where it works: a subagent that may start subagents of its own gets a `task` tool one level down, drawing on its own tools, asking its model by default, reporting under its lane, and isolating its subagents from the worktree it works in, when it works in one, so that what they change is handed back to it; then its system prompt is made for the tools it has, the folder it works in and the model it asks.
+    fn arm(&self, run: &mut Run) {
+        let directory = run.lease.as_ref().map(Lease::directory);
+        if run.nests {
+            let pool = run.registry.filtered(|tool| tool.name() != SUBMIT_RESULT);
+            let (events, lane) = (self.settings.events.clone(), run.lane.clone());
+            let filed: Arc<EventSink> = Arc::new(move |event| events(lane.file(event)));
+            let isolation = match (&directory, &self.settings.isolation) {
+                (Some(directory), Some(isolation)) => Some(Arc::new(Isolation {
+                    directory: directory.clone(),
+                    store: isolation.store.clone(),
+                    patches: isolation.patches.clone(),
+                    tools: isolation.tools.clone(),
+                })),
+                _ => self.settings.isolation.clone(),
+            };
+            run.registry.register(Task::new(TaskSettings {
+                model: run.model.clone(),
+                models: self.settings.models.named(&run.lane.model),
+                registry: Arc::new(pool),
+                approvals: self.settings.approvals.clone(),
+                events: filed,
+                agents: self.settings.agents.clone(),
+                effort: run.effort,
+                prompt: self.settings.prompt.clone(),
+                jobs: self.settings.jobs.clone(),
+                isolation,
+                hooks: run.hooks.clone(),
+                nesting: self.settings.nesting.below(run.seat.clone(), &run.id),
+            }));
+            run.registry = run.registry.fitted();
+        }
+        run.system = (self.settings.prompt)(
+            &run.definition,
+            &run.registry.names(),
+            directory.as_deref(),
+            &run.lane.model,
+        );
+    }
+
+    /// Runs `runs` together, each once it took a seat of the shared throttle, with the seat of the subagent this tool belongs to given up meanwhile, then applies what those in worktrees of their own changed in the order given, and returns each one's lane and outcome in that order.
     async fn run_together(&self, runs: Vec<Run>) -> Vec<(Lane, Result<String, ToolError>)> {
         let events = &self.settings.events;
-        let ended: Vec<Ended> =
-            stream::iter(runs.into_iter().map(|run| finish(run, events.clone())))
-                .buffered(MAX_CONCURRENT)
-                .collect()
-                .await;
+        let nesting = &self.settings.nesting;
+        let ended: Vec<Ended> = nesting
+            .lending(
+                stream::iter(
+                    runs.into_iter()
+                        .map(|run| finish(run, events.clone(), nesting.clone())),
+                )
+                .buffered(MAX_TASKS)
+                .collect(),
+            )
+            .await;
         let mut outcomes = Vec::with_capacity(ended.len());
         for ended in ended {
             outcomes
@@ -704,23 +840,21 @@ impl Task {
         outcomes
     }
 
-    /// Starts `runs`, started by the call `call`, in the background, at most [`MAX_CONCURRENT`] at a time, and says which handle each got.
+    /// Starts `runs`, started by the call `call`, in the background, each once it took a seat of the shared throttle, and says which handle each got.
     fn start_in_background(&self, call: &str, runs: Vec<Run>) -> ToolOutput {
-        let gate = Arc::new(Semaphore::new(MAX_CONCURRENT));
         let call = Some(call.to_owned()).filter(|call| !call.is_empty());
         let started: Vec<(String, Lane)> = runs
             .into_iter()
             .map(|run| {
                 let lane = run.lane.clone();
-                let gate = gate.clone();
                 let events = self.settings.events.clone();
                 let isolation = self.settings.isolation.clone();
+                let nesting = self.settings.nesting.clone();
                 let handle =
                     self.settings
                         .jobs
                         .spawn(lane.label.clone(), call.clone(), async move {
-                            let _turn = gate.acquire_owned().await.ok();
-                            let ended = finish(run, events.clone()).await;
+                            let ended = finish(run, events.clone(), nesting).await;
                             conclude(ended, isolation.as_deref(), events.as_ref())
                                 .await
                                 .1
@@ -746,6 +880,18 @@ impl Task {
             started.len(),
             handles.join("\n")
         ))
+    }
+}
+
+/// What the agent with the `task` tool standing at `nesting` is told about whether the subagents it starts can start subagents of their own.
+fn nesting_note(nesting: &Nesting) -> String {
+    let below = nesting.most.saturating_sub(nesting.depth);
+    match below {
+        0 => "Children start blank and cannot ask the user or start subagents of their own; give them everything they need.".to_owned(),
+        1 => "Children start blank and cannot ask the user; give them everything they need. A child may start subagents of its own, which cannot start more.".to_owned(),
+        levels => format!(
+            "Children start blank and cannot ask the user; give them everything they need. A child may start subagents of its own, down to {levels} levels below yours."
+        ),
     }
 }
 
@@ -811,6 +957,10 @@ impl Tool for Task {
             "type": "boolean",
             "description": "Run the subagent in a git worktree of its own, a copy of your working tree; its changes are applied to yours as a patch when it ends."
         });
+        let model = json!({
+            "type": "string",
+            "description": "The model the subagent asks instead of its kind's or yours: an alias (`haiku`, `sonnet`, `opus`, `inherit`), a model id, or `provider/model` for another signed-in provider."
+        });
         json!({
             "type": "object",
             "properties": {
@@ -820,7 +970,7 @@ impl Tool for Task {
                 "output_schema": output_schema,
                 "tasks": {
                     "type": "array",
-                    "description": "Several independent assignments, run in parallel; give this instead of `task`. Call-level `agent` and `output_schema` apply to items that omit them.",
+                    "description": "Several independent assignments, run in parallel; give this instead of `task`. Call-level `agent`, `output_schema`, `isolated` and `model` apply to items that omit them.",
                     "maxItems": MAX_TASKS,
                     "items": {
                         "type": "object",
@@ -829,13 +979,15 @@ impl Tool for Task {
                             "task": { "type": "string", "description": "The self-contained assignment." },
                             "description": description,
                             "output_schema": output_schema,
-                            "isolated": isolated
+                            "isolated": isolated,
+                            "model": model
                         },
                         "required": ["task"]
                     }
                 },
                 "background": { "type": "boolean", "description": "Start the subagents in the background and return a handle for each at once; `wait` returns their results." },
-                "isolated": isolated
+                "isolated": isolated,
+                "model": model
             }
         })
     }
@@ -868,24 +1020,38 @@ impl Tool for Task {
 
     /// Runs the subagents the call asks for, their tool activity reported under the call `id`, and returns what they came to.
     ///
-    /// Every assignment is checked, and every worktree asked for made, before any subagent starts. A single subagent's result is its last message or its structured result; several run at once and their outcomes are combined under headings, one failing leaving the others be. A subagent in a worktree of its own has what it changed applied to the main agent's working tree when it ends, several in the order of the list, and its result says what became of it. In the background, each gets a handle for `wait` and the call returns at once.
+    /// Every assignment is checked, its model found, and every worktree asked for made, before any subagent starts. A single subagent's result is its last message or its structured result; several run at once and their outcomes are combined under headings, one failing leaving the others be. A subagent in a worktree of its own has what it changed applied to the working tree of the agent that started it when it ends, several in the order of the list, and its result says what became of it. In the background, each gets a handle for `wait` and the call returns at once; only the main agent can start subagents in the background.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::InvalidArguments`] for arguments that do not fit the schema or a subagent asking for the background, and [`ToolError::Failed`] when an assignment cannot be prepared, a worktree cannot be made, or every subagent failed.
     async fn call_as(&self, id: &str, args: Value) -> Result<ToolOutput, ToolError> {
         let args: Args = parse_args(args)?;
         let background = args.background;
+        if background && self.settings.nesting.seat.is_some() {
+            return Err(ToolError::InvalidArguments(
+                "a subagent cannot start subagents in the background; leave out `background`"
+                    .to_owned(),
+            ));
+        }
         let items = args.items()?;
         let several = items.len() > 1;
-        let runs = items
-            .into_iter()
-            .enumerate()
-            .map(|(index, item)| {
-                let place = several.then_some(index + 1);
-                self.prepare(id, place, item).map_err(|error| match place {
+        let mut runs = Vec::with_capacity(items.len());
+        for (index, item) in items.into_iter().enumerate() {
+            let place = several.then_some(index + 1);
+            let run = self
+                .prepare(id, place, item)
+                .await
+                .map_err(|error| match place {
                     Some(_) => ToolError::Failed(format!("tasks[{index}]: {error}")),
                     None => error,
-                })
-            })
-            .collect::<Result<Vec<Run>, ToolError>>()?;
-        let runs = self.isolate(runs).await?;
+                })?;
+            runs.push(run);
+        }
+        let mut runs = self.isolate(runs).await?;
+        for run in &mut runs {
+            self.arm(run);
+        }
         for run in &runs {
             (self.settings.events)(run.lane.opened());
             if let Some(lease) = &run.lease {
@@ -936,13 +1102,15 @@ mod tests {
         let events: Arc<EventSink> = Arc::new(move |event| log.lock().unwrap().push(event));
         let mut registry = base.clone();
         registry.register(Task::new(TaskSettings {
+            models: crate::Models::default(),
+            nesting: crate::Nesting::default(),
             model,
             registry: Arc::new(base),
             approvals: deny_all(),
             events,
             agents: builtin_agents(),
             effort: None,
-            prompt: Arc::new(|agent, _, _| format!("SUB:{}", agent.name)),
+            prompt: Arc::new(|agent, _, _, _| format!("SUB:{}", agent.name)),
             hooks: None,
             isolation: None,
             jobs: Arc::new(Jobs::new(|_| {})),
@@ -1012,7 +1180,8 @@ mod tests {
         let log = log.lock().unwrap();
         assert!(log.contains(&AgentEvent::Spawned {
             id: "t1".into(),
-            agent: "scout".into()
+            agent: "scout".into(),
+            model: None
         }));
         let nested: Vec<_> = log
             .iter()
@@ -1047,7 +1216,7 @@ mod tests {
         );
     }
 
-    /// A scout only gets the read-only tools it lists, and no subagent can start subagents.
+    /// A scout only gets the read-only tools it lists, and the default kind, which lists none, gets a `task` tool of its own one level down.
     #[tokio::test]
     async fn subagents_get_restricted_tools() {
         let model = Router::new(|seen| {
@@ -1089,6 +1258,7 @@ mod tests {
                 "glob",
                 "grep",
                 "read",
+                "task",
                 "web_search",
                 "write"
             ]
@@ -1163,13 +1333,15 @@ mod tests {
         let dir = scratch("task-background");
         let jobs = Arc::new(Jobs::new(|_| {}));
         let task = Task::new(TaskSettings {
+            models: crate::Models::default(),
+            nesting: crate::Nesting::default(),
             model,
             registry: Arc::new(Registry::builtin(&dir).unwrap()),
             approvals: deny_all(),
             events: Arc::new(move |event| sink.lock().unwrap().push(event)),
             agents: builtin_agents(),
             effort: None,
-            prompt: Arc::new(|agent, _, _| format!("SUB:{}", agent.name)),
+            prompt: Arc::new(|agent, _, _, _| format!("SUB:{}", agent.name)),
             hooks: None,
             isolation: None,
             jobs: jobs.clone(),
@@ -1248,13 +1420,15 @@ mod tests {
         let base = Registry::builtin(&dir).unwrap();
         let mut registry = base.clone();
         registry.register(Task::new(TaskSettings {
+            models: crate::Models::default(),
+            nesting: crate::Nesting::default(),
             model: model.clone(),
             registry: Arc::new(base),
             approvals: deny_all(),
             events: Arc::new(|_| {}),
             agents: builtin_agents(),
             effort: None,
-            prompt: Arc::new(|agent, _, _| format!("SUB:{}", agent.name)),
+            prompt: Arc::new(|agent, _, _, _| format!("SUB:{}", agent.name)),
             hooks: None,
             isolation: None,
             jobs: Arc::new(Jobs::new(|_| {})),
