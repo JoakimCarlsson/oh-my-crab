@@ -787,11 +787,13 @@ mod tests {
     }
 
     /// A model that deletes `f.txt` with `bash` on its first request, then answers, keeping the results it was given.
+    #[cfg(unix)]
     struct Deleter {
         /// The results each request carried.
         results: Mutex<Vec<Vec<omc_providers::ToolResult>>>,
     }
 
+    #[cfg(unix)]
     #[async_trait]
     impl ChatModel for Deleter {
         /// Calls `bash` with `rm f.txt`, then answers.
@@ -813,6 +815,7 @@ mod tests {
     }
 
     /// A project's hook that refuses `rm` in `bash` is skipped while the project is untrusted, so the file is deleted, and enforced once it is trusted, so the model is told why and the file stays; the user's note after each call reaches the model either way.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_project_hook_runs_only_once_trusted() {
         let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -897,6 +900,7 @@ mod tests {
     }
 
     /// A prompt hook that blocks ends the turn before the model is asked, with its reason; one that adds context has it told before the prompt.
+    #[cfg(unix)]
     #[tokio::test]
     async fn prompt_hooks_block_or_add_context() {
         let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

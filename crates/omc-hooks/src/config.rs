@@ -365,8 +365,8 @@ mod tests {
             &base,
             "home/.claude/plugins/installed_plugins.json",
             &format!(
-                r#"{{"plugins":{{"kit@m":[{{"scope":"user","installPath":"{}"}}]}}}}"#,
-                base.join("kit").display()
+                r#"{{"plugins":{{"kit@m":[{{"scope":"user","installPath":{}}}]}}}}"#,
+                serde_json::to_string(&base.join("kit")).unwrap()
             ),
         );
         put(&base, "kit/hooks/hooks.json", &hook("plugin"));
