@@ -217,9 +217,13 @@ is still reached for its resources. Prompts of servers are not offered.
 ## Approvals and limits
 
 Every call to a tool-server tool asks the user first, unless the conversation
-is in yolo mode or a `PreToolUse` hook allows it. An "always allow" answer
-covers later calls of the same tool, and no other, for as long as that `crab`
-process runs. Tool-server tools count as tools that change things, so plan mode
+is in yolo mode, a `PreToolUse` hook allows it or a permission rule allows it.
+An "always allow" answer adds a rule for the tool, such as
+`mcp__github__get_issue`, which covers later calls of the same tool and no
+other, for the rest of the conversation or, kept, for later ones too. Rules
+can name a whole server, `mcp__github`, or a pattern, `mcp__github__get_*`;
+a deny rule stops a tool in yolo mode too. See
+[permission rules](permissions.md). Tool-server tools count as tools that change things, so plan mode
 refuses them.
 
 Text longer than 20 KB is cut to its first and last 10 KB around a note of what

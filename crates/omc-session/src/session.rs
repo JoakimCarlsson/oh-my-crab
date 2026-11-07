@@ -20,6 +20,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::AbortHandle;
 
 use crate::lifecycle::IDLE_AFTER;
+use crate::permissions::{self, FileKeeper, PermissionsFile};
 use crate::prompt::compose;
 use crate::settings::{
     CACHE, CHECKPOINTS, EFFORT, MEMORY, MODE, MODEL, Mode, OFF, ON, WARMING, parse_retention,
@@ -332,6 +333,8 @@ impl Session {
             false,
             &disabled,
         );
+        self.shared.approvals.forget_session();
+        self.put_rules_in_force(&Locations::detect(&directory), &assessment);
         let locations = assessment.locations.clone();
         let hooks = engine_for(&assessment, setting());
         let discovered = discover(&locations, &disabled);
@@ -724,6 +727,11 @@ impl Session {
         let arrived = open.hub.arrived();
         add_tools(open, arrived);
         let assessment = open.trust.assess(&open.locations, &open.disabled);
+        let locations = open.locations.clone();
+        self.put_rules_in_force(&locations, &assessment);
+        let Some(open) = &mut self.open else {
+            return;
+        };
         open.hooks = engine_for(&assessment, (open.trust.setting)());
         self.shared.lifecycle.set_engine(open.hooks.clone());
         open.locations = Arc::new(assessment.locations.clone());
@@ -740,6 +748,29 @@ impl Session {
             let commands = commands_of(&open.discovered);
             self.say(Event::Commands(commands));
         }
+    }
+
+    /// Puts in force the permission rules for a conversation in `locations` whose project's trust is `assessment`'s, read from crab's permissions file and Claude Code's settings, and keeps "always allow" answers in crab's file when there is one; what cannot be read is reported on standard error, and what cannot be kept is told to the client.
+    fn put_rules_in_force(&self, locations: &Locations, assessment: &Assessment) {
+        let file = PermissionsFile::locate();
+        let loaded = permissions::load(locations, assessment, file.as_ref());
+        for problem in &loaded.problems {
+            eprintln!("permissions: {problem}");
+        }
+        self.shared.approvals.set_rules(loaded.book);
+        let shared = Arc::downgrade(&self.shared);
+        let keeper = file.map(|file| {
+            FileKeeper::new(
+                file,
+                assessment.project.clone(),
+                Box::new(move |problem| {
+                    if let Some(shared) = shared.upgrade() {
+                        shared.say(Event::Failed(problem));
+                    }
+                }),
+            ) as Arc<dyn omc_agent::Keeper>
+        });
+        self.shared.approvals.set_keeper(keeper);
     }
 
     /// Takes in the end of turn `number`; a turn that was cancelled meanwhile is ignored.

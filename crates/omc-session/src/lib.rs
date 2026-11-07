@@ -11,6 +11,7 @@ mod languages;
 mod lifecycle;
 mod listing;
 mod memory;
+mod permissions;
 mod picker;
 mod prefix;
 mod prompt;
@@ -28,6 +29,9 @@ mod warmer;
 pub use hooks::{hooks, trust};
 pub use listing::tools;
 pub use memory::memory;
+pub use permissions::{
+    FILE_VARIABLE as PERMISSIONS_FILE_VARIABLE, add_permission, permissions, remove_permission,
+};
 pub use providers::{account, key_source, providers, save_key, signed_in};
 pub use serve::serve;
 pub use session::{Options, run, run_with};

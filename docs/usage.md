@@ -12,6 +12,11 @@ crab fork <id> <copy> <folder> [turn]  copy a conversation's branch, up to befor
 crab memory [folder]            print the memories a conversation in the folder starts with, as JSON
 crab hooks [folder]             print the hooks a conversation in the folder would find and its project's trust, as JSON
 crab trust <folder> [on|off]    print whether the folder's project is trusted, or record that it is or is not
+crab permissions [folder]       print the permission rules a conversation in the folder would use, as JSON
+crab permissions add <allow|ask|deny> <user|project> <rule> [folder]
+                                add a rule to crab's permissions file
+crab permissions remove <rule> [folder]
+                                take a rule out of crab's permissions file
 ```
 
 `crab --help` prints the same list; `crab` with no subcommand or an unknown
@@ -58,6 +63,10 @@ one prints it as an error.
   untrusted project leaves out. See [hooks](extending/hooks.md).
 - **`trust`** prints or records whether a project is trusted, for every
   worktree of its repository. See [project trust](extending/project-trust.md).
+- **`permissions`** prints every permission rule found, where it came from
+  and whether it is used, or adds a rule to crab's permissions file for the
+  user or the folder's project, or takes one out. See
+  [permission rules](extending/permissions.md).
 
 How saved conversations, queued prompts and the rest fit together is in
 [concepts](concepts.md). The commands and events are defined in

@@ -10,7 +10,9 @@ The columns:
 
 - **Asks** says whether a call asks the reader first outside yolo mode, and
   what an "always allow" answer covers. See
-  [tool calls and approvals](../concepts.md#tool-calls-and-approvals).
+  [tool calls and approvals](../concepts.md#tool-calls-and-approvals) and
+  [permission rules](../extending/permissions.md), which can also stop or
+  allow calls of any tool.
 - **Plan** says whether plan mode allows the tool. Plan mode keeps every tool
   on the list but refuses calls to the others without running them. See
   [modes](../concepts.md#modes).
@@ -20,9 +22,9 @@ The columns:
 | Tool       | What it does                                                                                     | Asks           | Plan | Detail                    |
 | ---------- | ------------------------------------------------------------------------------------------------ | -------------- | ---- | ------------------------- |
 | `read`     | Reads a file or folder; outlines of long code files; images, PDFs, SQLite, archives and JSON queries | no, for files  | yes  | [files](files.md)         |
-| `edit`     | Changes files by line number against the tag of the last read, and resolves merge conflicts      | yes, the tool  | no   | [files](files.md)         |
-| `write`    | Creates a file or overwrites it whole                                                            | yes, the tool  | no   | [files](files.md)         |
-| `ast_edit` | Rewrites code by syntax tree across files                                                        | yes, the tool  | no   | [files](files.md#generated-files) |
+| `edit`     | Changes files by line number against the tag of the last read, and resolves merge conflicts      | yes, per folder | no   | [files](files.md)         |
+| `write`    | Creates a file or overwrites it whole                                                            | yes, per folder | no   | [files](files.md)         |
+| `ast_edit` | Rewrites code by syntax tree across files                                                        | yes, per folder | no   | [files](files.md#generated-files) |
 
 After `edit` and `write`, the file is formatted and its diagnostics are added
 to the result; see [language services](../language-services.md).
@@ -45,7 +47,7 @@ to the result; see [language services](../language-services.md).
 
 | Tool   | What it does                                                                                       | Asks          | Plan | Detail             |
 | ------ | -------------------------------------------------------------------------------------------------- | ------------- | ---- | ------------------ |
-| `bash` | Runs a shell command in the working folder; condenses noisy output; `background: true` returns a handle at once | yes, the tool | no   | [calls](calls.md)  |
+| `bash` | Runs a shell command in the working folder; condenses noisy output; `background: true` returns a handle at once | yes, per command | no   | [calls](calls.md)  |
 | `wait` | Blocks until the next background `bash` command or `task` subagent ends, and returns its result    | no            | yes  | [background runs](../concepts.md#background-runs) |
 
 ## Web

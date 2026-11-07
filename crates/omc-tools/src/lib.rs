@@ -33,7 +33,8 @@ pub use registry::Registry;
 pub use sandbox::Sandbox;
 pub use spill::Spill;
 pub use tool::{
-    Caller, FileChange, Image, NoCaller, Tool, ToolOutput, marked_lines, parse_args, sanitize,
+    Caller, FileChange, Image, NoCaller, Subject, Tool, ToolOutput, marked_lines, parse_args,
+    sanitize,
 };
 pub use tools::{
     Ask, AstEdit, AstGrep, Bash, CheckpointTool, ContextNotes, Edit, ExitPlanMode, Glob, Grep, Lsp,

@@ -70,6 +70,27 @@ impl ToolOutput {
     }
 }
 
+/// What permission rules look at in a call, beyond the name of its tool.
+///
+/// Rules such as `Bash(cargo test:*)` or `Edit(src/**)` are matched against
+/// this: a command line, the files a call touches, the folder it works through
+/// or the site it reaches. A tool whose calls differ in none of these has
+/// [`Subject::Whole`], and only rules about the whole tool apply to it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Subject {
+    /// Nothing finer than the tool itself.
+    #[default]
+    Whole,
+    /// A shell command line, as it is run.
+    Command(String),
+    /// The files the call reads or changes, as absolute paths.
+    Files(Vec<std::path::PathBuf>),
+    /// A file or a folder the call works through, everything below it included, as an absolute path.
+    Tree(std::path::PathBuf),
+    /// The host name of the site the call reaches, lowercased.
+    Site(String),
+}
+
 /// A capability the model can invoke by name with JSON arguments.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -107,6 +128,13 @@ pub trait Tool: Send + Sync {
     /// returns a narrower scope per call.
     fn approval_scope(&self, _args: &Value) -> Option<String> {
         self.needs_approval().then(|| self.name().to_owned())
+    }
+
+    /// What permission rules look at in a call with `args`: its command line, its files, its folder or its site.
+    ///
+    /// By default [`Subject::Whole`], so that only rules about the whole tool apply.
+    fn subject(&self, _args: &Value) -> Subject {
+        Subject::Whole
     }
 
     /// Returns a one-line description of a call with `args`, shown to the user.

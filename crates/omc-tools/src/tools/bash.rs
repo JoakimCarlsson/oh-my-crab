@@ -18,7 +18,7 @@ use tokio::process::Command;
 
 use super::capture::Capture;
 use crate::tool::parse_args;
-use crate::{Jobs, Sandbox, Tool, ToolError, ToolOutput};
+use crate::{Jobs, Sandbox, Subject, Tool, ToolError, ToolOutput};
 pub(super) use condense::Condenser;
 use condense::{Rules, rules_for};
 use intercept::Verdict;
@@ -200,6 +200,11 @@ impl Tool for Bash {
     /// Shows the command line.
     fn describe(&self, args: &Value) -> String {
         args["command"].as_str().unwrap_or("?").to_string()
+    }
+
+    /// The command line, which permission rules take apart into the commands it runs.
+    fn subject(&self, args: &Value) -> Subject {
+        Subject::Command(args["command"].as_str().unwrap_or_default().to_owned())
     }
 
     /// A copy that runs commands in the foreground only, when this one can start background runs.

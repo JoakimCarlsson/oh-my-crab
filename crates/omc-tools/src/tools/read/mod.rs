@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use super::snapshot::tag_file;
 use super::{conflict, lookalike};
 use crate::tool::parse_args;
-use crate::{Sandbox, Tool, ToolError, ToolOutput};
+use crate::{Sandbox, Subject, Tool, ToolError, ToolOutput};
 use media::Media;
 pub(crate) use outline::{Fold, folds};
 use selector::Selector;
@@ -132,6 +132,25 @@ impl Tool for Read {
             return Some(github::SCOPE.to_owned());
         }
         web::is_url(path).then(|| format!("read {}", web::scope(path)))
+    }
+
+    /// The site a URL or GitHub read reaches, by its host, or the file a read of the disk opens, where it points without the selector after it.
+    fn subject(&self, args: &Value) -> Subject {
+        let path = args["path"].as_str().unwrap_or_default();
+        if self.github(path).is_some() {
+            return Subject::Site("github.com".to_owned());
+        }
+        if web::is_url(path) {
+            return Subject::Site(web::host(path));
+        }
+        let file = match self.locate(path) {
+            Ok((file, ..)) => file,
+            Err(_) => selector::split(path).map_or_else(
+                || self.sandbox.locate(path),
+                |(name, _)| self.sandbox.locate(name),
+            ),
+        };
+        Subject::Files(vec![file])
     }
 
     /// Describes the tool to the model.

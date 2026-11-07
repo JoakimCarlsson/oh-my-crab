@@ -7,6 +7,7 @@ mod hooks;
 mod journal;
 mod loop_guard;
 mod nesting;
+pub mod permissions;
 mod picker;
 mod pruning;
 mod recall;
@@ -22,7 +23,7 @@ mod worktree;
 pub use agent::{
     AgentError, AgentEvent, Context, Live, compact, run_turn, run_turn_recorded, run_turn_steered,
 };
-pub use approval::{ApprovalRequest, Approvals, Decision, Prompter};
+pub use approval::{ApprovalRequest, Approvals, Decision, Keeper, Place, Prompter};
 pub use compaction::{COMPACT, context, replayed};
 pub use hooks::{
     CompactTrigger, Compacting, Gate, Hooks, MAX_STOP_IN_A_ROW, MAX_STOP_PER_TURN, Screened,

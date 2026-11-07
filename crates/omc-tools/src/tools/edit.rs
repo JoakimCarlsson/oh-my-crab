@@ -14,7 +14,7 @@ use super::snapshot::{is_outline_tag, outline_tag, tag};
 use super::{generated, lookalike};
 use crate::language::{Languages, Written, settle};
 use crate::tool::{marked_lines, parse_args};
-use crate::{FileChange, Sandbox, Tool, ToolError, ToolOutput};
+use crate::{FileChange, Sandbox, Subject, Tool, ToolError, ToolOutput};
 
 /// Lines of context shown around a changed region in the preview.
 const PREVIEW_CONTEXT: usize = 2;
@@ -214,6 +214,23 @@ impl Tool for Edit {
     /// Edits change files, so they need approval.
     fn needs_approval(&self) -> bool {
         true
+    }
+
+    /// Every file the call edits, where each points.
+    fn subject(&self, args: &Value) -> Subject {
+        let files = args["files"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        Subject::Files(
+            files
+                .iter()
+                .map(|section| {
+                    self.sandbox
+                        .locate(section["path"].as_str().unwrap_or_default())
+                })
+                .collect(),
+        )
     }
 
     /// Shows each file with the lines the operations remove and add.

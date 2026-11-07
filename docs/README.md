@@ -40,6 +40,8 @@
 - [Tool servers (MCP)](extending/mcp.md).
 - [Hooks](extending/hooks.md).
 - [Project trust](extending/project-trust.md).
+- [Permission rules](extending/permissions.md): allow, ask and deny rules, and
+  where "always allow" answers are kept.
 
 ## Providers
 

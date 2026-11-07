@@ -96,7 +96,7 @@ lines are shortened):
 {"Tool":{"id":"toolu_01BJncUS5JG4uPGyhLqWQqzL","title":null,"kind":null,"state":"Done","target":null,"diff":null,"output":"[tag 5906]\n     1\tdef add(a, b):\n     2\t    return a - b\n","parent":null,"agent":null,"worktree":null}}
 {"Used":{"used":23009,"size":1000000}}
 {"Tool":{"id":"toolu_01TuYTkx2rQq1MVbexcwgAye","title":"edit","kind":"Edit","state":"Running","target":"calc.py\nreplace lines 2-2\n-     return a - b\n+     return a + b","diff":null,"output":null,"parent":null,"agent":null,"worktree":null}}
-{"Ask":{"ticket":1,"title":"edit: calc.py","command":"calc.py\nreplace lines 2-2\n-     return a - b\n+     return a + b","plan":null,"choices":[{"id":"allow","name":"Allow once","verdict":"Allow"},{"id":"always","name":"Always allow","verdict":"Always"},{"id":"reject","name":"Reject","verdict":"Reject"}]}}
+{"Ask":{"ticket":1,"title":"edit: calc.py","command":"calc.py\nreplace lines 2-2\n-     return a - b\n+     return a + b","plan":null,"choices":[{"id":"allow","name":"Allow once","verdict":"Allow"},{"id":"always","name":"Always allow Edit(/**)","verdict":"Always"},{"id":"always-project","name":"Always allow Edit(/**) in this project","verdict":"Always"},{"id":"always-user","name":"Always allow Edit(//home/me/calc/**) in every project","verdict":"Always"},{"id":"reject","name":"Reject","verdict":"Reject"}]}}
 {"Choose":{"ticket":1,"option":"allow"}}
 {"Tool":{"id":"toolu_01TuYTkx2rQq1MVbexcwgAye","title":null,"kind":null,"state":"Done","target":null,"diff":{"path":"calc.py","old":"def add(a, b):\n    return a - b\n","new":"def add(a, b):\n    return a + b\n"},"output":"calc.py: tag D960\n     1\tdef add(a, b):\n     2\t    return a + b","parent":null,"agent":null,"worktree":null}}
 {"Started":"Text"}
@@ -403,7 +403,14 @@ Answers an `Ask` under `ticket`.
 | `ticket` | integer | required | The `Ask` being answered.                                  |
 | `option` | string  | optional | The `id` of the `Choice` picked; `null` declines.          |
 
-Any `option` other than `allow` or `always` declines, as `null` does.
+`allow` lets the call run once. `always` lets it run and adds the permission
+rules the `Ask` named for the rest of the conversation; `always-project` and
+`always-user` do that and keep the rules in crab's permissions file, for the
+project or for every project, and are accepted only when the `Ask` offered
+them. Any other `option` declines, as `null` does. A client that only knows
+`allow`, `always` and `reject` keeps working as before; the new choices are
+just more entries in `choices`. See
+[permission rules](extending/permissions.md).
 
 ```json
 {"Choose":{"ticket":1,"option":"allow"}}
@@ -785,15 +792,31 @@ A `Choice`:
 | `name`    | string    | What the reader is shown.                     |
 | `verdict` | `Verdict` | `Allow`, `Always` or `Reject`.                |
 
-A tool call offers `allow` ("Allow once"), `always` ("Always allow", or
-"Always allow <scope>" when the approval covers less than the whole tool) and
-`reject`. A plan offers `allow` ("Approve and start") and `reject` ("Keep
+A tool call offers, in this order:
+
+- `allow` ("Allow once");
+- `always`, verdict `Always`, named after the permission rules it adds for the
+  rest of the conversation, such as "Always allow Bash(cargo test:*)" or
+  "Always allow Edit(/src/**)", or just "Always allow" when the rule is the
+  tool's own name;
+- `always-project`, verdict `Always`, "… in this project": the same, and the
+  rules are kept in crab's permissions file for the project;
+- `always-user`, verdict `Always`, "… in every project": the same, kept for
+  every project, with paths written from the root of the file system;
+- `reject`.
+
+The first `Always` choice is always `always`. `always-project` and
+`always-user` are offered only when crab has a permissions file to keep rules
+in. No `Always` choice is offered when no rule can cover the call: a command
+line crab will not take apart, one that writes a file, or a call an ask rule
+matched. A plan offers `allow` ("Approve and start") and `reject` ("Keep
 planning").
 
-From a real run:
+From real runs, an edit and a command:
 
 ```json
-{"Ask":{"ticket":1,"title":"edit: calc.py","command":"calc.py\nreplace lines 2-2\n-     return a - b\n+     return a + b","plan":null,"choices":[{"id":"allow","name":"Allow once","verdict":"Allow"},{"id":"always","name":"Always allow","verdict":"Always"},{"id":"reject","name":"Reject","verdict":"Reject"}]}}
+{"Ask":{"ticket":1,"title":"edit: calc.py","command":"calc.py\nreplace lines 2-2\n-     return a - b\n+     return a + b","plan":null,"choices":[{"id":"allow","name":"Allow once","verdict":"Allow"},{"id":"always","name":"Always allow Edit(/**)","verdict":"Always"},{"id":"always-project","name":"Always allow Edit(/**) in this project","verdict":"Always"},{"id":"always-user","name":"Always allow Edit(//home/me/calc/**) in every project","verdict":"Always"},{"id":"reject","name":"Reject","verdict":"Reject"}]}}
+{"Ask":{"ticket":1,"title":"bash: git status","command":"git status","plan":null,"choices":[{"id":"allow","name":"Allow once","verdict":"Allow"},{"id":"always","name":"Always allow Bash(git status:*)","verdict":"Always"},{"id":"always-project","name":"Always allow Bash(git status:*) in this project","verdict":"Always"},{"id":"always-user","name":"Always allow Bash(git status:*) in every project","verdict":"Always"},{"id":"reject","name":"Reject","verdict":"Reject"}]}}
 ```
 
 ### `Inquire`

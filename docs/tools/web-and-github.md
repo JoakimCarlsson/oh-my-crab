@@ -49,9 +49,9 @@ nothing is written to disk. Lists of comments, reviews and files show their
 first 100 entries. The header of each result says how the request was signed.
 
 Reading the network asks first unless the conversation is in yolo mode, as
-`bash` does. The approval is per site: "always allow" for one origin never
-covers another, and every GitHub path and github.com URL counts as
-`https://github.com`. A redirect to another origin is not followed but
+`bash` does. The approval is per site: "always allow" adds a rule for the
+host, such as `WebFetch(domain:docs.rs)`, which never covers another host,
+and every GitHub path and github.com URL counts as `github.com`. A redirect to another origin is not followed but
 reported, so that reading its target is approved afresh, and a host name that
 resolves to a local or private address is refused.
 

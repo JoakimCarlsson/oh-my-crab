@@ -87,13 +87,21 @@ reading a web page, and tool-server tools. The question is an `Ask` event
 offering "Allow once", "Always allow" and "Reject". A rejected call fails and
 the model reads that the user denied it.
 
-"Always allow" covers a scope, not every call: later calls with the same scope
-run without asking. For most tools the scope is the tool itself. Reading the
-web is scoped per site, so allowing one origin never allows another, and every
-GitHub path counts as `https://github.com`. The choice then reads, for
-example, "Always allow read https://docs.rs". These answers are kept in memory
-for as long as the `crab` process runs and are not saved, so a reopened
-conversation asks again.
+"Always allow" adds permission rules in Claude Code's syntax, never a whole
+tool that reaches further than the call: for `bash` a rule per command, such
+as `Bash(cargo test:*)` for `cargo test -p foo`, which a later `cargo test;
+rm -rf ~` does not ride on; for `edit`, `write` and `ast_edit` the folder,
+such as `Edit(/src/**)`; for reading the web the host, such as
+`WebFetch(domain:docs.rs)`, with every GitHub path counted as `github.com`;
+for other tools the tool. The rules hold for the rest of the conversation, or,
+with the "in this project" and "in every project" choices, are kept in crab's
+permissions file for later conversations.
+
+Permission rules can also be written by hand, in crab's file or in Claude
+Code's settings: allow rules that skip the question, ask rules that always
+ask, and deny rules that stop a call even in yolo mode. A project's own
+settings bring allow rules only once it is trusted. See
+[permission rules](extending/permissions.md).
 
 Hooks can allow or refuse a call before the reader is asked, and the client
 can deny a tool outright when it opens the conversation. See
@@ -110,7 +118,8 @@ The `mode` setting says how much the agent asks:
   the reader sees as an `Ask` with a `plan`: "Approve and start" ends plan
   mode, returning to the mode it began in, and the agent carries on in the
   same turn; "Keep planning" keeps it in plan mode.
-- **`yolo`** ("Run freely") runs everything without asking.
+- **`yolo`** ("Run freely") runs everything without asking, except what a
+  deny rule stops.
 
 `"yolo": true` in `Open` starts in yolo mode. The [tool index](tools/README.md)
 marks which tools plan mode allows.

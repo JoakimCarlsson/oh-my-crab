@@ -936,8 +936,10 @@ fn tool_specs(registry: &Registry) -> Vec<ToolSpec> {
 /// are put right against the schema again; only then is the call described,
 /// asked about or run, so the user approves exactly what runs. A call whose
 /// arguments cannot be read or put right fails without being asked about.
-/// Calls that need approval are asked about one at a time, in order, unless a
-/// hook allowed them. Approved calls then run one after another so edits cannot
+/// Every call is put to the permission rules: one a deny rule matches fails
+/// without running, in yolo mode too. Calls that need approval, and calls an
+/// ask rule matches, are asked about one at a time, in order, unless a hook
+/// allowed them or allow rules cover them. Approved calls then run one after another so edits cannot
 /// race, while calls that need no approval run concurrently. The hooks see each
 /// call that succeeded once more, after it ran, and what they say is added to
 /// its result.
@@ -978,15 +980,15 @@ async fn run_calls(
             }
             Admitted::Ready(ready) => ready,
         };
-        let Some(request) = &ready.request else {
-            concurrent.push((index, ready));
-            continue;
-        };
-        if ready.allowed || approvals.allows(request).await {
-            sequential.push((index, ready));
-        } else {
-            let message = "the user denied this tool call".to_string();
-            slots[index] = Some(finish(call, message, true, Vec::new(), events));
+        match approvals
+            .check(&ready.request, ready.needed, ready.allowed)
+            .await
+        {
+            Ok(()) if ready.needed => sequential.push((index, ready)),
+            Ok(()) => concurrent.push((index, ready)),
+            Err(message) => {
+                slots[index] = Some(finish(call, message, true, Vec::new(), events));
+            }
         }
     }
     let gate = tokio::sync::Mutex::new(());
@@ -1040,8 +1042,10 @@ struct Ready<'r> {
     arguments: Value,
     /// A note from the hooks for the model, added to the result.
     note: Option<String>,
-    /// What the reader is asked to approve, when the call needs approval.
-    request: Option<ApprovalRequest>,
+    /// What the reader is asked to approve, and what permission rules look at.
+    request: ApprovalRequest,
+    /// Whether the call needs the reader's approval before it runs.
+    needed: bool,
     /// Whether a hook allowed it without asking the reader.
     allowed: bool,
 }
@@ -1098,13 +1102,16 @@ async fn admit<'r>(
         }
         Some((_, Err(message))) => Admitted::Ended(finish(call, message, true, Vec::new(), events)),
         Some((tool, Ok(arguments))) => Admitted::Ready(Ready {
-            request: tool
-                .approval_scope(&arguments)
-                .map(|scope| ApprovalRequest {
-                    tool: call.name.clone(),
-                    scope,
-                    summary,
-                }),
+            needed: tool.approval_scope(&arguments).is_some(),
+            request: ApprovalRequest {
+                tool: call.name.clone(),
+                scope: tool
+                    .approval_scope(&arguments)
+                    .unwrap_or_else(|| call.name.clone()),
+                summary,
+                subject: tool.subject(&arguments),
+                ..ApprovalRequest::default()
+            },
             tool,
             arguments,
             note: screened.note,
@@ -1254,10 +1261,19 @@ impl<'a> Nested<'a> {
         }
     }
 
-    /// Asks the reader about `request`, timing how long the answer takes, and says whether the call may run.
-    async fn ask(&self, request: &ApprovalRequest) -> bool {
+    /// Puts `request` to the permission rules and, when they leave it open, to the reader, timing how long the answer takes; `needed` says whether the tool asks before it runs and `hooked` whether a hook allowed the call.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason for the model when a rule or the reader refuses the call.
+    async fn ask(
+        &self,
+        request: &ApprovalRequest,
+        needed: bool,
+        hooked: bool,
+    ) -> Result<(), String> {
         self.lock_waiting().1 = Some(Instant::now());
-        let allowed = self.batch.approvals.allows(request).await;
+        let allowed = self.batch.approvals.check(request, needed, hooked).await;
         let mut waiting = self.lock_waiting();
         if let Some(since) = waiting.1.take() {
             waiting.0 += since.elapsed();
@@ -1293,20 +1309,17 @@ impl Caller for Nested<'_> {
             Admitted::Ended(result) => return Err(result.text),
             Admitted::Ready(ready) => ready,
         };
-        let _turn = match &ready.request {
-            Some(_) => Some(self.batch.gate.lock().await),
-            None => None,
+        let _turn = match ready.needed {
+            true => Some(self.batch.gate.lock().await),
+            false => None,
         };
-        if let Some(request) = ready.request.as_ref().filter(|_| !ready.allowed) {
-            let request = ApprovalRequest {
-                summary: format!("{} (called by {})", request.summary, self.agent),
-                ..request.clone()
-            };
-            if !self.ask(&request).await {
-                let message = "the user denied this tool call".to_owned();
-                finish(&call, message.clone(), true, Vec::new(), &filed);
-                return Err(message);
-            }
+        let request = ApprovalRequest {
+            summary: format!("{} (called by {})", ready.request.summary, self.agent),
+            ..ready.request.clone()
+        };
+        if let Err(message) = self.ask(&request, ready.needed, ready.allowed).await {
+            finish(&call, message.clone(), true, Vec::new(), &filed);
+            return Err(message);
         }
         let done = perform(&call, ready, self.batch.hooks, &NoCaller).await;
         finish(

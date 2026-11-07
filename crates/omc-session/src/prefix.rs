@@ -308,6 +308,19 @@ impl Tool for Gated {
         self.current().ok()?.approval_scope(args)
     }
 
+    /// What permission rules look at in a call with `args` of the tool of the mode on now, whichever mode has it when that one is refused.
+    fn subject(&self, args: &Value) -> omc_tools::Subject {
+        match self.current() {
+            Ok(tool) => tool.subject(args),
+            Err(_) => self
+                .full
+                .as_ref()
+                .or(self.plan.as_ref())
+                .map(|tool| tool.subject(args))
+                .unwrap_or_default(),
+        }
+    }
+
     /// The tool's own one-line description of a call with `args`, whichever mode has it.
     fn describe(&self, args: &Value) -> String {
         self.full

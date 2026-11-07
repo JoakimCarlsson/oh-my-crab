@@ -1,7 +1,7 @@
 //! The `crab` binary: the harness, served to another program over standard input and output.
 
 /// Usage text printed for `--help` and after a bad argument.
-const USAGE: &str = "usage: crab <serve|tools|providers|account|history|rename|import|fork|memory|hooks|trust>\n\n  serve                    hold a conversation: read commands from standard input, write events to standard output\n  tools                    print the tools the agent can have, as a JSON list of name and description\n  providers                print the providers a conversation can be opened with, as a JSON list of id, name and sign-in\n  account <provider> [folder]  print who <provider> is signed in as with the logins in [folder], or in crab's own folder, or nothing\n  history <id> [folder]    print the saved conversation <id> as JSON: its title, saved settings and turns, which works while it is open elsewhere\n  rename <id> <folder> <title>  name the saved conversation <id>, which fails while it is open elsewhere\n  import <id> <folder>          save the conversation a client kept, read as JSON from standard input, as the conversation <id>\n  fork <id> <copy> <folder> [turn]  copy the branch the saved conversation <id> is on, up to before [turn] or whole, to the new conversation <copy>\n  memory [folder]          print the memories a conversation in [folder], or in the current folder, starts with, as JSON: its project's, which every worktree of the repository shares, and the user's\n  hooks [folder]           print the hooks a conversation in [folder], or in the current folder, would find, whether each runs, and its project's trust, as JSON\n  trust <folder> [on|off]  print whether the project <folder> belongs to is trusted, as JSON, or record that it is (on) or is not (off), for every worktree of its repository";
+const USAGE: &str = "usage: crab <serve|tools|providers|account|history|rename|import|fork|memory|hooks|trust|permissions>\n\n  serve                    hold a conversation: read commands from standard input, write events to standard output\n  tools                    print the tools the agent can have, as a JSON list of name and description\n  providers                print the providers a conversation can be opened with, as a JSON list of id, name and sign-in\n  account <provider> [folder]  print who <provider> is signed in as with the logins in [folder], or in crab's own folder, or nothing\n  history <id> [folder]    print the saved conversation <id> as JSON: its title, saved settings and turns, which works while it is open elsewhere\n  rename <id> <folder> <title>  name the saved conversation <id>, which fails while it is open elsewhere\n  import <id> <folder>          save the conversation a client kept, read as JSON from standard input, as the conversation <id>\n  fork <id> <copy> <folder> [turn]  copy the branch the saved conversation <id> is on, up to before [turn] or whole, to the new conversation <copy>\n  memory [folder]          print the memories a conversation in [folder], or in the current folder, starts with, as JSON: its project's, which every worktree of the repository shares, and the user's\n  hooks [folder]           print the hooks a conversation in [folder], or in the current folder, would find, whether each runs, and its project's trust, as JSON\n  trust <folder> [on|off]  print whether the project <folder> belongs to is trusted, as JSON, or record that it is (on) or is not (off), for every worktree of its repository\n  permissions [folder]     print the permission rules a conversation in [folder], or in the current folder, would use, with where each comes from and whether it is used, as JSON\n  permissions add <allow|ask|deny> <user|project> <rule> [folder]  add a rule to crab's permissions file, for every project (user) or for the project of [folder] (project)\n  permissions remove <rule> [folder]  take a rule out of crab's permissions file, the user's and the project's of [folder]";
 
 /// Runs the conversation the command line asks for.
 ///
@@ -118,6 +118,39 @@ async fn main() -> anyhow::Result<()> {
             let standing = omc_session::trust(Some(folder), trusted)
                 .map_err(|reason| anyhow::anyhow!(reason))?;
             println!("{}", serde_json::to_string(&standing)?);
+            Ok(())
+        }
+        Some("permissions") => {
+            let arguments: Vec<String> = std::env::args().skip(2).collect();
+            let listed = match arguments.first().map(String::as_str) {
+                Some("add") => {
+                    let [_, effect, place, rule, rest @ ..] = arguments.as_slice() else {
+                        return Err(anyhow::anyhow!(
+                            "permissions add needs allow, ask or deny, user or project, and a rule"
+                        ));
+                    };
+                    let project = match place.as_str() {
+                        "user" => false,
+                        "project" => true,
+                        other => {
+                            return Err(anyhow::anyhow!(
+                                "a rule is kept for the user or the project, not {other}"
+                            ));
+                        }
+                    };
+                    let folder = rest.first().map(std::path::PathBuf::from);
+                    omc_session::add_permission(effect, rule, project, folder)
+                }
+                Some("remove") => {
+                    let [_, rule, rest @ ..] = arguments.as_slice() else {
+                        return Err(anyhow::anyhow!("permissions remove needs a rule"));
+                    };
+                    omc_session::remove_permission(rule, rest.first().map(std::path::PathBuf::from))
+                }
+                folder => omc_session::permissions(folder.map(std::path::PathBuf::from)),
+            }
+            .map_err(|reason| anyhow::anyhow!(reason))?;
+            println!("{}", serde_json::to_string(&listed)?);
             Ok(())
         }
         Some("-h" | "--help") => {

@@ -15,7 +15,7 @@ use super::atomic::write_atomic;
 use super::generated;
 use super::snapshot::tag;
 use crate::tool::{marked_lines, parse_args};
-use crate::{FileChange, Sandbox, Tool, ToolError, ToolOutput};
+use crate::{FileChange, Sandbox, Subject, Tool, ToolError, ToolOutput};
 
 /// Most preview lines shown for one file.
 const PREVIEW_LINES: usize = 40;
@@ -124,6 +124,11 @@ impl Tool for AstEdit {
     /// Rewrites change files, so they need approval.
     fn needs_approval(&self) -> bool {
         true
+    }
+
+    /// The file or folder the call rewrites in, the working folder when it names none.
+    fn subject(&self, args: &Value) -> Subject {
+        Subject::Tree(self.sandbox.locate(args["path"].as_str().unwrap_or(".")))
     }
 
     /// Shows where the rewrite applies, then the pattern as removed lines and the rewrite as added ones.

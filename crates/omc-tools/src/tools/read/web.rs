@@ -63,6 +63,14 @@ pub(super) fn scope(raw: &str) -> String {
     }
 }
 
+/// The host a `read` of `raw` reaches, lowercased, for permission rules about sites; all of `raw` when it is not a URL that can be read, which matches no site.
+pub(super) fn host(raw: &str) -> String {
+    match target(raw) {
+        Ok((url, _)) => url.host_str().unwrap_or_default().to_ascii_lowercase(),
+        Err(_) => raw.to_owned(),
+    }
+}
+
 /// A fetched response, as far as reading it needs.
 pub(super) struct Page {
     /// The URL the response came from, after redirects.

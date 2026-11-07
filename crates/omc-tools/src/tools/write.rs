@@ -9,7 +9,7 @@ use super::snapshot::tag;
 use super::{generated, lookalike};
 use crate::language::{Languages, Written, settle};
 use crate::tool::{marked_lines, parse_args};
-use crate::{Sandbox, Tool, ToolError, ToolOutput};
+use crate::{Sandbox, Subject, Tool, ToolError, ToolOutput};
 
 /// Creates a file or replaces its whole content.
 pub struct Write {
@@ -83,6 +83,14 @@ impl Tool for Write {
     /// Writes change files, so they need approval.
     fn needs_approval(&self) -> bool {
         true
+    }
+
+    /// The file written, where it points.
+    fn subject(&self, args: &Value) -> Subject {
+        Subject::Files(vec![
+            self.sandbox
+                .locate(args["path"].as_str().unwrap_or_default()),
+        ])
     }
 
     /// Shows the file, the size of the content and all of it.

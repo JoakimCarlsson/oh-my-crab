@@ -92,6 +92,24 @@ impl Sandbox {
         }
     }
 
+    /// Where `path` points, for permission rules to match: as [`Sandbox::resolve`] resolves it, or, when it leaves the root, joined to the root with `.` and `..` folded away and symlinks followed as far as they exist, so that a rule about a folder outside still sees it.
+    pub fn locate(&self, path: &str) -> PathBuf {
+        if let Ok(resolved) = self.resolve(path) {
+            return resolved;
+        }
+        let mut folded = PathBuf::new();
+        for component in self.root.join(path).components() {
+            match component {
+                Component::ParentDir => {
+                    folded.pop();
+                }
+                Component::CurDir => {}
+                other => folded.push(other),
+            }
+        }
+        canonicalize_existing(&folded).unwrap_or(folded)
+    }
+
     /// Describes where `path` really points, for the approval prompt.
     ///
     /// Shows the resolved path relative to the root, or flags a path that

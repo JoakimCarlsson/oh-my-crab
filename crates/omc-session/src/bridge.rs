@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use omc_agent::{ApprovalRequest, Decision, Prompter};
+use omc_agent::{ApprovalRequest, Decision, Place, Prompter};
 use omc_wire::{Choice, Event, Inquiry, Permission, Question, Reply, Verdict};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
@@ -15,8 +15,14 @@ use crate::lifecycle::Lifecycle;
 /// The id of the choice that lets a call run this once.
 const ALLOW: &str = "allow";
 
-/// The id of the choice that lets a tool run for the rest of the session.
+/// The id of the choice that lets a call run and allows its rules for the rest of the conversation.
 const ALWAYS: &str = "always";
+
+/// The id of the choice that lets a call run and keeps its rules for every conversation in the project.
+const ALWAYS_PROJECT: &str = "always-project";
+
+/// The id of the choice that lets a call run and keeps its rules for every conversation in every project.
+const ALWAYS_USER: &str = "always-user";
 
 /// The id of the choice that refuses a call.
 const REJECT: &str = "reject";
@@ -75,6 +81,8 @@ impl Questions {
             let _ = waiting.send(match option {
                 Some(ALLOW) => Decision::AllowOnce,
                 Some(ALWAYS) => Decision::AllowAlways,
+                Some(ALWAYS_PROJECT) => Decision::AllowAndKeep(Place::Project),
+                Some(ALWAYS_USER) => Decision::AllowAndKeep(Place::User),
                 _ => Decision::Deny,
             });
         }
@@ -132,7 +140,7 @@ impl Questions {
         );
         matches!(
             answer.await,
-            Ok(Decision::AllowOnce | Decision::AllowAlways)
+            Ok(Decision::AllowOnce | Decision::AllowAlways | Decision::AllowAndKeep(_))
         )
     }
 
@@ -191,19 +199,40 @@ fn choice(id: &str, name: &str, verdict: Verdict) -> Choice {
     }
 }
 
-/// The answers a permission question about `request` offers; "always" names
-/// its scope when that is narrower than the whole tool.
+/// The answers a permission question about `request` offers: allowing it once, allowing it always, naming the rules that adds, for the conversation and, when rules can be kept, for the project and for every project, and refusing it. "Always" is left out when no rule can cover the call.
 fn choices(request: &ApprovalRequest) -> Vec<Choice> {
-    let always = if request.scope == request.tool {
-        "Always allow".to_owned()
-    } else {
-        format!("Always allow {}", request.scope)
-    };
-    vec![
-        choice(ALLOW, "Allow once", Verdict::Allow),
-        choice(ALWAYS, &always, Verdict::Always),
-        choice(REJECT, "Reject", Verdict::Reject),
-    ]
+    let mut offered = vec![choice(ALLOW, "Allow once", Verdict::Allow)];
+    if !request.rules.is_empty() {
+        let named = |rules: &[String]| match rules {
+            [only] if *only == request.tool => String::new(),
+            rules => format!(" {}", rules.join(", ")),
+        };
+        let rules = named(&request.rules);
+        offered.push(choice(
+            ALWAYS,
+            &format!("Always allow{rules}"),
+            Verdict::Always,
+        ));
+        if request.keepable {
+            offered.push(choice(
+                ALWAYS_PROJECT,
+                &format!("Always allow{rules} in this project"),
+                Verdict::Always,
+            ));
+            if !request.everywhere.is_empty() {
+                offered.push(choice(
+                    ALWAYS_USER,
+                    &format!(
+                        "Always allow{} in every project",
+                        named(&request.everywhere)
+                    ),
+                    Verdict::Always,
+                ));
+            }
+        }
+    }
+    offered.push(choice(REJECT, "Reject", Verdict::Reject));
+    offered
 }
 
 #[cfg(test)]
@@ -224,6 +253,8 @@ mod tests {
                         tool: "bash".into(),
                         scope: "bash".into(),
                         summary: "ls".into(),
+                        rules: vec!["Bash(ls:*)".into()],
+                        ..ApprovalRequest::default()
                     })
                     .await
             })
@@ -233,6 +264,78 @@ mod tests {
         };
         questions.answer(asked.ticket, Some(ALWAYS));
         assert_eq!(asking.await.unwrap(), Decision::AllowAlways);
+    }
+
+    /// "Always" names the rules it adds, offers keeping them for the project and every project when they can be kept, and each choice reaches the waiting call as its decision.
+    #[tokio::test]
+    async fn always_names_its_rules_and_offers_where_to_keep_them() {
+        let (out, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let questions = std::sync::Arc::new(Questions::new(out));
+        for (option, decision) in [
+            (ALWAYS, Decision::AllowAlways),
+            (ALWAYS_PROJECT, Decision::AllowAndKeep(Place::Project)),
+            (ALWAYS_USER, Decision::AllowAndKeep(Place::User)),
+        ] {
+            let asking = {
+                let questions = questions.clone();
+                tokio::spawn(async move {
+                    questions
+                        .ask(&ApprovalRequest {
+                            tool: "edit".into(),
+                            scope: "edit".into(),
+                            summary: "src/a.rs".into(),
+                            rules: vec!["Edit(/src/**)".into()],
+                            everywhere: vec!["Edit(//w/src/**)".into()],
+                            keepable: true,
+                            ..ApprovalRequest::default()
+                        })
+                        .await
+                })
+            };
+            let Some(Event::Ask(asked)) = seen.recv().await else {
+                panic!("no question");
+            };
+            let names: Vec<(&str, &str)> = asked
+                .choices
+                .iter()
+                .map(|choice| (choice.id.as_str(), choice.name.as_str()))
+                .collect();
+            assert_eq!(
+                names,
+                [
+                    (ALLOW, "Allow once"),
+                    (ALWAYS, "Always allow Edit(/src/**)"),
+                    (ALWAYS_PROJECT, "Always allow Edit(/src/**) in this project"),
+                    (
+                        ALWAYS_USER,
+                        "Always allow Edit(//w/src/**) in every project"
+                    ),
+                    (REJECT, "Reject"),
+                ]
+            );
+            questions.answer(asked.ticket, Some(option));
+            assert_eq!(asking.await.unwrap(), decision);
+        }
+    }
+
+    /// A call no rule can cover is offered no "always", and one whose rules cannot be kept only the conversation's.
+    #[tokio::test]
+    async fn always_is_offered_only_where_it_means_something() {
+        let uncovered = ApprovalRequest {
+            tool: "bash".into(),
+            ..ApprovalRequest::default()
+        };
+        let ids: Vec<String> = choices(&uncovered).into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, [ALLOW, REJECT]);
+        let unkept = ApprovalRequest {
+            tool: "web_search".into(),
+            rules: vec!["WebSearch".into()],
+            ..ApprovalRequest::default()
+        };
+        let offered = choices(&unkept);
+        let ids: Vec<&str> = offered.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, [ALLOW, ALWAYS, REJECT]);
+        assert_eq!(offered[1].name, "Always allow WebSearch");
     }
 
     /// A summary of several lines is shown whole, not only the first line in the title.
@@ -249,6 +352,7 @@ mod tests {
                         tool: "ast_edit".into(),
                         scope: "ast_edit".into(),
                         summary: summary.into(),
+                        ..ApprovalRequest::default()
                     })
                     .await
             })
@@ -275,6 +379,7 @@ mod tests {
                         tool: "edit".into(),
                         scope: "edit".into(),
                         summary: "x".into(),
+                        ..ApprovalRequest::default()
                     })
                     .await
             })
@@ -365,6 +470,7 @@ mod tests {
                         tool: "bash".into(),
                         scope: "bash".into(),
                         summary: "ls".into(),
+                        ..ApprovalRequest::default()
                     })
                     .await
             })

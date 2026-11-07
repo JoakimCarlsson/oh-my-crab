@@ -179,7 +179,7 @@ Tools that change files or run commands ask first. Ask for a change:
 > {"Prompt":{"text":"Add test_greet.py with one plain assert for greet.","files":[],"turn":"t2"}}
 < {"Used":{"used":23486,"size":1000000}}
 < {"Tool":{"id":"toolu_01DaXrXmX4fnwJ27Zr2ZsYt8","title":"write","kind":"Edit","state":"Running","target":"test_greet.py (5 lines, 89 bytes)\n+ from greet import greet\n+ \n+ \n+ def test_greet():\n+     assert greet(\"World\") == \"Hello, World!\"",…}}
-< {"Ask":{"ticket":1,"title":"write: test_greet.py (5 lines, 89 bytes)","command":"test_greet.py (5 lines, 89 bytes)\n+ from greet import greet\n…","plan":null,"choices":[{"id":"allow","name":"Allow once","verdict":"Allow"},{"id":"always","name":"Always allow","verdict":"Always"},{"id":"reject","name":"Reject","verdict":"Reject"}]}}
+< {"Ask":{"ticket":1,"title":"write: test_greet.py (5 lines, 89 bytes)","command":"test_greet.py (5 lines, 89 bytes)\n+ from greet import greet\n…","plan":null,"choices":[{"id":"allow","name":"Allow once","verdict":"Allow"},{"id":"always","name":"Always allow Edit(/**)","verdict":"Always"},{"id":"always-project","name":"Always allow Edit(/**) in this project","verdict":"Always"},{"id":"always-user","name":"Always allow Edit(//path/to/hello/**) in every project","verdict":"Always"},{"id":"reject","name":"Reject","verdict":"Reject"}]}}
 ```
 
 The turn now waits. Answer with `Choose`, naming the ticket and one of the
@@ -196,10 +196,13 @@ choices' ids:
 < {"Finished":null}
 ```
 
-`allow` lets this one call run. `always` lets every later call with the same
-scope run without asking for as long as this `crab` process runs; for `bash`, `edit`
-and `write` the scope is the whole tool, and for reading a web page it is the
-site. `reject`, or `"option":null`, refuses the call, and the model is told it
+`allow` lets this one call run. `always` adds the permission rules its name
+shows for the rest of the conversation: for `edit` and `write` the folder,
+such as `Edit(/**)` here, for `bash` a rule per command, such as
+`Bash(python -m pytest)` or `Bash(git status:*)`, and for reading a web page
+the host. `always-project` and `always-user`, when offered, also keep the
+rules in crab's permissions file for later conversations; see
+[permission rules](extending/permissions.md). `reject`, or `"option":null`, refuses the call, and the model is told it
 was refused. See [concepts](concepts.md#tool-calls-and-approvals).
 
 ## Plan mode
@@ -245,8 +248,9 @@ starts on the plan in the same turn:
 
 `Plan` is the agent's todo list, sent whole each time it changes. An `edit`
 event carries the file's `diff` once it is done. After `always` for `edit`,
-later edits in this conversation did not ask again. `bash` asked once more,
-was answered `always` too, and every later command ran without asking.
+later edits in the project folder in this conversation did not ask again.
+`bash` asked once more, was answered `always` too, and later runs of that
+command ran without asking, while other commands still asked.
 
 ## Yolo mode
 
