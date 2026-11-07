@@ -243,9 +243,21 @@ fn unique() -> String {
     )
 }
 
-/// `path` with its symbolic links resolved, or as it is when it cannot be.
+/// `path` with its symbolic links resolved, or as it is when it cannot be, in the ordinary form git can work with: Windows gives resolved paths the `\\?\` form for long paths, under which git cannot make the files it locks.
 fn real(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    ordinary(&path.canonicalize().unwrap_or_else(|_| path.to_path_buf()))
+}
+
+/// `path` without the `\\?\` mark of Windows' long-path form: `\\?\C:\a` becomes `C:\a` and `\\?\UNC\host\share` becomes `\\host\share`; any other path is left as it is.
+fn ordinary(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(shared) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{shared}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
 }
 
 /// Takes the state of the main agent's working tree, as [`Isolation::directory`] says where it is, for worktrees to start from: a commit on top of its head holding every file git does not ignore as it is on disk.
@@ -652,5 +664,26 @@ pub fn prune(root: &Path, current: Option<&str>, age: Duration) {
             }
         }
         let _ = std::fs::remove_dir(conversation.path());
+    }
+}
+
+#[cfg(test)]
+/// Tests for the paths handed to git.
+mod tests {
+    use super::*;
+
+    /// The long-path mark is taken off drive and network paths, and every other path is kept.
+    #[test]
+    fn long_paths_become_ordinary() {
+        assert_eq!(ordinary(Path::new(r"\\?\D:\a\b")), PathBuf::from(r"D:\a\b"));
+        assert_eq!(
+            ordinary(Path::new(r"\\?\UNC\host\share\x")),
+            PathBuf::from(r"\\host\share\x")
+        );
+        assert_eq!(
+            ordinary(Path::new(r"\\?\Volume{1}\x")),
+            PathBuf::from(r"\\?\Volume{1}\x")
+        );
+        assert_eq!(ordinary(Path::new("/home/a")), PathBuf::from("/home/a"));
     }
 }

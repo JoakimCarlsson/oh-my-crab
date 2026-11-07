@@ -498,7 +498,9 @@ mod tests {
     }
 
     /// A missing path that ends exactly one file's path reads that file and
-    /// says so; several candidates are listed in the error.
+    /// says so; several candidates are listed in the error. On a file system
+    /// that ignores case, a path in the wrong case is no lookalike: it opens
+    /// the file itself.
     #[tokio::test]
     async fn reads_the_one_file_a_mistyped_path_means() {
         let (tool, dir) = tool("read-lookalike");
@@ -512,11 +514,12 @@ mod tests {
             "{out}"
         );
         assert!(out.ends_with("     2\tb\n"), "{out}");
-        assert!(
-            text(&tool, "CRATES/B/SRC/LIB.RS")
-                .await
-                .contains("crates/b/src/lib.rs")
-        );
+        let shouted = text(&tool, "CRATES/B/SRC/LIB.RS").await;
+        if dir.join("CRATES/B/SRC/LIB.RS").exists() {
+            assert!(shouted.ends_with("     1\tc\n"), "{shouted}");
+        } else {
+            assert!(shouted.contains("crates/b/src/lib.rs"), "{shouted}");
+        }
         let several = tool.call(json!({ "path": "src/lib.rs" })).await;
         assert!(
             matches!(&several, Err(ToolError::Failed(m)) if m.contains("crates/a/src/lib.rs, crates/b/src/lib.rs")),
