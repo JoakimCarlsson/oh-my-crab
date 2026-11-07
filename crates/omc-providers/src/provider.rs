@@ -186,7 +186,9 @@ mod tests {
         }
         let kimi = Provider::from_id("kimi-code").unwrap().def();
         assert_eq!(kimi.default_model, Some("kimi-for-coding"));
-        assert!(matches!(kimi.auth, Auth::ApiKey { env } if env.contains(&"KIMI_CODE_API_KEY")));
+        assert!(
+            matches!(kimi.auth, Auth::DeviceCodeOrKey { env, .. } if env.contains(&"KIMI_CODE_API_KEY"))
+        );
         for provider in Provider::ALL {
             let def = provider.def();
             assert!(!def.label.is_empty());

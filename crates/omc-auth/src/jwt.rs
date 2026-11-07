@@ -18,6 +18,16 @@ pub fn email(token: &str) -> Option<String> {
     claims(token)?.get("email")?.as_str().map(str::to_owned)
 }
 
+/// The first of the string or number claims `names` that `token` carries, as text.
+pub fn first_claim(token: &str, names: &[&str]) -> Option<String> {
+    let claims = claims(token)?;
+    names.iter().find_map(|name| match claims.get(*name)? {
+        serde_json::Value::String(text) if !text.is_empty() => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    })
+}
+
 /// Extracts `chatgpt_account_id` from an OpenAI access token, if present.
 pub fn chatgpt_account_id(token: &str) -> Option<String> {
     claims(token)?

@@ -170,6 +170,7 @@ fn credentials_from(
             |p| p.org_name.clone(),
         ),
         base_url: None,
+        headers: Vec::new(),
         access,
         refresh,
         expires_at_ms: now_ms() + usable.as_millis() as u64,
@@ -297,6 +298,7 @@ mod tests {
             org_id: Some("org".into()),
             org_name: Some("Team".into()),
             base_url: None,
+            headers: Vec::new(),
         };
         let credentials = credentials_from(&TEST_SPEC, &token, Some(&previous)).unwrap();
         assert_eq!(credentials.org_id.as_deref(), Some("org"));

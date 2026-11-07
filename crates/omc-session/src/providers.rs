@@ -10,16 +10,16 @@ use omc_wire::{KeySource, ProviderInfo, SignIn};
 fn sign_in(auth: &Auth) -> SignIn {
     match auth {
         Auth::OAuth(_) => SignIn::Browser,
-        Auth::DeviceCode(_) => SignIn::DeviceCode,
+        Auth::DeviceCode(_) | Auth::DeviceCodeOrKey { .. } => SignIn::DeviceCode,
         Auth::ApiKey { .. } => SignIn::ApiKey,
         Auth::None => SignIn::None,
     }
 }
 
-/// The environment variables `auth` reads an API key from, or none when it takes no key.
+/// The environment variables `auth` reads an API key from, or none when it takes no key; a provider that signs in with a device code and also takes a key lists them too.
 fn key_env(auth: &Auth) -> &'static [&'static str] {
     match auth {
-        Auth::ApiKey { env } => env,
+        Auth::ApiKey { env } | Auth::DeviceCodeOrKey { env, .. } => env,
         _ => &[],
     }
 }
@@ -59,7 +59,7 @@ pub fn signed_in(id: &str, home: Option<PathBuf>) -> bool {
 
 /// Where the API key of the provider `id` comes from, with the logins kept in `home` or in the harness's own folder when there is none: the environment wins over a saved key.
 ///
-/// Nothing is returned when the provider is unknown, takes no key, or has none.
+/// Nothing is returned when the provider is unknown, takes no key, or has none; a login kept for a provider that also signs in to an account is not a key.
 pub fn key_source(id: &str, home: Option<PathBuf>) -> Option<KeySource> {
     let env = key_env(&Provider::from_id(id)?.def().auth);
     if env.is_empty() {
@@ -70,7 +70,11 @@ pub fn key_source(id: &str, home: Option<PathBuf>) -> Option<KeySource> {
             name: name.to_owned(),
         });
     }
-    signed_in(id, home).then_some(KeySource::Saved)
+    omc_auth::stored(id, home)
+        .ok()
+        .flatten()
+        .filter(|stored| !stored.is_login())
+        .map(|_| KeySource::Saved)
 }
 
 /// Keeps `key` as the API key of the provider `id` with the logins in `home`, or in the harness's own folder when there is none, or forgets the saved key when `key` is nothing or blank.
@@ -104,7 +108,7 @@ mod tests {
         );
         let kimi = listed.iter().find(|info| info.id == "kimi-code").unwrap();
         assert_eq!(kimi.name, "Kimi Code");
-        assert_eq!(kimi.sign_in, SignIn::ApiKey);
+        assert_eq!(kimi.sign_in, SignIn::DeviceCode);
         assert_eq!(kimi.key_env, ["KIMI_CODE_API_KEY", "KIMI_API_KEY"]);
         let lmstudio = listed.iter().find(|info| info.id == "lmstudio").unwrap();
         assert_eq!(lmstudio.sign_in, SignIn::None);
@@ -152,6 +156,22 @@ mod tests {
         assert!(!signed_in("openrouter", Some(home.clone())));
         assert!(save_key("ollama", Some("k"), Some(home.clone())).is_err());
         assert_eq!(key_source("ollama", Some(home.clone())), None);
+        if std::env::var_os("KIMI_CODE_API_KEY").is_none()
+            && std::env::var_os("KIMI_API_KEY").is_none()
+        {
+            save_key("kimi-code", Some("sk-kimi"), Some(home.clone())).unwrap();
+            assert_eq!(
+                key_source("kimi-code", Some(home.clone())),
+                Some(KeySource::Saved)
+            );
+            std::fs::write(
+                home.join("auth.json"),
+                r#"{"credentials":{"kimi-code":{"access":"a","refresh":"r","expires_at_ms":1,"account_id":"u-1"}}}"#,
+            )
+            .unwrap();
+            assert_eq!(key_source("kimi-code", Some(home.clone())), None);
+            assert!(signed_in("kimi-code", Some(home.clone())));
+        }
         std::fs::remove_dir_all(home).unwrap();
     }
 }

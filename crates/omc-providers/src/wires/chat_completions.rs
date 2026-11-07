@@ -31,11 +31,17 @@ pub(crate) fn base_url(provider: Provider, credentials: &Credentials) -> String 
         .unwrap_or_else(|| provider.def().base_url())
 }
 
-/// Adds the provider's headers and the bearer token to `request`.
+/// Adds the provider's headers, those kept with the login in their place where they share a name, and the bearer token to `request`.
 fn authorized(request: reqwest::RequestBuilder, target: &Target<'_>) -> reqwest::RequestBuilder {
     let mut request = request;
+    let own = &target.credentials.headers;
     for (name, value) in target.headers {
-        request = request.header(*name, *value);
+        if !own.iter().any(|(kept, _)| kept.eq_ignore_ascii_case(name)) {
+            request = request.header(*name, *value);
+        }
+    }
+    for (name, value) in own {
+        request = request.header(name.as_str(), value.as_str());
     }
     if target.credentials.access.is_empty() {
         return request;
@@ -799,6 +805,41 @@ mod tests {
         assert!(received.contains("authorization: bearer secret"));
         assert!(received.contains("copilot-integration-id: copilot-chat"));
         assert!(received.contains("x-initiator: user"));
+    }
+
+    /// Headers kept with a login take the place of the provider's own of the same name, in any case, and the provider's others still go.
+    #[tokio::test]
+    async fn login_headers_replace_the_providers() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (address, server) = serve_once(body);
+        let mut credentials = Credentials::static_key("token".to_string());
+        credentials.headers = vec![
+            ("user-agent".to_string(), "Client/2".to_string()),
+            ("X-Device".to_string(), "d1".to_string()),
+        ];
+        let target = Target {
+            credentials: &credentials,
+            base_url: &address,
+            headers: &[("User-Agent", "oh-my-crab/0"), ("X-Team", "t")],
+            replay_reasoning: false,
+        };
+        let messages = [Message::User("hi".into())];
+        let request = Request {
+            system: "sys",
+            messages: &messages,
+            tools: &[],
+            effort: None,
+        };
+        complete(target, "m", request, &mut Recorder::default())
+            .await
+            .unwrap();
+        let received = server.join().unwrap().to_ascii_lowercase();
+        assert!(received.contains("user-agent: client/2"), "{received}");
+        assert!(!received.contains("oh-my-crab/0"), "{received}");
+        assert!(received.contains("x-device: d1") && received.contains("x-team: t"));
     }
 
     /// Entries the server marks as not for chat or hidden from the picker are left out.

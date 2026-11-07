@@ -20,7 +20,8 @@ pub fn env_key_named<'a>(names: &[&'a str]) -> Option<(&'a str, String)> {
 /// Signs in to the provider `id` the way `auth` says and stores the result as active.
 ///
 /// An OAuth provider runs the browser flow and `notify` is told the
-/// authorization URL; a device-code provider is told the page and the code.
+/// authorization URL; a device-code provider, or one that also takes a key, is
+/// told the page and the code.
 /// An API-key provider reads its key from the environment, and a provider
 /// without credentials just becomes active.
 ///
@@ -35,7 +36,9 @@ pub async fn login(
 ) -> Result<(), AuthError> {
     let credentials = match auth {
         Auth::OAuth(spec) => flow::login(spec, |url| notify(LoginPrompt::Url(url))).await?,
-        Auth::DeviceCode(spec) => device::login(spec, notify).await?,
+        Auth::DeviceCode(spec) | Auth::DeviceCodeOrKey { device: spec, .. } => {
+            device::login(spec, notify).await?
+        }
         Auth::ApiKey { env } => Credentials::static_key(
             env_key(env).ok_or_else(|| AuthError::MissingKey(env.join(" or ")))?,
         ),
@@ -49,8 +52,9 @@ pub async fn login(
 
 /// Returns credentials for the provider `id` that are valid right now.
 ///
-/// Expired OAuth tokens are refreshed and the refreshed credentials are saved.
-/// An API key from the environment is preferred over a stored one.
+/// Expired OAuth and device-login tokens are refreshed and the refreshed
+/// credentials are saved. An API key from the environment is preferred over a
+/// stored login or key.
 ///
 /// # Errors
 ///
@@ -69,11 +73,14 @@ pub async fn credentials_for(id: &str, auth: &'static Auth) -> Result<Credential
                 .remove(id)
                 .ok_or_else(|| AuthError::MissingKey(env.join(" or ")));
         }
-        Auth::DeviceCode(_) => {
-            return store::load()?
-                .credentials
-                .remove(id)
-                .ok_or(AuthError::NotLoggedIn);
+        Auth::DeviceCode(device) => {
+            return device_credentials(id, device, AuthError::NotLoggedIn).await;
+        }
+        Auth::DeviceCodeOrKey { device, env } => {
+            if let Some(key) = env_key(env) {
+                return Ok(Credentials::static_key(key));
+            }
+            return device_credentials(id, device, AuthError::MissingKey(env.join(" or "))).await;
         }
         Auth::None => return Ok(Credentials::static_key(String::new())),
     };
@@ -87,6 +94,27 @@ pub async fn credentials_for(id: &str, auth: &'static Auth) -> Result<Credential
         return Ok(stored);
     }
     let renewed = flow::refresh(spec, &stored).await?;
+    file.credentials.insert(id.to_string(), renewed.clone());
+    store::save(&file)?;
+    Ok(renewed)
+}
+
+/// The credentials stored for the provider `id`, which signs in with `device` or a saved key, renewed and saved again when they are a login whose token expired; `missing` when nothing is stored.
+///
+/// # Errors
+///
+/// Returns `missing` when nothing is stored, or another [`AuthError`] when renewing or saving fails.
+async fn device_credentials(
+    id: &str,
+    device: &'static crate::Device,
+    missing: AuthError,
+) -> Result<Credentials, AuthError> {
+    let mut file = store::load()?;
+    let stored = file.credentials.get(id).cloned().ok_or(missing)?;
+    if !stored.is_expired() {
+        return Ok(stored);
+    }
+    let renewed = device::refresh(device, &stored).await?;
     file.credentials.insert(id.to_string(), renewed.clone());
     store::save(&file)?;
     Ok(renewed)

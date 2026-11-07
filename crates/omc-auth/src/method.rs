@@ -28,6 +28,9 @@ pub struct Spec {
     pub account_from_jwt: bool,
 }
 
+/// Makes the headers, as names and values, that name a client to a provider.
+pub type Identity = fn() -> Vec<(String, String)>;
+
 /// Static description of a provider's device-code login.
 pub struct Device {
     /// Public OAuth client id.
@@ -42,6 +45,10 @@ pub struct Device {
     pub headers: &'static [(&'static str, &'static str)],
     /// Endpoint that tells which API address serves the account, when that varies.
     pub endpoint_url: Option<&'static str>,
+    /// The API address every login made this way is served from, when it differs from the provider's own.
+    pub api_url: Option<&'static str>,
+    /// Makes the headers that name the client to the provider, once at login: they are sent with the flow's requests and kept with the login for every request made with it.
+    pub identity: Option<Identity>,
 }
 
 /// What a login asks the user to do.
@@ -64,6 +71,13 @@ pub enum Auth {
     OAuth(&'static Spec),
     /// The device-code flow: the user enters a short code on a web page.
     DeviceCode(&'static Device),
+    /// Either the device-code flow, signing in to an account, or a static key read from the first of these environment variables that is set or saved with the logins; a key from the environment wins.
+    DeviceCodeOrKey {
+        /// How the account is signed in to.
+        device: &'static Device,
+        /// Environment variables a key is read from, in order.
+        env: &'static [&'static str],
+    },
     /// A static key read from the first of these environment variables that is set.
     ApiKey {
         /// Environment variables checked in order.

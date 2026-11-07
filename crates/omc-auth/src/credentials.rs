@@ -27,6 +27,9 @@ pub struct Credentials {
     /// API address the account is served from, when the provider assigns one per account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Headers sent with every request made with these credentials, made when the login was; they take the place of the provider's own headers of the same names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<(String, String)>,
 }
 
 impl Credentials {
@@ -41,12 +44,18 @@ impl Credentials {
             org_id: None,
             org_name: None,
             base_url: None,
+            headers: Vec::new(),
         }
     }
 
     /// The name the reader knows the account by: its organization or its address, whichever the provider reported.
     pub fn account_name(&self) -> Option<&str> {
         self.org_name.as_deref().or(self.email.as_deref())
+    }
+
+    /// Whether these credentials come from signing in, rather than being a key: a login keeps a refresh token, a key does not.
+    pub fn is_login(&self) -> bool {
+        !self.refresh.is_empty()
     }
 
     /// Returns whether the access token has expired or is about to.

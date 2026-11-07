@@ -31,4 +31,6 @@ static DEVICE: Device = Device {
     token_url: "https://github.com/login/oauth/access_token",
     headers: &[("User-Agent", "copilot-developer-action/0.0.1")],
     endpoint_url: Some("https://api.github.com/copilot_internal/user"),
+    api_url: None,
+    identity: None,
 };

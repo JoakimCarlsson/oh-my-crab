@@ -930,8 +930,12 @@ otherwise.
 
 Signed in with OAuth or a device code: `claude`, `codex` and `copilot`.
 
-With an API key from the environment, or one a client saved: `kimi-code`
-(Kimi Code, the Kimi For Coding subscription), `moonshot`, `zai-coding` (the
+Signed in with a Kimi account's one-time code or with an API key: `kimi-code`
+(Kimi Code, the Kimi For Coding subscription). The account login presents
+itself as Kimi's own command-line client, which Kimi's terms forbid third-party
+tools to do; see [docs/providers](docs/providers/supported.md).
+
+With an API key from the environment, or one a client saved: `moonshot`, `zai-coding` (the
 Z.ai GLM Coding Plan), `zai`, `minimax`, `deepseek`, `xai`, `groq`,
 `cerebras`, `mistral`, `openai`, `gemini`, `together`, `fireworks` and
 `openrouter`.

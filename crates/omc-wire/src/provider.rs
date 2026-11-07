@@ -30,7 +30,7 @@ pub struct ProviderInfo {
     pub name: String,
     /// How it is signed in to.
     pub sign_in: SignIn,
-    /// The environment variables an API key is read from, first first; empty when the provider takes no key.
+    /// The environment variables an API key is read from, first first; empty when the provider takes no key. A provider that signs in with a browser or a device code and lists these also takes a key instead, from one of them or saved with the logins.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub key_env: Vec<String>,
 }

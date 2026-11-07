@@ -13,7 +13,7 @@ These providers are built into the `omc` binary. To add one, see
 | `ollama`     | ChatCompletions   | none                                  | `http://localhost:11434/v1`, or `OMC_OLLAMA_URL`                               |
 | `openrouter` | ChatCompletions   | `OPENROUTER_API_KEY`                  | `https://openrouter.ai/api/v1`, or `OMC_OPENROUTER_URL`                        |
 | `copilot`    | ChatCompletions   | device code                           | `https://api.githubcopilot.com`, or the account's own                          |
-| `kimi-code`  | ChatCompletions   | `KIMI_CODE_API_KEY` or `KIMI_API_KEY` | `https://api.kimi.ai/coding/v1`, or `OMC_KIMI_CODE_URL`                        |
+| `kimi-code`  | ChatCompletions   | Kimi account (device code), or `KIMI_CODE_API_KEY` / `KIMI_API_KEY` | `https://api.kimi.ai/coding/v1`, or `OMC_KIMI_CODE_URL`                        |
 | `moonshot`   | ChatCompletions   | `MOONSHOT_API_KEY`                    | `https://api.moonshot.ai/v1`, or `OMC_MOONSHOT_URL`                            |
 | `zai-coding` | ChatCompletions   | `ZAI_API_KEY`                         | `https://api.z.ai/api/coding/paas/v4`, or `OMC_ZAI_CODING_URL`                 |
 | `zai`        | ChatCompletions   | `ZAI_API_KEY`                         | `https://api.z.ai/api/paas/v4`, or `OMC_ZAI_URL`                               |
@@ -42,10 +42,23 @@ default leads the model list a client is offered; the rest is what the server's
 `/models` lists, without embedding, speech and image models. Local servers take
 the first model they list.
 
-Kimi Code is the Kimi For Coding subscription, with its key from the Kimi Code
-console. It asks every tool to identify itself truthfully, so crab sends
-`User-Agent: oh-my-crab/<version>`. Subscriptions from the China site set
-`OMC_KIMI_CODE_URL=https://api.kimi.com/coding/v1`, and keys from Moonshot's
+Kimi Code is the Kimi For Coding subscription. It is signed in to either way:
+
+- With a key from the Kimi Code console, from the environment or saved by a
+  client. Requests go to `https://api.kimi.ai/coding/v1` with
+  `User-Agent: oh-my-crab/<version>`, as Kimi asks third-party tools to.
+  Subscriptions from the China site set
+  `OMC_KIMI_CODE_URL=https://api.kimi.com/coding/v1`.
+- With a Kimi account, by signing in with a one-time code at `auth.kimi.com`.
+  The login refreshes its token by itself and goes to
+  `https://api.kimi.com/coding/v1`. Kimi lets only its own clients sign in
+  with an account, so this login names itself as Kimi's command-line client:
+  its client id, `User-Agent: KimiCLI/<version>` and its `X-Msh-*` device
+  headers, kept with the login. Kimi's terms call changing a client's
+  identity a violation that can suspend the account's membership; use the
+  key when that risk is not wanted.
+
+A key in the environment wins over a saved login or key. Keys from Moonshot's
 China platform set `OMC_MOONSHOT_URL=https://api.moonshot.cn/v1`.
 
 Kimi, Moonshot, Z.ai, MiniMax, DeepSeek and Fireworks are sent the model's
