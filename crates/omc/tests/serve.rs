@@ -12,6 +12,7 @@ const DEADLINE: Duration = Duration::from_secs(10);
 fn close_ends_the_process_while_input_is_open() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_crab"))
         .arg("serve")
+        .env("OMC_MODELS_REFRESH", "0")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()

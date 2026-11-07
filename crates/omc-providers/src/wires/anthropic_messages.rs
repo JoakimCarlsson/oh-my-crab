@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use crate::chat::{Blocks, parse_arguments};
 use crate::identity;
 use crate::models::{
-    ClaudeModel, ThinkingMode, claude_efforts, claude_output_limit, claude_supports_display,
+    ClaudeModel, ThinkingMode, claude_efforts, claude_max_output, claude_supports_display,
     claude_thinking_mode, parse_claude,
 };
 use crate::{
@@ -394,7 +394,7 @@ fn budget_for(effort: Effort) -> u64 {
 /// others get an enabled budget, with `max_tokens` kept above it.
 pub(crate) fn thinking_params(model: &str, effort: Option<Effort>) -> ThinkingParams {
     let parsed = parse_claude(model);
-    let limit = claude_output_limit(&parsed);
+    let limit = claude_max_output(model);
     let none = ThinkingParams {
         thinking: None,
         effort: None,
@@ -999,9 +999,28 @@ mod tests {
             Some(json!({ "type": "adaptive", "display": "summarized" }))
         );
         assert_eq!(params.effort, Some(Effort::High));
-        let older = thinking_params("claude-sonnet-4-6", Some(Effort::Max));
+        let older = thinking_params("claude-sonnet-4-6", Some(Effort::XHigh));
         assert_eq!(older.thinking, Some(json!({ "type": "adaptive" })));
         assert_eq!(older.effort, Some(Effort::High));
+        let capped = thinking_params("claude-opus-4-5-20251101", Some(Effort::Max));
+        assert_eq!(capped.effort, Some(Effort::High));
+    }
+
+    /// The output limit comes from the catalog where its generation would suggest less, and Bedrock and Vertex forms of an id read as the id.
+    #[test]
+    fn the_output_limit_comes_from_the_catalog() {
+        assert_eq!(
+            thinking_params("claude-sonnet-4-6", None).max_tokens,
+            128_000
+        );
+        assert_eq!(
+            thinking_params("us.anthropic.claude-sonnet-4-5-20250929-v1:0", None).max_tokens,
+            64_000
+        );
+        assert_eq!(
+            thinking_params("claude-opus-4-5@20251101", Some(Effort::Low)).effort,
+            Some(Effort::Low)
+        );
     }
 
     /// Budget models get a budget below `max_tokens`, and no effort except on Opus 4.5.

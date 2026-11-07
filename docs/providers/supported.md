@@ -72,6 +72,39 @@ The id is what you give when signing in or opening a conversation, for example
 `claude` or `copilot`. The definitions live in
 `crates/omc-providers/src/providers/`.
 
+## Model catalog
+
+How large a model's context window is, how much one reply may hold, which
+efforts it takes, what it takes as input and what it costs come from a model
+catalog. A snapshot of the [models.dev](https://models.dev) catalog is
+compiled into crab; `crab serve` downloads a fresh copy into
+`<cache>/models.json` in the background when the one there is missing or a
+day old, and the next process uses it. Set `OMC_MODELS_REFRESH=0` to turn the
+download off, or `OMC_MODELS_URL` to take the catalog from elsewhere. A
+download that fails changes nothing; crab works offline with the snapshot.
+
+A model is looked up under its provider's name in the catalog (`anthropic`
+for `claude` and `anthropic`, `amazon-bedrock`, `google-vertex-anthropic`,
+`github-copilot`, `openrouter` and so on), as written and then without a
+Vertex `@version`, a Bedrock `-v1:0` suffix or a trailing date. A Claude
+model a host does not list is looked up as Anthropic serves it. What the
+catalog does not describe is worked out from the id as before, and a Chat
+Completions model it does not know is given a 128,000-token window.
+
+- The window is the catalog's input limit where the provider sets one below
+  the context window, as Copilot does, else the context window. Claude models
+  before the fifth generation are held to 200,000 tokens on every host, since
+  their longer window needs the long-context beta crab does not send.
+- The output limit is what Claude requests ask for as `max_tokens`.
+- Efforts are offered as the catalog lists them on the Anthropic wire; a model
+  the catalog says reasons only within a token budget gets the ladder of its
+  generation. Chat Completions models are offered none, since that wire sends
+  no effort.
+- Prices are the catalog's base prices; prices for long prompts are not
+  modelled. Claude's hour-long cache writes cost twice the input price.
+- `codex` keeps its own windows and prices: the ChatGPT backend serves smaller
+  windows than the OpenAI API the catalog describes.
+
 ## Wires
 
 A wire is a protocol. Several providers can share one.

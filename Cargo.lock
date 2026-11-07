@@ -1468,6 +1468,7 @@ name = "omc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "omc-providers",
  "omc-session",
  "omc-wire",
  "serde_json",

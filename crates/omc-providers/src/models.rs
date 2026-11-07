@@ -1,7 +1,11 @@
 //! What each known model can do and costs: context window, output limit, thinking efforts, prices and cache lifetimes.
+//!
+//! The model catalog is asked first; what it does not describe is worked out
+//! from the model's id, as the heuristics below do.
 
 use std::time::Duration;
 
+use crate::catalog::{self, Cost, Entry};
 use crate::wires::anthropic_messages;
 use crate::{Effort, Provider, Tokens, Wire};
 
@@ -47,7 +51,10 @@ pub(crate) struct ClaudeModel {
 ///
 /// Two-digit-or-shorter number segments make up the revision, so a trailing
 /// date such as `20250514` is ignored and `claude-3-7-sonnet` reads as 3.7.
+/// A host's form of the id, such as Bedrock's `us.anthropic.claude-sonnet-4-5-20250929-v1:0`
+/// or Vertex's `claude-sonnet-4-5@20250929`, reads as the id it stands for.
 pub(crate) fn parse_claude(id: &str) -> ClaudeModel {
+    let id = catalog::claude_id(id);
     let mut family = Family::Other;
     let mut numbers = Vec::new();
     for part in id.split('-').skip_while(|part| *part == "claude") {
@@ -125,7 +132,15 @@ pub(crate) fn claude_supports_display(model: &ClaudeModel) -> bool {
         .is_some_and(|revision| revision >= Revision::new(4, 7))
 }
 
-/// The most output tokens a request to a Claude model may ask for.
+/// The most output tokens a request to the Claude model `id` may ask for: the catalog's limit, else the one its generation suggests.
+pub(crate) fn claude_max_output(id: &str) -> u64 {
+    catalog::claude(id)
+        .map(|entry| entry.output)
+        .filter(|output| *output > 0)
+        .unwrap_or_else(|| claude_output_limit(&parse_claude(id)))
+}
+
+/// The most output tokens a request to a Claude model may ask for, as its generation suggests.
 pub(crate) fn claude_output_limit(model: &ClaudeModel) -> u64 {
     let Some(revision) = model.revision else {
         return 64_000;
@@ -141,7 +156,25 @@ pub(crate) fn claude_output_limit(model: &ClaudeModel) -> u64 {
 }
 
 /// The effort levels a Claude model accepts, lightest first.
+///
+/// The catalog's efforts win; a model the catalog says does not reason takes
+/// none, and one it says reasons within a token budget, without naming
+/// efforts, gets the ladder its generation suggests.
 pub(crate) fn claude_efforts(id: &str) -> Vec<Effort> {
+    if let Some(entry) = catalog::claude(id) {
+        if !entry.reasoning {
+            return Vec::new();
+        }
+        let levels = entry.levels();
+        if !levels.is_empty() {
+            return levels;
+        }
+    }
+    claude_heuristic_efforts(id)
+}
+
+/// The effort levels a Claude model accepts as its generation suggests, lightest first.
+fn claude_heuristic_efforts(id: &str) -> Vec<Effort> {
     let model = parse_claude(id);
     let revision = model.revision;
     match claude_thinking_mode(&model) {
@@ -156,11 +189,23 @@ pub(crate) fn claude_efforts(id: &str) -> Vec<Effort> {
     }
 }
 
-/// The context window of a Claude model, in tokens.
+/// The context window crab assumes for Claude models before the fifth generation, whose longer windows need the long-context beta crab does not send.
+const CLAUDE_STANDARD_WINDOW: u64 = 200_000;
+
+/// The context window of a Claude model, in tokens, as its generation suggests.
 pub(crate) fn claude_context_window(id: &str) -> u64 {
     match parse_claude(id).revision {
         Some(revision) if revision >= Revision::new(5, 0) => 1_000_000,
-        _ => 200_000,
+        _ => CLAUDE_STANDARD_WINDOW,
+    }
+}
+
+/// The context window of the Claude model `id` as the catalog's `entry` gives it, held to the standard window before the fifth generation.
+fn claude_catalog_window(id: &str, entry: &Entry) -> u64 {
+    let window = entry.window();
+    match parse_claude(id).revision {
+        Some(revision) if revision >= Revision::new(5, 0) => window,
+        _ => window.min(CLAUDE_STANDARD_WINDOW),
     }
 }
 
@@ -196,8 +241,29 @@ pub(crate) fn codex_context_window(id: &str) -> u64 {
 /// The context window assumed for a model a server does not describe.
 const UNKNOWN_CONTEXT_WINDOW: u64 = 128_000;
 
+/// The catalog's entry for `model` of `provider`: the provider's own, else, for a Claude model, Anthropic's.
+fn entry(provider: Provider, model: &str) -> Option<Entry> {
+    catalog::find(provider, model).or_else(|| {
+        (provider.wire() == Wire::AnthropicMessages)
+            .then(|| catalog::claude(model))
+            .flatten()
+    })
+}
+
 /// How many tokens of context `model` of `provider` takes in.
+///
+/// The catalog's window wins, the input limit when the provider sets one below
+/// the context window; a Claude model before the fifth generation is held to
+/// 200,000 tokens, since crab does not send the long-context beta. Models the
+/// catalog does not describe get the window their id suggests, or 128,000
+/// tokens on a Chat Completions server.
 pub fn context_window(provider: Provider, model: &str) -> u64 {
+    if let Some(entry) = entry(provider, model) {
+        return match provider.wire() {
+            Wire::AnthropicMessages => claude_catalog_window(model, &entry),
+            _ => entry.window(),
+        };
+    }
     match provider.wire() {
         Wire::AnthropicMessages => claude_context_window(model),
         Wire::OpenAiResponses => codex_context_window(model),
@@ -206,6 +272,8 @@ pub fn context_window(provider: Provider, model: &str) -> u64 {
 }
 
 /// The effort levels `model` of `provider` accepts, lightest first; none when it does not think.
+///
+/// A Chat Completions server is offered no effort, since that wire sends none.
 pub fn efforts(provider: Provider, model: &str) -> Vec<Effort> {
     match provider.wire() {
         Wire::AnthropicMessages => claude_efforts(model),
@@ -318,13 +386,76 @@ fn codex_pricing(id: &str) -> Option<Pricing> {
     }
 }
 
+/// The prices the catalog's `cost` stands for; `anthropic` says the model is Claude, whose cache reads cost a tenth of input, short-lived writes a quarter more than input and hour-long writes twice input when the catalog does not say.
+fn catalog_pricing(cost: Cost, anthropic: bool) -> Pricing {
+    let (read, write) = if anthropic { (0.1, 1.25) } else { (1.0, 1.0) };
+    let cache_write = cost.cache_write.unwrap_or(cost.input * write);
+    Pricing {
+        input: cost.input,
+        output: cost.output,
+        cache_read: cost.cache_read.unwrap_or(cost.input * read),
+        cache_write,
+        cache_write_long: if anthropic {
+            cost.input * 2.0
+        } else {
+            cache_write
+        },
+    }
+}
+
 /// What `model` of `provider` charges, when it is known.
+///
+/// The catalog's base prices win; prices for long prompts are not modelled.
+/// Codex is priced as its id suggests, being paid by subscription.
 pub fn pricing(provider: Provider, model: &str) -> Option<Pricing> {
+    let anthropic = provider.wire() == Wire::AnthropicMessages;
+    if provider.wire() != Wire::OpenAiResponses
+        && let Some(cost) = entry(provider, model).and_then(|entry| entry.cost)
+    {
+        return Some(catalog_pricing(cost, anthropic));
+    }
     match provider.wire() {
         Wire::AnthropicMessages => claude_pricing(model),
         Wire::OpenAiResponses => codex_pricing(model),
         Wire::ChatCompletions => None,
     }
+}
+
+/// What the catalog says of one model, in the terms crab uses it in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelInfo {
+    /// How many tokens of context a request may hold, as [`context_window`] gives it.
+    pub context_window: u64,
+    /// The most output tokens one reply may have.
+    pub max_output: u64,
+    /// Whether the model reasons before it answers.
+    pub reasoning: bool,
+    /// The effort levels crab offers for the model, as [`efforts`] gives them.
+    pub efforts: Vec<Effort>,
+    /// The kinds of input the model takes, such as `text`, `image` and `pdf`.
+    pub input: Vec<String>,
+    /// What the model charges, as [`pricing`] gives it.
+    pub pricing: Option<Pricing>,
+}
+
+impl ModelInfo {
+    /// Whether the model takes images as input.
+    pub fn takes_images(&self) -> bool {
+        self.input.iter().any(|kind| kind == "image")
+    }
+}
+
+/// What the model catalog says of `model` of `provider`, or nothing when the catalog does not describe it.
+pub fn model_info(provider: Provider, model: &str) -> Option<ModelInfo> {
+    let entry = entry(provider, model)?;
+    Some(ModelInfo {
+        context_window: context_window(provider, model),
+        max_output: entry.output,
+        reasoning: entry.reasoning,
+        efforts: efforts(provider, model),
+        input: entry.input,
+        pricing: pricing(provider, model),
+    })
 }
 
 /// How long `provider` keeps the prompt cache entries a request to `model` writes when it asks for `retention`; nothing when the provider has no such lifetime or does not say.
@@ -389,8 +520,12 @@ mod tests {
             [Effort::Low, Effort::Medium, Effort::High, Effort::Max]
         );
         assert_eq!(
-            efforts(Provider::Claude, "claude-sonnet-4-6"),
+            claude_heuristic_efforts("claude-sonnet-4-6"),
             [Effort::Low, Effort::Medium, Effort::High]
+        );
+        assert_eq!(
+            efforts(Provider::Claude, "claude-sonnet-4-6"),
+            [Effort::Low, Effort::Medium, Effort::High, Effort::Max]
         );
         assert_eq!(efforts(Provider::Claude, "claude-3-5-haiku-20241022"), []);
         assert!(!efforts(Provider::Claude, "claude-sonnet-4-5-20250929").is_empty());
@@ -505,6 +640,53 @@ mod tests {
         assert_eq!(input("gpt-5.5"), None);
         let price = pricing(Provider::Codex, "gpt-5").unwrap();
         assert_eq!(price.cache_write_for(Retention::Long), price.input);
+    }
+
+    /// Chat Completions models get their window and prices from the catalog, the input limit where one is set, and unknown models keep the old default.
+    #[test]
+    fn chat_completions_models_come_from_the_catalog() {
+        assert_eq!(
+            context_window(Provider::OpenRouter, "anthropic/claude-haiku-4.5"),
+            200_000
+        );
+        assert_eq!(
+            context_window(Provider::Copilot, "claude-opus-4.8"),
+            168_000
+        );
+        assert_eq!(
+            context_window(Provider::OpenRouter, "no-such/model"),
+            UNKNOWN_CONTEXT_WINDOW
+        );
+        assert_eq!(
+            context_window(Provider::Ollama, "llama3"),
+            UNKNOWN_CONTEXT_WINDOW
+        );
+        let price = pricing(Provider::OpenRouter, "anthropic/claude-haiku-4.5").unwrap();
+        assert_eq!((price.input, price.output), (1.0, 5.0));
+        assert_eq!(price.cache_write_long, price.cache_write);
+        assert!(efforts(Provider::OpenRouter, "anthropic/claude-haiku-4.5").is_empty());
+        assert_eq!(pricing(Provider::Ollama, "llama3"), None);
+    }
+
+    /// Claude windows come from the catalog, held to the standard window before the fifth generation, and the catalog's prices gain the hour-long write price.
+    #[test]
+    fn claude_models_come_from_the_catalog() {
+        assert_eq!(
+            context_window(Provider::Claude, "claude-sonnet-4-6"),
+            200_000
+        );
+        assert_eq!(
+            context_window(Provider::Claude, "claude-opus-5-5"),
+            1_000_000
+        );
+        let info = model_info(Provider::Claude, "claude-opus-5-5").unwrap();
+        assert_eq!(info.max_output, 128_000);
+        assert!(info.reasoning && info.takes_images());
+        assert_eq!(info.efforts, Effort::ALL);
+        let price = info.pricing.unwrap();
+        assert_eq!(price.cache_write_long, price.input * 2.0);
+        assert_eq!(model_info(Provider::Claude, "claude-unknown-9"), None);
+        assert_eq!(model_info(Provider::Codex, "gpt-5.5"), None);
     }
 
     /// Codex ids parse and map to the reference's ladders and windows.

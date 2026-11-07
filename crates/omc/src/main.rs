@@ -5,7 +5,7 @@ const USAGE: &str = "usage: crab <serve|tools|providers|account|history|rename|i
 
 /// Runs the conversation the command line asks for.
 ///
-/// `serve` ends the process as soon as the conversation is over, on [`omc_wire::Command::Close`] as on the end of standard input, without waiting for the thread that reads standard input to see its end.
+/// `serve` refreshes the cached model catalog in the background, and ends the process as soon as the conversation is over, on [`omc_wire::Command::Close`] as on the end of standard input, without waiting for the thread that reads standard input to see its end.
 ///
 /// # Errors
 ///
@@ -14,6 +14,7 @@ const USAGE: &str = "usage: crab <serve|tools|providers|account|history|rename|i
 async fn main() -> anyhow::Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("serve") => {
+            tokio::spawn(omc_providers::refresh_catalog());
             omc_session::serve(tokio::io::stdin(), tokio::io::stdout()).await?;
             std::process::exit(0)
         }

@@ -67,6 +67,24 @@ one fails, document what you added.
   session builds its registry in `omc-session`, and add it to
   [tools](tools/README.md).
 
+## Regenerating the model catalog
+
+The model catalog crab compiles in, `crates/omc-providers/catalog/models.json`,
+is made from the [models.dev](https://models.dev) catalog (MIT licensed, its
+licence beside it in `catalog/LICENSE`). Regenerate it with
+
+```sh
+make catalog
+```
+
+which runs `curl -fsSL https://models.dev/api.json | cargo run -p omc-providers --example catalog -- crates/omc-providers/catalog/models.json`.
+The build itself never goes to the network. The snapshot keeps only the
+providers crab maps to it (`SOURCES` in `crates/omc-providers/src/catalog.rs`)
+and, for each text model, its context window, input and output limits,
+whether it reasons and with which efforts, its kinds of input and its base
+prices, one model a line so a regenerated file diffs by model. Commit it with
+the change that needed it.
+
 ## Releasing
 
 A release is a git tag named after `version` in the root `Cargo.toml`, with

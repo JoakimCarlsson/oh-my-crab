@@ -1,5 +1,6 @@
 //! Streaming chat requests and model discovery for the logged-in provider.
 
+mod catalog;
 mod chat;
 mod custom;
 mod error;
@@ -12,13 +13,17 @@ mod sse;
 mod wires;
 mod xxh64;
 
+pub use catalog::{catalog_snapshot, refresh as refresh_catalog};
 pub use chat::{
     ChatModel, Compaction, DeltaSink, Effort, Elided, Elision, Excised, Image, Message, Part,
     Pruning, RemoteModel, Reply, Request, Sink, Stop, Tokens, ToolCall, ToolResult, ToolSpec,
 };
 pub use custom::{Custom, custom_providers_path};
 pub use error::ProviderError;
-pub use models::{Pricing, Retention, cache_ttl, context_window, efforts, pricing, warmable};
+pub use models::{
+    ModelInfo, Pricing, Retention, cache_ttl, context_window, efforts, model_info, pricing,
+    warmable,
+};
 pub use prompt::PROMPT;
 pub use provider::{Def, Provider, Wire, active_provider, credentials_for, login};
 

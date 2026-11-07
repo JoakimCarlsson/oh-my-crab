@@ -51,6 +51,8 @@ starts `crab`. A switch that is off when set to `0` is also off with `false`,
 | `OMC_BASH_INTERCEPT` | Set to `0` to run every command instead of turning away shell uses a dedicated tool does better.            | on                            | [How tool calls run](tools/calls.md)                       |
 | `OMC_SEARCH`         | The search services `web_search` tries, in order, comma separated: `brave`, `tavily`, `exa`, `perplexity`, `kagi`, `searxng` (or `searx`), `duckduckgo` (or `ddg`). | every service set up, DuckDuckGo last | [Reading the web and GitHub](tools/web-and-github.md) |
 | `OMC_SEARXNG_URL`    | The SearXNG instance `web_search` asks, when `SEARXNG_URL` is not set.                                      | unset                         | [Reading the web and GitHub](tools/web-and-github.md)      |
+| `OMC_MODELS_REFRESH` | Set to `0` to stop `crab serve` from downloading the model catalog into `<cache>/models.json` once a day; the bundled snapshot and any copy already cached are still used. | on                            | [Model catalog](providers/supported.md#model-catalog)      |
+| `OMC_MODELS_URL`     | Where the model catalog is downloaded from, in the models.dev format.                                       | `https://models.dev/api.json` | [Model catalog](providers/supported.md#model-catalog)      |
 
 An empty `OMC_PROVIDERS_FILE`, `OMC_HOOKS_FILE`, `OMC_TRUST_FILE`,
 `OMC_PERMISSIONS_FILE`, `OMC_MEMORY_DIR`, `OMC_DEBUGGERS_FILE`, `OMC_MCP_FILE` or
@@ -139,6 +141,7 @@ Crab does not read these; it sets them for the hook commands it runs.
 | `<data>/memory/user/memories.jsonl`                           | The user's memories, kept across every project.                                                          | crab; the user may edit it          | [Memory](memory.md)                               |
 | `<data>/trust.json`                                           | Trust decisions per project, with the hook commands each was trusted with. Moved by `OMC_TRUST_FILE`.    | crab, on a `Trust` command or `crab trust` | [Project trust](extending/project-trust.md) |
 | `<cache>/output/<conversation id>/`                           | The whole output of tool calls that were cut short; `run-<pid>-<seconds>` for a conversation without an id. Removed after seven days unwritten. | crab               | [How tool calls run](tools/calls.md)              |
+| `<cache>/models.json`                                         | The model catalog downloaded from models.dev: context windows, output limits, efforts, input kinds and prices. Its providers replace those of the snapshot compiled into crab. Downloaded again when a day old, unless `OMC_MODELS_REFRESH` is `0`. | crab | [Model catalog](providers/supported.md#model-catalog) |
 | `<cache>/worktrees/<conversation id>/`                        | The git worktrees of isolated subagents, named like the conversation's output folder. Removed a day after they were made. | crab                     | [Subagents](tools/subagents.md)                   |
 
 On Unix the memory and output folders and their files are readable by the
