@@ -144,11 +144,13 @@ pub fn default_specs() -> Vec<Spec> {
     ]
 }
 
+/// Whether each program, run with each set of arguments, exited successfully.
+type Asked = std::collections::HashMap<(PathBuf, Vec<String>), bool>;
+
 /// Whether the program at `program` exits successfully when run with `arguments`, its output dropped; asked once a process for each program and arguments.
 fn runs(program: &Path, arguments: &[String]) -> bool {
-    use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    static ASKED: OnceLock<Mutex<HashMap<(PathBuf, Vec<String>), bool>>> = OnceLock::new();
+    static ASKED: OnceLock<Mutex<Asked>> = OnceLock::new();
     let key = (program.to_path_buf(), arguments.to_vec());
     let asked = ASKED.get_or_init(Mutex::default);
     if let Some(known) = asked.lock().ok().and_then(|held| held.get(&key).copied()) {
