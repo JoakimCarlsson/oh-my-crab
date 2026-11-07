@@ -107,9 +107,15 @@ changes, and answers once something has been left out.
 
 ## Tool-server tools
 
-Tools of the [tool servers](../extending/mcp.md) the client passes in `Open`
-are added beside these. Every call asks, the scope being that one tool, and
+Tools of the [tool servers](../extending/mcp.md), the ones the client passes
+in `Open` and the ones set up in files, are added beside these as
+`mcp__<server>__<tool>`. Every call asks, the scope being that one tool, and
 plan mode refuses them.
+
+When a server offers resources, `mcp_resources` comes with them: without a
+`uri` it lists the resources and templates of every server, or of `server`;
+with one it reads that resource. It only reads, so it never asks and plan
+mode allows it.
 
 ## What subagents and scripts do not get
 

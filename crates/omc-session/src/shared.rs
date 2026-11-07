@@ -215,6 +215,15 @@ impl Shared {
             .home = home;
     }
 
+    /// The folder the conversation keeps its logins in, when the client chose one.
+    pub(crate) fn home(&self) -> Option<std::path::PathBuf> {
+        self.login
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .home
+            .clone()
+    }
+
     /// Runs `work` against the folder the conversation keeps its logins in.
     pub(crate) async fn with_home<F: std::future::Future>(&self, work: F) -> F::Output {
         let home = self

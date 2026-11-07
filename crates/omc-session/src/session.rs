@@ -47,6 +47,12 @@ struct Open {
     hooks: Option<Arc<Engine>>,
     /// Whether the project may be used, and what it brings that is left out.
     trust: Trust,
+    /// The tool servers reached, and the sign-ins they wait for.
+    hub: Arc<omc_mcp::Hub>,
+    /// The tool servers the client passed.
+    client_servers: Vec<omc_wire::ToolServer>,
+    /// The tool servers of the user's own files.
+    user_servers: Vec<omc_mcp::Server>,
 }
 
 /// Where a conversation's project stands on trust, and what the client was told about it.
@@ -198,6 +204,8 @@ impl Session {
                 turn,
                 context,
             } => {
+                self.rescan();
+                self.reach_servers().await;
                 if let Some(focus) = compact_request(&text) {
                     if !files.is_empty() {
                         return self.say(Event::Failed(
@@ -214,7 +222,6 @@ impl Session {
                         text: text.clone(),
                         files: Vec::new(),
                     });
-                    self.rescan();
                     return self.start(Job::Compact(focus), mark);
                 }
                 let names: Vec<String> = files
@@ -241,7 +248,10 @@ impl Session {
             Command::Language { ticket, answer } => {
                 self.shared.client_languages.answer(ticket, answer);
             }
-            Command::Trust { ticket, verdict } => self.trust(ticket, verdict),
+            Command::Trust { ticket, verdict } => {
+                self.trust(ticket, verdict);
+                self.reach_servers().await;
+            }
             Command::Switch { branch } => self.switch(&branch),
             Command::Close => {}
         }
@@ -313,13 +323,6 @@ impl Session {
         );
         registry.register(DebugTool::new(sandbox, self.shared.debuggers.clone()));
         registry.register(Script::new(spill.clone()));
-        let (tools, unreachable) = omc_mcp::tools(&servers, &spill).await;
-        for tool in tools {
-            registry.register_shared(tool);
-        }
-        for reason in unreachable {
-            eprintln!("tool server unavailable: {reason}");
-        }
         let setting = hook_setting(&self.shared, &directory, conversation.clone());
         let (own, store) = (omc_hooks::own_file(), TrustStore::locate());
         let assessment = assessed(
@@ -333,6 +336,20 @@ impl Session {
         let hooks = engine_for(&assessment, setting());
         let discovered = discover(&locations, &disabled);
         register_skills(&mut registry, &discovered.skills);
+        let hub = omc_mcp::Hub::new(
+            spill.clone(),
+            omc_mcp::Tokens::locate(self.shared.home().as_deref()),
+            sign_in_listener(&self.shared),
+        );
+        let user_servers = user_servers_for(&locations);
+        let wanted = omc_mcp::config::merged(&servers, &assessment.servers, &user_servers);
+        let reached = hub.connect(&wanted).await;
+        for tool in reached.tools {
+            registry.register_shared(tool);
+        }
+        for reason in reached.failed {
+            eprintln!("tool server unavailable: {reason}");
+        }
         let credentials = match self
             .shared
             .with_home(omc_providers::credentials_for(provider))
@@ -379,6 +396,9 @@ impl Session {
             isolation,
             hooks,
             trust: Trust::new(assessment, setting, own, store),
+            hub,
+            client_servers: servers,
+            user_servers,
         });
         let mode = if yolo { Mode::Yolo } else { Mode::Asking };
         self.shared
@@ -501,6 +521,23 @@ impl Session {
         self.tell_trust();
     }
 
+    /// Reaches the tool servers the conversation has now and has not tried yet, those of a project trusted since among them, and gives the agent their tools, and those of servers signed in to since, from the next turn on.
+    async fn reach_servers(&mut self) {
+        let Some(open) = &mut self.open else {
+            return;
+        };
+        let wanted = omc_mcp::config::merged(
+            &open.client_servers,
+            &open.trust.assessment.servers,
+            &open.user_servers,
+        );
+        let reached = open.hub.connect(&wanted).await;
+        for reason in reached.failed {
+            eprintln!("tool server unavailable: {reason}");
+        }
+        add_tools(open, reached.tools);
+    }
+
     /// Tells the client what the project brings that is left out until it is trusted, under a new ticket, when something is and it differs from what the client was told last.
     fn tell_trust(&mut self) {
         let Some(open) = &mut self.open else {
@@ -609,12 +646,11 @@ impl Session {
 
     /// Answers the prompt that tells the model `told`, which the client sent as `text` with the files named `files` under the turn id `turn`: starts a turn with it, or queues it for the turn that is running and tells the client so.
     ///
-    /// The skills are read again first, so that a skill added since the last turn can be invoked.
+    /// The skills must have been read again first, as [`Self::rescan`] does, so that a skill added since the last turn can be invoked.
     fn prompt(&mut self, told: String, turn: Option<String>, text: String, files: Vec<String>) {
         if self.open.is_none() {
             return self.say(Event::Failed("the conversation is not open".to_owned()));
         }
-        self.rescan();
         let Some(open) = &self.open else {
             return;
         };
@@ -680,11 +716,13 @@ impl Session {
         self.tell_trust();
     }
 
-    /// Does what [`Self::rescan`] does, without telling the client what is left out.
+    /// Does what [`Self::rescan`] does, without telling the client what is left out; the tools of tool servers signed in to since are given to the agent too.
     fn reread(&mut self) {
         let Some(open) = &mut self.open else {
             return;
         };
+        let arrived = open.hub.arrived();
+        add_tools(open, arrived);
         let assessment = open.trust.assess(&open.locations, &open.disabled);
         open.hooks = engine_for(&assessment, (open.trust.setting)());
         self.shared.lifecycle.set_engine(open.hooks.clone());
@@ -932,6 +970,52 @@ fn assessed(
         eprintln!("hooks: {problem}");
     }
     assessment
+}
+
+/// Gives the agent of `open` the tools `tools` too, from the next turn on.
+fn add_tools(open: &mut Open, tools: Vec<Arc<dyn Tool>>) {
+    if tools.is_empty() {
+        return;
+    }
+    let mut registry = (*open.base).clone();
+    for tool in tools {
+        registry.register_shared(tool);
+    }
+    open.base = Arc::new(registry);
+}
+
+/// The tool servers of the user's own files for work in `locations`, the problems found in them reported on standard error.
+fn user_servers_for(locations: &Locations) -> Vec<omc_mcp::Server> {
+    let found = omc_mcp::config::user_servers(
+        &locations.directory,
+        locations.root.as_deref(),
+        omc_mcp::config::own_file().as_deref(),
+        locations.home.as_deref(),
+        locations.claude.as_deref(),
+    );
+    for problem in &found.problems {
+        eprintln!("tool servers: {problem}");
+    }
+    found.servers
+}
+
+/// What tells the client of `shared` about signing in to tool servers: the page to open as a [`Event::LoginUrl`], noted on standard error with how the sign-in ends.
+fn sign_in_listener(shared: &Arc<Shared>) -> omc_mcp::Listener {
+    let shared = Arc::downgrade(shared);
+    Arc::new(move |notice| match notice {
+        omc_mcp::Notice::SignIn { server, url } => {
+            eprintln!("tool server {server} wants signing in: {url}");
+            if let Some(shared) = shared.upgrade() {
+                shared.say(Event::LoginUrl(url));
+            }
+        }
+        omc_mcp::Notice::SignedIn { server } => {
+            eprintln!("tool server {server} signed in; its tools come with the next prompt");
+        }
+        omc_mcp::Notice::Failed { server, reason } => {
+            eprintln!("tool server sign-in failed: {server}: {reason}");
+        }
+    })
 }
 
 /// The engine running the hooks `assessment` lets run, with `setting`; nothing when there are none.
@@ -1301,6 +1385,11 @@ fn compact_request(text: &str) -> Option<Option<String>> {
 mod tests {
     use super::*;
 
+    /// A hub with no tool servers, keeping no sign-ins.
+    fn test_hub() -> Arc<omc_mcp::Hub> {
+        omc_mcp::Hub::new(Spill::disabled(), None, Arc::new(|_| {}))
+    }
+
     /// The trust of a conversation in `directory`, recorded in `store` when there is one, reading no hooks of the user's, vouched for when `vouched` is set.
     fn test_trust(directory: &Path, store: Option<TrustStore>, vouched: bool) -> Trust {
         let locations = Locations {
@@ -1366,6 +1455,9 @@ mod tests {
                 isolation: None,
                 hooks: None,
                 trust: test_trust(&directory, None, true),
+                hub: test_hub(),
+                client_servers: Vec::new(),
+                user_servers: Vec::new(),
             }),
             running: None,
             turns: 0,
@@ -1580,6 +1672,9 @@ mod tests {
             isolation: None,
             hooks: None,
             trust,
+            hub: test_hub(),
+            client_servers: Vec::new(),
+            user_servers: Vec::new(),
         });
         session.tell_trust();
         session.rescan();
@@ -1660,6 +1755,9 @@ mod tests {
                 isolation: None,
                 hooks: None,
                 trust,
+                hub: test_hub(),
+                client_servers: Vec::new(),
+                user_servers: Vec::new(),
             });
             session.tell_trust();
             let Ok(Event::Trust(request)) = events.try_recv() else {
@@ -1789,6 +1887,9 @@ mod tests {
                 isolation: None,
                 hooks: None,
                 trust: test_trust(&directory, None, true),
+                hub: test_hub(),
+                client_servers: Vec::new(),
+                user_servers: Vec::new(),
             }),
             running: None,
             turns: 1,

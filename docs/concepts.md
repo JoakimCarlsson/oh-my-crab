@@ -13,9 +13,11 @@ a model, and from then on the two talk about that conversation only. One
 replaces it, and `Close` ends the process. pandemonium starts one process per
 agent session.
 
-What a conversation can use is fixed when it opens: the built-in tools, the
-tools of the tool servers the client passes, less the tools the client denies,
-and the skills, agent definitions and instruction files found on disk.
+What a conversation can use is set when it opens: the built-in tools, the
+tools of the tool servers the client passes and of those set up in files, less
+the tools the client denies, and the skills, agent definitions and instruction
+files found on disk. A project's tool servers join once it is trusted, and a
+server that wanted a sign-in once the reader signed in.
 See [`Open`](wire-protocol.md#open).
 
 ## Turn

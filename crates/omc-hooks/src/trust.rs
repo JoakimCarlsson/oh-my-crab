@@ -1,12 +1,13 @@
 //! Whether what a project folder brings may be used, and what is left out until it may.
 //!
-//! A freshly cloned repository can hold hooks, which run commands without the model being asked, and instruction files, skills and agent definitions, which steer the agent. None of them is used until the reader trusts the project. Trust is recorded per repository, so the main checkout and every linked worktree of it share one decision, in `trust.json` in crab's data folder. The user's own config, and a project that is the user's home folder, are always trusted.
+//! A freshly cloned repository can hold hooks, which run commands without the model being asked, tool servers in `.mcp.json`, which crab would start or reach, and instruction files, skills and agent definitions, which steer the agent. None of them is used until the reader trusts the project. Trust is recorded per repository, so the main checkout and every linked worktree of it share one decision, in `trust.json` in crab's data folder. The user's own config, and a project that is the user's home folder, are always trusted.
 
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use omc_context::{Discovered, Locations, discover};
+use omc_mcp::Server;
 use omc_memory::Project;
 use omc_wire::{Input, Skipped};
 use serde::{Deserialize, Serialize};
@@ -26,7 +27,7 @@ pub struct Record {
     pub root: PathBuf,
     /// Whether it is trusted.
     pub trusted: bool,
-    /// The project's hooks the reader trusted, each as its event, matcher and command, sorted; a project with a hook not among these has its hooks left out until it is trusted again.
+    /// The project's hooks the reader trusted, each as its event, matcher and command, and its tool servers, each as [`server_entry`] writes it, sorted; a project with a hook or tool server not among these has its hooks and tool servers left out until it is trusted again.
     #[serde(default)]
     pub hooks: Vec<String>,
 }
@@ -190,10 +191,17 @@ pub struct Assessment {
     pub found: Vec<Hook>,
     /// What the project brings that is left out.
     pub skipped: Vec<Skipped>,
-    /// The project's hooks as they are now, as [`Record::hooks`] keeps them.
+    /// The project's hooks and tool servers as they are now, as [`Record::hooks`] keeps them.
     pub project_hooks: Vec<String>,
+    /// The project's tool servers that may be reached: all of them when its hooks run, none otherwise.
+    pub servers: Vec<Server>,
     /// What could not be read.
     pub problems: Vec<String>,
+}
+
+/// How trust records the project tool server `server`: `ToolServer`, its name and its command line or address, as the file writes them, apart by tabs.
+pub fn server_entry(server: &Server) -> String {
+    format!("ToolServer\t{}\t{}", server.name, server.summary)
 }
 
 /// The project's hooks among `hooks`, each as its event, matcher and command, sorted, as trust records them.
@@ -208,7 +216,7 @@ pub fn project_hooks(hooks: &[Hook]) -> Vec<String> {
     listed
 }
 
-/// What a conversation for `locations` may use: its hooks, from the user's own file `own` and the places [`config::load`] reads, and its instruction files, skills and agent definitions less those `disabled` names, as the trust `store` records for its project, or as `vouched` says when the conversation was trusted without a record.
+/// What a conversation for `locations` may use: its hooks, from the user's own file `own` and the places [`config::load`] reads, its project's tool servers, which wait for trust as its hooks do and are listed with them as hooks to trust, and its instruction files, skills and agent definitions less those `disabled` names, as the trust `store` records for its project, or as `vouched` says when the conversation was trusted without a record.
 pub fn assess(
     locations: &Locations,
     own: Option<&Path>,
@@ -222,7 +230,11 @@ pub fn assess(
         ..locations.clone()
     };
     let loaded = config::load(&full, own);
-    let listed = project_hooks(&loaded.hooks);
+    let declared = omc_mcp::config::project_servers(&full.ancestors());
+    let mut listed = project_hooks(&loaded.hooks);
+    listed.extend(declared.servers.iter().map(server_entry));
+    listed.sort();
+    listed.dedup();
     let standing = if vouched || trusted_by_environment() {
         Standing::Vouched
     } else if is_home(&project.root, locations.home.as_deref()) {
@@ -244,6 +256,11 @@ pub fn assess(
         ..locations.clone()
     };
     let mut problems = loaded.problems.clone();
+    let servers = if standing.runs_project_hooks() {
+        declared.servers.clone()
+    } else {
+        Vec::new()
+    };
     let hooks = if standing.runs_project_hooks() {
         loaded.hooks.clone()
     } else if standing.reads_project() {
@@ -268,6 +285,20 @@ pub fn assess(
             path: hook.file.clone(),
         })
         .collect();
+    skipped.extend(
+        declared
+            .servers
+            .iter()
+            .filter(|server| !servers.contains(server))
+            .map(|server| Skipped {
+                kind: Input::Hook,
+                name: server.label(),
+                path: server.file.clone().unwrap_or_default(),
+            }),
+    );
+    if standing.reads_project() {
+        problems.extend(declared.problems);
+    }
     if !standing.reads_project() {
         skipped.extend(left_out(
             &discover(&full, disabled),
@@ -282,6 +313,7 @@ pub fn assess(
         found: loaded.hooks,
         skipped,
         project_hooks: listed,
+        servers,
         problems,
     }
 }
@@ -486,6 +518,46 @@ mod tests {
         let own = assess(&own, None, Some(&store), false, &[]);
         assert_eq!(own.standing, Standing::Own);
         assert_eq!(own.hooks.len(), 1);
+    }
+
+    /// A project's tool servers wait for trust as its hooks do: listed as hooks while untrusted, reached once trusted, and waiting again when one is added or changed.
+    #[test]
+    fn tool_servers_wait_for_trust() {
+        let base = scratch("trust-servers");
+        let main = base.join("repo");
+        repository(&main);
+        let file = |command: &str| {
+            format!(r#"{{"mcpServers":{{"memo":{{"command":"{command}","args":["serve"]}}}}}}"#)
+        };
+        put(&main, ".mcp.json", &file("memo-mcp"));
+        let store = TrustStore::new(base.join("data/trust.json"));
+        let at = || assess(&locations(&base, &main), None, Some(&store), false, &[]);
+        let untrusted = at();
+        assert!(untrusted.servers.is_empty());
+        let skipped: Vec<(Input, &str)> = untrusted
+            .skipped
+            .iter()
+            .map(|skipped| (skipped.kind, skipped.name.as_str()))
+            .collect();
+        assert_eq!(skipped, [(Input::Hook, "tool server memo: memo-mcp serve")]);
+        assert_eq!(untrusted.skipped[0].path, main.join(".mcp.json"));
+        assert_eq!(
+            untrusted.project_hooks,
+            ["ToolServer\tmemo\tmemo-mcp serve"]
+        );
+        store
+            .set(&untrusted.project, true, untrusted.project_hooks.clone())
+            .unwrap();
+        let trusted = at();
+        assert_eq!(trusted.standing, Standing::Trusted);
+        assert_eq!(trusted.servers.len(), 1);
+        assert_eq!(trusted.servers[0].folder.as_deref(), Some(main.as_path()));
+        assert!(trusted.skipped.is_empty());
+        put(&main, ".mcp.json", &file("curl-evil"));
+        let changed = at();
+        assert_eq!(changed.standing, Standing::Changed);
+        assert!(changed.servers.is_empty());
+        assert_eq!(changed.skipped[0].name, "tool server memo: curl-evil serve");
     }
 
     /// A project with nothing of its own to leave out has nothing skipped, whatever its standing.

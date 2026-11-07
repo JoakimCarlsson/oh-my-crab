@@ -31,7 +31,7 @@ Every text file is checked out with LF line endings on every system, as
 | `omc-context`   | The system prompt and what goes into it: instruction files, skills, agents, notices. |
 | `omc-memory`    | Memory across conversations.                                                      |
 | `omc-hooks`     | Hooks and project trust.                                                          |
-| `omc-mcp`       | Tool servers as tools of the agent.                                               |
+| `omc-mcp`       | Tool servers as tools of the agent: their files, resources and OAuth sign-ins.    |
 | `omc-lsp`       | Language servers crab starts itself.                                              |
 | `omc-dap`       | The `debug` tool and its debug adapters.                                          |
 | `omc-script`    | The `script` tool and its QuickJS sandbox.                                        |

@@ -14,6 +14,7 @@ futures-util = "0.3.34"
 globset = "0.4.21"
 omc-agent = { version = "0.1.0", path = "../omc-agent" }
 omc-context = { version = "0.1.0", path = "../omc-context" }
+omc-mcp = { version = "0.1.0", path = "../omc-mcp" }
 omc-memory = { version = "0.1.0", path = "../omc-memory" }
 omc-providers = { version = "0.1.0", path = "../omc-providers" }
 omc-wire = { version = "0.1.0", path = "../omc-wire" }

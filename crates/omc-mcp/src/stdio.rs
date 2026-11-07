@@ -1,12 +1,17 @@
 //! A tool server that is a program, spoken to line by line.
 
+use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use omc_wire::Reach;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
+
+/// What a request to a program that has stopped fails with.
+pub(crate) const STOPPED: &str = "the tool server stopped";
 
 /// A running program that speaks the protocol on its standard streams.
 pub(crate) struct Program {
@@ -16,25 +21,32 @@ pub(crate) struct Program {
     stdin: Mutex<ChildStdin>,
     /// What answers are read from.
     lines: Mutex<Lines<BufReader<ChildStdout>>>,
+    /// Whether the program was found to have stopped: its output ended or it could not be written to.
+    stopped: AtomicBool,
 }
 
 impl Program {
-    /// Starts the program `reach` describes.
+    /// Starts the program `reach` describes, in `folder` when there is one and in crab's own folder otherwise.
     ///
     /// # Errors
     ///
     /// Fails with the reason when `reach` is not a command or the program cannot be started.
-    pub(crate) fn start(reach: &Reach) -> Result<Self, String> {
+    pub(crate) fn start(reach: &Reach, folder: Option<&Path>) -> Result<Self, String> {
         let Reach::Command { program, args, env } = reach else {
             return Err("not a command".to_owned());
         };
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(args)
             .envs(env.iter().map(|(name, value)| (name, value)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        if let Some(folder) = folder {
+            command.current_dir(folder);
+        }
+        let mut child = command
             .spawn()
             .map_err(|error| format!("could not start {program}: {error}"))?;
         let stdin = child.stdin.take().ok_or("no input pipe")?;
@@ -43,7 +55,13 @@ impl Program {
             _child: child,
             stdin: Mutex::new(stdin),
             lines: Mutex::new(BufReader::new(stdout).lines()),
+            stopped: AtomicBool::new(false),
         })
+    }
+
+    /// Whether the program was found to have stopped.
+    pub(crate) fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
     }
 
     /// Writes `message` as one line.
@@ -55,14 +73,17 @@ impl Program {
         let mut stdin = self.stdin.lock().await;
         let mut line = message.to_string();
         line.push('\n');
-        stdin
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|error| error.to_string())?;
-        stdin.flush().await.map_err(|error| error.to_string())
+        let written = match stdin.write_all(line.as_bytes()).await {
+            Ok(()) => stdin.flush().await,
+            Err(error) => Err(error),
+        };
+        written.map_err(|error| {
+            self.stopped.store(true, Ordering::Relaxed);
+            format!("{STOPPED}: {error}")
+        })
     }
 
-    /// Sends the request `method` under `id` and returns its result.
+    /// Sends the request `method` under `id` and returns its result; a `ping` the program sends meanwhile is answered, and other requests it sends are refused.
     ///
     /// # Errors
     ///
@@ -76,14 +97,44 @@ impl Program {
         let mut lines = self.lines.lock().await;
         self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
             .await?;
-        while let Some(line) = lines.next_line().await.map_err(|error| error.to_string())? {
+        while let Ok(Some(line)) = lines.next_line().await {
             let Ok(message) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
-            if message["id"] == json!(id) && message.get("method").is_none() {
+            if let Some(asked) = message.get("method").and_then(Value::as_str) {
+                if let Some(their) = message.get("id") {
+                    self.send(&reply(their, asked)).await?;
+                }
+                continue;
+            }
+            if message["id"] == json!(id) {
                 return crate::answer(&message);
             }
         }
-        Err("the tool server stopped".to_owned())
+        self.stopped.store(true, Ordering::Relaxed);
+        Err(STOPPED.to_owned())
+    }
+}
+
+/// The answer to the request `method` a program sent under `id`: an empty result for `ping`, and "method not found" for anything else, since crab offers the program nothing else.
+fn reply(id: &Value, method: &str) -> Value {
+    if method == "ping" {
+        json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+    } else {
+        json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "method not found" } })
+    }
+}
+
+#[cfg(test)]
+/// Tests for answering what a program asks.
+mod tests {
+    use super::reply;
+    use serde_json::json;
+
+    /// A ping is answered with an empty result, anything else refused.
+    #[test]
+    fn pings_are_answered() {
+        assert_eq!(reply(&json!(7), "ping")["result"], json!({}));
+        assert_eq!(reply(&json!("a"), "roots/list")["error"]["code"], -32601);
     }
 }

@@ -330,7 +330,7 @@ Opens the conversation; it must come before anything else. Carries an
 | `provider`     | string                     | required | The provider's id, such as `claude`; see [supported providers](providers/supported.md) and `crab providers`.                 |
 | `model`        | string                     | optional | The model to start with; the provider's first listed or default model when `null`.                                           |
 | `yolo`         | bool                       | required | Whether tools that change things run without asking: mode `yolo` instead of `default`.                                       |
-| `tools`        | list of `ToolServer`       | default  | Tool servers (MCP) whose tools the agent is given besides its own.                                                           |
+| `tools`        | list of `ToolServer`       | default  | Tool servers (MCP) whose tools the agent is given besides its own; they win over servers of the same name set up in files.   |
 | `denied`       | list of string             | default  | Names of tools the agent is not given, whoever offers them.                                                                  |
 | `disabled`     | list of string             | default  | Instruction files (by path), skills and agent definitions (by name) the reader turned off.                                   |
 | `conversation` | string                     | optional | The id the history is saved under and loaded from; nothing is saved when `null`.                                             |
@@ -370,7 +370,9 @@ A `ToolServer` is one tool server, by the name its tools are filed under:
   sent with every request). Both are required.
 
 A server crab cannot reach is reported on standard error and left out; the
-conversation opens without it. See [tool servers](extending/mcp.md).
+conversation opens without it. Crab also reads tool servers from files, the
+project's once it is trusted; a server passed here wins over one of the same
+name there. See [tool servers](extending/mcp.md).
 
 ### `Prompt`
 
@@ -883,7 +885,10 @@ A `Login` succeeded.
 ### `LoginUrl`
 
 During `Login`, the address the reader opens in a browser to sign in. Crab
-does not open it; the client does.
+does not open it; the client does. Also sent, outside any `Login`, when a tool
+server wants the reader to sign in to it with OAuth, usually while the
+conversation opens; the server's tools arrive once the browser comes back
+(see [Signing in](extending/mcp.md#signing-in)).
 
 ```json
 {"LoginUrl":"https://claude.ai/oauth/authorize?code=true"}
@@ -1017,7 +1022,7 @@ every prompt. Carries a `TrustRequest`:
 | ---------- | --------------- | --------------------------------------------------------------------------------------------- |
 | `ticket`   | integer         | Names the request in the answer.                                                              |
 | `root`     | path            | The folder trust is recorded for: the repository's main checkout, or the folder outside one.  |
-| `standing` | `Standing`      | `Unknown` (nobody decided), `Changed` (trusted, but a hook was added or changed since) or `Declined`. |
+| `standing` | `Standing`      | `Unknown` (nobody decided), `Changed` (trusted, but a hook or tool server was added or changed since) or `Declined`. |
 | `skipped`  | list of `Skipped` | What was left out.                                                                          |
 
 A `Skipped`:
@@ -1025,7 +1030,7 @@ A `Skipped`:
 | Field  | Type    | Meaning                                                                                       |
 | ------ | ------- | --------------------------------------------------------------------------------------------- |
 | `kind` | `Input` | `Hook`, `Instruction`, `Skill` or `Agent`.                                                    |
-| `name` | string  | A skill or agent's name, an instruction file's path, or a hook's event, matcher and command.  |
+| `name` | string  | A skill or agent's name, an instruction file's path, a hook's event, matcher and command, or, for a project's tool server, which is a `Hook` too, `tool server <name>: <command line or address>`. |
 | `path` | path    | The file it is defined in.                                                                    |
 
 From a real run:

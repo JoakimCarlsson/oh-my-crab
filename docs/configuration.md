@@ -36,6 +36,10 @@ starts `crab`. A switch that is off when set to `0` is also off with `false`,
 | `OMC_<ID>_URL`       | The address of a built-in provider, such as `OMC_OLLAMA_URL`; listed per provider below.                     | the provider's own address    | [Supported providers](providers/supported.md)              |
 | `OMC_HOOKS_FILE`     | The file the user's own hooks for crab are read from.                                                       | `<config>/hooks.json`         | [Hooks](extending/hooks.md)                                |
 | `OMC_TRUST_FILE`     | The file trust decisions are kept in.                                                                       | `<data>/trust.json`           | [Project trust](extending/project-trust.md)                |
+| `OMC_MCP_FILE`       | The file the user's own tool servers for crab are read from.                                                | `<config>/mcp.json`           | [Tool servers](extending/mcp.md)                           |
+| `OMC_MCP_CONFIG`     | Set to `0` to read no tool-server file at all, leaving only the servers the client passes.                  | on                            | [Tool servers](extending/mcp.md)                           |
+| `OMC_MCP_CLAUDE`     | Set to `1` to read the tool servers of Claude Code's `~/.claude.json` too; any other value is ignored.      | unset                         | [Tool servers](extending/mcp.md)                           |
+| `OMC_MCP_AUTH_FILE`  | The file sign-ins to tool servers are kept in.                                                              | `<config>/mcp-auth.json`      | [Tool servers](extending/mcp.md#signing-in)                |
 | `OMC_TRUST_ALL`      | Set to `1` to trust every project for this process without recording anything; any other value is ignored. | unset                         | [Project trust](extending/project-trust.md)                |
 | `OMC_MEMORY`         | Set to `0` to turn memory off for every conversation; the `memory` setting is then not offered.             | on                            | [Memory](memory.md)                                        |
 | `OMC_MEMORY_DIR`     | The folder memories are kept in.                                                                            | `<data>/memory`               | [Memory](memory.md)                                        |
@@ -48,7 +52,8 @@ starts `crab`. A switch that is off when set to `0` is also off with `false`,
 | `OMC_SEARXNG_URL`    | The SearXNG instance `web_search` asks, when `SEARXNG_URL` is not set.                                      | unset                         | [Reading the web and GitHub](tools/web-and-github.md)      |
 
 An empty `OMC_PROVIDERS_FILE`, `OMC_HOOKS_FILE`, `OMC_TRUST_FILE`,
-`OMC_MEMORY_DIR` or `OMC_DEBUGGERS_FILE` counts as unset. An empty or blank
+`OMC_MEMORY_DIR`, `OMC_DEBUGGERS_FILE`, `OMC_MCP_FILE` or `OMC_MCP_AUTH_FILE`
+counts as unset. An empty or blank
 `OMC_<ID>_URL` does too, and a trailing `/` is dropped.
 
 ### Provider keys and addresses
@@ -98,7 +103,7 @@ More on each provider is in [Supported providers](providers/supported.md).
 
 | Variable                                           | What it does                                                                                                   | Default            | Details                                     |
 | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- | ------------------ | ------------------------------------------- |
-| `CLAUDE_CONFIG_DIR`                                | Claude Code's config folder, read for instructions, skills, agents, hooks, settings and plugins.               | `~/.claude`        | [Skills and agents](extending/skills-and-agents.md)                 |
+| `CLAUDE_CONFIG_DIR`                                | Claude Code's config folder, read for instructions, skills, agents, hooks, settings and plugins, and for `.claude.json` with `OMC_MCP_CLAUDE=1`. | `~/.claude`        | [Skills and agents](extending/skills-and-agents.md)                 |
 | `CODEX_HOME`                                       | Codex's config folder, read for instructions, skills and agents.                                               | `~/.codex`         | [Skills and agents](extending/skills-and-agents.md) |
 | `HOME`                                             | The home folder: the default of the two above and `~/.agents/skills`; a project that is this folder is the user's own. | the system's | [Project trust](extending/project-trust.md) |
 | `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME` | On Linux, where `<config>`, `<data>` and `<cache>` are.                                                      | see [Folders](#folders) | [Folders](#folders)                    |
@@ -124,6 +129,8 @@ Crab does not read these; it sets them for the hook commands it runs.
 | `<config>/auth.json`                                          | Logins, saved API keys and the provider last signed in to. A client can keep it elsewhere by opening the conversation with a `home` folder: then it is `<home>/auth.json`. | crab, when signing in or saving a key | [Providers](providers/overview.md)            |
 | `<config>/providers.json`                                     | Custom providers. Read once, when the providers are first listed. Moved by `OMC_PROVIDERS_FILE`, not by `home`. | the user                     | [Custom endpoints](providers/custom-endpoints.md) |
 | `<config>/hooks.json`                                         | The user's own hooks. Moved by `OMC_HOOKS_FILE`.                                                         | the user                            | [Hooks](extending/hooks.md)                       |
+| `<config>/mcp.json`                                           | The user's own tool servers, in the shape of `.mcp.json`. Read when a conversation opens. Moved by `OMC_MCP_FILE`. | the user                  | [Tool servers](extending/mcp.md)                  |
+| `<config>/mcp-auth.json`                                      | Sign-ins to tool servers: client registrations and tokens, by server address, readable by the user alone. `<home>/mcp-auth.json` for a conversation opened with a `home` folder. Moved by `OMC_MCP_AUTH_FILE`. | crab, when signing in to a tool server | [Tool servers](extending/mcp.md#signing-in) |
 | `<config>/debuggers.json`                                     | Changes to the known debug adapters, and others added. Moved by `OMC_DEBUGGERS_FILE`.                    | the user                            | [Debugging](tools/debug.md)                       |
 | `<data>/conversations/<id>.jsonl`                             | The saved history of the conversation `<id>`. A client can keep them elsewhere by opening the conversation with a `history` folder. | crab                | [Commands and conversations](usage.md)            |
 | `<data>/memory/projects/<name>-<hash>/memories.jsonl`         | A project's memories, one JSON object a line, beside `project.json` (which project it is) and `memories.lock`. Moved by `OMC_MEMORY_DIR`. | crab; the user may edit it | [Memory](memory.md)                    |
@@ -148,6 +155,7 @@ Always read, trusted or not. `~/.claude` is `CLAUDE_CONFIG_DIR` when set, and
 | `~/.claude/agents/<name>.md`, `~/.codex/agents/<name>.toml` | Agent definitions.                                                   | [Skills and agents](extending/skills-and-agents.md) |
 | `~/.claude/settings.json`                                  | Hooks, and the plugins `enabledPlugins` switches on or off.           | [Hooks](extending/hooks.md)                 |
 | `~/.claude/plugins/installed_plugins.json`                 | The installed Claude Code plugins, whose skills, agents and `hooks/hooks.json` are read. | [Claude Code plugins](extending/skills-and-agents.md#claude-code-plugins) |
+| `~/.claude.json`                                           | Only with `OMC_MCP_CLAUDE=1`: the tool servers under `mcpServers`, and under `projects` for the working folder or repository root. | [Tool servers](extending/mcp.md) |
 
 ### The project
 
@@ -162,9 +170,10 @@ repository), except where noted.
 | `.claude/agents/<name>.md`, `.codex/agents/<name>.toml`                    | Agent definitions.                                              | [Skills and agents](extending/skills-and-agents.md) |
 | `.oh-my-crab/hooks.json`, `.claude/settings.json`, `.claude/settings.local.json` | Hooks.                                                    | [Hooks](extending/hooks.md)                 |
 | `.claude/settings.json`, `.claude/settings.local.json` of the working folder only | The plugins `enabledPlugins` switches on or off.         | [Project trust](extending/project-trust.md) |
+| `.oh-my-crab/mcp.json`, `.mcp.json`                                        | Tool servers; in each folder the first wins, and the nearer folder wins. | [Tool servers](extending/mcp.md)            |
 
-Crab reads no tool-server configuration from anywhere; the tool servers are
-the ones the client passes when it opens the conversation
+Tool servers come from the client, the project, crab's own `mcp.json` and,
+when asked for, Claude Code's `~/.claude.json`, in that order of precedence
 ([Tool servers](extending/mcp.md)). What a project brings is not used until
 it is trusted: see [Project trust](extending/project-trust.md).
 

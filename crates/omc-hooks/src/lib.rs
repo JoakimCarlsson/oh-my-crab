@@ -9,8 +9,8 @@
 //! format of Claude Code's hooks, so the hooks a user already has keep working.
 //! [`load`] reads their definitions, [`Engine`] runs them for the agent loop.
 //!
-//! What a project folder brings, hooks, instruction files, skills and agent
-//! definitions, is used only once the project is trusted; [`assess`] says what
+//! What a project folder brings, hooks, tool servers, instruction files, skills
+//! and agent definitions, is used only once the project is trusted; [`assess`] says what
 //! a conversation may use and what it leaves out, and [`TrustStore`] records
 //! the reader's decisions per repository.
 
@@ -33,5 +33,5 @@ pub use matcher::{Matcher, claude_names};
 pub use run::{Outcome, run};
 pub use trust::{
     Assessment, Record, Standing, TRUST_ALL_VARIABLE, TRUST_FILE_VARIABLE, TrustStore, assess,
-    project_hooks, trusted_by_environment,
+    project_hooks, server_entry, trusted_by_environment,
 };
