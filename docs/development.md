@@ -82,6 +82,8 @@ and Apple silicon) and Windows, and publishes a GitHub release with the
 archives and generated notes. A tag with a `-` in it, such as `-rc.1`, is
 published as a pre-release.
 
+The workflow publishes the release with GitHub's generated notes. Then replace the body by hand with `gh release edit <version> --notes-file <file>`: `## What's new` and `## Fixes`, written from the issues closed and pull requests merged since the previous release with their numbers, then `## Install` and the **Full changelog** link. No intro paragraph, and no hard line wrapping.
+
 pandemonium depends on crab's crates by git tag, so a pandemonium release
 names the crab tag it was built with. Every crate is ready for crates.io too
 (`cargo package --workspace` succeeds); publishing there is not part of the
