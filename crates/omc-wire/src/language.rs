@@ -1,6 +1,8 @@
 //! What the harness asks of the client's language services, and what comes back.
 //!
-//! A client that runs language servers of its own says so when it opens a conversation, and the harness then asks it, instead of starting servers itself, to format a file it has just written and to say what is wrong with the files it has changed. The messages are the harness's own, not the language server protocol, so a client may answer them however it likes.
+//! A client that runs language servers of its own says so when it opens a conversation, and the harness then asks it, instead of starting servers itself, to format a file it has just written and to say what is wrong with the files it has changed. A client that also says it navigates code is asked, besides, where symbols are defined and used, what they are, which symbols a file or the project has, what is wrong with the whole project, and how to rename a symbol. The messages are the harness's own, not the language server protocol, so a client may answer them however it likes.
+//!
+//! Every place is counted the way the harness counts them: lines and characters from one, a character being a Unicode scalar value, not a UTF-16 code unit.
 
 use std::path::PathBuf;
 
@@ -53,7 +55,79 @@ pub struct Diagnostic {
     pub code: Option<String>,
 }
 
+/// A place in a file the harness asks about: the file, and the line and character in it, both counted from one.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Place {
+    /// The file, as an absolute path.
+    pub path: PathBuf,
+    /// The line, counted from one.
+    pub line: u32,
+    /// The character of the line, counted from one.
+    pub column: u32,
+}
+
+/// A stretch of a file the client's language services point at.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Stretch {
+    /// The file, as an absolute path.
+    pub path: PathBuf,
+    /// The line it starts on, counted from one.
+    pub line: u32,
+    /// The character of that line it starts at, counted from one.
+    pub column: u32,
+    /// The line it ends on, counted from one.
+    pub end_line: u32,
+    /// The character of that line it ends before, counted from one.
+    pub end_column: u32,
+}
+
+/// A symbol the client's language services know: a function, type, field, module and so on.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SymbolInfo {
+    /// Its name.
+    pub name: String,
+    /// What kind of symbol it is, in lower case, such as `function` or `struct`.
+    pub kind: String,
+    /// More about it, such as a function's signature, when the server says.
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// The symbol it is inside of, such as the type of a method, when the server says.
+    #[serde(default)]
+    pub container: Option<String>,
+    /// How deeply it is nested in the symbols of its file, from nought for the outermost; nought for the symbols of a project.
+    #[serde(default)]
+    pub depth: u32,
+    /// Where its name is.
+    pub location: Stretch,
+}
+
+/// One stretch of a file's text replaced: from the line and character it starts at to the line and character it ends before, all counted from one, in the text as it is on disk.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TextEdit {
+    /// The line the stretch starts on, counted from one.
+    pub line: u32,
+    /// The character of that line it starts at, counted from one.
+    pub column: u32,
+    /// The line it ends on, counted from one.
+    pub end_line: u32,
+    /// The character of that line it ends before, counted from one.
+    pub end_column: u32,
+    /// What replaces it.
+    pub text: String,
+}
+
+/// The edits a rename makes to one file, each placed in the file's text as it is on disk before any of them.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FileEdits {
+    /// The file, as an absolute path.
+    pub path: PathBuf,
+    /// The edits, in any order; none of them overlap.
+    pub edits: Vec<TextEdit>,
+}
+
 /// What the harness asks the client's language services.
+///
+/// Only [`LanguageAsk::Format`] and [`LanguageAsk::Diagnostics`] are asked of a client that set [`crate::Opening::languages`] alone; the others are asked only of a client that also set [`crate::Opening::navigation`].
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LanguageAsk {
@@ -70,6 +144,58 @@ pub enum LanguageAsk {
         paths: Vec<PathBuf>,
         /// How long the client may wait for fresh diagnostics, in milliseconds.
         wait_ms: u64,
+    },
+    /// Where the symbol at `at` is defined; answered with [`LanguageAnswer::Locations`].
+    Definition {
+        /// The symbol's place.
+        at: Place,
+    },
+    /// Where the type of the symbol at `at` is defined; answered with [`LanguageAnswer::Locations`].
+    TypeDefinition {
+        /// The symbol's place.
+        at: Place,
+    },
+    /// Where the symbol at `at`, a trait, interface or abstract method, is implemented; answered with [`LanguageAnswer::Locations`].
+    Implementation {
+        /// The symbol's place.
+        at: Place,
+    },
+    /// Everywhere the symbol at `at` is used, its declaration included; answered with [`LanguageAnswer::Locations`].
+    References {
+        /// The symbol's place.
+        at: Place,
+    },
+    /// What the symbol at `at` is, its type and documentation; answered with [`LanguageAnswer::Hover`].
+    Hover {
+        /// The symbol's place.
+        at: Place,
+    },
+    /// The symbols of the file at `path`, outermost first and each followed by those inside it; answered with [`LanguageAnswer::Symbols`].
+    DocumentSymbols {
+        /// The file, as an absolute path.
+        path: PathBuf,
+    },
+    /// The symbols of the project whose names match `query`; answered with [`LanguageAnswer::Symbols`].
+    WorkspaceSymbols {
+        /// What to match the names against.
+        query: String,
+        /// A file whose language's server to ask, or nothing to ask every server of the project.
+        #[serde(default)]
+        near: Option<PathBuf>,
+    },
+    /// Everything the servers of the project have said is wrong with any of its files; answered with [`LanguageAnswer::Diagnostics`].
+    WorkspaceDiagnostics {
+        /// How long the client may wait for servers still loading or checking the project, in milliseconds.
+        wait_ms: u64,
+    },
+    /// The edits that rename the symbol at `at` to `new_name` in every file that uses it, made to the files as they are on disk now; answered with [`LanguageAnswer::Edits`].
+    ///
+    /// The client writes nothing: the harness makes the edits itself, asking the reader first when it must, and then formats the files and checks them.
+    Rename {
+        /// The symbol's place.
+        at: Place,
+        /// The name to rename it to.
+        new_name: String,
     },
 }
 
@@ -95,6 +221,41 @@ pub enum LanguageAnswer {
     Diagnostics {
         /// What the servers said, in any order.
         diagnostics: Vec<Diagnostic>,
+    },
+    /// The places a definition, type definition, implementation or references question found; empty when there are none.
+    Locations {
+        /// The places, in any order.
+        locations: Vec<Stretch>,
+    },
+    /// What the symbol asked about is, as plain text or Markdown, or nothing when the server has nothing to say about it.
+    Hover {
+        /// What the server said.
+        text: Option<String>,
+    },
+    /// The symbols of a file or of the project.
+    Symbols {
+        /// The symbols, a file's outermost first and each followed by those inside it.
+        symbols: Vec<SymbolInfo>,
+    },
+    /// The edits a rename makes, by file; the client has written none of them.
+    Edits {
+        /// The files the rename changes, each with its edits.
+        files: Vec<FileEdits>,
+    },
+    /// The client's language services, or the server of the file, do not answer this kind of question.
+    Unsupported {
+        /// Why, as the model is told it.
+        reason: String,
+    },
+    /// No language server reads files like the one asked about, or the one that would is not installed or could not be started.
+    NoServer {
+        /// Why, as the model is told it.
+        reason: String,
+    },
+    /// The server was asked and failed, or refused, as a rename that would create, move or delete files is.
+    Failed {
+        /// Why, as the model is told it.
+        reason: String,
     },
 }
 
@@ -133,6 +294,71 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<LanguageAnswer>(&text).unwrap(),
             answer
+        );
+    }
+
+    /// The navigation questions and answers read back as they were written, with snake_case tags, and a workspace symbol search that leaves out `near` reads as one with none.
+    #[test]
+    fn navigation_messages_round_trip() {
+        let at = Place {
+            path: PathBuf::from("/w/src/lib.rs"),
+            line: 3,
+            column: 8,
+        };
+        let asks = [
+            LanguageAsk::References { at: at.clone() },
+            LanguageAsk::TypeDefinition { at: at.clone() },
+            LanguageAsk::Rename {
+                at,
+                new_name: "total".into(),
+            },
+            LanguageAsk::WorkspaceDiagnostics { wait_ms: 3000 },
+        ];
+        for ask in asks {
+            let text = serde_json::to_string(&ask).unwrap();
+            assert_eq!(serde_json::from_str::<LanguageAsk>(&text).unwrap(), ask);
+        }
+        assert!(
+            serde_json::to_string(&LanguageAsk::TypeDefinition {
+                at: Place {
+                    path: PathBuf::from("/w/a.rs"),
+                    line: 1,
+                    column: 1
+                }
+            })
+            .unwrap()
+            .starts_with(r#"{"type_definition":"#)
+        );
+        assert_eq!(
+            serde_json::from_str::<LanguageAsk>(r#"{"workspace_symbols":{"query":"Config"}}"#)
+                .unwrap(),
+            LanguageAsk::WorkspaceSymbols {
+                query: "Config".into(),
+                near: None
+            }
+        );
+        let answer = LanguageAnswer::Edits {
+            files: vec![FileEdits {
+                path: PathBuf::from("/w/src/lib.rs"),
+                edits: vec![TextEdit {
+                    line: 3,
+                    column: 8,
+                    end_line: 3,
+                    end_column: 13,
+                    text: "total".into(),
+                }],
+            }],
+        };
+        let text = serde_json::to_string(&answer).unwrap();
+        assert_eq!(
+            serde_json::from_str::<LanguageAnswer>(&text).unwrap(),
+            answer
+        );
+        assert_eq!(
+            serde_json::from_str::<LanguageAnswer>(r#"{"no_server":{"reason":"none"}}"#).unwrap(),
+            LanguageAnswer::NoServer {
+                reason: "none".into()
+            }
         );
     }
 }

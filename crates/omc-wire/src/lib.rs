@@ -29,6 +29,7 @@ pub use frame::{decode, encode};
 pub use import::{Imported, ImportedTurn};
 pub use inquiry::{Alternative, Inquiry, Question, Reply, summary};
 pub use language::{Diagnostic, LanguageAnswer, LanguageAsk, LanguageRequest, Severity};
+pub use language::{FileEdits, Place, Stretch, SymbolInfo, TextEdit};
 pub use memory::{MemoryEntry, MemoryListing};
 pub use permission::{Choice, Permission, Verdict};
 pub use plan::{PlanStep, Progress};

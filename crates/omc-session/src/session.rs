@@ -282,6 +282,7 @@ impl Session {
             before,
             defaults,
             languages,
+            navigation,
         } = opening;
         let provider = provider.as_str();
         self.shared.set_home(home);
@@ -302,6 +303,9 @@ impl Session {
         }
         self.shared.lifecycle.set_engine(None);
         self.shared.lifecycle.forget_start();
+        self.shared
+            .client_languages
+            .set_navigation(languages && navigation);
         let saved = match &conversation {
             Some(id) => match load_history(id, history, keep, before.as_deref()) {
                 Ok(saved) => Some(saved),
@@ -1613,6 +1617,250 @@ mod tests {
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
+    /// A session with nothing open whose events come back, opened with the `Open` command `line` decoded from the wire for a scratch folder named `name` holding `src/lib.rs` with `text`; the open fails on a conversation id that cannot be loaded, after the client's language offer is taken in. Returns the session, its events, the folder and the built-in tools, which ask the client's language services.
+    async fn opened_with_languages(
+        name: &str,
+        line: impl Fn(&Path) -> String,
+        text: &str,
+    ) -> (Session, UnboundedReceiver<Event>, PathBuf, Arc<Registry>) {
+        let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session")
+            .join(name);
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(directory.join("src")).unwrap();
+        let directory = directory.canonicalize().unwrap();
+        std::fs::write(directory.join("src/lib.rs"), text).unwrap();
+        let (out, events) = unbounded_channel();
+        let (ended, _finished) = unbounded_channel();
+        let mut session = Session {
+            shared: Shared::new(out),
+            history: Vec::new(),
+            journal: None,
+            open: None,
+            running: None,
+            turns: 0,
+            resets_at_start: 0,
+            ended,
+            trust_tickets: 0,
+            idle: None,
+        };
+        session
+            .handle(omc_wire::decode(&line(&directory)).unwrap())
+            .await;
+        session
+            .shared
+            .languages
+            .set(session.languages_for(&directory, true, false));
+        let registry = Arc::new(
+            Registry::builtin_in(&directory, None, session.shared.languages.clone()).unwrap(),
+        );
+        (session, events, directory, registry)
+    }
+
+    /// The `Open` line a client written before navigation existed sends: it offers language services and says nothing of navigating code.
+    fn open_line_without_navigation(directory: &Path) -> String {
+        serde_json::json!({"Open": {
+            "directory": directory,
+            "provider": "claude",
+            "yolo": true,
+            "conversation": "not/usable",
+            "languages": true,
+        }})
+        .to_string()
+    }
+
+    /// An `Open` that leaves out `navigation`, as a client written before it does, reads as not navigating, and the `lsp` tool then never sends that client a question it does not know: every action but a file's diagnostics is refused without a `Language` event, and a file's diagnostics still go out as the `diagnostics` request they always were.
+    #[tokio::test]
+    async fn an_open_without_navigation_never_asks_the_new_questions() {
+        let opening: Command =
+            omc_wire::decode(&open_line_without_navigation(Path::new("/w"))).unwrap();
+        let Command::Open(opening) = opening else {
+            panic!("not an open");
+        };
+        assert!(opening.languages && !opening.navigation);
+        let (mut session, mut events, directory, registry) = opened_with_languages(
+            "no-navigation",
+            open_line_without_navigation,
+            "pub fn helper() {}\n",
+        )
+        .await;
+        while events.try_recv().is_ok() {}
+        let calls = [
+            serde_json::json!({"action": "references", "path": "src/lib.rs", "symbol": "helper", "line": 1}),
+            serde_json::json!({"action": "definition", "path": "src/lib.rs", "symbol": "helper"}),
+            serde_json::json!({"action": "hover", "path": "src/lib.rs", "symbol": "helper"}),
+            serde_json::json!({"action": "symbols", "path": "src/lib.rs"}),
+            serde_json::json!({"action": "symbols", "query": "helper"}),
+            serde_json::json!({"action": "diagnostics"}),
+            serde_json::json!({"action": "rename", "path": "src/lib.rs", "symbol": "helper", "new_name": "aid"}),
+        ];
+        for call in calls {
+            let Err(error) = registry.call_as("c", "lsp", call.clone()).await else {
+                panic!("{call} was answered");
+            };
+            assert!(error.to_string().contains("cannot answer this"), "{error}");
+            assert!(events.try_recv().is_err(), "{call} asked the client");
+        }
+        let checking = tokio::spawn({
+            let registry = registry.clone();
+            async move {
+                registry
+                    .call_as(
+                        "c",
+                        "lsp",
+                        serde_json::json!({"action": "diagnostics", "path": "src/lib.rs"}),
+                    )
+                    .await
+                    .unwrap()
+            }
+        });
+        let Some(Event::Language(request)) = events.recv().await else {
+            panic!("a file's diagnostics did not go to the client");
+        };
+        assert!(
+            matches!(request.ask, omc_wire::LanguageAsk::Diagnostics { .. }),
+            "{:?}",
+            request.ask
+        );
+        session
+            .handle(Command::Language {
+                ticket: request.ticket,
+                answer: omc_wire::LanguageAnswer::Diagnostics {
+                    diagnostics: Vec::new(),
+                },
+            })
+            .await;
+        checking.await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(directory.join("src/lib.rs")).unwrap(),
+            "pub fn helper() {}\n"
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A client that opens with `navigation` is asked about code over the wire: its references come back as the tool's places, and a rename is answered with edits that the harness, not the client, writes, formats through the client and checks, giving each file's new tag.
+    #[tokio::test]
+    async fn a_navigating_client_answers_references_and_renames() {
+        let line = |directory: &Path| {
+            serde_json::json!({"Open": {
+                "directory": directory,
+                "provider": "claude",
+                "yolo": true,
+                "conversation": "not/usable",
+                "languages": true,
+                "navigation": true,
+            }})
+            .to_string()
+        };
+        let (mut session, mut events, directory, registry) = opened_with_languages(
+            "navigation",
+            line,
+            "pub fn helper() {}\npub fn main() { helper(); }\n",
+        )
+        .await;
+        while events.try_recv().is_ok() {}
+        let file = directory.join("src/lib.rs");
+        let call = |args: serde_json::Value| {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.call_as("c", "lsp", args).await })
+        };
+        let mut next_request = async || {
+            let event = events.recv().await.unwrap();
+            let line = omc_wire::encode(&event).unwrap();
+            let Event::Language(request) = omc_wire::decode::<Event>(&line).unwrap() else {
+                panic!("not a language request: {line}");
+            };
+            request
+        };
+        let looking = call(
+            serde_json::json!({"action": "references", "path": "src/lib.rs", "symbol": "helper", "line": 1}),
+        );
+        let request = next_request().await;
+        let omc_wire::LanguageAsk::References { at } = &request.ask else {
+            panic!("not a references request: {:?}", request.ask);
+        };
+        assert_eq!((&at.path, at.line, at.column), (&file, 1, 8));
+        let stretch = |line, column| omc_wire::Stretch {
+            path: file.clone(),
+            line,
+            column,
+            end_line: line,
+            end_column: column + 6,
+        };
+        session
+            .handle(Command::Language {
+                ticket: request.ticket,
+                answer: omc_wire::LanguageAnswer::Locations {
+                    locations: vec![stretch(1, 8), stretch(2, 17)],
+                },
+            })
+            .await;
+        let found = looking.await.unwrap().unwrap();
+        assert!(found.text.contains("2:17"), "{}", found.text);
+        let renaming = call(
+            serde_json::json!({"action": "rename", "path": "src/lib.rs", "symbol": "helper", "line": 1, "new_name": "aid"}),
+        );
+        let request = next_request().await;
+        let omc_wire::LanguageAsk::Rename { new_name, .. } = &request.ask else {
+            panic!("not a rename request: {:?}", request.ask);
+        };
+        assert_eq!(new_name, "aid");
+        let edit = |line, column| omc_wire::TextEdit {
+            line,
+            column,
+            end_line: line,
+            end_column: column + 6,
+            text: "aid".to_owned(),
+        };
+        session
+            .handle(Command::Language {
+                ticket: request.ticket,
+                answer: omc_wire::LanguageAnswer::Edits {
+                    files: vec![omc_wire::FileEdits {
+                        path: file.clone(),
+                        edits: vec![edit(1, 8), edit(2, 17)],
+                    }],
+                },
+            })
+            .await;
+        let request = next_request().await;
+        assert_eq!(
+            request.ask,
+            omc_wire::LanguageAsk::Format { path: file.clone() }
+        );
+        session
+            .handle(Command::Language {
+                ticket: request.ticket,
+                answer: omc_wire::LanguageAnswer::Formatted { text: None },
+            })
+            .await;
+        let request = next_request().await;
+        assert!(matches!(
+            request.ask,
+            omc_wire::LanguageAsk::Diagnostics { .. }
+        ));
+        session
+            .handle(Command::Language {
+                ticket: request.ticket,
+                answer: omc_wire::LanguageAnswer::Diagnostics {
+                    diagnostics: Vec::new(),
+                },
+            })
+            .await;
+        let renamed = renaming.await.unwrap().unwrap();
+        let written = "pub fn aid() {}\npub fn main() { aid(); }\n";
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), written);
+        assert!(
+            renamed.text.contains(&format!(
+                "src/lib.rs: 2 edit(s), tag {}",
+                omc_tools::snapshot_tag(written.as_bytes())
+            )),
+            "{}",
+            renamed.text
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
     /// The language services a program gives the conversation win over the client's, and with neither the harness's own servers are used.
     #[cfg(feature = "lsp")]
     #[test]
@@ -2061,6 +2309,7 @@ mod tests {
                 defaults: Vec::new(),
                 before: None,
                 languages: false,
+                navigation: false,
             }))
             .await;
         assert!(session.running.is_none());

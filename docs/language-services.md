@@ -12,6 +12,8 @@ one set of language servers runs:
   the conversation. `crab` then sends it each request as a `Language` event
   with a ticket, and it answers with a `Language` command under that ticket. A
   request it does not answer in time gets no formatting and no diagnostics.
+  A client that also sets `navigation` answers the `lsp` tool's questions
+  about code as well (see below); one that does not is never sent them.
 - Otherwise `crab` starts the usual server of each language itself, when its
   program is installed: `rust-analyzer`, `gopls`, `typescript-language-server`,
   `pyright-langserver` or `pylsp`, `clangd`, `lua-language-server` and `zls`.
@@ -81,9 +83,25 @@ Where the answers come from follows the language services above:
   servers are installed. `symbols` with a `query` and `diagnostics` for the
   whole project ask every server already running and those of the languages
   the project root names, starting them.
-- With a client that runs the language servers (`languages` in `Open`), the
-  wire carries only formatting and the diagnostics of named files, so `lsp`
-  answers `diagnostics` for a file through the client and refuses the other
-  actions with a message saying so.
+- With a client that runs the language servers and navigates code
+  (`languages` and `navigation` in `Open`), every action is asked of the
+  client as a `Language` request: `definition`, `type_definition`,
+  `implementation`, `references`, `hover`, `document_symbols`,
+  `workspace_symbols`, `workspace_diagnostics` and `rename`, each place
+  counted in lines and characters from one (see
+  [wire protocol](wire-protocol.md#language-1)). The client answers from its
+  own servers, `unsupported` when a server does not offer the action and
+  `no_server` when none reads the file; the tool gives the model its reason.
+  A rename comes back as edits, never written by the client: `crab` makes
+  them to the files on disk and then treats them as any rename, refusing
+  edits outside the working directory, asking first outside yolo mode,
+  writing every file or none, having the client format them and report their
+  diagnostics, and giving each file's new snapshot tag. `crab` waits a minute
+  for each answer.
+- With a client that runs the language servers but did not set `navigation`,
+  as a client written before it existed, the wire carries only formatting and
+  the diagnostics of named files, so `lsp` answers `diagnostics` for a file
+  through the client and refuses the other actions with a message saying so,
+  without asking the client anything it would not understand.
 - A program embedding the crates answers whatever its `LanguageService`
   implements; the navigation methods of that trait refuse by default.

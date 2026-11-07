@@ -47,6 +47,9 @@ pub struct Opening {
     /// Whether the client answers [`crate::Event::Language`] requests: it runs language servers of its own, so the harness asks it to format the files it writes and to say what is wrong with them, and starts none itself.
     #[serde(default)]
     pub languages: bool,
+    /// Whether the client, which set `languages`, also answers the questions about code the `lsp` tool asks: definitions, references, hovers, symbols, the diagnostics of the whole project and renames, as the [`crate::LanguageAsk`] variants besides `Format` and `Diagnostics`. A client that leaves it out is never sent those, so a client written before they existed keeps working; the harness then refuses those questions itself. Means nothing without `languages`.
+    #[serde(default)]
+    pub navigation: bool,
 }
 
 /// One request from the client, answered by [`crate::Event`]s.

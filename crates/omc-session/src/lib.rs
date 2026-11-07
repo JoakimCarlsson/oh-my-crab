@@ -6,6 +6,7 @@
 //! so another program can hold the conversation.
 
 mod bridge;
+mod edits;
 mod hooks;
 mod languages;
 mod lifecycle;

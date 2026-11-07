@@ -37,8 +37,11 @@ below.
   value holds the fields: `{"Rename":{"title":"x"}}`.
 - **Variant names** are PascalCase as written in Rust (`Open`, `Running`,
   `Always`), except in these types, whose names are snake_case or lowercase:
-  `LanguageAsk` (`format`, `diagnostics`), `LanguageAnswer` (`formatted`,
-  `diagnostics`), `Severity` (`error`, `warning`, `information`, `hint`),
+  `LanguageAsk` (`format`, `diagnostics`, `definition`, `type_definition`,
+  `implementation`, `references`, `hover`, `document_symbols`,
+  `workspace_symbols`, `workspace_diagnostics`, `rename`), `LanguageAnswer`
+  (`formatted`, `diagnostics`, `locations`, `hover`, `symbols`, `edits`,
+  `unsupported`, `no_server`, `failed`), `Severity` (`error`, `warning`, `information`, `hint`),
   `SignIn` (`browser`, `device_code`, `api_key`, `none`) and `KeySource`,
   which is internally tagged by a `from` field.
 - **Field names** are snake_case as written in Rust.
@@ -49,6 +52,9 @@ below.
   a list defaults to `[]`, a string to `""`, a boolean to `false`. Crab still
   writes them in what it sends, except `key_env` in `ProviderInfo`, which is
   left out when empty.
+- **Unknown fields** in a message sent to crab are ignored, so a client may
+  set a field a newer crab reads, such as `navigation` in `Open`, and an
+  older crab goes on as if it were not there.
 - **Paths** are JSON strings.
 - **Pairs** (`(String, String)`) are two-element arrays: `["effort","high"]`.
 - **Integers** are unsigned: tickets and token counts are `u64`.
@@ -339,6 +345,7 @@ Opens the conversation; it must come before anything else. Carries an
 | `defaults`     | list of pairs              | default  | `[setting id, value]` pairs for settings the saved conversation has no choice for.                                           |
 | `before`       | string                     | optional | A turn id: the conversation goes back to before that turn, on a new branch; the turns left behind stay saved. See [Branches](#branches). |
 | `languages`    | bool                       | default  | Whether the client answers `Language` requests; crab then starts no language servers of its own.                             |
+| `navigation`   | bool                       | default  | Whether the client, which set `languages`, also answers the questions about code of the `lsp` tool; see [`Language`](#language-1). Means nothing without `languages`. |
 
 The shortest valid `Open`:
 
@@ -349,7 +356,7 @@ The shortest valid `Open`:
 With every field:
 
 ```json
-{"Open":{"directory":"/home/me/project","home":null,"provider":"claude","model":"claude-sonnet-4-5","yolo":false,"tools":[{"name":"files","reach":{"Command":{"program":"mcp-files","args":["--root","."],"env":[["LOG","warn"]]}}},{"name":"issues","reach":{"Http":{"url":"https://example.com/mcp","headers":[["Authorization","Bearer x"]]}}}],"denied":["web_search"],"disabled":["AGENTS.md"],"conversation":"c-42","history":null,"keep":50,"defaults":[["effort","high"]],"before":null,"languages":true}}
+{"Open":{"directory":"/home/me/project","home":null,"provider":"claude","model":"claude-sonnet-4-5","yolo":false,"tools":[{"name":"files","reach":{"Command":{"program":"mcp-files","args":["--root","."],"env":[["LOG","warn"]]}}},{"name":"issues","reach":{"Http":{"url":"https://example.com/mcp","headers":[["Authorization","Bearer x"]]}}}],"denied":["web_search"],"disabled":["AGENTS.md"],"conversation":"c-42","history":null,"keep":50,"defaults":[["effort","high"]],"before":null,"languages":true,"navigation":true}}
 ```
 
 #### `ToolServer` and `Reach`
@@ -504,6 +511,26 @@ Answers a `Language` request under `ticket`.
   file, or `null` when it cannot be formatted or is formatted already.
 - `diagnostics`: field `diagnostics` (list of `Diagnostic`), what the language
   servers said, in any order.
+- `locations`: field `locations` (list of `Stretch`), the places a
+  `definition`, `type_definition`, `implementation` or `references` request
+  found, in any order; empty when there are none.
+- `hover`: field `text` (optional string), what the symbol is, as plain text
+  or Markdown, or `null` when the server has nothing to say about it.
+- `symbols`: field `symbols` (list of `SymbolInfo`), the symbols of a file,
+  the outermost first and each followed by those inside it, or of the
+  project.
+- `edits`: field `files` (list of `FileEdits`), the edits a `rename` makes.
+  The client writes none of them; crab makes them to the files on disk.
+- `unsupported`: field `reason` (string). The client's language services, or
+  the server of the file, do not answer this kind of question.
+- `no_server`: field `reason` (string). No language server reads files like
+  the one asked about, or the one that would is not installed or could not
+  be started.
+- `failed`: field `reason` (string). The server was asked and failed, or
+  refused, as a rename that would create, move or delete files must be.
+
+The `reason` of the last three is shown to the model as it is. An answer of
+the wrong kind counts as a failure.
 
 A `Diagnostic`:
 
@@ -517,9 +544,41 @@ A `Diagnostic`:
 | `source`   | string     | optional | What said it, such as `rustc`.                       |
 | `code`     | string     | optional | The diagnostic's code, such as `E0308`.              |
 
+A `Stretch`, a stretch of a file, has `path` (path, absolute), `line` and
+`column` (integers, where it starts) and `end_line` and `end_column`
+(integers, where it ends, before that character), all counted from one.
+
+A `SymbolInfo`:
+
+| Field       | Type      | Presence | Meaning                                                                                  |
+| ----------- | --------- | -------- | ---------------------------------------------------------------------------------------- |
+| `name`      | string    | required | Its name.                                                                                |
+| `kind`      | string    | required | What kind of symbol it is, in lower case, such as `function` or `struct`.                |
+| `detail`    | string    | optional | More about it, such as a function's signature.                                           |
+| `container` | string    | optional | The symbol it is inside of, such as the type of a method.                                |
+| `depth`     | integer   | default  | How deeply it is nested in its file's symbols, from 0; 0 for the symbols of a project.   |
+| `location`  | `Stretch` | required | Where its name is.                                                                       |
+
+A `FileEdits` has `path` (path, absolute) and `edits` (list of `TextEdit`),
+the edits to that file in any order, none overlapping. A `TextEdit` has
+`line`, `column`, `end_line` and `end_column` (integers, counted from one, the
+stretch replaced in the file as it is on disk before any of the edits) and
+`text` (string, what replaces it).
+
+Lines and columns are counted from one, and a column counts characters
+(Unicode scalar values), not UTF-16 code units or bytes; a client whose
+language servers count UTF-16 code units converts.
+
 ```json
 {"Language":{"ticket":4,"answer":{"formatted":{"text":"fn main() {}\n"}}}}
 {"Language":{"ticket":5,"answer":{"diagnostics":{"diagnostics":[{"path":"/home/me/project/src/lib.rs","line":3,"column":9,"severity":"error","message":"mismatched types","source":"rustc","code":"E0308"}]}}}}
+{"Language":{"ticket":6,"answer":{"locations":{"locations":[{"path":"/home/me/project/src/lib.rs","line":3,"column":8,"end_line":3,"end_column":14},{"path":"/home/me/project/src/main.rs","line":5,"column":5,"end_line":5,"end_column":11}]}}}}
+{"Language":{"ticket":7,"answer":{"hover":{"text":"```rust\npub fn helper() -> u32\n```"}}}}
+{"Language":{"ticket":8,"answer":{"symbols":{"symbols":[{"name":"Config","kind":"struct","detail":null,"container":null,"depth":0,"location":{"path":"/home/me/project/src/lib.rs","line":1,"column":12,"end_line":1,"end_column":18}}]}}}}
+{"Language":{"ticket":9,"answer":{"edits":{"files":[{"path":"/home/me/project/src/lib.rs","edits":[{"line":3,"column":8,"end_line":3,"end_column":14,"text":"assist"}]}]}}}}
+{"Language":{"ticket":10,"answer":{"unsupported":{"reason":"the rust-analyzer language server does not find implementations"}}}}
+{"Language":{"ticket":11,"answer":{"no_server":{"reason":"no language server reads .toml files"}}}}
+{"Language":{"ticket":12,"answer":{"failed":{"reason":"the rename would also create a file"}}}}
 ```
 
 ### `Trust`
@@ -861,15 +920,57 @@ Crab asks the client's language services something, and waits for a
 A request not answered in time gets no formatting or no diagnostics, and the
 tool goes on.
 
-Only these two are asked. The `lsp` tool's `diagnostics` of a file go to the
-client as a `diagnostics` request; its other actions (definitions,
-references, hovers, symbols, renames and the diagnostics of the whole project)
-are not sent to the client, and the tool tells the model they cannot be
-answered in this conversation.
+A client that also set `navigation` in `Open` is asked the `lsp` tool's
+questions about code too. Each names a place as a `Place`: `path` (path,
+absolute), `line` and `column` (integers, counted from one, a column counting
+characters). Crab waits a minute and a little more for each answer, enough
+for a server to start and load the project; one not answered in time fails
+the tool call. Any of them may be answered `unsupported`, `no_server` or
+`failed`.
+
+- `definition`, `type_definition`, `implementation`, `references`: field
+  `at` (`Place`). Where the symbol there is defined, where its type is
+  defined, where it is implemented, or every use of it with its declaration;
+  answer with `locations`.
+- `hover`: field `at` (`Place`). What the symbol there is; answer with
+  `hover`.
+- `document_symbols`: field `path` (path). The symbols of the file; answer
+  with `symbols`.
+- `workspace_symbols`: fields `query` (string) and `near` (optional path). The
+  project's symbols whose names match `query`, from the server of the file
+  `near` when it is given, otherwise from every server of the project; answer
+  with `symbols`.
+- `workspace_diagnostics`: field `wait_ms` (integer). Everything the servers of
+  the project have said is wrong with any of its files, waiting up to
+  `wait_ms` milliseconds for servers still loading or checking it; answer with
+  `diagnostics`. Crab waits `wait_ms` and a little more.
+- `rename`: fields `at` (`Place`) and `new_name` (string). The edits that
+  rename the symbol there in every file that uses it, made to the files as
+  they are on disk now; answer with `edits`. The client must not write them:
+  crab checks that they stay inside the working directory, asks the reader
+  first outside yolo mode, writes every file or none, then asks the client to
+  `format` them and for their `diagnostics` as after an `edit`, and gives the
+  model each file's new snapshot tag. A rename the server would make by
+  creating, moving or deleting files is answered `failed`.
+
+A client that did not set `navigation` is never sent these, so a client
+written before they existed keeps working with a newer crab. With it, the
+`lsp` tool's `diagnostics` of a file still go to the client as a
+`diagnostics` request, and its other actions are not sent: the tool tells the
+model they cannot be answered in this conversation.
 
 ```json
 {"Language":{"ticket":4,"ask":{"format":{"path":"/home/me/project/src/main.rs"}}}}
 {"Language":{"ticket":5,"ask":{"diagnostics":{"paths":["/home/me/project/src/lib.rs"],"wait_ms":3000}}}}
+{"Language":{"ticket":6,"ask":{"references":{"at":{"path":"/home/me/project/src/lib.rs","line":3,"column":8}}}}}
+{"Language":{"ticket":7,"ask":{"definition":{"at":{"path":"/home/me/project/src/main.rs","line":5,"column":5}}}}}
+{"Language":{"ticket":8,"ask":{"type_definition":{"at":{"path":"/home/me/project/src/main.rs","line":4,"column":9}}}}}
+{"Language":{"ticket":9,"ask":{"implementation":{"at":{"path":"/home/me/project/src/lib.rs","line":10,"column":11}}}}}
+{"Language":{"ticket":10,"ask":{"hover":{"at":{"path":"/home/me/project/src/lib.rs","line":3,"column":8}}}}}
+{"Language":{"ticket":11,"ask":{"document_symbols":{"path":"/home/me/project/src/lib.rs"}}}}
+{"Language":{"ticket":12,"ask":{"workspace_symbols":{"query":"Config","near":null}}}}
+{"Language":{"ticket":13,"ask":{"workspace_diagnostics":{"wait_ms":3000}}}}
+{"Language":{"ticket":14,"ask":{"rename":{"at":{"path":"/home/me/project/src/lib.rs","line":3,"column":8},"new_name":"assist"}}}}
 ```
 
 ### `Finished`

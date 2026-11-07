@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -11,12 +11,15 @@ use omc_tools::{
     Diagnostic, FORMAT_WAIT, LanguageError, LanguageService, Location, Lookup, Renamed, Spot,
     Symbol,
 };
-use omc_wire::{Event, LanguageAnswer, LanguageAsk, LanguageRequest};
+use omc_wire::{Event, LanguageAnswer, LanguageAsk, LanguageRequest, Place, Stretch, SymbolInfo};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
 /// How much longer than the client was asked to wait it is given to answer, for the time the messages take.
 const GRACE: Duration = Duration::from_millis(250);
+
+/// How long the client is given to answer a question about code, which may need its server to start and load the project first.
+pub(crate) const NAVIGATION_WAIT: Duration = Duration::from_secs(60);
 
 /// Language services the client provides: each question goes to it as an [`Event::Language`] and is answered by a [`omc_wire::Command::Language`] under the same ticket.
 pub(crate) struct ClientLanguages {
@@ -26,6 +29,8 @@ pub(crate) struct ClientLanguages {
     pending: Mutex<HashMap<u64, oneshot::Sender<LanguageAnswer>>>,
     /// The ticket the next question is put under.
     next: AtomicU64,
+    /// Whether the client said, when it opened the conversation, that it answers questions about code; it is never asked them otherwise.
+    navigates: AtomicBool,
 }
 
 impl ClientLanguages {
@@ -35,6 +40,32 @@ impl ClientLanguages {
             out,
             pending: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
+            navigates: AtomicBool::new(false),
+        }
+    }
+
+    /// Has questions about code go to the client from now on when `navigates`, or be refused without asking it, as for a client that did not say it answers them.
+    pub(crate) fn set_navigation(&self, navigates: bool) {
+        self.navigates.store(navigates, Ordering::Relaxed);
+    }
+
+    /// Asks the client the question about code `ask`, waiting [`NAVIGATION_WAIT`] for its answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LanguageError::Unsupported`] without asking when the client did not say it answers questions about code, the failure the client answers with, and [`LanguageError::Failed`] when it does not answer in time.
+    async fn navigate(&self, ask: LanguageAsk) -> Result<LanguageAnswer, LanguageError> {
+        if !self.navigates.load(Ordering::Relaxed) {
+            return Err(client_cannot_navigate());
+        }
+        match self.ask(ask, NAVIGATION_WAIT + GRACE).await {
+            None => Err(LanguageError::Failed(
+                "the client's language services did not answer in time".to_owned(),
+            )),
+            Some(LanguageAnswer::Unsupported { reason }) => Err(LanguageError::Unsupported(reason)),
+            Some(LanguageAnswer::NoServer { reason }) => Err(LanguageError::NoServer(reason)),
+            Some(LanguageAnswer::Failed { reason }) => Err(LanguageError::Failed(reason)),
+            Some(answer) => Ok(answer),
         }
     }
 
@@ -87,7 +118,7 @@ impl LanguageService for ClientLanguages {
         };
         match self.ask(ask, FORMAT_WAIT + GRACE).await? {
             LanguageAnswer::Formatted { text } => text,
-            LanguageAnswer::Diagnostics { .. } => None,
+            _ => None,
         }
     }
 
@@ -103,42 +134,133 @@ impl LanguageService for ClientLanguages {
         }
     }
 
-    /// Refuses, since the client is asked only to format files and say what is wrong with them.
-    async fn locate(&self, _lookup: Lookup, _at: &Spot) -> Result<Vec<Location>, LanguageError> {
-        Err(client_cannot_navigate())
+    /// Asks the client where `lookup` leads from the symbol at `at`, or refuses when it does not navigate code.
+    async fn locate(&self, lookup: Lookup, at: &Spot) -> Result<Vec<Location>, LanguageError> {
+        let at = place(at);
+        let ask = match lookup {
+            Lookup::Definition => LanguageAsk::Definition { at },
+            Lookup::TypeDefinition => LanguageAsk::TypeDefinition { at },
+            Lookup::Implementation => LanguageAsk::Implementation { at },
+            Lookup::References => LanguageAsk::References { at },
+        };
+        match self.navigate(ask).await? {
+            LanguageAnswer::Locations { locations } => {
+                Ok(locations.into_iter().map(location).collect())
+            }
+            _ => Err(answered_otherwise(lookup.noun())),
+        }
     }
 
-    /// Refuses, since the client is asked only to format files and say what is wrong with them.
-    async fn hover(&self, _at: &Spot) -> Result<Option<String>, LanguageError> {
-        Err(client_cannot_navigate())
+    /// Asks the client what the symbol at `at` is, or refuses when it does not navigate code.
+    async fn hover(&self, at: &Spot) -> Result<Option<String>, LanguageError> {
+        match self.navigate(LanguageAsk::Hover { at: place(at) }).await? {
+            LanguageAnswer::Hover { text } => Ok(text),
+            _ => Err(answered_otherwise("hover")),
+        }
     }
 
-    /// Refuses, since the client is asked only to format files and say what is wrong with them.
-    async fn document_symbols(&self, _path: &Path) -> Result<Vec<Symbol>, LanguageError> {
-        Err(client_cannot_navigate())
+    /// Asks the client for the symbols of the file at `path`, or refuses when it does not navigate code.
+    async fn document_symbols(&self, path: &Path) -> Result<Vec<Symbol>, LanguageError> {
+        let ask = LanguageAsk::DocumentSymbols {
+            path: path.to_path_buf(),
+        };
+        match self.navigate(ask).await? {
+            LanguageAnswer::Symbols { symbols } => Ok(symbols.into_iter().map(symbol).collect()),
+            _ => Err(answered_otherwise("document symbols")),
+        }
     }
 
-    /// Refuses, since the client is asked only to format files and say what is wrong with them.
+    /// Asks the client for the project's symbols matching `query`, of the server of the file at `near` when it is given, or refuses when it does not navigate code.
     async fn workspace_symbols(
         &self,
-        _query: &str,
-        _near: Option<&Path>,
+        query: &str,
+        near: Option<&Path>,
     ) -> Result<Vec<Symbol>, LanguageError> {
-        Err(client_cannot_navigate())
+        let ask = LanguageAsk::WorkspaceSymbols {
+            query: query.to_owned(),
+            near: near.map(Path::to_path_buf),
+        };
+        match self.navigate(ask).await? {
+            LanguageAnswer::Symbols { symbols } => Ok(symbols.into_iter().map(symbol).collect()),
+            _ => Err(answered_otherwise("workspace symbols")),
+        }
     }
 
-    /// Refuses, since the client is asked only to format files and say what is wrong with them.
-    async fn rename(&self, _at: &Spot, _new_name: &str) -> Result<Vec<Renamed>, LanguageError> {
-        Err(client_cannot_navigate())
+    /// Asks the client for the edits renaming the symbol at `at` to `new_name`, and makes them to the texts on disk without writing them; refuses when the client does not navigate code.
+    async fn rename(&self, at: &Spot, new_name: &str) -> Result<Vec<Renamed>, LanguageError> {
+        let ask = LanguageAsk::Rename {
+            at: place(at),
+            new_name: new_name.to_owned(),
+        };
+        match self.navigate(ask).await? {
+            LanguageAnswer::Edits { files } => {
+                crate::edits::renamed(files).map_err(LanguageError::Failed)
+            }
+            _ => Err(answered_otherwise("rename")),
+        }
     }
 
-    /// Refuses, since the client is asked about the files named only.
-    async fn all_diagnostics(&self, _wait: Duration) -> Result<Vec<Diagnostic>, LanguageError> {
-        Err(client_cannot_navigate())
+    /// Asks the client everything its servers have said is wrong with the project, letting it wait up to `wait` for servers still loading or checking it; refuses when it does not navigate code.
+    async fn all_diagnostics(&self, wait: Duration) -> Result<Vec<Diagnostic>, LanguageError> {
+        if !self.navigates.load(Ordering::Relaxed) {
+            return Err(client_cannot_navigate());
+        }
+        let ask = LanguageAsk::WorkspaceDiagnostics {
+            wait_ms: u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+        };
+        match self.ask(ask, wait + GRACE).await {
+            Some(LanguageAnswer::Diagnostics { diagnostics }) => Ok(diagnostics),
+            Some(LanguageAnswer::Unsupported { reason }) => Err(LanguageError::Unsupported(reason)),
+            Some(LanguageAnswer::NoServer { reason }) => Err(LanguageError::NoServer(reason)),
+            Some(LanguageAnswer::Failed { reason }) => Err(LanguageError::Failed(reason)),
+            Some(_) => Err(answered_otherwise("workspace diagnostics")),
+            None => Err(LanguageError::Failed(
+                "the client's language services did not answer in time".to_owned(),
+            )),
+        }
     }
 }
 
-/// What the model is told when it asks the client's language services about code: the wire carries only formatting and the diagnostics of named files, so only those can be asked.
+/// `spot` as the wire places it.
+fn place(spot: &Spot) -> Place {
+    Place {
+        path: spot.path.clone(),
+        line: spot.line,
+        column: spot.column,
+    }
+}
+
+/// The stretch `stretch` the client pointed at, as the tools place it.
+fn location(stretch: Stretch) -> Location {
+    Location {
+        path: stretch.path,
+        line: stretch.line,
+        column: stretch.column,
+        end_line: stretch.end_line,
+        end_column: stretch.end_column,
+    }
+}
+
+/// The symbol `info` the client named, as the tools know it.
+fn symbol(info: SymbolInfo) -> Symbol {
+    Symbol {
+        name: info.name,
+        kind: info.kind,
+        detail: info.detail,
+        container: info.container,
+        depth: usize::try_from(info.depth).unwrap_or(usize::MAX),
+        location: location(info.location),
+    }
+}
+
+/// What the model is told when the client answers a question about `what` with an answer to another kind of question.
+fn answered_otherwise(what: &str) -> LanguageError {
+    LanguageError::Failed(format!(
+        "the client's language services answered the {what} question with something else"
+    ))
+}
+
+/// What the model is told when it asks about code the language services of a client that did not say it answers such questions: only formatting and the diagnostics of named files can be asked of it.
 fn client_cannot_navigate() -> LanguageError {
     LanguageError::Unsupported(
         "the client runs this conversation's language servers and is asked only to format files and report the diagnostics of named files, so it cannot answer this; `lsp` with action diagnostics and a file path still works"
@@ -235,6 +357,60 @@ mod tests {
                 .is_err()
         );
         assert!(events.try_recv().is_err());
+    }
+
+    /// A client that said it navigates code is asked about it under a ticket, and its places, hovers and refusals come back as the tools know them.
+    #[tokio::test]
+    async fn a_navigating_client_is_asked_about_code() {
+        let (out, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let languages = Arc::new(ClientLanguages::new(out));
+        languages.set_navigation(true);
+        let answering = languages.clone();
+        let client = tokio::spawn(async move {
+            let Some(Event::Language(request)) = events.recv().await else {
+                panic!("no references request");
+            };
+            let LanguageAsk::References { at } = request.ask else {
+                panic!("not a references request: {:?}", request.ask);
+            };
+            assert_eq!((at.line, at.column), (2, 5));
+            answering.answer(
+                request.ticket,
+                LanguageAnswer::Locations {
+                    locations: vec![Stretch {
+                        path: at.path.clone(),
+                        line: 7,
+                        column: 3,
+                        end_line: 7,
+                        end_column: 8,
+                    }],
+                },
+            );
+            let Some(Event::Language(request)) = events.recv().await else {
+                panic!("no hover request");
+            };
+            answering.answer(
+                request.ticket,
+                LanguageAnswer::Unsupported {
+                    reason: "no hovers here".into(),
+                },
+            );
+        });
+        let at = Spot {
+            path: PathBuf::from("/w/a.rs"),
+            line: 2,
+            column: 5,
+        };
+        let found = languages.locate(Lookup::References, &at).await.unwrap();
+        assert_eq!(
+            (found[0].line, found[0].column, found[0].end_column),
+            (7, 3, 8)
+        );
+        assert_eq!(
+            languages.hover(&at).await,
+            Err(LanguageError::Unsupported("no hovers here".into()))
+        );
+        client.await.unwrap();
     }
 
     /// A client that does not answer in time is given up on, with no diagnostics and no formatting, and a late answer is dropped.
