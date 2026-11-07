@@ -13,6 +13,8 @@ pub struct Spec {
     pub commands: Vec<Vec<String>>,
     /// The names of files whose presence at the root of a project says the project is written in its languages, so that it is worth starting before any file is asked about.
     pub markers: Vec<String>,
+    /// The arguments a program found is run with to check that it works, as `--version`; empty when finding it is enough.
+    pub probe: Vec<String>,
 }
 
 impl Spec {
@@ -29,7 +31,14 @@ impl Spec {
                 .map(|command| command.iter().map(|part| (*part).to_owned()).collect())
                 .collect(),
             markers: Vec::new(),
+            probe: Vec::new(),
         }
+    }
+
+    /// The same server, counted as installed only when a program found also runs with `arguments` and exits successfully, as rustup's stand-in for a component that is not installed does not.
+    pub fn probed_with(mut self, arguments: &[&str]) -> Self {
+        self.probe = arguments.iter().map(|part| (*part).to_owned()).collect();
+        self
     }
 
     /// The same server, started early in a project that has one of the files `markers` names at its root.
@@ -57,11 +66,13 @@ impl Spec {
         self.command().is_some()
     }
 
-    /// The first of the commands whose program is found, as the program's path and the arguments.
+    /// The first of the commands whose program is found and, when the server is probed, runs, as the program's path and the arguments.
     pub(crate) fn command(&self) -> Option<(PathBuf, Vec<String>)> {
         self.commands.iter().find_map(|command| {
             let (program, arguments) = command.split_first()?;
-            Some((find_program(program)?, arguments.to_vec()))
+            let found = find_program(program)?;
+            (self.probe.is_empty() || runs(&found, &self.probe))
+                .then(|| (found, arguments.to_vec()))
         })
     }
 }
@@ -70,7 +81,8 @@ impl Spec {
 pub fn default_specs() -> Vec<Spec> {
     vec![
         Spec::new("rust-analyzer", &[("rs", "rust")], &[&["rust-analyzer"]])
-            .marked_by(&["Cargo.toml"]),
+            .marked_by(&["Cargo.toml"])
+            .probed_with(&["--version"]),
         Spec::new("gopls", &[("go", "go")], &[&["gopls"]]).marked_by(&["go.mod", "go.work"]),
         Spec::new(
             "typescript-language-server",
@@ -132,6 +144,29 @@ pub fn default_specs() -> Vec<Spec> {
     ]
 }
 
+/// Whether the program at `program` exits successfully when run with `arguments`, its output dropped; asked once a process for each program and arguments.
+fn runs(program: &Path, arguments: &[String]) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static ASKED: OnceLock<Mutex<HashMap<(PathBuf, Vec<String>), bool>>> = OnceLock::new();
+    let key = (program.to_path_buf(), arguments.to_vec());
+    let asked = ASKED.get_or_init(Mutex::default);
+    if let Some(known) = asked.lock().ok().and_then(|held| held.get(&key).copied()) {
+        return known;
+    }
+    let works = std::process::Command::new(program)
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if let Ok(mut held) = asked.lock() {
+        held.insert(key, works);
+    }
+    works
+}
+
 /// The path of the program `name`: `name` itself when it names a file, otherwise the first file of that name in a folder of the `PATH`.
 fn find_program(name: &str) -> Option<PathBuf> {
     let direct = Path::new(name);
@@ -148,6 +183,20 @@ fn find_program(name: &str) -> Option<PathBuf> {
 /// Tests for choosing servers.
 mod tests {
     use super::*;
+
+    /// A probed program counts only when it runs successfully, and the answer is kept for the next ask.
+    #[test]
+    fn a_probed_program_must_run() {
+        let Some(sh) = find_program("sh") else {
+            return;
+        };
+        let succeeding = Spec::new("ok", &[], &[&["sh"]]).probed_with(&["-c", "exit 0"]);
+        let failing = Spec::new("broken", &[], &[&["sh"]]).probed_with(&["-c", "exit 1"]);
+        assert_eq!(succeeding.command().map(|(path, _)| path), Some(sh.clone()));
+        assert!(!failing.is_installed());
+        assert!(!failing.is_installed());
+        assert!(Spec::new("plain", &[], &[&["sh"]]).is_installed());
+    }
 
     /// Files are matched to servers by extension, ignoring case.
     #[test]

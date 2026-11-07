@@ -1,0 +1,2 @@
+# Check out every text file with LF line endings on every system, as the prompt templates and fixtures compiled into crab expect.
+* text=auto eol=lf
