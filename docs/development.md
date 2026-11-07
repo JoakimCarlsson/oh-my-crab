@@ -69,12 +69,12 @@ one fails, document what you added.
 
 ## Releasing
 
-A release is a git tag `v<version>` matching `version` in the root
-`Cargo.toml`, such as `v0.1.0`, or `v0.2.0-rc.1` for a release candidate:
+A release is a git tag named after `version` in the root `Cargo.toml`, with
+no `v` in front: `0.1.0`, or `0.2.0-rc.1` for a release candidate.
 
 1. Set the version in `[workspace.package]` and in the `omc-*` entries of
    `[workspace.dependencies]` and of each crate's `Cargo.toml`, then commit.
-2. Tag the commit and push the tag: `git tag v0.1.0 && git push origin v0.1.0`.
+2. Tag the commit and push the tag: `git tag -a 0.1.0 -m 0.1.0 && git push origin 0.1.0`.
 
 The release workflow checks that the tag matches the version, runs fmt,
 clippy and the tests, builds `crab` for Linux (x86-64 and ARM), macOS (Intel

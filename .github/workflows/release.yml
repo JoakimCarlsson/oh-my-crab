@@ -2,7 +2,7 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["[0-9]+.[0-9]+.[0-9]+*"]
 
 permissions:
   contents: write
@@ -21,7 +21,7 @@ jobs:
       - name: The tag matches the workspace version
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
-          if [ "v$version" != "$TAG" ]; then
+          if [ "$version" != "$TAG" ]; then
             echo "::error::tag $TAG does not match workspace version $version"
             exit 1
           fi
