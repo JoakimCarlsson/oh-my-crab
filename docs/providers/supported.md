@@ -2,7 +2,7 @@
 
 These providers are built into the `omc` binary. To add one, see
 [adding.md](adding.md); to reach a server without changing crab, define it in
-`providers.json` as the README's "Custom endpoints" says.
+`providers.json` as [custom endpoints](custom-endpoints.md) says.
 
 ## Providers
 
@@ -66,7 +66,7 @@ earlier reasoning back as `reasoning_content`, which their thinking models want
 around tool calls.
 
 Servers crab has no definition for are added in `providers.json`; see
-"Custom endpoints" in the [README](../../README.md#custom-endpoints).
+[custom endpoints](custom-endpoints.md).
 
 The id is what you give when signing in or opening a conversation, for example
 `claude` or `copilot`. The definitions live in

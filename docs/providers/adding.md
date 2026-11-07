@@ -2,7 +2,7 @@
 
 Every provider in this guide is built into the `omc` binary. A server that
 speaks Chat Completions can also be added without a change to crab, in
-`providers.json`; see "Custom endpoints" in the [README](../../README.md#custom-endpoints).
+`providers.json`; see [custom endpoints](custom-endpoints.md).
 See [supported.md](supported.md) for what exists today.
 
 A provider is two things kept apart:
