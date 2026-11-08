@@ -6,9 +6,9 @@ reader, and less `debug`, whose sessions belong to the conversation and would
 be steered by several subagents at once. The kinds come with the harness (`task`,
 `scout` and `reviewer`) or from agent definitions in the project's and the
 user's agent folders and in installed Claude Code plugins (see
-[Skills, agents and instruction files](../extending/skills-and-agents.md)). One call runs one assignment, or up to 16 given as
+[Skills, agents and instruction files](../extending/skills-and-agents.md)). One call runs one assignment, or up to 32 given as
 `tasks`, and their results come back under a heading each; one failing leaves
-the others be. Eight subagents run at once across the whole conversation,
+the others be. Thirty-two subagents run at once across the whole conversation,
 whatever call or level started them (see [Nesting](#nesting)). With
 `background` the call returns a handle per subagent at once and `wait` returns
 each result as it ends; only the main agent can start subagents in the
@@ -56,7 +56,7 @@ its definition or the call names another, draws its tools from its parent's,
 and its work is reported under its parent's call, the ids chained as in
 [Tool events are updates](../wire-protocol.md#tool-events-are-updates).
 
-All subagents of a conversation share eight seats, however deep they are: a
+All subagents of a conversation share 32 seats, however deep they are: a
 subagent takes a seat to run and holds it until it ends, and the rest wait.
 A subagent waiting for its own subagents gives its seat up while they run and
 takes one again once they ended, so a tree of subagents waiting on each other

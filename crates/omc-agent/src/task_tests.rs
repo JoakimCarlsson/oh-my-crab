@@ -441,22 +441,27 @@ impl ChatModel for Counting {
     }
 }
 
-/// No more than the cap of subagents of one call run at once, and they do run together.
+/// Two full batches started together never run more than the cap of subagents at once, and they do run together.
 #[tokio::test]
-async fn a_batch_runs_at_most_the_cap_at_once() {
+async fn batches_run_at_most_the_cap_at_once() {
     let model = Arc::new(Counting {
         now: AtomicUsize::new(0),
         most: AtomicUsize::new(0),
     });
     let (task, _) = simple("task-batch-cap", model.clone());
-    let items: Vec<Value> = (0..MAX_CONCURRENT + 3)
+    let items: Vec<Value> = (0..MAX_TASKS)
         .map(|index| json!({"task": format!("t{index}")}))
         .collect();
-    let out = task.call_as("t1", json!({ "tasks": items })).await.unwrap();
-    assert!(out.text.starts_with(&format!(
-        "{0} of {0} subagents completed.",
-        MAX_CONCURRENT + 3
-    )));
+    let (first, second) = tokio::join!(
+        task.call_as("t1", json!({ "tasks": items.clone() })),
+        task.call_as("t2", json!({ "tasks": items })),
+    );
+    for out in [first.unwrap(), second.unwrap()] {
+        assert!(
+            out.text
+                .starts_with(&format!("{0} of {0} subagents completed.", MAX_TASKS))
+        );
+    }
     let most = model.most.load(Ordering::SeqCst);
     assert!(most > 1 && most <= MAX_CONCURRENT, "{most} ran at once");
 }

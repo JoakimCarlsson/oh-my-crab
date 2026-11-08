@@ -39,10 +39,10 @@ const WITHHELD: &[&str] = &[
 const DEFAULT_AGENT: &str = "task";
 
 /// The most subagents one call may start.
-pub const MAX_TASKS: usize = 16;
+pub const MAX_TASKS: usize = 32;
 
 /// How many subagents run at once by default, across every call and level of a conversation; the rest wait for one of them to end or to wait for subagents of its own.
-pub const MAX_CONCURRENT: usize = 8;
+pub const MAX_CONCURRENT: usize = 32;
 
 /// The names under which an agent definition's tool list lets its subagents start subagents of their own: crab's `task`, and `agent`, as Claude Code calls its tool.
 const NESTING_TOOLS: &[&str] = &["task", "agent"];

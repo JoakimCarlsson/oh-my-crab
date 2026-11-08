@@ -73,7 +73,7 @@ to the result; see [language services](../language-services.md).
 
 | Tool            | What it does                                                                                 | Asks | Plan                       | Detail                     |
 | --------------- | -------------------------------------------------------------------------------------------- | ---- | -------------------------- | -------------------------- |
-| `task`          | Runs up to 16 subagents on self-contained assignments, optionally in worktrees or the background | no   | yes, with read-only subagents | [subagents](subagents.md) |
+| `task`          | Runs up to 32 subagents on self-contained assignments, optionally in worktrees or the background | no   | yes, with read-only subagents | [subagents](subagents.md) |
 | `submit_result` | *Sometimes.* Hands a subagent's typed result back, checked against the call's `output_schema` | no   | yes                        | [subagents](subagents.md) |
 
 `submit_result` is given only to a subagent asked for a typed result.
