@@ -39,6 +39,8 @@
 - [Skills, agents and instruction files](extending/skills-and-agents.md).
 - [Tool servers (MCP)](extending/mcp.md).
 - [Hooks](extending/hooks.md).
+- [Extensions](extending/extensions.md): long-running programs that watch and
+  steer a conversation and give the model tools, and their protocol.
 - [Project trust](extending/project-trust.md).
 - [Permission rules](extending/permissions.md): allow, ask and deny rules, and
   where "always allow" answers are kept.

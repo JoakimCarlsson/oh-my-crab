@@ -2,9 +2,10 @@
 
 use std::sync::Arc;
 
-use omc_agent::{Context, EventSink, Hooks, Models, Scribe, compact, run_turn_steered};
+use omc_agent::{Chained, Context, EventSink, Hooks, Models, Scribe, compact, run_turn_steered};
 use omc_auth::AuthError;
 use omc_context::{Discovered, Environment, Locations};
+use omc_extensions::{ExtensionHooks, Prompted};
 use omc_hooks::{Engine, HookEvent, Submitted};
 use omc_providers::Provider;
 use omc_providers::{ChatModel, Message, RemoteModel};
@@ -132,6 +133,15 @@ impl Turn {
         let unnamed = self.shared.title().is_none();
         let memories = self.shared.memories_now();
         let tree = self.shared.tree(&self.locations.directory).await;
+        let extensions = self.shared.lifecycle.extensions();
+        let mut links: Vec<Arc<dyn Hooks>> = Vec::new();
+        if let Some(hooks) = &self.hooks {
+            links.push(hooks.clone());
+        }
+        if let Some(extensions) = &extensions {
+            links.push(Arc::new(extensions.clone()));
+        }
+        let checks = Chained::of(links);
         let toolset = Toolset::build(&Inputs {
             base: &self.base,
             denied: &self.denied,
@@ -158,7 +168,7 @@ impl Turn {
             unnamed,
             isolation: self.isolation.clone(),
             memories: memories.clone(),
-            hooks: self.hooks.clone().map(|hooks| -> Arc<dyn Hooks> { hooks }),
+            hooks: checks.clone(),
         });
         let key = Key {
             provider: self.provider,
@@ -197,12 +207,16 @@ impl Turn {
             notebook: Some(&self.shared.notebook),
             window: Some(window),
             checkpoint: checkpoint.as_deref(),
-            hooks: self.hooks.as_deref().map(|hooks| hooks as &dyn Hooks),
+            hooks: checks.as_deref(),
         };
         let result = match job {
             Job::Prompt(prompt) => {
                 let added = match self.submitted(&prompt).await {
                     Ok(added) => added,
+                    Err(blocked) => return blocked,
+                };
+                let (prompt, extended) = match self.extended(extensions.as_ref(), prompt).await {
+                    Ok(extended) => extended,
                     Err(blocked) => return blocked,
                 };
                 let mut told = prefix.notices(
@@ -223,11 +237,15 @@ impl Turn {
                     told.push(prefix.memory_notice(&digest));
                 }
                 told.extend(added);
+                told.extend(extended);
                 told.push(prompt);
                 let steering: Option<&dyn omc_agent::Steering> = if self
                     .hooks
                     .as_ref()
                     .is_some_and(|hooks| hooks.has(HookEvent::UserPromptSubmit))
+                    || extensions
+                        .as_ref()
+                        .is_some_and(|extensions| extensions.wants("turn_start"))
                 {
                     None
                 } else {
@@ -258,6 +276,10 @@ impl Turn {
                 .await
             }
         };
+        if let Some(extensions) = &extensions {
+            let failed = result.as_ref().err().map(ToString::to_string);
+            extensions.turn_end(failed.as_deref()).await;
+        }
         match result {
             Ok(()) => Ended::Done(self.history),
             Err(error) => {
@@ -297,6 +319,43 @@ fn failure_kind(error: &omc_agent::AgentError) -> Option<&'static str> {
 }
 
 impl Turn {
+    /// Asks `extensions` about `prompt`, which is about to start a turn, and returns the prompt to send, rewritten when one rewrote it, and the context they add before it; when one blocks it, the turn that ends for that reason, recorded in the saved history as lost.
+    async fn extended(
+        &self,
+        extensions: Option<&ExtensionHooks>,
+        prompt: String,
+    ) -> Result<(String, Option<String>), Ended> {
+        let Some(extensions) = extensions else {
+            return Ok((prompt, None));
+        };
+        match extensions.turn_start(&prompt).await {
+            Prompted::Go => Ok((prompt, None)),
+            Prompted::Changed {
+                prompt: rewritten,
+                context,
+            } => Ok((
+                rewritten.unwrap_or(prompt),
+                context.map(|context| {
+                    format!(
+                        "<extension-context>\n{}\n</extension-context>",
+                        context.trim()
+                    )
+                }),
+            )),
+            Prompted::Blocked(reason) => {
+                let reason = format!("an extension blocked the prompt: {}", reason.trim());
+                if let Some(Err(error)) = self
+                    .scribe
+                    .as_ref()
+                    .map(|scribe| scribe.cut_losing(self.history.len(), &reason))
+                {
+                    eprintln!("history not saved: {error}");
+                }
+                Err(Ended::Failed(reason))
+            }
+        }
+    }
+
     /// Runs the hooks of the prompt `prompt` and returns the context they add before it; when they block it, the turn that ends for that reason, recorded in the saved history as lost so the reader still sees the prompt.
     async fn submitted(&self, prompt: &str) -> Result<Option<String>, Ended> {
         let Some(hooks) = &self.hooks else {

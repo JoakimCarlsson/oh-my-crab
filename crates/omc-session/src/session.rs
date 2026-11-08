@@ -54,6 +54,10 @@ struct Open {
     client_servers: Vec<omc_wire::ToolServer>,
     /// The tool servers of the user's own files.
     user_servers: Vec<omc_mcp::Server>,
+    /// The extensions started for the conversation.
+    extensions: Arc<omc_extensions::Extensions>,
+    /// The extensions of the user's own file.
+    user_extensions: Vec<omc_extensions::Extension>,
 }
 
 /// Where a conversation's project stands on trust, and what the client was told about it.
@@ -383,6 +387,17 @@ impl Session {
                 Err(error) => return self.say(Event::Failed(error.to_string())),
             },
         };
+        let made = setting();
+        let extensions = omc_extensions::Extensions::new(omc_extensions::Setting {
+            session: made.session,
+            folder: made.folder,
+            mode: made.mode,
+        });
+        let user_extensions = user_extensions_for();
+        let started = extensions
+            .start(&wanted_extensions(&user_extensions, &assessment.extensions))
+            .await;
+        register_new(&mut registry, started);
         let commands = commands_of(&discovered);
         let commands_value = serde_json::to_value(&commands).unwrap_or_default();
         let (journal, messages) = saved.unzip();
@@ -394,6 +409,9 @@ impl Session {
         self.journal = journal;
         self.shared.attach(self.journal.clone());
         self.shared.lifecycle.set_engine(hooks.clone());
+        self.shared
+            .lifecycle
+            .set_extensions(Some(extensions.clone()));
         self.open = Some(Open {
             provider,
             base: Arc::new(registry),
@@ -407,6 +425,8 @@ impl Session {
             hub,
             client_servers: servers,
             user_servers,
+            extensions,
+            user_extensions,
         });
         let mode = if yolo { Mode::Yolo } else { Mode::Asking };
         self.shared
@@ -531,11 +551,18 @@ impl Session {
         self.tell_trust();
     }
 
-    /// Reaches the tool servers the conversation has now and has not tried yet, those of a project trusted since among them, and gives the agent their tools, and those of servers signed in to since, from the next turn on.
+    /// Reaches the tool servers the conversation has now and has not tried yet, those of a project trusted since among them, and gives the agent their tools, and those of servers signed in to since, from the next turn on; the extensions not started yet, those of a project trusted since among them, are started, and their tools given too.
     async fn reach_servers(&mut self) {
         let Some(open) = &mut self.open else {
             return;
         };
+        let wanted = wanted_extensions(&open.user_extensions, &open.trust.assessment.extensions);
+        let started = open.extensions.start(&wanted).await;
+        if !started.is_empty() {
+            let mut registry = (*open.base).clone();
+            register_new(&mut registry, started);
+            open.base = Arc::new(registry);
+        }
         let wanted = omc_mcp::config::merged(
             &open.client_servers,
             &open.trust.assessment.servers,
@@ -1043,6 +1070,44 @@ fn add_tools(open: &mut Open, tools: Vec<Arc<dyn Tool>>) {
     open.base = Arc::new(registry);
 }
 
+/// The extensions of the user's own file, the problems found in it reported on standard error.
+fn user_extensions_for() -> Vec<omc_extensions::Extension> {
+    let found =
+        omc_extensions::config::user_extensions(omc_extensions::config::own_file().as_deref());
+    for problem in &found.problems {
+        eprintln!("extensions: {problem}");
+    }
+    found.extensions
+}
+
+/// The extensions to start: every one of `user`, then those of `project` whose names are not taken yet, so that the user's run first.
+fn wanted_extensions(
+    user: &[omc_extensions::Extension],
+    project: &[omc_extensions::Extension],
+) -> Vec<omc_extensions::Extension> {
+    let mut wanted = user.to_vec();
+    for extension in project {
+        if !wanted.iter().any(|kept| kept.name == extension.name) {
+            wanted.push(extension.clone());
+        }
+    }
+    wanted
+}
+
+/// Adds `tools` to `registry`, except those named like a tool it already has, which are reported on standard error and left out.
+fn register_new(registry: &mut Registry, tools: Vec<Arc<dyn Tool>>) {
+    for tool in tools {
+        if registry.get(tool.name()).is_some() {
+            eprintln!(
+                "extension tool skipped: a tool named {} already exists",
+                tool.name()
+            );
+            continue;
+        }
+        registry.register_shared(tool);
+    }
+}
+
 /// The tool servers of the user's own files for work in `locations`, the problems found in them reported on standard error.
 fn user_servers_for(locations: &Locations) -> Vec<omc_mcp::Server> {
     let found = omc_mcp::config::user_servers(
@@ -1449,6 +1514,15 @@ mod tests {
         omc_mcp::Hub::new(Spill::disabled(), None, Arc::new(|_| {}))
     }
 
+    /// Extensions for a test conversation, none started.
+    fn test_extensions() -> Arc<omc_extensions::Extensions> {
+        omc_extensions::Extensions::new(omc_extensions::Setting {
+            session: None,
+            folder: PathBuf::from("."),
+            mode: Arc::new(|| "default"),
+        })
+    }
+
     /// The trust of a conversation in `directory`, recorded in `store` when there is one, reading no hooks of the user's, vouched for when `vouched` is set.
     fn test_trust(directory: &Path, store: Option<TrustStore>, vouched: bool) -> Trust {
         let locations = Locations {
@@ -1517,6 +1591,8 @@ mod tests {
                 hub: test_hub(),
                 client_servers: Vec::new(),
                 user_servers: Vec::new(),
+                extensions: test_extensions(),
+                user_extensions: Vec::new(),
             }),
             running: None,
             turns: 0,
@@ -1978,6 +2054,8 @@ mod tests {
             hub: test_hub(),
             client_servers: Vec::new(),
             user_servers: Vec::new(),
+            extensions: test_extensions(),
+            user_extensions: Vec::new(),
         });
         session.tell_trust();
         session.rescan();
@@ -2061,6 +2139,8 @@ mod tests {
                 hub: test_hub(),
                 client_servers: Vec::new(),
                 user_servers: Vec::new(),
+                extensions: test_extensions(),
+                user_extensions: Vec::new(),
             });
             session.tell_trust();
             let Ok(Event::Trust(request)) = events.try_recv() else {
@@ -2193,6 +2273,8 @@ mod tests {
                 hub: test_hub(),
                 client_servers: Vec::new(),
                 user_servers: Vec::new(),
+                extensions: test_extensions(),
+                user_extensions: Vec::new(),
             }),
             running: None,
             turns: 1,

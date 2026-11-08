@@ -2,7 +2,8 @@
 
 A freshly cloned repository can steer the agent, so what a project folder
 brings is not used until the reader trusts the project: its hooks, the tool
-servers of its `.mcp.json` and `.oh-my-crab/mcp.json`, its
+servers of its `.mcp.json` and `.oh-my-crab/mcp.json`, the
+[extensions](extensions.md) of its `.oh-my-crab/extensions.json`, its
 instruction files (`AGENTS.md`, `CLAUDE.md`, `.claude/rules` and the like),
 its skills and agent definitions, the Claude Code plugins its settings
 switch on or off, and the allow rules of its Claude Code settings; the deny
@@ -14,7 +15,8 @@ user's own. A project's tool servers wait for trust exactly as its hooks do,
 since each starts a program or reaches an address: they are listed in the
 `Trust` event as hooks named `tool server <name>: <command line or address>`,
 and are recorded with the hooks when the project is trusted (see
-[Tool servers](mcp.md#trust)). In yolo mode the language servers of an untrusted project start on the first
+[Tool servers](mcp.md#trust)). Its extensions wait the same way, listed as
+hooks named `extension <name>: <command line>`. In yolo mode the language servers of an untrusted project start on the first
 write instead of when the conversation opens.
 
 Trust is recorded per repository: the main checkout and every linked worktree

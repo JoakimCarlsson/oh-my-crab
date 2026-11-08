@@ -6,7 +6,9 @@ the reader is about to be asked about a call, after a batch of calls, when a
 prompt is about to start a turn, when a subagent starts and ends, when the
 agent is about to end its turn or a turn fails, before and after a
 compaction, before and after the model changes, when crab waits on the
-reader, and when the conversation ends. A hook is a shell
+reader, and when the conversation ends. For a program that stays running,
+keeps state and can give the model tools of its own, see
+[extensions](extensions.md). A hook is a shell
 command line, run with `bash -c` (`cmd /C` on Windows) in the conversation's
 folder, that reads a JSON payload on standard input and answers on standard
 output and with its exit code. The format is Claude Code's, as its hooks

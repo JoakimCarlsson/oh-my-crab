@@ -1,10 +1,11 @@
-//! The hooks that run around a conversation rather than inside one call: when it opens, resumes or has been compacted, when it ends, and when it waits on the reader.
+//! The hooks and extensions that run around a conversation rather than inside one call: when it opens, resumes or has been compacted, when it ends, when its model changes, and when it waits on the reader.
 //!
 //! The context `SessionStart` and `PostModelSwitch` hooks give reaches the model as a notice at the start of the next prompt, like the other context that changes during a conversation, so the system prompt and tool list stay byte for byte the same and the provider's prompt cache keeps them.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use omc_extensions::{ExtensionHooks, Extensions};
 use omc_hooks::{Engine, HookEvent};
 use tokio::sync::watch;
 
@@ -13,6 +14,9 @@ pub(crate) const IDLE_AFTER: Duration = Duration::from_secs(60);
 
 /// The tag the context of `SessionStart` hooks is told to the model in.
 pub(crate) const START_TAG: &str = "session-start-hook";
+
+/// The tag the context extensions give when the conversation starts is told to the model in.
+pub(crate) const EXTENSION_START_TAG: &str = "session-start-extension";
 
 /// The tag the context of `PostModelSwitch` hooks is told to the model in.
 pub(crate) const SWITCH_TAG: &str = "model-switch-hook";
@@ -36,6 +40,8 @@ pub(crate) struct Lifecycle {
     engine: Mutex<Option<Arc<Engine>>>,
     /// The last run of hooks for each tag, until a turn that told the model its context ended.
     starting: Mutex<Vec<Notice>>,
+    /// The extensions of the conversation, when it has any.
+    extensions: Mutex<Option<Arc<Extensions>>>,
 }
 
 impl Lifecycle {
@@ -52,17 +58,51 @@ impl Lifecycle {
             .clone()
     }
 
+    /// Makes `extensions` the extensions of the conversation; nothing for none.
+    pub(crate) fn set_extensions(&self, extensions: Option<Arc<Extensions>>) {
+        *self
+            .extensions
+            .lock()
+            .unwrap_or_else(|held| held.into_inner()) = extensions;
+    }
+
+    /// The extensions of the conversation, as the main agent runs them, when it has any.
+    pub(crate) fn extensions(&self) -> Option<ExtensionHooks> {
+        self.extensions
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .clone()
+            .map(ExtensionHooks::new)
+    }
+
+    /// The extensions of the conversation, when one of them wants `event`.
+    fn extensions_for(&self, event: &str) -> Option<ExtensionHooks> {
+        self.extensions()
+            .filter(|extensions| extensions.wants(event))
+    }
+
     /// The hooks that run now, when any of them runs at `event`.
     fn engine_for(&self, event: HookEvent) -> Option<Arc<Engine>> {
         self.engine().filter(|engine| engine.has(event))
     }
 
     /// Starts the `SessionStart` hooks for `source` (`startup`, `resume` or `compact`), told the `model`, on a task of their own, and keeps their context for the next prompt in place of any earlier one; does nothing when no hook runs at that event or there is no runtime to run them on.
+    ///
+    /// The extensions that want `session_start` are asked too, on a task of their own, and the context they give is kept the same way.
     pub(crate) fn begin(&self, source: &'static str, model: Option<String>) {
-        let Some(engine) = self.engine_for(HookEvent::SessionStart) else {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        if let Some(extensions) = self.extensions_for("session_start") {
+            let (done, starting) = watch::channel(None);
+            let model = model.clone();
+            runtime.spawn(async move {
+                let context = extensions.session_start(source, model.as_deref()).await;
+                let _ = done.send(Some(context));
+            });
+            self.keep(EXTENSION_START_TAG, starting);
+        }
+        let Some(engine) = self.engine_for(HookEvent::SessionStart) else {
             return;
         };
         let (done, starting) = watch::channel(None);
@@ -74,11 +114,17 @@ impl Lifecycle {
     }
 
     /// Starts the `PostModelSwitch` hooks for a switch from the model `from` to `to` on a task of their own, and keeps their context for the next prompt in place of that of an earlier switch; does nothing when no hook runs at that event or there is no runtime to run them on.
+    ///
+    /// The extensions that want `model_change` are told on a task of their own.
     pub(crate) fn switched(&self, from: String, to: String) {
-        let Some(engine) = self.engine_for(HookEvent::PostModelSwitch) else {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        if let Some(extensions) = self.extensions_for("model_change") {
+            let (from, to) = (from.clone(), to.clone());
+            runtime.spawn(async move { extensions.model_change(&from, &to).await });
+        }
+        let Some(engine) = self.engine_for(HookEvent::PostModelSwitch) else {
             return;
         };
         let (done, switching) = watch::channel(None);
@@ -125,20 +171,35 @@ impl Lifecycle {
 
     /// Tells the `Notification` hooks, on a task of their own, that crab waits on the reader: `kind` is the kind of notification, `title` and `message` what it says. Does nothing when no hook runs at that event.
     pub(crate) fn notify(&self, kind: &'static str, title: &str, message: &str) {
-        let Some(engine) = self.engine_for(HookEvent::Notification) else {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        if let Some(extensions) = self.extensions_for("notification") {
+            let (title, message) = (title.to_owned(), message.to_owned());
+            runtime.spawn(async move { extensions.notification(kind, &title, &message).await });
+        }
+        let Some(engine) = self.engine_for(HookEvent::Notification) else {
             return;
         };
         let (title, message) = (title.to_owned(), message.to_owned());
         runtime.spawn(async move { engine.notification(kind, &title, &message).await });
     }
 
-    /// Runs the `SessionEnd` hooks of the hooks that run now for `reason`, and waits for them; each may run only as long as its timeout allows.
+    /// Runs the `SessionEnd` hooks of the hooks that run now for `reason`, and waits for them; each may run only as long as its timeout allows. The extensions are told `session_end`, then shut down and forgotten.
     pub(crate) async fn end(&self, reason: &str) {
         if let Some(engine) = self.engine_for(HookEvent::SessionEnd) {
             engine.session_end(reason).await;
+        }
+        let extensions = self
+            .extensions
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .take();
+        if let Some(extensions) = extensions {
+            ExtensionHooks::new(extensions.clone())
+                .session_end(reason)
+                .await;
+            extensions.shutdown().await;
         }
     }
 }

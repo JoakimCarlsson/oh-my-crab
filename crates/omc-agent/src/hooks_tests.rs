@@ -550,3 +550,54 @@ async fn a_batch_check_stops_the_turn() {
             .any(|(_, event, what)| *event == "batch" && what == "1")
     );
 }
+
+/// Chained checks run in order: a rewrite of the first is what the second sees, the second's denial wins, and both notes after a call are kept.
+#[tokio::test]
+async fn chained_checks_run_in_order() {
+    let first = Scripted {
+        before: vec![(
+            "write",
+            Screened {
+                gate: Gate::Allow,
+                arguments: Some(json!({"path": "b.txt", "content": "x"})),
+                ..Screened::default()
+            },
+        )],
+        after: Some("first"),
+        ..Scripted::default()
+    };
+    let second = Scripted {
+        after: Some("second"),
+        ..Scripted::default()
+    };
+    let chained = crate::Chained::of(vec![Arc::new(first), Arc::new(second)]).unwrap();
+    let call = ToolCall {
+        id: "w".into(),
+        name: "write".into(),
+        arguments: json!({"path": "a.txt", "content": "x"}),
+    };
+    let screened = chained.before_tool(&call, &call.arguments).await;
+    assert_eq!(screened.gate, Gate::Allow);
+    assert_eq!(
+        screened.arguments,
+        Some(json!({"path": "b.txt", "content": "x"}))
+    );
+    let followed = chained.after_tool(&call, &call.arguments, "ok").await;
+    assert_eq!(followed.note.as_deref(), Some("first\n\nsecond"));
+    let denying = Scripted {
+        before: vec![(
+            "write",
+            Screened {
+                gate: Gate::Deny("no".into()),
+                ..Screened::default()
+            },
+        )],
+        ..Scripted::default()
+    };
+    let chained =
+        crate::Chained::of(vec![Arc::new(Scripted::default()), Arc::new(denying)]).unwrap();
+    assert_eq!(
+        chained.before_tool(&call, &call.arguments).await.gate,
+        Gate::Deny("no".into())
+    );
+}

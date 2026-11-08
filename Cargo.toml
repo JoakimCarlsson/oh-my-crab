@@ -12,6 +12,7 @@ readme = "README.md"
 
 [workspace.dependencies]
 omc-agent = { version = "0.1.0", path = "crates/omc-agent" }
+omc-extensions = { version = "0.1.0", path = "crates/omc-extensions" }
 omc-auth = { version = "0.1.0", path = "crates/omc-auth" }
 omc-providers = { version = "0.1.0", path = "crates/omc-providers" }
 omc-script = { version = "0.1.0", path = "crates/omc-script" }

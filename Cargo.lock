@@ -1536,6 +1536,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "omc-extensions"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "dirs",
+ "futures-util",
+ "omc-agent",
+ "omc-mcp",
+ "omc-providers",
+ "omc-tools",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "omc-hooks"
 version = "0.1.0"
 dependencies = [
@@ -1546,6 +1561,7 @@ dependencies = [
  "libc",
  "omc-agent",
  "omc-context",
+ "omc-extensions",
  "omc-mcp",
  "omc-memory",
  "omc-providers",
@@ -1640,6 +1656,7 @@ dependencies = [
  "omc-auth",
  "omc-context",
  "omc-dap",
+ "omc-extensions",
  "omc-hooks",
  "omc-lsp",
  "omc-mcp",

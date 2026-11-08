@@ -26,7 +26,7 @@ pub use agent::{
 pub use approval::{ApprovalRequest, Approvals, Decision, Keeper, Place, Prompter, Standing};
 pub use compaction::{COMPACT, context, replayed};
 pub use hooks::{
-    Batched, CompactTrigger, Compacting, Followed, Gate, Hooks, MAX_STOP_IN_A_ROW,
+    Batched, Chained, CompactTrigger, Compacting, Followed, Gate, Hooks, MAX_STOP_IN_A_ROW,
     MAX_STOP_PER_TURN, Permit, Screened,
 };
 pub use journal::{

@@ -7,6 +7,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use omc_context::{Discovered, Locations, discover};
+use omc_extensions::Extension;
 use omc_mcp::Server;
 use omc_memory::Project;
 use omc_wire::{Input, Skipped};
@@ -195,6 +196,8 @@ pub struct Assessment {
     pub project_hooks: Vec<String>,
     /// The project's tool servers that may be reached: all of them when its hooks run, none otherwise.
     pub servers: Vec<Server>,
+    /// The project's extensions that may be started: all of them when its hooks run, none otherwise.
+    pub extensions: Vec<Extension>,
     /// What could not be read.
     pub problems: Vec<String>,
 }
@@ -216,7 +219,7 @@ pub fn project_hooks(hooks: &[Hook]) -> Vec<String> {
     listed
 }
 
-/// What a conversation for `locations` may use: its hooks, from the user's own file `own` and the places [`config::load`] reads, its project's tool servers, which wait for trust as its hooks do and are listed with them as hooks to trust, and its instruction files, skills and agent definitions less those `disabled` names, as the trust `store` records for its project, or as `vouched` says when the conversation was trusted without a record.
+/// What a conversation for `locations` may use: its hooks, from the user's own file `own` and the places [`config::load`] reads, its project's tool servers and extensions, which wait for trust as its hooks do and are listed with them as hooks to trust, and its instruction files, skills and agent definitions less those `disabled` names, as the trust `store` records for its project, or as `vouched` says when the conversation was trusted without a record.
 pub fn assess(
     locations: &Locations,
     own: Option<&Path>,
@@ -231,8 +234,10 @@ pub fn assess(
     };
     let loaded = config::load(&full, own);
     let declared = omc_mcp::config::project_servers(&full.ancestors());
+    let extensions = omc_extensions::config::project_extensions(&full.ancestors());
     let mut listed = project_hooks(&loaded.hooks);
     listed.extend(declared.servers.iter().map(server_entry));
+    listed.extend(extensions.extensions.iter().map(Extension::entry));
     listed.sort();
     listed.dedup();
     let standing = if vouched || trusted_by_environment() {
@@ -258,6 +263,11 @@ pub fn assess(
     let mut problems = loaded.problems.clone();
     let servers = if standing.runs_project_hooks() {
         declared.servers.clone()
+    } else {
+        Vec::new()
+    };
+    let started = if standing.runs_project_hooks() {
+        extensions.extensions.clone()
     } else {
         Vec::new()
     };
@@ -296,8 +306,20 @@ pub fn assess(
                 path: server.file.clone().unwrap_or_default(),
             }),
     );
+    skipped.extend(
+        extensions
+            .extensions
+            .iter()
+            .filter(|extension| !started.contains(extension))
+            .map(|extension| Skipped {
+                kind: Input::Hook,
+                name: extension.label(),
+                path: extension.file.clone(),
+            }),
+    );
     if standing.reads_project() {
         problems.extend(declared.problems);
+        problems.extend(extensions.problems);
     }
     if !standing.reads_project() {
         skipped.extend(left_out(
@@ -314,6 +336,7 @@ pub fn assess(
         skipped,
         project_hooks: listed,
         servers,
+        extensions: started,
         problems,
     }
 }
@@ -558,6 +581,46 @@ mod tests {
         assert_eq!(changed.standing, Standing::Changed);
         assert!(changed.servers.is_empty());
         assert_eq!(changed.skipped[0].name, "tool server memo: curl-evil serve");
+    }
+
+    /// A project's extensions wait for trust as its hooks do: listed as hooks while untrusted, started once trusted, and waiting again when one changes.
+    #[test]
+    fn extensions_wait_for_trust() {
+        let base = scratch("trust-extensions");
+        let main = base.join("repo");
+        repository(&main);
+        let file = |command: &str| {
+            format!(r#"{{"extensions":{{"guard":{{"command":"{command}","args":["guard.py"]}}}}}}"#)
+        };
+        put(&main, ".oh-my-crab/extensions.json", &file("python3"));
+        let store = TrustStore::new(base.join("data/trust.json"));
+        let at = || assess(&locations(&base, &main), None, Some(&store), false, &[]);
+        let untrusted = at();
+        assert!(untrusted.extensions.is_empty());
+        assert_eq!(untrusted.skipped.len(), 1);
+        assert_eq!(untrusted.skipped[0].kind, Input::Hook);
+        assert_eq!(
+            untrusted.skipped[0].name,
+            "extension guard: python3 guard.py"
+        );
+        assert_eq!(
+            untrusted.project_hooks,
+            ["Extension\tguard\tpython3 guard.py"]
+        );
+        store
+            .set(&untrusted.project, true, untrusted.project_hooks.clone())
+            .unwrap();
+        let trusted = at();
+        assert_eq!(trusted.standing, Standing::Trusted);
+        assert_eq!(trusted.extensions.len(), 1);
+        assert_eq!(
+            trusted.extensions[0].folder.as_deref(),
+            Some(main.as_path())
+        );
+        put(&main, ".oh-my-crab/extensions.json", &file("curl"));
+        let changed = at();
+        assert_eq!(changed.standing, Standing::Changed);
+        assert!(changed.extensions.is_empty());
     }
 
     /// A project with nothing of its own to leave out has nothing skipped, whatever its standing.

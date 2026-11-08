@@ -213,3 +213,197 @@ pub(crate) fn with_note(mut text: String, note: &str) -> String {
     text.push_str("\n</hook-note>");
     text
 }
+
+/// Several sets of checks run as one, in order: the shell hooks and the extensions of a conversation, for instance.
+///
+/// Before a call, each set sees the arguments the sets before it left; a denial wins over asking and asking over allowing. After a call, each sees the result the sets before it left. Every note is kept, in order, and the first reason to stop the turn wins.
+pub struct Chained {
+    /// The sets of checks, in the order they run.
+    links: Vec<Arc<dyn Hooks>>,
+}
+
+impl Chained {
+    /// The checks of `links`, run in that order; nothing when there are none, and the one set itself when there is one.
+    pub fn of(links: Vec<Arc<dyn Hooks>>) -> Option<Arc<dyn Hooks>> {
+        match links.len() {
+            0 => None,
+            1 => links.into_iter().next(),
+            _ => Some(Arc::new(Self { links })),
+        }
+    }
+}
+
+/// `parts` joined by blank lines, or nothing when there are none.
+fn joined(parts: Vec<String>) -> Option<String> {
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+#[async_trait]
+impl Hooks for Chained {
+    /// Runs each set in turn on the arguments the ones before it left, stopping at the first denial.
+    async fn before_tool(&self, call: &ToolCall, arguments: &Value) -> Screened {
+        let mut current = arguments.clone();
+        let mut rewritten = None;
+        let mut notes = Vec::new();
+        let mut halt = None;
+        let mut gate = Gate::Pass;
+        for link in &self.links {
+            let screened = link.before_tool(call, &current).await;
+            if let Some(arguments) = screened.arguments {
+                current = arguments.clone();
+                rewritten = Some(arguments);
+            }
+            notes.extend(screened.note);
+            halt = halt.or(screened.halt);
+            gate = match (gate, screened.gate) {
+                (_, Gate::Deny(reason)) => {
+                    gate = Gate::Deny(reason);
+                    break;
+                }
+                (Gate::Ask, _) | (_, Gate::Ask) => Gate::Ask,
+                (Gate::Allow, _) | (_, Gate::Allow) => Gate::Allow,
+                _ => Gate::Pass,
+            };
+        }
+        Screened {
+            gate,
+            arguments: rewritten,
+            note: joined(notes),
+            halt,
+        }
+    }
+
+    /// Runs each set in turn on the result the ones before it left.
+    async fn after_tool(&self, call: &ToolCall, arguments: &Value, output: &str) -> Followed {
+        let mut current = output.to_owned();
+        let mut replaced = None;
+        let mut notes = Vec::new();
+        let mut halt = None;
+        for link in &self.links {
+            let followed = link.after_tool(call, arguments, &current).await;
+            if let Some(output) = followed.output {
+                current = output.clone();
+                replaced = Some(output);
+            }
+            notes.extend(followed.note);
+            halt = halt.or(followed.halt);
+        }
+        Followed {
+            note: joined(notes),
+            output: replaced,
+            halt,
+        }
+    }
+
+    /// Runs each set on the failure, keeping every note.
+    async fn after_tool_failed(
+        &self,
+        call: &ToolCall,
+        arguments: &Value,
+        error: &str,
+        took: Duration,
+    ) -> Followed {
+        let mut notes = Vec::new();
+        let mut halt = None;
+        for link in &self.links {
+            let followed = link.after_tool_failed(call, arguments, error, took).await;
+            notes.extend(followed.note);
+            halt = halt.or(followed.halt);
+        }
+        Followed {
+            note: joined(notes),
+            output: None,
+            halt,
+        }
+    }
+
+    /// Asks each set in turn: the first denial refuses the call; otherwise the last allowance runs it, with the rules of every allowance.
+    async fn permission_request(&self, call: &ToolCall, arguments: &Value) -> Permit {
+        let mut allowed: Option<(Option<Value>, Vec<String>)> = None;
+        for link in &self.links {
+            match link.permission_request(call, arguments).await {
+                Permit::Pass => {}
+                Permit::Deny { reason, halt } => return Permit::Deny { reason, halt },
+                Permit::Allow { arguments, rules } => {
+                    let (kept, mut all) = allowed.take().unwrap_or_default();
+                    all.extend(rules);
+                    allowed = Some((arguments.or(kept), all));
+                }
+            }
+        }
+        match allowed {
+            Some((arguments, rules)) => Permit::Allow { arguments, rules },
+            None => Permit::Pass,
+        }
+    }
+
+    /// Runs each set on the batch, keeping every note.
+    async fn after_batch(&self, calls: &[ToolCall], results: &[ToolResult]) -> Batched {
+        let mut notes = Vec::new();
+        let mut halt = None;
+        for link in &self.links {
+            let batched = link.after_batch(calls, results).await;
+            notes.extend(batched.note);
+            halt = halt.or(batched.halt);
+        }
+        Batched {
+            note: joined(notes),
+            halt,
+        }
+    }
+
+    /// Tells every set of the reply.
+    async fn replied(&self, reply: &Reply) {
+        for link in &self.links {
+            link.replied(reply).await;
+        }
+    }
+
+    /// Tells every set of the compaction.
+    async fn after_compact(&self, trigger: CompactTrigger, summary: &str) {
+        for link in &self.links {
+            link.after_compact(trigger, summary).await;
+        }
+    }
+
+    /// The reasons every set gives to go on, joined; nothing when none gives one.
+    async fn stop(&self, answer: &str, again: bool) -> Option<String> {
+        let mut reasons = Vec::new();
+        for link in &self.links {
+            reasons.extend(link.stop(answer, again).await);
+        }
+        joined(reasons)
+    }
+
+    /// Blocked when any set blocks; otherwise going on with the instructions of every set.
+    async fn before_compact(&self, trigger: CompactTrigger, focus: Option<&str>) -> Compacting {
+        let mut added = Vec::new();
+        for link in &self.links {
+            match link.before_compact(trigger, focus).await {
+                Compacting::Blocked(reason) => return Compacting::Blocked(reason),
+                Compacting::Go(instructions) => added.extend(instructions),
+            }
+        }
+        Compacting::Go(joined(added))
+    }
+
+    /// The context of every set, joined.
+    async fn subagent_start(&self) -> Option<String> {
+        let mut added = Vec::new();
+        for link in &self.links {
+            added.extend(link.subagent_start().await);
+        }
+        joined(added)
+    }
+
+    /// Every set, run for the subagent.
+    fn for_subagent(&self, id: &str, kind: &str) -> Arc<dyn Hooks> {
+        Arc::new(Self {
+            links: self
+                .links
+                .iter()
+                .map(|link| link.for_subagent(id, kind))
+                .collect(),
+        })
+    }
+}
