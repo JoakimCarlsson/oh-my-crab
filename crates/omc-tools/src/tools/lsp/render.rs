@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::language::message;
-use crate::{Diagnostic, Location, Sandbox, Severity, Symbol};
+use crate::{CodeAction, Diagnostic, Location, Sandbox, ServerStatus, Severity, Symbol};
 
 /// The most places a lookup shows.
 const MAX_LOCATIONS: usize = 100;
@@ -244,12 +244,93 @@ pub(super) fn diagnostics(sandbox: &Sandbox, scope: &str, mut found: Vec<Diagnos
     out
 }
 
-/// The lines of `old` that differ in `new`, as removed and added lines under the number of the line, at most `most` of them; for a rename, which changes lines without adding or removing any, this is the whole change.
+/// The code actions `offered` for `what`, numbered from one as they are applied, each with its kind and whether it is preferred or disabled.
+pub(super) fn code_actions(what: &str, offered: &[CodeAction]) -> String {
+    if offered.is_empty() {
+        return format!("No code actions offered at {what}.");
+    }
+    let mut out = format!("{} code action(s) at {what}:", offered.len());
+    for (index, action) in offered.iter().enumerate() {
+        let _ = write!(out, "\n{:>3}. {}", index + 1, action.title);
+        if let Some(kind) = action.kind.as_deref().filter(|kind| !kind.is_empty()) {
+            let _ = write!(out, "  [{kind}]");
+        }
+        if action.preferred {
+            out.push_str("  (preferred)");
+        }
+        if let Some(reason) = &action.disabled {
+            let _ = write!(out, "  (disabled: {reason})");
+        }
+    }
+    out.push_str("\nApply one with the same call and apply: <number>, best with title as listed.");
+    out
+}
+
+/// The language servers `servers` under `heading`, each with its state, its languages and anything more said about it.
+pub(super) fn servers(heading: &str, servers: &[ServerStatus]) -> String {
+    if servers.is_empty() {
+        return format!("{heading}: no language servers.");
+    }
+    let mut out = format!("{heading}:");
+    for server in servers {
+        let _ = write!(out, "\n{}: {}", server.name, server.state);
+        if !server.languages.is_empty() {
+            let _ = write!(out, " ({})", server.languages.join(", "));
+        }
+        if let Some(detail) = server.detail.as_deref().filter(|detail| !detail.is_empty()) {
+            let _ = write!(out, "; {detail}");
+        }
+    }
+    out
+}
+
+/// How many lines differ between `old` and `new`: those that differ where both have a line, and those one has beyond the other, once the lines they start and end with alike are left out.
+pub(super) fn changed_line_count(old: &str, new: &str) -> usize {
+    let (old_lines, new_lines): (Vec<&str>, Vec<&str>) =
+        (old.lines().collect(), new.lines().collect());
+    let (before, after) = alike_ends(&old_lines, &new_lines);
+    (old_lines.len() - before - after).max(new_lines.len() - before - after)
+}
+
+/// How many lines `old` and `new` start with alike, and how many of the rest they end with alike.
+fn alike_ends(old: &[&str], new: &[&str]) -> (usize, usize) {
+    let before = old
+        .iter()
+        .zip(new)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let after = old[before..]
+        .iter()
+        .rev()
+        .zip(new[before..].iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    (before, after)
+}
+
+/// The lines of `old` that differ in `new`, as removed and added lines under the number of the line, at most `most` of them; for a rename, which changes lines without adding or removing any, this is the whole change. When lines are added or removed, the stretch between the lines both start and end with alike is shown as removed and then added, at most `most` lines of each.
 pub(super) fn changed_lines(old: &str, new: &str, most: usize) -> String {
     let old_lines: Vec<&str> = old.lines().collect();
     let new_lines: Vec<&str> = new.lines().collect();
     if old_lines.len() != new_lines.len() {
-        return format!("  ({} line(s) become {})", old_lines.len(), new_lines.len());
+        let (before, after) = alike_ends(&old_lines, &new_lines);
+        let removed = &old_lines[before..old_lines.len() - after];
+        let added = &new_lines[before..new_lines.len() - after];
+        let mut out = format!(
+            "\n  @@ line {}: {} line(s) become {}",
+            before + 1,
+            removed.len(),
+            added.len()
+        );
+        for (sign, lines) in [("-", removed), ("+", added)] {
+            for line in lines.iter().take(most) {
+                let _ = write!(out, "\n  {sign} {line}");
+            }
+            if lines.len() > most {
+                let _ = write!(out, "\n  [{} more {sign} line(s)]", lines.len() - most);
+            }
+        }
+        return out;
     }
     let changed: Vec<usize> = (0..old_lines.len())
         .filter(|index| old_lines[*index] != new_lines[*index])

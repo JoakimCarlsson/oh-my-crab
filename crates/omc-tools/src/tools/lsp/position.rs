@@ -110,6 +110,13 @@ pub(super) fn find_anywhere(text: &str, symbol: &str) -> Result<Found, String> {
         .ok_or_else(|| format!("`{symbol}` is not written anywhere in the file as a whole word"))
 }
 
+/// How many characters the part of `symbol` a language server is pointed at has: its last part when it is qualified, as [`find`] places it, otherwise all of it.
+pub(super) fn named_length(symbol: &str) -> u32 {
+    let symbol = symbol.trim();
+    let length = symbol.chars().count() - last_part(symbol);
+    u32::try_from(length).unwrap_or(u32::MAX)
+}
+
 /// How many characters into `symbol` its last part starts: after the last `::`, `.`, `->` or `#` when it is qualified, otherwise nought.
 fn last_part(symbol: &str) -> usize {
     let cut = ["::", ".", "->", "#"]

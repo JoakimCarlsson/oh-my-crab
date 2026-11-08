@@ -26,7 +26,10 @@ pub use jobs::{Finished, Jobs};
 pub use language::{
     DIAGNOSTICS_WAIT, Diagnostic, FORMAT_WAIT, LanguageService, Languages, Severity,
 };
-pub use navigation::{LanguageError, Location, Lookup, Renamed, Spot, Symbol};
+pub use navigation::{
+    Applied, Chosen, CodeAction, LanguageError, Location, Lookup, Renamed, ServerStatus, Spot,
+    Symbol,
+};
 pub use notebook::{NOTEBOOK_LIMIT, Notebook};
 pub use program::find_program;
 pub use registry::Registry;

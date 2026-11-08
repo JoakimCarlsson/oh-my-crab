@@ -73,15 +73,59 @@ pub struct Symbol {
     pub location: Location,
 }
 
-/// One file a rename changes.
+/// One file a rename, a code action or the move of another file changes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Renamed {
     /// The file, as an absolute path.
     pub path: PathBuf,
-    /// Its whole text with the rename made.
+    /// Its whole text with the change made.
     pub text: String,
-    /// How many places in it the rename changes.
+    /// How many places in it the change touches.
     pub edits: usize,
+}
+
+/// A change a language server offers for a stretch of a file: a quick fix, a refactoring, organising imports and so on.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodeAction {
+    /// What the server calls it, as the reader would see it in an editor.
+    pub title: String,
+    /// Its kind, such as `quickfix` or `refactor.extract`, when the server says.
+    pub kind: Option<String>,
+    /// Whether the server prefers it among those offered, as the fix it would apply first.
+    pub preferred: bool,
+    /// Why it cannot be applied now, when the server offers it but says so.
+    pub disabled: Option<String>,
+}
+
+/// What applying a code action changes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Applied {
+    /// The title of the action applied.
+    pub title: String,
+    /// The files it changes, each with its whole new text made from its text on disk now; nothing is written.
+    pub files: Vec<Renamed>,
+}
+
+/// The code action to apply among those offered for a stretch of a file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Chosen {
+    /// Its place in the list offered, counted from one.
+    pub index: usize,
+    /// Its title, when the caller knows it; an action of that title is taken over the one at `index` when the list has changed.
+    pub title: Option<String>,
+}
+
+/// One language server of the conversation and how it stands.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServerStatus {
+    /// The name it is known by, such as `rust-analyzer`.
+    pub name: String,
+    /// The languages it reads.
+    pub languages: Vec<String>,
+    /// How it stands, in a word or two: `running`, `loading`, `starting`, `stopped`, `failed`, `not started` or `not installed`.
+    pub state: String,
+    /// More about it, such as why it failed or how many times it was started again, when there is more to say.
+    pub detail: Option<String>,
 }
 
 /// Why a language service could not answer a question about code.

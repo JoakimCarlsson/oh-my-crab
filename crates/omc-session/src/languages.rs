@@ -8,10 +8,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use omc_tools::{
-    Diagnostic, FORMAT_WAIT, LanguageError, LanguageService, Location, Lookup, Renamed, Spot,
-    Symbol,
+    Applied, Chosen, CodeAction, Diagnostic, FORMAT_WAIT, LanguageError, LanguageService, Location,
+    Lookup, Renamed, ServerStatus, Spot, Symbol,
 };
-use omc_wire::{Event, LanguageAnswer, LanguageAsk, LanguageRequest, Place, Stretch, SymbolInfo};
+use omc_wire::{
+    ActionInfo, Event, LanguageAnswer, LanguageAsk, LanguageRequest, Place, ServerInfo, Stretch,
+    SymbolInfo,
+};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
@@ -218,6 +221,140 @@ impl LanguageService for ClientLanguages {
                 "the client's language services did not answer in time".to_owned(),
             )),
         }
+    }
+
+    /// Asks the client to format the whole file at `path`, as after a write, which any client offering language services answers; or, of a client that navigates code, only the stretch `range`.
+    async fn reformat(
+        &self,
+        path: &Path,
+        range: Option<&Location>,
+    ) -> Result<Option<String>, LanguageError> {
+        let Some(range) = range else {
+            return Ok(self.format(path).await);
+        };
+        let ask = LanguageAsk::FormatRange {
+            range: stretch(range),
+        };
+        match self.navigate(ask).await? {
+            LanguageAnswer::Formatted { text } => Ok(text),
+            _ => Err(answered_otherwise("format range")),
+        }
+    }
+
+    /// Asks the client for the code actions offered for `range`, or refuses when it does not navigate code.
+    async fn code_actions(
+        &self,
+        range: &Location,
+        only: &[String],
+    ) -> Result<Vec<CodeAction>, LanguageError> {
+        let ask = LanguageAsk::CodeActions {
+            range: stretch(range),
+            only: only.to_vec(),
+        };
+        match self.navigate(ask).await? {
+            LanguageAnswer::Actions { actions } => Ok(actions.into_iter().map(action).collect()),
+            _ => Err(answered_otherwise("code actions")),
+        }
+    }
+
+    /// Asks the client for the edits applying the chosen code action makes, and makes them to the texts on disk without writing them; refuses when the client does not navigate code.
+    async fn apply_code_action(
+        &self,
+        range: &Location,
+        only: &[String],
+        chosen: &Chosen,
+    ) -> Result<Applied, LanguageError> {
+        let ask = LanguageAsk::ApplyCodeAction {
+            range: stretch(range),
+            only: only.to_vec(),
+            index: u32::try_from(chosen.index).unwrap_or(u32::MAX),
+            title: chosen.title.clone(),
+        };
+        match self.navigate(ask).await? {
+            LanguageAnswer::Applied { title, files } => Ok(Applied {
+                title,
+                files: crate::edits::renamed(files).map_err(LanguageError::Failed)?,
+            }),
+            _ => Err(answered_otherwise("apply code action")),
+        }
+    }
+
+    /// Asks the client for the edits moving the file at `from` to `to` makes, and makes them to the texts on disk without writing them; refuses when the client does not navigate code.
+    async fn rename_file(&self, from: &Path, to: &Path) -> Result<Vec<Renamed>, LanguageError> {
+        let ask = LanguageAsk::WillRenameFile {
+            from: from.to_path_buf(),
+            to: to.to_path_buf(),
+        };
+        match self.navigate(ask).await? {
+            LanguageAnswer::Edits { files } => {
+                crate::edits::renamed(files).map_err(LanguageError::Failed)
+            }
+            _ => Err(answered_otherwise("rename file")),
+        }
+    }
+
+    /// Tells a client that navigates code that the file at `from` is now at `to`; a client that does not is told nothing.
+    async fn file_renamed(&self, from: &Path, to: &Path) {
+        let ask = LanguageAsk::FileRenamed {
+            from: from.to_path_buf(),
+            to: to.to_path_buf(),
+        };
+        let _ = self.navigate(ask).await;
+    }
+
+    /// Asks the client which servers it runs and how they stand, or refuses when it does not navigate code.
+    async fn status(&self) -> Result<Vec<ServerStatus>, LanguageError> {
+        match self.navigate(LanguageAsk::Status {}).await? {
+            LanguageAnswer::Servers { servers } => Ok(servers.into_iter().map(server).collect()),
+            _ => Err(answered_otherwise("status")),
+        }
+    }
+
+    /// Asks the client to restart the server named `server`, or that of the file at `near`, or all of them, or refuses when it does not navigate code.
+    async fn reload(
+        &self,
+        server_name: Option<&str>,
+        near: Option<&Path>,
+    ) -> Result<Vec<ServerStatus>, LanguageError> {
+        let ask = LanguageAsk::Reload {
+            server: server_name.map(str::to_owned),
+            near: near.map(Path::to_path_buf),
+        };
+        match self.navigate(ask).await? {
+            LanguageAnswer::Servers { servers } => Ok(servers.into_iter().map(server).collect()),
+            _ => Err(answered_otherwise("reload")),
+        }
+    }
+}
+
+/// `location` as the wire places a stretch.
+fn stretch(location: &Location) -> Stretch {
+    Stretch {
+        path: location.path.clone(),
+        line: location.line,
+        column: location.column,
+        end_line: location.end_line,
+        end_column: location.end_column,
+    }
+}
+
+/// The code action `info` the client offered, as the tools know it.
+fn action(info: ActionInfo) -> CodeAction {
+    CodeAction {
+        title: info.title,
+        kind: info.kind,
+        preferred: info.preferred,
+        disabled: info.disabled,
+    }
+}
+
+/// The server `info` the client described, as the tools know it.
+fn server(info: ServerInfo) -> ServerStatus {
+    ServerStatus {
+        name: info.name,
+        languages: info.languages,
+        state: info.state,
+        detail: info.detail,
     }
 }
 

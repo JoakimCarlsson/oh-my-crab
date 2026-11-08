@@ -74,6 +74,8 @@ struct Heard {
     news: Notify,
     /// Whether the server has stopped talking, having exited or closed its output.
     stopped: AtomicBool,
+    /// The workspace edits the server asked to have made since they were last taken, as it wrote them, which a command it carries out asks for instead of answering with them.
+    applied: Mutex<Vec<Value>>,
 }
 
 /// A language server that has been started and told what it works on.
@@ -94,8 +96,10 @@ pub(crate) struct Client {
     started: Instant,
     /// Whether the server has once been seen with no work to do for a while, which it is when it has loaded the project.
     loaded: AtomicBool,
-    /// The server's process, which is killed when the client is dropped.
-    _child: Child,
+    /// Held while the server carries out a command, so that the edits it asks for meanwhile are those of that command alone.
+    commanding: tokio::sync::Mutex<()>,
+    /// The server's process, which is killed when the client is dropped or stopped.
+    child: Mutex<Child>,
 }
 
 impl Client {
@@ -131,7 +135,8 @@ impl Client {
             capabilities: Value::Null,
             started: Instant::now(),
             loaded: AtomicBool::new(false),
-            _child: child,
+            commanding: tokio::sync::Mutex::new(()),
+            child: Mutex::new(child),
         };
         let answer = client
             .request("initialize", initialize_params(root), INITIALIZE_WAIT)
@@ -283,15 +288,7 @@ impl Client {
         let edits = self
             .request(
                 "textDocument/formatting",
-                json!({
-                    "textDocument": {"uri": uri},
-                    "options": {
-                        "tabSize": 4,
-                        "insertSpaces": true,
-                        "trimTrailingWhitespace": true,
-                        "insertFinalNewline": true,
-                    },
-                }),
+                json!({"textDocument": {"uri": uri}, "options": format_options()}),
                 wait,
             )
             .await
@@ -444,6 +441,138 @@ impl Client {
         }
     }
 
+    /// The titles of the work the server reports doing now, such as loading or checking the project; empty when it is doing none.
+    pub(crate) fn work(&self) -> Vec<String> {
+        lock(&self.heard.working).values().cloned().collect()
+    }
+
+    /// What the server last said is wrong with the file at `uri`, as it said it.
+    pub(crate) fn published_for(&self, uri: &str) -> Vec<Value> {
+        lock(&self.heard.published)
+            .get(uri)
+            .map(|published| published.diagnostics.clone())
+            .unwrap_or_default()
+    }
+
+    /// `text`, the text of the file at `path` in the language `language`, with only the stretch `range` of the protocol formatted by the server; nothing when it leaves the text as it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns why when the server does not format stretches of files, cannot be told the text, or fails.
+    pub(crate) async fn format_range(
+        &self,
+        path: &Path,
+        language: &str,
+        text: &str,
+        range: Value,
+        wait: Duration,
+    ) -> Result<Option<String>, String> {
+        if !self.can("documentRangeFormattingProvider") {
+            return Err("the server does not format stretches of files".to_owned());
+        }
+        let (uri, ..) = self.sync(path, language, text, false).await?;
+        let edits = self
+            .request(
+                "textDocument/rangeFormatting",
+                json!({"textDocument": {"uri": uri}, "range": range, "options": format_options()}),
+                wait,
+            )
+            .await?;
+        let edits = edits.as_array().cloned().unwrap_or_default();
+        let formatted = apply_edits(text, &edits)
+            .ok_or_else(|| "the server's formatting edits overlap".to_owned())?;
+        Ok((formatted != text).then_some(formatted))
+    }
+
+    /// Whether the server formats whole files.
+    pub(crate) fn formats(&self) -> bool {
+        self.formats
+    }
+
+    /// Has the server carry out `command`, as a command of the protocol with its name and arguments, and returns the workspace edits it asked to have made while it did, which are not made.
+    ///
+    /// # Errors
+    ///
+    /// Returns why when the server fails or does not answer in time.
+    pub(crate) async fn run_command(
+        &self,
+        command: &Value,
+        wait: Duration,
+    ) -> Result<Vec<Value>, String> {
+        let _alone = self.commanding.lock().await;
+        lock(&self.heard.applied).clear();
+        let params = json!({
+            "command": command["command"],
+            "arguments": command.get("arguments").cloned().unwrap_or_else(|| json!([])),
+        });
+        self.ask("workspace/executeCommand", params, wait).await?;
+        Ok(std::mem::take(&mut *lock(&self.heard.applied)))
+    }
+
+    /// Whether the server said, when it started, that its `capability` has `option` set, such as `resolveProvider` of `codeActionProvider`.
+    pub(crate) fn capabilities_say(&self, capability: &str, option: &str) -> bool {
+        self.capabilities[capability][option]
+            .as_bool()
+            .unwrap_or(false)
+    }
+
+    /// Whether the server carries out the command named `name` itself, as it said when it started.
+    pub(crate) fn runs(&self, name: &str) -> bool {
+        self.capabilities["executeCommandProvider"]["commands"]
+            .as_array()
+            .is_some_and(|commands| commands.iter().any(|held| held.as_str() == Some(name)))
+    }
+
+    /// Whether the server takes part in renames of files as `operation` names, `willRename` or `didRename`, as it said when it started.
+    pub(crate) fn takes_part(&self, operation: &str) -> bool {
+        !self.capabilities["workspace"]["fileOperations"][operation].is_null()
+    }
+
+    /// Tells the server, which takes part, that the file at `from` is to be moved to `to`, and returns the workspace edit it asks for first; nothing when it asks for none.
+    ///
+    /// # Errors
+    ///
+    /// Returns why when the server fails or does not answer in time.
+    pub(crate) async fn will_rename(
+        &self,
+        from: &Path,
+        to: &Path,
+        wait: Duration,
+    ) -> Result<Option<Value>, String> {
+        if !self.takes_part("willRename") {
+            return Ok(None);
+        }
+        let params = json!({"files": [{"oldUri": file_uri(from), "newUri": file_uri(to)}]});
+        let edit = self.ask("workspace/willRenameFiles", params, wait).await?;
+        Ok((!edit.is_null()).then_some(edit))
+    }
+
+    /// Tells the server that the file at `from` is now at `to`: closes it where it was, when the server had it open, and, when the server takes part, says it was moved.
+    pub(crate) async fn did_rename(&self, from: &Path, to: &Path) {
+        let old = file_uri(from);
+        if lock(&self.documents).remove(&old).is_some() {
+            let _ = self
+                .notify(
+                    "textDocument/didClose",
+                    json!({"textDocument": {"uri": old}}),
+                )
+                .await;
+        }
+        if self.takes_part("didRename") {
+            let params = json!({"files": [{"oldUri": old, "newUri": file_uri(to)}]});
+            let _ = self.notify("workspace/didRenameFiles", params).await;
+        }
+    }
+
+    /// Asks the server to shut down, waiting up to `wait`, then tells it to exit and ends its process whether it did or not.
+    pub(crate) async fn stop(&self, wait: Duration) {
+        if self.is_running() {
+            let _ = self.request("shutdown", Value::Null, wait).await;
+            let _ = self.notify("exit", Value::Null).await;
+        }
+        let _ = lock(&self.child).start_kill();
+    }
+
     /// Everything the server has said is wrong with any file, by the file's address, as it said it.
     pub(crate) fn published(&self) -> Vec<(String, Vec<Value>)> {
         lock(&self.heard.published)
@@ -479,6 +608,16 @@ fn is_check(title: &str) -> bool {
     title.contains("check") || title.contains("clippy") || title.contains("lint")
 }
 
+/// The options a server is asked to format with: four spaces a level, trailing whitespace trimmed, and a final newline.
+fn format_options() -> Value {
+    json!({
+        "tabSize": 4,
+        "insertSpaces": true,
+        "trimTrailingWhitespace": true,
+        "insertFinalNewline": true,
+    })
+}
+
 /// The parameters of the request that starts a server on the project at `root`: who the client is and what it understands.
 fn initialize_params(root: &Path) -> Value {
     let uri = file_uri(root);
@@ -505,12 +644,27 @@ fn initialize_params(root: &Path) -> Value {
                 "hover": {"dynamicRegistration": false, "contentFormat": ["markdown", "plaintext"]},
                 "documentSymbol": {"dynamicRegistration": false, "hierarchicalDocumentSymbolSupport": true},
                 "rename": {"dynamicRegistration": false, "prepareSupport": false},
+                "rangeFormatting": {"dynamicRegistration": false},
+                "codeAction": {
+                    "dynamicRegistration": false,
+                    "isPreferredSupport": true,
+                    "disabledSupport": true,
+                    "dataSupport": true,
+                    "resolveSupport": {"properties": ["edit"]},
+                    "codeActionLiteralSupport": {"codeActionKind": {"valueSet": [
+                        "", "quickfix", "refactor", "refactor.extract", "refactor.inline",
+                        "refactor.rewrite", "source", "source.organizeImports", "source.fixAll",
+                    ]}},
+                },
             },
             "workspace": {
                 "workspaceFolders": true,
                 "configuration": true,
+                "applyEdit": true,
+                "executeCommand": {"dynamicRegistration": false},
                 "symbol": {"dynamicRegistration": false},
                 "workspaceEdit": {"documentChanges": true},
+                "fileOperations": {"dynamicRegistration": false, "willRename": true, "didRename": true},
             },
             "window": {"workDoneProgress": true},
             "experimental": {"serverStatusNotification": true},
@@ -536,6 +690,10 @@ async fn listen(
                             .as_array()
                             .map_or(0, Vec::len)
                     ]),
+                    "workspace/applyEdit" => {
+                        lock(&heard.applied).push(message["params"]["edit"].clone());
+                        json!({"applied": true})
+                    }
                     _ => Value::Null,
                 };
                 let _ = send(

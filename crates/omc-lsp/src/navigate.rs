@@ -1,9 +1,9 @@
-//! Reading what servers answer to questions about code: places, hovers, symbols and the edits of a rename, put in the harness's terms.
+//! Reading what servers answer to questions about code: places, hovers, symbols, code actions and the edits of a rename, a code action or the move of a file, put in the harness's terms.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use omc_tools::{Location, Renamed, Symbol};
+use omc_tools::{CodeAction, Location, Renamed, Symbol};
 use serde_json::Value;
 
 use crate::client::apply_edits;
@@ -231,30 +231,41 @@ pub(crate) fn workspace_symbols(answer: &Value, texts: &mut Texts) -> Vec<Symbol
 ///
 /// # Errors
 ///
-/// Returns why when the answer would create, move or delete files, names a file that is not on disk, or holds edits that overlap.
+/// As [`edited`].
 pub(crate) fn renamed(answer: &Value) -> Result<Vec<Renamed>, String> {
+    edited(std::slice::from_ref(answer), "rename")
+}
+
+/// The files the workspace edits `edits` of a server change together, each with its whole new text, made from its text on disk now, the edits of each file made to that text all at once; `what` names what they are for, such as `rename`, to the model.
+///
+/// # Errors
+///
+/// Returns why when an edit would create, move or delete files, names a file that is not on disk, or holds edits that overlap.
+pub(crate) fn edited(edits: &[Value], what: &str) -> Result<Vec<Renamed>, String> {
     let mut by_file: Vec<(String, Vec<Value>)> = Vec::new();
     let mut add =
         |uri: &str, edits: &[Value]| match by_file.iter_mut().find(|(seen, _)| seen == uri) {
             Some((_, held)) => held.extend(edits.iter().cloned()),
             None => by_file.push((uri.to_owned(), edits.to_vec())),
         };
-    if let Some(changes) = answer["documentChanges"].as_array() {
-        for change in changes {
-            if change.get("kind").is_some() {
-                return Err(format!(
-                    "the rename would also {} a file, which is not done here; rename the file with bash, then the symbol",
-                    change["kind"].as_str().unwrap_or("change")
-                ));
+    for answer in edits {
+        if let Some(changes) = answer["documentChanges"].as_array() {
+            for change in changes {
+                if change.get("kind").is_some() {
+                    return Err(format!(
+                        "the {what} would also {} a file, which is not done here; move or create the file with rename_file or write, then try again",
+                        change["kind"].as_str().unwrap_or("change")
+                    ));
+                }
+                let Some(uri) = change["textDocument"]["uri"].as_str() else {
+                    continue;
+                };
+                add(uri, change["edits"].as_array().map_or(&[], Vec::as_slice));
             }
-            let Some(uri) = change["textDocument"]["uri"].as_str() else {
-                continue;
-            };
-            add(uri, change["edits"].as_array().map_or(&[], Vec::as_slice));
-        }
-    } else if let Some(changes) = answer["changes"].as_object() {
-        for (uri, edits) in changes {
-            add(uri, edits.as_array().map_or(&[], Vec::as_slice));
+        } else if let Some(changes) = answer["changes"].as_object() {
+            for (uri, edits) in changes {
+                add(uri, edits.as_array().map_or(&[], Vec::as_slice));
+            }
         }
     }
     let mut files = Vec::with_capacity(by_file.len());
@@ -263,11 +274,11 @@ pub(crate) fn renamed(answer: &Value) -> Result<Vec<Renamed>, String> {
             continue;
         }
         let path =
-            path_of(&uri).ok_or_else(|| format!("the rename names {uri}, which is not a file"))?;
+            path_of(&uri).ok_or_else(|| format!("the {what} names {uri}, which is not a file"))?;
         let text = std::fs::read_to_string(&path)
             .map_err(|error| format!("{} cannot be read: {error}", path.display()))?;
         let new = apply_edits(&text, &edits)
-            .ok_or_else(|| format!("the rename's edits to {} overlap", path.display()))?;
+            .ok_or_else(|| format!("the {what}'s edits to {} overlap", path.display()))?;
         files.push(Renamed {
             path,
             text: new,
@@ -275,6 +286,71 @@ pub(crate) fn renamed(answer: &Value) -> Result<Vec<Renamed>, String> {
         });
     }
     Ok(files)
+}
+
+/// The code action a server wrote as `item`, a code action or a bare command, as the tools know it; nothing when it has no title.
+pub(crate) fn code_action(item: &Value) -> Option<CodeAction> {
+    Some(CodeAction {
+        title: item["title"].as_str()?.to_owned(),
+        kind: item["kind"].as_str().map(str::to_owned),
+        preferred: item["isPreferred"].as_bool().unwrap_or(false),
+        disabled: item["disabled"]["reason"].as_str().map(str::to_owned),
+    })
+}
+
+/// The code actions in a server's answer to a code action request, as it wrote them, leaving out those without a title.
+pub(crate) fn code_actions(answer: &Value) -> Vec<Value> {
+    answer
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| code_action(item).is_some())
+        .cloned()
+        .collect()
+}
+
+/// The action among `offered` titled `title` when there is one, otherwise the `index`-th, counted from one.
+///
+/// # Errors
+///
+/// Returns why, listing what is offered, when there is no such action.
+pub(crate) fn choose<'a>(
+    offered: &'a [Value],
+    index: usize,
+    title: Option<&str>,
+) -> Result<&'a Value, String> {
+    let titled = title.and_then(|title| {
+        offered
+            .iter()
+            .find(|item| item["title"].as_str() == Some(title))
+    });
+    if let Some(found) = titled {
+        return Ok(found);
+    }
+    offered
+        .get(index.wrapping_sub(1))
+        .filter(|item| title.is_none_or(|title| item["title"].as_str() == Some(title)))
+        .ok_or_else(|| {
+            let titles: Vec<String> = offered
+                .iter()
+                .enumerate()
+                .filter_map(|(at, item)| Some(format!("{}. {}", at + 1, item["title"].as_str()?)))
+                .collect();
+            match title {
+                Some(title) => format!(
+                    "no code action titled \"{title}\" is offered there now; offered: {}",
+                    if titles.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        titles.join("; ")
+                    }
+                ),
+                None => format!(
+                    "there is no code action {index} there; {} are offered",
+                    offered.len()
+                ),
+            }
+        })
 }
 
 #[cfg(test)]
@@ -377,6 +453,6 @@ mod tests {
         let changes = json!({"changes": {file_uri(&a): [edit(0, 3, 6)]}});
         assert_eq!(renamed(&changes).unwrap()[0].text, "fn new() {}\n");
         let moving = json!({"documentChanges": [{"kind": "rename", "oldUri": file_uri(&a), "newUri": file_uri(&b)}]});
-        assert!(renamed(&moving).unwrap_err().contains("rename a file"));
+        assert!(renamed(&moving).unwrap_err().contains("also rename a file"));
     }
 }

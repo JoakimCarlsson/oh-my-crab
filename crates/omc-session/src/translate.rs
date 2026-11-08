@@ -8,13 +8,13 @@ use omc_wire::{Diff, Event, Kind, PastTurn, Tool, ToolState, Usage};
 /// shown as `target`: a `read` whose target is a web address, as a URL or a
 /// GitHub path shows, fetches rather than reads, and a `debug` call runs a
 /// command when it starts or runs the program, and is something else when it
-/// only looks at it or sets breakpoints. An `lsp` call edits when it renames
-/// and is not a dry run, and searches otherwise.
+/// only looks at it or sets breakpoints. An `lsp` call edits when it changes
+/// files and is not a dry run, and searches otherwise.
 fn kind_of(name: &str, target: &str) -> Kind {
     match name {
         "read" if is_web(target) => Kind::Fetch,
         "debug" if runs_program(target) => Kind::Execute,
-        "lsp" if target.starts_with("rename") && !target.ends_with("[dry run]") => Kind::Edit,
+        "lsp" if lsp_writes(target) => Kind::Edit,
         "lsp" => Kind::Search,
         "read" | "skill" => Kind::Read,
         "edit" | "write" | "ast_edit" => Kind::Edit,
@@ -22,6 +22,14 @@ fn kind_of(name: &str, target: &str) -> Kind {
         "bash" => Kind::Execute,
         _ => Kind::Other,
     }
+}
+
+/// Whether the `lsp` call shown as `target` changes files: a rename, a format, a file move or an applied code action that is not a dry run.
+fn lsp_writes(target: &str) -> bool {
+    let action = target.split_whitespace().next().unwrap_or_default();
+    let changes = matches!(action, "rename" | "format" | "rename_file")
+        || (action == "code_actions" && target.contains(", apply #"));
+    changes && !target.ends_with("[dry run]")
 }
 
 /// Whether the `debug` call shown as `target` starts or runs the program: a launch, an attach, a continue or a step.
@@ -400,6 +408,18 @@ mod tests {
             Kind::Search
         );
         assert_eq!(kind_of("lsp", "references `a` in src/a.rs:3"), Kind::Search);
+        assert_eq!(kind_of("lsp", "format in src/a.rs"), Kind::Edit);
+        assert_eq!(
+            kind_of("lsp", "rename_file in src/a.rs to src/b.rs"),
+            Kind::Edit
+        );
+        assert_eq!(
+            kind_of("lsp", "code_actions in src/a.rs:3, apply #1"),
+            Kind::Edit
+        );
+        assert_eq!(kind_of("lsp", "code_actions in src/a.rs:3"), Kind::Search);
+        assert_eq!(kind_of("lsp", "format in src/a.rs [dry run]"), Kind::Search);
+        assert_eq!(kind_of("lsp", "status"), Kind::Search);
         assert_eq!(kind_of("debug", "variables frame 0"), Kind::Other);
         assert_eq!(kind_of("debug", "break a.c:3"), Kind::Other);
     }

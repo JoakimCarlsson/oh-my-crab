@@ -39,9 +39,11 @@ below.
   `Always`), except in these types, whose names are snake_case or lowercase:
   `LanguageAsk` (`format`, `diagnostics`, `definition`, `type_definition`,
   `implementation`, `references`, `hover`, `document_symbols`,
-  `workspace_symbols`, `workspace_diagnostics`, `rename`), `LanguageAnswer`
-  (`formatted`, `diagnostics`, `locations`, `hover`, `symbols`, `edits`,
-  `unsupported`, `no_server`, `failed`), `Severity` (`error`, `warning`, `information`, `hint`),
+  `workspace_symbols`, `workspace_diagnostics`, `rename`, `format_range`,
+  `code_actions`, `apply_code_action`, `will_rename_file`, `file_renamed`,
+  `status`, `reload`), `LanguageAnswer` (`formatted`, `diagnostics`,
+  `locations`, `hover`, `symbols`, `edits`, `unsupported`, `no_server`,
+  `failed`, `actions`, `applied`, `servers`, `done`), `Severity` (`error`, `warning`, `information`, `hint`),
   `SignIn` (`browser`, `device_code`, `api_key`, `none`) and `KeySource`,
   which is internally tagged by a `from` field.
 - **Field names** are snake_case as written in Rust.
@@ -528,6 +530,17 @@ Answers a `Language` request under `ticket`.
   be started.
 - `failed`: field `reason` (string). The server was asked and failed, or
   refused, as a rename that would create, move or delete files must be.
+- `actions`: field `actions` (list of `ActionInfo`), the code actions a
+  `code_actions` request found, in the order the server gave them, which
+  `apply_code_action` counts by.
+- `applied`: fields `title` (string, the action applied) and `files` (list of
+  `FileEdits`), the edits applying a code action makes, those the server
+  asked for while carrying out its command among them. The client writes
+  none of them.
+- `servers`: field `servers` (list of `ServerInfo`), the client's language
+  servers, answering `status` and `reload`.
+- `done`: no fields (`{"done":{}}`). What was asked, such as telling the
+  servers a file moved, has been done.
 
 The `reason` of the last three is shown to the model as it is. An answer of
 the wrong kind counts as a failure.
@@ -565,6 +578,17 @@ the edits to that file in any order, none overlapping. A `TextEdit` has
 stretch replaced in the file as it is on disk before any of the edits) and
 `text` (string, what replaces it).
 
+An `ActionInfo` has `title` (string, what the server calls it), `kind`
+(optional string, such as `quickfix` or `refactor.extract`), `preferred`
+(bool, default, whether the server prefers it) and `disabled` (optional
+string, why it cannot be applied now).
+
+A `ServerInfo` has `name` (string, such as `rust-analyzer`), `languages`
+(list of strings, default, the languages it reads), `state` (string, how it
+stands in a word or two: `running`, `loading`, `starting`, `stopped`,
+`failed` and so on) and `detail` (optional string, more about it, such as why
+it failed).
+
 Lines and columns are counted from one, and a column counts characters
 (Unicode scalar values), not UTF-16 code units or bytes; a client whose
 language servers count UTF-16 code units converts.
@@ -579,6 +603,10 @@ language servers count UTF-16 code units converts.
 {"Language":{"ticket":10,"answer":{"unsupported":{"reason":"the rust-analyzer language server does not find implementations"}}}}
 {"Language":{"ticket":11,"answer":{"no_server":{"reason":"no language server reads .toml files"}}}}
 {"Language":{"ticket":12,"answer":{"failed":{"reason":"the rename would also create a file"}}}}
+{"Language":{"ticket":13,"answer":{"actions":{"actions":[{"title":"Import `std::collections::HashMap`","kind":"quickfix","preferred":true,"disabled":null}]}}}}
+{"Language":{"ticket":14,"answer":{"applied":{"title":"Import `std::collections::HashMap`","files":[{"path":"/home/me/project/src/lib.rs","edits":[{"line":1,"column":1,"end_line":1,"end_column":1,"text":"use std::collections::HashMap;\n\n"}]}]}}}}
+{"Language":{"ticket":15,"answer":{"servers":{"servers":[{"name":"rust-analyzer","languages":["rust"],"state":"running","detail":null}]}}}}
+{"Language":{"ticket":16,"answer":{"done":{}}}}
 ```
 
 ### `Trust`
@@ -740,7 +768,8 @@ The agent started using a tool, or said more about one it is using. Carries a
 `Kind` is one of `Read`, `Edit`, `Search`, `Execute`, `Fetch` and `Other`.
 `read` of a web address is `Fetch`; `debug` is `Execute` when it launches,
 attaches, continues or steps the program, and `Other` otherwise; `lsp` is
-`Edit` when it renames (not as a dry run), and `Search` otherwise.
+`Edit` when it renames, formats, moves a file or applies a code action (not
+as a dry run), and `Search` otherwise.
 
 `ToolState` is one of `Running`, `Done` and `Failed`.
 
@@ -952,12 +981,51 @@ the tool call. Any of them may be answered `unsupported`, `no_server` or
   `format` them and for their `diagnostics` as after an `edit`, and gives the
   model each file's new snapshot tag. A rename the server would make by
   creating, moving or deleting files is answered `failed`.
+- `format_range`: field `range` (`Stretch`). The whole text of the file the
+  stretch names with only that stretch formatted; answer with `formatted`.
+  Formatting a whole file for the `lsp` tool is the `format` request above,
+  which a client without `navigation` is sent too.
+- `code_actions`: fields `range` (`Stretch`) and `only` (list of strings,
+  default). The code actions the server of the file offers there, only those
+  whose kinds start with one of `only` when it names any; answer with
+  `actions`.
+- `apply_code_action`: fields `range` (`Stretch`), `only` (list of strings,
+  default), `index` (integer, counted from one) and `title` (optional
+  string). Ask for the actions as for `code_actions`, take the one titled
+  `title` when there is one and otherwise the `index`-th, resolve it when the
+  server needs that, and when it has a command have the server carry it out,
+  keeping the edits the server asks for while it does (`workspace/applyEdit`)
+  instead of making them; answer with `applied`. The client must not write
+  them: crab writes them as it does a rename's, asking the reader first
+  outside yolo mode. An action that would create, move or delete files is
+  answered `failed`, and one that only runs a command the server does not
+  carry out itself `unsupported`.
+- `will_rename_file`: fields `from` and `to` (paths, absolute). The edits the
+  servers of the project make before the file is moved, such as to the
+  imports and module declarations that name it, made to the files as they
+  are on disk now; answer with `edits`, which may name the moved file at its
+  old path. Nothing is moved or written by the client: crab moves the file,
+  writes the edits, has the files formatted and checked, then sends
+  `file_renamed`.
+- `file_renamed`: fields `from` and `to` (paths, absolute). The file has been
+  moved; tell the servers, and answer `done`.
+- `status`: no fields (`{"status":{}}`). The client's language servers for
+  the project and how each stands; answer with `servers`.
+- `reload`: fields `server` (optional string, a name as `servers` gives it)
+  and `near` (optional path). Stop and start again that server, or the one
+  that reads the file `near`, or every server running for the project when
+  neither is given; answer with `servers`, listing those restarted.
 
 A client that did not set `navigation` is never sent these, so a client
 written before they existed keeps working with a newer crab. With it, the
 `lsp` tool's `diagnostics` of a file still go to the client as a
-`diagnostics` request, and its other actions are not sent: the tool tells the
-model they cannot be answered in this conversation.
+`diagnostics` request and its `format` of a whole file as a `format` request,
+and its other actions are not sent: the tool tells the model they cannot be
+answered in this conversation. A client that set `navigation` before
+`format_range`, `code_actions`, `apply_code_action`, `will_rename_file`,
+`file_renamed`, `status` and `reload` existed fails to read them; it should
+answer a request it cannot read with `unsupported` if it can, and otherwise
+crab gives up on it after the wait, failing that tool call alone.
 
 ```json
 {"Language":{"ticket":4,"ask":{"format":{"path":"/home/me/project/src/main.rs"}}}}
@@ -971,6 +1039,13 @@ model they cannot be answered in this conversation.
 {"Language":{"ticket":12,"ask":{"workspace_symbols":{"query":"Config","near":null}}}}
 {"Language":{"ticket":13,"ask":{"workspace_diagnostics":{"wait_ms":3000}}}}
 {"Language":{"ticket":14,"ask":{"rename":{"at":{"path":"/home/me/project/src/lib.rs","line":3,"column":8},"new_name":"assist"}}}}
+{"Language":{"ticket":15,"ask":{"format_range":{"range":{"path":"/home/me/project/src/lib.rs","line":3,"column":1,"end_line":9,"end_column":2}}}}}
+{"Language":{"ticket":16,"ask":{"code_actions":{"range":{"path":"/home/me/project/src/lib.rs","line":3,"column":5,"end_line":3,"end_column":12},"only":["quickfix"]}}}}
+{"Language":{"ticket":17,"ask":{"apply_code_action":{"range":{"path":"/home/me/project/src/lib.rs","line":3,"column":5,"end_line":3,"end_column":12},"only":["quickfix"],"index":1,"title":"Import `std::collections::HashMap`"}}}}
+{"Language":{"ticket":18,"ask":{"will_rename_file":{"from":"/home/me/project/src/util.rs","to":"/home/me/project/src/helpers.rs"}}}}
+{"Language":{"ticket":19,"ask":{"file_renamed":{"from":"/home/me/project/src/util.rs","to":"/home/me/project/src/helpers.rs"}}}}
+{"Language":{"ticket":20,"ask":{"status":{}}}}
+{"Language":{"ticket":21,"ask":{"reload":{"server":"rust-analyzer","near":null}}}}
 ```
 
 ### `Finished`

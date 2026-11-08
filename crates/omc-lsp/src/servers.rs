@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use omc_tools::{
-    Diagnostic, LanguageError, LanguageService, Location, Lookup, Renamed, Spot, Symbol,
+    Applied, Chosen, CodeAction, Diagnostic, LanguageError, LanguageService, Location, Lookup,
+    Renamed, ServerStatus, Spot, Symbol,
 };
 use serde_json::{Value, json};
 use tokio::sync::OnceCell;
@@ -46,6 +47,54 @@ impl Ready {
         json!({"line": line, "character": character(&self.text, line, at.column)})
     }
 
+    /// The range of the protocol for the stretch `range` of the file.
+    fn range(&self, range: &Location) -> Value {
+        let (line, end_line) = (
+            range.line.saturating_sub(1),
+            range.end_line.saturating_sub(1),
+        );
+        json!({
+            "start": {"line": line, "character": character(&self.text, line, range.column)},
+            "end": {"line": end_line, "character": character(&self.text, end_line, range.end_column)},
+        })
+    }
+
+    /// The code actions the server offers for the stretch `range` of the file, only those of the kinds `only` when it names any, as the server wrote them, with what it said is wrong there.
+    ///
+    /// # Errors
+    ///
+    /// As [`Ready::ask`].
+    async fn code_actions(
+        &self,
+        range: &Location,
+        only: &[String],
+    ) -> Result<Vec<Value>, LanguageError> {
+        let wanted = self.range(range);
+        let (start, end) = (line_of(&wanted["start"]), line_of(&wanted["end"]));
+        let wrong: Vec<Value> = self
+            .client
+            .published_for(&self.uri)
+            .into_iter()
+            .filter(|diagnostic| {
+                let range = &diagnostic["range"];
+                line_of(&range["start"]) <= end && start <= line_of(&range["end"])
+            })
+            .collect();
+        let mut context = json!({"diagnostics": wrong, "triggerKind": 1});
+        if !only.is_empty() {
+            context["only"] = json!(only);
+        }
+        let answer = self
+            .ask(
+                "codeActionProvider",
+                "code action",
+                "textDocument/codeAction",
+                json!({"range": wanted, "context": context}),
+            )
+            .await?;
+        Ok(navigate::code_actions(&answer))
+    }
+
     /// Asks the server `method` about the file with `params` added to the file's address, once it is known to answer what `capability` names, which `what` describes to the model.
     ///
     /// # Errors
@@ -71,6 +120,14 @@ impl Ready {
             .map_err(LanguageError::Failed)
     }
 }
+
+/// The line of the position `position` of the protocol, counted from nought; nought when it has none.
+fn line_of(position: &Value) -> u64 {
+    position["line"].as_u64().unwrap_or(0)
+}
+
+/// How long a server is given to shut down when it is restarted, before its process is ended.
+const STOP_WAIT: Duration = Duration::from_secs(2);
 
 /// The most times a server that stopped is started again, so that one that keeps stopping is given up on.
 const MOST_RESTARTS: u32 = 3;
@@ -227,6 +284,83 @@ impl Servers {
             }
         }
         found
+    }
+
+    /// How the server `spec` describes stands now.
+    fn status_of(&self, spec: &Spec) -> ServerStatus {
+        let mut languages: Vec<String> = Vec::new();
+        for (_, language) in &spec.extensions {
+            if !languages.contains(language) {
+                languages.push(language.clone());
+            }
+        }
+        let (state, detail) = {
+            let started = self.started.lock().unwrap_or_else(|held| held.into_inner());
+            match started.get(&spec.id) {
+                None if spec.is_installed() => ("not started".to_owned(), None),
+                None => {
+                    let programs: Vec<&str> = spec
+                        .commands
+                        .iter()
+                        .filter_map(|command| command.first().map(String::as_str))
+                        .collect();
+                    (
+                        "not installed".to_owned(),
+                        Some(format!("looked for {}", programs.join(", "))),
+                    )
+                }
+                Some(slot) => {
+                    let restarts = (slot.restarts > 0)
+                        .then(|| format!("started again {} time(s)", slot.restarts));
+                    match slot.started.get() {
+                        None => ("starting".to_owned(), restarts),
+                        Some(None) => (
+                            "failed".to_owned(),
+                            Some("it could not be started".to_owned()),
+                        ),
+                        Some(Some(client)) if !client.is_running() => {
+                            ("stopped".to_owned(), restarts)
+                        }
+                        Some(Some(client)) => {
+                            let work = client.work();
+                            if work.is_empty() {
+                                ("running".to_owned(), restarts)
+                            } else {
+                                let doing = format!("working on: {}", work.join(", "));
+                                (
+                                    "loading".to_owned(),
+                                    Some(restarts.map_or(doing.clone(), |restarts| {
+                                        format!("{doing}; {restarts}")
+                                    })),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        ServerStatus {
+            name: spec.id.clone(),
+            languages,
+            state,
+            detail,
+        }
+    }
+
+    /// Stops the server `spec` describes when it runs, and starts it again as if for the first time.
+    async fn restart(&self, spec: &Spec) -> ServerStatus {
+        let running = {
+            let mut started = self.started.lock().unwrap_or_else(|held| held.into_inner());
+            let slot = started.entry(spec.id.clone()).or_default();
+            let running = slot.started.get().cloned().flatten();
+            *slot = Slot::default();
+            running
+        };
+        if let Some(client) = running {
+            client.stop(STOP_WAIT).await;
+        }
+        let _ = self.starting(spec).await;
+        self.status_of(spec)
     }
 
     /// The server `spec` describes, running or being started on a task of its own, so that a caller that stops waiting does not stop it starting; it is started once, started again when it has stopped, up to [`MOST_RESTARTS`] times, and one that could not be started is not tried again.
@@ -423,6 +557,197 @@ impl LanguageService for Servers {
             ));
         }
         navigate::renamed(&answer).map_err(LanguageError::Failed)
+    }
+
+    /// The whole text of the file at `path` formatted by its server, or with only the stretch `range` formatted.
+    async fn reformat(
+        &self,
+        path: &Path,
+        range: Option<&Location>,
+    ) -> Result<Option<String>, LanguageError> {
+        let ready = self.ready(path).await?;
+        let Some(range) = range else {
+            if !ready.client.formats() {
+                return Err(LanguageError::Unsupported(format!(
+                    "the {} language server does not format files",
+                    ready.id
+                )));
+            }
+            return Ok(self.format(path).await);
+        };
+        let language = self
+            .specs
+            .iter()
+            .find_map(|spec| spec.language_of(path))
+            .unwrap_or_default();
+        ready
+            .client
+            .format_range(path, language, &ready.text, ready.range(range), QUESTION_WAIT)
+            .await
+            .map_err(|reason| {
+                if ready.client.can("documentRangeFormattingProvider") {
+                    LanguageError::Failed(reason)
+                } else {
+                    LanguageError::Unsupported(format!(
+                        "the {} language server does not format stretches of files; format the whole file instead",
+                        ready.id
+                    ))
+                }
+            })
+    }
+
+    /// Asks the server of the file `range` names which code actions it offers there.
+    async fn code_actions(
+        &self,
+        range: &Location,
+        only: &[String],
+    ) -> Result<Vec<CodeAction>, LanguageError> {
+        let ready = self.ready(&range.path).await?;
+        let offered = ready.code_actions(range, only).await?;
+        Ok(offered.iter().filter_map(navigate::code_action).collect())
+    }
+
+    /// Asks the server of the file `range` names for the code actions offered there again, resolves the chosen one when the server needs that, has the server carry out its command when it has one the server runs, and makes the edits of both to the texts on disk without writing them.
+    async fn apply_code_action(
+        &self,
+        range: &Location,
+        only: &[String],
+        chosen: &Chosen,
+    ) -> Result<Applied, LanguageError> {
+        let ready = self.ready(&range.path).await?;
+        let offered = ready.code_actions(range, only).await?;
+        let mut action = navigate::choose(&offered, chosen.index, chosen.title.as_deref())
+            .map_err(LanguageError::Failed)?
+            .clone();
+        let title = action["title"].as_str().unwrap_or_default().to_owned();
+        if let Some(reason) = action["disabled"]["reason"].as_str() {
+            return Err(LanguageError::Failed(format!(
+                "the code action \"{title}\" cannot be applied now: {reason}"
+            )));
+        }
+        let bare_command = action["command"].is_string();
+        let resolves = ready
+            .client
+            .capabilities_say("codeActionProvider", "resolveProvider");
+        if !bare_command && action.get("edit").is_none() && resolves {
+            action = ready
+                .client
+                .ask("codeAction/resolve", action, QUESTION_WAIT)
+                .await
+                .map_err(LanguageError::Failed)?;
+        }
+        let mut edits: Vec<Value> = action.get("edit").cloned().into_iter().collect();
+        let command = if bare_command {
+            Some(action.clone())
+        } else {
+            action.get("command").cloned()
+        };
+        if let Some(command) = command {
+            let name = command["command"].as_str().unwrap_or_default();
+            if ready.client.runs(name) {
+                edits.extend(
+                    ready
+                        .client
+                        .run_command(&command, QUESTION_WAIT)
+                        .await
+                        .map_err(LanguageError::Failed)?,
+                );
+            } else if edits.is_empty() {
+                return Err(LanguageError::Unsupported(format!(
+                    "the code action \"{title}\" only runs the editor command {name}, which the {} language server does not carry out itself",
+                    ready.id
+                )));
+            }
+        }
+        let files = navigate::edited(&edits, "code action").map_err(LanguageError::Failed)?;
+        Ok(Applied { title, files })
+    }
+
+    /// Asks the server of the file at `from`, and every other running server of the project, for the edits moving it to `to` makes.
+    async fn rename_file(&self, from: &Path, to: &Path) -> Result<Vec<Renamed>, LanguageError> {
+        let ready = self.ready(from).await?;
+        let mut servers = vec![ready.client.clone()];
+        for (_, client) in self.project().await {
+            if !servers.iter().any(|held| Arc::ptr_eq(held, &client)) {
+                servers.push(client);
+            }
+        }
+        let mut edits = Vec::new();
+        for client in servers {
+            if let Some(edit) = client
+                .will_rename(from, to, QUESTION_WAIT)
+                .await
+                .map_err(LanguageError::Failed)?
+            {
+                edits.push(edit);
+            }
+        }
+        navigate::edited(&edits, "move").map_err(LanguageError::Failed)
+    }
+
+    /// Tells every running server that the file at `from` is now at `to`.
+    async fn file_renamed(&self, from: &Path, to: &Path) {
+        let running: Vec<Arc<Client>> = {
+            let started = self.started.lock().unwrap_or_else(|held| held.into_inner());
+            started
+                .values()
+                .filter_map(|slot| slot.started.get().cloned().flatten())
+                .collect()
+        };
+        for client in running {
+            client.did_rename(from, to).await;
+        }
+    }
+
+    /// Every server the harness knows, and how each stands.
+    async fn status(&self) -> Result<Vec<ServerStatus>, LanguageError> {
+        Ok(self.specs.iter().map(|spec| self.status_of(spec)).collect())
+    }
+
+    /// Restarts the server named `server`, or the one that reads the file at `near`, or every server tried so far.
+    async fn reload(
+        &self,
+        server: Option<&str>,
+        near: Option<&Path>,
+    ) -> Result<Vec<ServerStatus>, LanguageError> {
+        let tried: Vec<String> = self
+            .started
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        let chosen: Vec<&Spec> = self
+            .specs
+            .iter()
+            .filter(|spec| match (server, near) {
+                (Some(name), _) => spec.id.eq_ignore_ascii_case(name),
+                (None, Some(path)) => spec.language_of(path).is_some(),
+                (None, None) => tried.contains(&spec.id),
+            })
+            .collect();
+        if chosen.is_empty() {
+            let known: Vec<&str> = self.specs.iter().map(|spec| spec.id.as_str()).collect();
+            return Err(LanguageError::NoServer(match (server, near) {
+                (Some(name), _) => format!(
+                    "no language server is named {name}; the known ones are {}",
+                    known.join(", ")
+                ),
+                (None, Some(path)) => format!("no language server reads {}", path.display()),
+                (None, None) => {
+                    "no language server has been started in this conversation".to_owned()
+                }
+            }));
+        }
+        let mut restarted = Vec::with_capacity(chosen.len());
+        for spec in chosen {
+            if !spec.is_installed() {
+                restarted.push(self.status_of(spec));
+                continue;
+            }
+            restarted.push(self.restart(spec).await);
+        }
+        Ok(restarted)
     }
 
     /// Everything the servers of the project have said is wrong, once they have finished loading and checking it or `wait` has passed.

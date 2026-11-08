@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use super::*;
 use crate::testutil::scratch;
-use crate::{Diagnostic, Location, Renamed, Severity, Symbol};
+use crate::tools::snapshot::tag;
+use crate::{Applied, CodeAction, Diagnostic, Location, Renamed, ServerStatus, Severity, Symbol};
 
 /// A language service that answers navigation questions as it is told and records what it was asked.
 #[derive(Default)]
@@ -23,6 +24,20 @@ struct Told {
     no_server: Option<String>,
     /// The places it was asked about.
     asked: Mutex<Vec<Spot>>,
+    /// The code actions it offers anywhere.
+    actions: Vec<CodeAction>,
+    /// The files applying any code action changes.
+    applied: Vec<Renamed>,
+    /// The files moving any file changes.
+    moved: Vec<Renamed>,
+    /// The whole formatted text it gives any file, when it formats.
+    formatted: Option<String>,
+    /// The stretches it was asked about, for code actions and formatting.
+    ranges: Mutex<Vec<Location>>,
+    /// The code actions it was asked to apply.
+    chosen: Mutex<Vec<Chosen>>,
+    /// The moves it was told were made.
+    renamed_files: Mutex<Vec<(PathBuf, PathBuf)>>,
 }
 
 #[async_trait]
@@ -69,6 +84,82 @@ impl LanguageService for Told {
     /// The diagnostics it was told.
     async fn all_diagnostics(&self, _wait: Duration) -> Result<Vec<Diagnostic>, LanguageError> {
         Ok(self.diagnostics.clone())
+    }
+
+    /// The formatted text it was told, recording the stretch asked.
+    async fn reformat(
+        &self,
+        _path: &Path,
+        range: Option<&Location>,
+    ) -> Result<Option<String>, LanguageError> {
+        self.ranges.lock().unwrap().extend(range.cloned());
+        Ok(self.formatted.clone())
+    }
+
+    /// The actions it was told, recording the stretch asked.
+    async fn code_actions(
+        &self,
+        range: &Location,
+        _only: &[String],
+    ) -> Result<Vec<CodeAction>, LanguageError> {
+        self.ranges.lock().unwrap().push(range.clone());
+        Ok(self.actions.clone())
+    }
+
+    /// The files it was told, under the title of the action chosen by number.
+    async fn apply_code_action(
+        &self,
+        range: &Location,
+        _only: &[String],
+        chosen: &Chosen,
+    ) -> Result<Applied, LanguageError> {
+        self.ranges.lock().unwrap().push(range.clone());
+        self.chosen.lock().unwrap().push(chosen.clone());
+        let action = self
+            .actions
+            .get(chosen.index - 1)
+            .ok_or_else(|| LanguageError::Failed("no such action".to_owned()))?;
+        Ok(Applied {
+            title: action.title.clone(),
+            files: self.applied.clone(),
+        })
+    }
+
+    /// The files it was told a move changes.
+    async fn rename_file(&self, _from: &Path, _to: &Path) -> Result<Vec<Renamed>, LanguageError> {
+        Ok(self.moved.clone())
+    }
+
+    /// Records the move.
+    async fn file_renamed(&self, from: &Path, to: &Path) {
+        self.renamed_files
+            .lock()
+            .unwrap()
+            .push((from.to_path_buf(), to.to_path_buf()));
+    }
+
+    /// One running server.
+    async fn status(&self) -> Result<Vec<ServerStatus>, LanguageError> {
+        Ok(vec![ServerStatus {
+            name: "rust-analyzer".to_owned(),
+            languages: vec!["rust".to_owned()],
+            state: "running".to_owned(),
+            detail: None,
+        }])
+    }
+
+    /// The server named, restarted.
+    async fn reload(
+        &self,
+        server: Option<&str>,
+        _near: Option<&Path>,
+    ) -> Result<Vec<ServerStatus>, LanguageError> {
+        Ok(vec![ServerStatus {
+            name: server.unwrap_or("rust-analyzer").to_owned(),
+            languages: vec!["rust".to_owned()],
+            state: "loading".to_owned(),
+            detail: Some("working on: Indexing".to_owned()),
+        }])
     }
 }
 
@@ -386,4 +477,274 @@ async fn symbols_need_a_file_or_a_query() {
         out.text,
         "1 symbol(s) in src/lib.rs:\n    1  function helper  fn() -> u32"
     );
+}
+
+/// Code actions are listed numbered for the symbol's stretch, and applying one by number writes what it changes after asking under `lsp code_actions`, while a listing or a dry run asks nothing and writes nothing.
+#[tokio::test]
+async fn code_actions_are_listed_and_applied() {
+    let dir = project("lsp-code-actions");
+    let main = dir.join("src/main.rs");
+    let fixed = "fn main() {\n    let _x = demo::helper();\n}\n";
+    let service = Told {
+        actions: vec![
+            CodeAction {
+                title: "Rename to `_x`".to_owned(),
+                kind: Some("quickfix".to_owned()),
+                preferred: true,
+                disabled: None,
+            },
+            CodeAction {
+                title: "Inline variable".to_owned(),
+                kind: Some("refactor.inline".to_owned()),
+                preferred: false,
+                disabled: Some("not here".to_owned()),
+            },
+        ],
+        applied: vec![Renamed {
+            path: main.clone(),
+            text: fixed.to_owned(),
+            edits: 1,
+        }],
+        ..Told::default()
+    };
+    let tool = tool(&dir, service);
+    let list = json!({"action": "code_actions", "path": "src/main.rs", "line": 2, "symbol": "x"});
+    assert_eq!(tool.approval_scope(&list), None);
+    let listed = tool.call(list).await.unwrap();
+    assert!(
+        listed.text.starts_with(
+            "2 code action(s) at `x` at src/main.rs:2:9:\n  1. Rename to `_x`  [quickfix]  (preferred)\n  2. Inline variable  [refactor.inline]  (disabled: not here)"
+        ),
+        "{}",
+        listed.text
+    );
+    let apply = json!({"action": "code_actions", "path": "src/main.rs", "line": 2, "symbol": "x", "apply": 1, "title": "Rename to `_x`"});
+    assert_eq!(
+        tool.approval_scope(&apply).as_deref(),
+        Some("lsp code_actions")
+    );
+    let mut dry = apply.clone();
+    dry["dry_run"] = json!(true);
+    assert_eq!(tool.approval_scope(&dry), None);
+    assert!(tool.call(dry).await.unwrap().text.starts_with("Dry run"));
+    assert!(std::fs::read_to_string(&main).unwrap().contains("let x"));
+    let out = tool.call(apply).await.unwrap();
+    assert_eq!(std::fs::read_to_string(&main).unwrap(), fixed);
+    assert!(
+        out.text.starts_with(
+            "Applied the code action \"Rename to `_x`\" at `x` at src/main.rs:2:9: 1 edit(s) in 1 file(s)."
+        ),
+        "{}",
+        out.text
+    );
+    assert!(out.text.contains(&format!("tag {}", tag(fixed.as_bytes()))));
+    let error = tool
+        .call(json!({"action": "code_actions", "path": "src/main.rs", "line": 2, "apply": 0}))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ToolError::InvalidArguments(_)));
+}
+
+/// A stretch is the symbol's name, a whole line, or lines from line to end_line, and the services are asked about exactly that.
+#[tokio::test]
+async fn code_actions_are_asked_for_the_stretch_named() {
+    let dir = project("lsp-code-action-ranges");
+    let service = Arc::new(Told::default());
+    let tool = Lsp::new(
+        Sandbox::new(&dir).unwrap(),
+        Languages::new(Some(service.clone())),
+    );
+    for args in [
+        json!({"action": "code_actions", "path": "src/main.rs", "line": 2, "symbol": "demo::helper"}),
+        json!({"action": "code_actions", "path": "src/main.rs", "line": 2}),
+        json!({"action": "code_actions", "path": "src/main.rs", "line": 1, "end_line": 3}),
+        json!({"action": "code_actions", "path": "src/main.rs", "line": 2, "column": 5, "end_line": 2, "end_column": 10}),
+    ] {
+        let out = tool.call(args).await.unwrap();
+        assert!(
+            out.text.starts_with("No code actions offered at"),
+            "{}",
+            out.text
+        );
+    }
+    let asked: Vec<(u32, u32, u32, u32)> = service
+        .ranges
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|range| (range.line, range.column, range.end_line, range.end_column))
+        .collect();
+    assert_eq!(
+        asked,
+        [(2, 19, 2, 25), (2, 1, 2, 28), (1, 1, 3, 2), (2, 5, 2, 10)]
+    );
+    let error = tool
+        .call(json!({"action": "code_actions", "path": "src/main.rs", "line": 3, "end_line": 1}))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ToolError::InvalidArguments(_)), "{error}");
+}
+
+/// Formatting writes the file the service formatted after asking under `lsp format`, a range is passed on as whole lines, and a file formatted already is left alone.
+#[tokio::test]
+async fn format_writes_the_formatted_file() {
+    let dir = project("lsp-format");
+    let lib = dir.join("src/lib.rs");
+    let formatted = "pub fn helper() -> u32 {\n    1\n}\n\npub fn more() {}\n";
+    let service = Arc::new(Told {
+        formatted: Some(formatted.to_owned()),
+        ..Told::default()
+    });
+    let tool = Lsp::new(
+        Sandbox::new(&dir).unwrap(),
+        Languages::new(Some(service.clone())),
+    );
+    let args = json!({"action": "format", "path": "src/lib.rs"});
+    assert_eq!(tool.approval_scope(&args).as_deref(), Some("lsp format"));
+    let dry = tool
+        .call(json!({"action": "format", "path": "src/lib.rs", "line": 1, "end_line": 2, "dry_run": true}))
+        .await
+        .unwrap();
+    assert!(
+        dry.text
+            .starts_with("Dry run: formatting src/lib.rs:1:1-2:6 would change 2 line(s)"),
+        "{}",
+        dry.text
+    );
+    assert!(dry.text.contains("  + pub fn more() {}"), "{}", dry.text);
+    let range = service.ranges.lock().unwrap()[0].clone();
+    assert_eq!(
+        (range.line, range.column, range.end_line, range.end_column),
+        (1, 1, 2, 6)
+    );
+    let out = tool.call(args.clone()).await.unwrap();
+    assert!(
+        out.text
+            .starts_with("Formatted src/lib.rs: 2 line(s) changed."),
+        "{}",
+        out.text
+    );
+    assert_eq!(std::fs::read_to_string(&lib).unwrap(), formatted);
+    let again = tool.call(args).await.unwrap();
+    assert_eq!(
+        again.text,
+        "src/lib.rs is formatted already; nothing was changed."
+    );
+}
+
+/// Moving a file writes it at its new path with the edits the services ask for, those to the moved file among them, removes it from the old one, tells the services, and asks first under `lsp rename_file`; a taken path is refused.
+#[tokio::test]
+async fn rename_file_moves_the_file_and_updates_what_names_it() {
+    let dir = project("lsp-rename-file");
+    std::fs::write(dir.join("src/util.rs"), "pub fn one() -> u32 {\n    1\n}\n").unwrap();
+    std::fs::write(dir.join("src/lib.rs"), "pub mod util;\n").unwrap();
+    let service = Arc::new(Told {
+        moved: vec![
+            Renamed {
+                path: dir.join("src/lib.rs"),
+                text: "pub mod helpers;\n".to_owned(),
+                edits: 1,
+            },
+            Renamed {
+                path: dir.join("src/util.rs"),
+                text: "pub fn one() -> u32 {\n    1 // moved\n}\n".to_owned(),
+                edits: 1,
+            },
+        ],
+        ..Told::default()
+    });
+    let tool = Lsp::new(
+        Sandbox::new(&dir).unwrap(),
+        Languages::new(Some(service.clone())),
+    );
+    let args =
+        json!({"action": "rename_file", "path": "src/util.rs", "new_path": "src/helpers.rs"});
+    assert_eq!(
+        tool.approval_scope(&args).as_deref(),
+        Some("lsp rename_file")
+    );
+    let taken = tool
+        .call(json!({"action": "rename_file", "path": "src/util.rs", "new_path": "src/main.rs"}))
+        .await
+        .unwrap_err();
+    assert!(taken.to_string().contains("exists already"), "{taken}");
+    let out = tool.call(args).await.unwrap();
+    assert!(
+        out.text
+            .starts_with("Moved src/util.rs to src/helpers.rs, with 2 edit(s) in 1 other file(s)."),
+        "{}",
+        out.text
+    );
+    assert!(!dir.join("src/util.rs").exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("src/helpers.rs")).unwrap(),
+        "pub fn one() -> u32 {\n    1 // moved\n}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("src/lib.rs")).unwrap(),
+        "pub mod helpers;\n"
+    );
+    assert_eq!(
+        service.renamed_files.lock().unwrap().as_slice(),
+        [(dir.join("src/util.rs"), dir.join("src/helpers.rs"))]
+    );
+    assert_eq!(out.changes.len(), 3);
+}
+
+/// Status and reload say how the servers stand, and need no approval.
+#[tokio::test]
+async fn status_and_reload_say_how_the_servers_stand() {
+    let dir = project("lsp-status");
+    let tool = tool(&dir, Told::default());
+    let args = json!({"action": "status"});
+    assert_eq!(tool.approval_scope(&args), None);
+    assert_eq!(
+        tool.call(args).await.unwrap().text,
+        "Language servers:\nrust-analyzer: running (rust)"
+    );
+    let args = json!({"action": "reload", "server": "rust-analyzer"});
+    assert_eq!(tool.approval_scope(&args), None);
+    assert_eq!(
+        tool.call(args).await.unwrap().text,
+        "Restarted:\nrust-analyzer: loading (rust); working on: Indexing"
+    );
+}
+
+/// The copy that only looks refuses to apply a code action, format or move a file, but lists actions and shows dry runs.
+#[tokio::test]
+async fn the_looking_copy_refuses_the_new_writes() {
+    let dir = project("lsp-looking-writes");
+    let looking = tool(
+        &dir,
+        Told {
+            formatted: Some("x\n".to_owned()),
+            ..Told::default()
+        },
+    )
+    .looking()
+    .unwrap();
+    for args in [
+        json!({"action": "code_actions", "path": "src/lib.rs", "line": 1, "apply": 1}),
+        json!({"action": "format", "path": "src/lib.rs"}),
+        json!({"action": "rename_file", "path": "src/lib.rs", "new_path": "src/other.rs"}),
+    ] {
+        assert_eq!(looking.approval_scope(&args), None);
+        let error = looking.call(args).await.unwrap_err();
+        assert!(error.to_string().contains("dry_run"), "{error}");
+    }
+    assert!(
+        looking
+            .call(json!({"action": "code_actions", "path": "src/lib.rs", "line": 1}))
+            .await
+            .is_ok()
+    );
+    assert!(
+        looking
+            .call(json!({"action": "format", "path": "src/lib.rs", "dry_run": true}))
+            .await
+            .unwrap()
+            .text
+            .starts_with("Dry run")
+    );
+    assert!(dir.join("src/lib.rs").exists());
 }

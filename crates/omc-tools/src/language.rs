@@ -10,7 +10,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 pub use omc_wire::{Diagnostic, Severity};
 
-use crate::navigation::{LanguageError, Location, Lookup, Renamed, Spot, Symbol, cannot_navigate};
+use crate::navigation::{
+    Applied, Chosen, CodeAction, LanguageError, Location, Lookup, Renamed, ServerStatus, Spot,
+    Symbol, cannot_navigate,
+};
 use crate::tools::write_atomic;
 
 /// How long a write waits for fresh diagnostics of the files it changed.
@@ -106,6 +109,83 @@ pub trait LanguageService: Send + Sync {
     ///
     /// As [`LanguageService::workspace_symbols`].
     async fn all_diagnostics(&self, _wait: Duration) -> Result<Vec<Diagnostic>, LanguageError> {
+        Err(cannot_navigate())
+    }
+
+    /// The whole text of the file at `path` formatted as its language says, or with only the lines and characters `range` covers formatted, as the file is on disk now; nothing when it is formatted already. By default the whole file is formatted with [`LanguageService::format`] and a range is refused.
+    ///
+    /// # Errors
+    ///
+    /// As [`LanguageService::locate`]; [`LanguageError::Unsupported`] as well when the server formats no files, or no stretches of them.
+    async fn reformat(
+        &self,
+        path: &Path,
+        range: Option<&Location>,
+    ) -> Result<Option<String>, LanguageError> {
+        match range {
+            None => Ok(self.format(path).await),
+            Some(_) => Err(cannot_navigate()),
+        }
+    }
+
+    /// The code actions the server of the file offers for the stretch `range` of it, as the file is on disk now, only those whose kinds start with one of `only` when it names any.
+    ///
+    /// # Errors
+    ///
+    /// As [`LanguageService::locate`].
+    async fn code_actions(
+        &self,
+        _range: &Location,
+        _only: &[String],
+    ) -> Result<Vec<CodeAction>, LanguageError> {
+        Err(cannot_navigate())
+    }
+
+    /// What applying the code action `chosen`, among those [`LanguageService::code_actions`] offers for `range` and `only`, changes: its edit and the edits the server asks for while carrying out its command, made to the files on disk now; nothing is written.
+    ///
+    /// # Errors
+    ///
+    /// As [`LanguageService::locate`]; [`LanguageError::Failed`] as well when no such action is offered, it is disabled, or it would create, move or delete files, and [`LanguageError::Unsupported`] when it only runs a command the server does not carry out itself.
+    async fn apply_code_action(
+        &self,
+        _range: &Location,
+        _only: &[String],
+        _chosen: &Chosen,
+    ) -> Result<Applied, LanguageError> {
+        Err(cannot_navigate())
+    }
+
+    /// The files the servers of the project change before the file at `from` is moved to `to`, such as the imports that name it, each with its whole new text made from its text on disk now; nothing is written or moved, and a server that does not take part changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`LanguageService::locate`]; [`LanguageError::Failed`] as well when the edits would create, move or delete files.
+    async fn rename_file(&self, _from: &Path, _to: &Path) -> Result<Vec<Renamed>, LanguageError> {
+        Err(cannot_navigate())
+    }
+
+    /// Tells the servers that the file at `from` has been moved to `to`, so that they read it there from now on; does nothing by default.
+    async fn file_renamed(&self, _from: &Path, _to: &Path) {}
+
+    /// The language servers of the conversation, those running and those that could run, and how each stands.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LanguageError::Unsupported`] when these services do not say.
+    async fn status(&self) -> Result<Vec<ServerStatus>, LanguageError> {
+        Err(cannot_navigate())
+    }
+
+    /// Stops and starts again the server named `server`, or the one that reads the file at `near`, or every running server when neither is given; returns how the servers restarted stand.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LanguageError::NoServer`] when no such server runs, [`LanguageError::Unsupported`] when these services cannot restart servers, and [`LanguageError::Failed`] when one does not start again.
+    async fn reload(
+        &self,
+        _server: Option<&str>,
+        _near: Option<&Path>,
+    ) -> Result<Vec<ServerStatus>, LanguageError> {
         Err(cannot_navigate())
     }
 }

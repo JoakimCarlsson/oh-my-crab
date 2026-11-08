@@ -1793,6 +1793,12 @@ mod tests {
             serde_json::json!({"action": "symbols", "query": "helper"}),
             serde_json::json!({"action": "diagnostics"}),
             serde_json::json!({"action": "rename", "path": "src/lib.rs", "symbol": "helper", "new_name": "aid"}),
+            serde_json::json!({"action": "code_actions", "path": "src/lib.rs", "line": 1}),
+            serde_json::json!({"action": "code_actions", "path": "src/lib.rs", "line": 1, "apply": 1}),
+            serde_json::json!({"action": "format", "path": "src/lib.rs", "line": 1}),
+            serde_json::json!({"action": "rename_file", "path": "src/lib.rs", "new_path": "src/aid.rs"}),
+            serde_json::json!({"action": "status"}),
+            serde_json::json!({"action": "reload"}),
         ];
         for call in calls {
             let Err(error) = registry.call_as("c", "lsp", call.clone()).await else {
@@ -1834,6 +1840,231 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(directory.join("src/lib.rs")).unwrap(),
             "pub fn helper() {}\n"
+        );
+        let formatting = tokio::spawn({
+            let registry = registry.clone();
+            async move {
+                registry
+                    .call_as(
+                        "c",
+                        "lsp",
+                        serde_json::json!({"action": "format", "path": "src/lib.rs", "dry_run": true}),
+                    )
+                    .await
+                    .unwrap()
+            }
+        });
+        let Some(Event::Language(request)) = events.recv().await else {
+            panic!("formatting a whole file did not go to the client");
+        };
+        assert!(
+            matches!(request.ask, omc_wire::LanguageAsk::Format { .. }),
+            "{:?}",
+            request.ask
+        );
+        session
+            .handle(Command::Language {
+                ticket: request.ticket,
+                answer: omc_wire::LanguageAnswer::Formatted {
+                    text: Some("pub fn helper() {\n}\n".to_owned()),
+                },
+            })
+            .await;
+        let formatted = formatting.await.unwrap();
+        assert!(
+            formatted.text.starts_with("Dry run: formatting src/lib.rs"),
+            "{}",
+            formatted.text
+        );
+        assert!(events.try_recv().is_err());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A client that opens with `navigation` lists and applies code actions and answers the move of a file over the wire: the action's edits and the move's edits come back as edits that the harness writes, formats through the client and checks, and the client is told the file moved once it has.
+    #[tokio::test]
+    async fn a_navigating_client_applies_code_actions_and_moves_files() {
+        let line = |directory: &Path| {
+            serde_json::json!({"Open": {
+                "directory": directory,
+                "provider": "claude",
+                "yolo": true,
+                "conversation": "not/usable",
+                "languages": true,
+                "navigation": true,
+            }})
+            .to_string()
+        };
+        let (mut session, mut events, directory, registry) =
+            opened_with_languages("navigation-actions", line, "pub mod util;\n").await;
+        std::fs::write(directory.join("src/util.rs"), "pub fn one() {}\n").unwrap();
+        while events.try_recv().is_ok() {}
+        let (lib, util) = (directory.join("src/lib.rs"), directory.join("src/util.rs"));
+        let call = |args: serde_json::Value| {
+            let registry = registry.clone();
+            tokio::spawn(async move { registry.call_as("c", "lsp", args).await })
+        };
+        let mut next_request = async || {
+            let event = events.recv().await.unwrap();
+            let line = omc_wire::encode(&event).unwrap();
+            let Event::Language(request) = omc_wire::decode::<Event>(&line).unwrap() else {
+                panic!("not a language request: {line}");
+            };
+            request
+        };
+        let edit = |line, column, end_column, text: &str| omc_wire::TextEdit {
+            line,
+            column,
+            end_line: line,
+            end_column,
+            text: text.to_owned(),
+        };
+        let listing = call(
+            serde_json::json!({"action": "code_actions", "path": "src/util.rs", "line": 1, "kind": "quickfix"}),
+        );
+        let request = next_request().await;
+        let omc_wire::LanguageAsk::CodeActions { range, only } = &request.ask else {
+            panic!("not a code actions request: {:?}", request.ask);
+        };
+        assert_eq!(
+            (&range.path, range.line, range.column, range.end_column),
+            (&util, 1, 1, 16)
+        );
+        assert_eq!(only, &["quickfix"]);
+        session
+            .handle(Command::Language {
+                ticket: request.ticket,
+                answer: omc_wire::LanguageAnswer::Actions {
+                    actions: vec![omc_wire::ActionInfo {
+                        title: "Add doc comment".to_owned(),
+                        kind: Some("quickfix".to_owned()),
+                        preferred: true,
+                        disabled: None,
+                    }],
+                },
+            })
+            .await;
+        let listed = listing.await.unwrap().unwrap();
+        assert!(
+            listed
+                .text
+                .contains("1. Add doc comment  [quickfix]  (preferred)"),
+            "{}",
+            listed.text
+        );
+        let applying = call(
+            serde_json::json!({"action": "code_actions", "path": "src/util.rs", "line": 1, "apply": 1, "title": "Add doc comment"}),
+        );
+        let request = next_request().await;
+        let omc_wire::LanguageAsk::ApplyCodeAction { index, title, .. } = &request.ask else {
+            panic!("not an apply request: {:?}", request.ask);
+        };
+        assert_eq!((*index, title.as_deref()), (1, Some("Add doc comment")));
+        session
+            .handle(Command::Language {
+                ticket: request.ticket,
+                answer: omc_wire::LanguageAnswer::Applied {
+                    title: "Add doc comment".to_owned(),
+                    files: vec![omc_wire::FileEdits {
+                        path: util.clone(),
+                        edits: vec![edit(1, 1, 1, "/// One.\n")],
+                    }],
+                },
+            })
+            .await;
+        for _ in 0..2 {
+            let request = next_request().await;
+            let answer = match request.ask {
+                omc_wire::LanguageAsk::Format { .. } => {
+                    omc_wire::LanguageAnswer::Formatted { text: None }
+                }
+                omc_wire::LanguageAsk::Diagnostics { .. } => {
+                    omc_wire::LanguageAnswer::Diagnostics {
+                        diagnostics: Vec::new(),
+                    }
+                }
+                other => panic!("not a format or diagnostics request: {other:?}"),
+            };
+            session
+                .handle(Command::Language {
+                    ticket: request.ticket,
+                    answer,
+                })
+                .await;
+        }
+        let applied = applying.await.unwrap().unwrap();
+        assert!(
+            applied
+                .text
+                .starts_with("Applied the code action \"Add doc comment\""),
+            "{}",
+            applied.text
+        );
+        assert_eq!(
+            std::fs::read_to_string(&util).unwrap(),
+            "/// One.\npub fn one() {}\n"
+        );
+        let helpers = directory.join("src/helpers.rs");
+        let moving = call(
+            serde_json::json!({"action": "rename_file", "path": "src/util.rs", "new_path": "src/helpers.rs"}),
+        );
+        let request = next_request().await;
+        assert_eq!(
+            request.ask,
+            omc_wire::LanguageAsk::WillRenameFile {
+                from: util.clone(),
+                to: helpers.clone()
+            }
+        );
+        session
+            .handle(Command::Language {
+                ticket: request.ticket,
+                answer: omc_wire::LanguageAnswer::Edits {
+                    files: vec![omc_wire::FileEdits {
+                        path: lib.clone(),
+                        edits: vec![edit(1, 9, 13, "helpers")],
+                    }],
+                },
+            })
+            .await;
+        let mut told = false;
+        while !told {
+            let request = next_request().await;
+            let answer = match request.ask {
+                omc_wire::LanguageAsk::Format { .. } => {
+                    omc_wire::LanguageAnswer::Formatted { text: None }
+                }
+                omc_wire::LanguageAsk::Diagnostics { .. } => {
+                    omc_wire::LanguageAnswer::Diagnostics {
+                        diagnostics: Vec::new(),
+                    }
+                }
+                omc_wire::LanguageAsk::FileRenamed { from, to } => {
+                    assert_eq!((&from, &to), (&util, &helpers));
+                    assert!(!util.exists() && helpers.exists());
+                    told = true;
+                    omc_wire::LanguageAnswer::Done {}
+                }
+                other => panic!("not a request a move makes: {other:?}"),
+            };
+            session
+                .handle(Command::Language {
+                    ticket: request.ticket,
+                    answer,
+                })
+                .await;
+        }
+        let moved = moving.await.unwrap().unwrap();
+        assert!(
+            moved
+                .text
+                .starts_with("Moved src/util.rs to src/helpers.rs"),
+            "{}",
+            moved.text
+        );
+        assert_eq!(std::fs::read_to_string(&lib).unwrap(), "pub mod helpers;\n");
+        assert_eq!(
+            std::fs::read_to_string(&helpers).unwrap(),
+            "/// One.\npub fn one() {}\n"
         );
         std::fs::remove_dir_all(&directory).unwrap();
     }

@@ -1,9 +1,9 @@
-//! Making the edits a client's language services answer a rename with to the texts of the files on disk, without writing them, so that the `lsp` tool writes them the way it writes any rename.
+//! Making the edits a client's language services answer a rename, a code action or the move of a file with to the texts of the files on disk, without writing them, so that the `lsp` tool writes them the way it writes any rename.
 
 use omc_tools::Renamed;
 use omc_wire::{FileEdits, TextEdit};
 
-/// The files the client's rename edits `files` change, each with its whole new text made from its text on disk now and the number of edits made to it; files with no edits are left out.
+/// The files the client's edits `files`, those of a rename, a code action or the move of a file, change, each with its whole new text made from its text on disk now and the number of edits made to it; files with no edits are left out.
 ///
 /// # Errors
 ///
@@ -24,7 +24,7 @@ pub(crate) fn renamed(files: Vec<FileEdits>) -> Result<Vec<Renamed>, String> {
         let text = std::fs::read_to_string(&file.path)
             .map_err(|error| format!("{} cannot be read: {error}", file.path.display()))?;
         let new = apply(&text, &file.edits)
-            .ok_or_else(|| format!("the rename's edits to {} overlap", file.path.display()))?;
+            .ok_or_else(|| format!("the edits to {} overlap", file.path.display()))?;
         renamed.push(Renamed {
             path: file.path,
             text: new,

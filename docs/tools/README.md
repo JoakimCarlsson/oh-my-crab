@@ -41,7 +41,7 @@ to the result; see [language services](../language-services.md).
 
 | Tool  | What it does                                                                                                   | Asks                                 | Plan                           | Detail                                                  |
 | ----- | -------------------------------------------------------------------------------------------------------------- | ------------------------------------ | ------------------------------ | ------------------------------------------------------- |
-| `lsp` | Asks a file's language server for definitions, references, implementations, hovers, symbols and diagnostics, and renames a symbol across files | for renames, all renames (`lsp rename`) | yes, but renames only as dry runs | [language services](../language-services.md#the-lsp-tool) |
+| `lsp` | Asks a file's language server for definitions, references, implementations, hovers, symbols, diagnostics and code actions, renames a symbol across files, applies code actions, formats files, moves a file with its imports, and shows and restarts the servers | for changes, per action (`lsp rename`, `lsp code_actions`, `lsp format`, `lsp rename_file`) | yes, but changes only as dry runs | [language services](../language-services.md#the-lsp-tool) |
 
 ## Shell
 
@@ -133,7 +133,7 @@ above the deepest level of subagents allowed (see
 [nesting](subagents.md#nesting)). Their `bash` cannot start background runs. A
 kind whose definition lists tools gets only those. In plan mode subagents get
 only the tools plan mode allows. Subagents and scripts do get `lsp`; in plan
-mode it is the copy that refuses renames.
+mode it is the copy that refuses changes other than dry runs.
 
 **Scripts** never get `script` itself, `task`, `ask`, `exit_plan_mode`,
 `todo`, `context_notes`, `new_context`, `checkpoint`, `rewind`, `wait`,
