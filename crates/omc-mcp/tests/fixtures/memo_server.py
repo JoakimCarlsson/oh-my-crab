@@ -30,7 +30,8 @@ def handle(message):
         result(message_id, {"tools": [
             {"name": "add", "description": "Adds two numbers.",
              "inputSchema": {"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
-                             "required": ["a", "b"]}},
+                             "required": ["a", "b"]},
+             "annotations": {"readOnlyHint": True}},
             {"name": "crash", "description": "Stops the server.", "inputSchema": {"type": "object"}},
         ]})
     elif method == "tools/call":

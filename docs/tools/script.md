@@ -9,7 +9,10 @@ call, prints with `print` or `console.log`, and returns a value, which comes
 back as indented JSON. Most tools resolve to their output text; `grep` and
 `glob` resolve to their matches and paths as data. A call that does not
 succeed rejects with a `ToolError` the program can catch, and an uncaught error
-fails the script with what it printed before. `Promise.all` runs calls at once.
+fails the script with what it printed before. `Promise.all` runs calls that
+only look at once, while a call that changes something, or that needs
+approval, waits for the calls started before it and runs alone (see
+[which calls run at once](calls.md#which-calls-run-at-once)).
 The tool's description lists the tools a script can call with their arguments
 as TypeScript-like signatures, made from their schemas in name order, so the
 description stays the same from one request to the next.

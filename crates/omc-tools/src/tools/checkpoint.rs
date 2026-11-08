@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::tool::parse_args;
-use crate::{Checkpoint, Tool, ToolError, ToolOutput};
+use crate::{Checkpoint, Concurrency, Tool, ToolError, ToolOutput};
 
 /// Arguments of a `checkpoint` call.
 #[derive(Deserialize)]
@@ -39,6 +39,11 @@ impl Tool for CheckpointTool {
     /// Changes nothing on disk.
     fn read_only(&self) -> bool {
         true
+    }
+
+    /// Changes where the conversation stands, so it runs alone, in the model's order.
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        Concurrency::Exclusive
     }
 
     /// Describes the tool to the model.
@@ -119,6 +124,11 @@ impl Tool for Rewind {
     /// Changes nothing on disk.
     fn read_only(&self) -> bool {
         true
+    }
+
+    /// Changes where the conversation stands, so it runs alone, in the model's order.
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        Concurrency::Exclusive
     }
 
     /// Describes the tool to the model.

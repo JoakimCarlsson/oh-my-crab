@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::tool::parse_args;
-use crate::{Host, Tool, ToolError, ToolOutput};
+use crate::{Concurrency, Host, Tool, ToolError, ToolOutput};
 
 /// The longest title that is kept, in characters.
 const LIMIT: usize = 80;
@@ -42,6 +42,11 @@ impl Tool for SetTitle {
     /// Naming changes nothing on disk.
     fn read_only(&self) -> bool {
         true
+    }
+
+    /// Names the conversation, so it runs alone, in the model's order.
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        Concurrency::Exclusive
     }
 
     /// Describes the tool to the model.

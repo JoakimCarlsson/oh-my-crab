@@ -91,6 +91,21 @@ pub enum Subject {
     Site(String),
 }
 
+/// Whether a call may run at the same time as other calls of the same model reply.
+///
+/// The calls of one reply run in the model's order, except that a run of
+/// shared calls one after another runs at once; an exclusive call waits for
+/// everything before it and holds back everything after it, so that what calls
+/// change happens in the order the model asked for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Concurrency {
+    /// The call only looks, and may overlap the shared calls next to it.
+    Shared,
+    /// The call changes something or has an effect beyond its result, and runs alone.
+    #[default]
+    Exclusive,
+}
+
 /// A capability the model can invoke by name with JSON arguments.
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -106,6 +121,21 @@ pub trait Tool: Send + Sync {
     /// Whether the tool only looks and never changes anything, so that plan mode and read-only agents may use it.
     fn read_only(&self) -> bool {
         false
+    }
+
+    /// Whether a call with `args` may overlap other calls of the same reply.
+    ///
+    /// By default a tool that is [`Tool::read_only`] is [`Concurrency::Shared`]
+    /// and every other tool is [`Concurrency::Exclusive`]. A tool that only
+    /// looks but steers the conversation or talks to the reader says it is
+    /// exclusive, and a tool that changes something in some calls only says
+    /// which calls those are.
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        if self.read_only() {
+            Concurrency::Shared
+        } else {
+            Concurrency::Exclusive
+        }
     }
 
     /// Whether the tool checks its arguments against its schema itself, so that the [`crate::Registry`] only puts them right before a call and leaves turning them away to the tool.

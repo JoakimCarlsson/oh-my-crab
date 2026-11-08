@@ -103,6 +103,11 @@ ask, and deny rules that stop a call even in yolo mode. A project's own
 settings bring allow rules only once it is trusted. See
 [permission rules](extending/permissions.md).
 
+When one reply asks for several calls, every question is asked before any
+call runs. Then calls that only look, side by side, run at once, while calls
+that change things run alone, in the model's order; see
+[which calls run at once](tools/calls.md#which-calls-run-at-once).
+
 Hooks can allow or refuse a call before the reader is asked, and the client
 can deny a tool outright when it opens the conversation. See
 [how tool calls run](tools/calls.md) and [hooks](extending/hooks.md).

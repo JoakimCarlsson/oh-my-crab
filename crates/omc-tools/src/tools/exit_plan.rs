@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::tool::parse_args;
-use crate::{Host, Tool, ToolError, ToolOutput};
+use crate::{Concurrency, Host, Tool, ToolError, ToolOutput};
 
 /// Arguments of an `exit_plan_mode` call.
 #[derive(Deserialize)]
@@ -42,6 +42,11 @@ impl Tool for ExitPlanMode {
     /// Submitting a plan changes nothing on disk.
     fn read_only(&self) -> bool {
         true
+    }
+
+    /// Talks to the reader and ends plan mode, so it runs alone, in the model's order.
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        Concurrency::Exclusive
     }
 
     /// Describes the tool to the model.

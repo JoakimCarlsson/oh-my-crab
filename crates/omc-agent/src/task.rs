@@ -12,7 +12,7 @@ use futures_util::{StreamExt, stream};
 use omc_context::{AgentDefinition, render, subagent_assignment};
 use omc_providers::{ChatModel, Effort, Message};
 use omc_tools::schema::check_schema;
-use omc_tools::{Jobs, Registry, Tool, ToolError, ToolOutput, parse_args};
+use omc_tools::{Concurrency, Jobs, Registry, Tool, ToolError, ToolOutput, parse_args};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -992,6 +992,27 @@ impl Tool for Task {
         })
     }
 
+    /// Shared when every subagent the call with `args` starts only looks: all the tools subagents are given only look, as in plan mode, or the definition of every kind it names lists only tools that look. Exclusive otherwise, and for arguments that cannot be read, since a subagent that can write changes files as any writing tool does.
+    fn concurrency(&self, args: &Value) -> Concurrency {
+        if self.settings.registry.iter().all(|tool| tool.read_only()) {
+            return Concurrency::Shared;
+        }
+        let looks = serde_json::from_value::<Args>(args.clone())
+            .ok()
+            .and_then(|args| args.items().ok())
+            .is_some_and(|items| {
+                items.iter().all(|item| {
+                    self.agent(item.agent.as_deref().unwrap_or(DEFAULT_AGENT))
+                        .is_ok_and(AgentDefinition::read_only)
+                })
+            });
+        if looks {
+            Concurrency::Shared
+        } else {
+            Concurrency::Exclusive
+        }
+    }
+
     /// Describes a call by its description, or the start of its assignment; a call starting several names how many and what they do.
     fn describe(&self, args: &Value) -> String {
         let named = |item: &Value| {
@@ -1385,18 +1406,18 @@ mod tests {
 
     #[async_trait]
     impl ChatModel for Stuck {
-        /// Calls `task` twice for the main agent, and hangs for the subagents.
+        /// Calls `task` twice for the main agent, with scouts, which only look, so that both calls run at once; and hangs for the subagents.
         async fn complete(
             &self,
             request: omc_providers::Request<'_>,
             _sink: &mut dyn omc_providers::Sink,
         ) -> Result<omc_providers::Reply, omc_providers::ProviderError> {
             if request.system == "MAIN" {
-                let mut reply = call("t1", "task", json!({"task": "a"}));
+                let mut reply = call("t1", "task", json!({"agent": "scout", "task": "a"}));
                 reply.tool_calls.push(omc_providers::ToolCall {
                     id: "t2".into(),
                     name: "task".into(),
-                    arguments: json!({"task": "b"}),
+                    arguments: json!({"agent": "scout", "task": "b"}),
                 });
                 return Ok(reply);
             }

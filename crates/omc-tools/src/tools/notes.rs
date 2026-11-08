@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::tool::parse_args;
-use crate::{Notebook, Tool, ToolError, ToolOutput};
+use crate::{Concurrency, Notebook, Tool, ToolError, ToolOutput};
 
 /// Arguments of a `context_notes` call.
 #[derive(Deserialize)]
@@ -39,6 +39,11 @@ impl Tool for ContextNotes {
     /// Changes nothing on disk.
     fn read_only(&self) -> bool {
         true
+    }
+
+    /// Changes the conversation's notebook or context, so it runs alone, in the model's order.
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        Concurrency::Exclusive
     }
 
     /// Describes the tool to the model.
@@ -120,6 +125,11 @@ impl Tool for NewContext {
     /// Changes nothing on disk.
     fn read_only(&self) -> bool {
         true
+    }
+
+    /// Changes the conversation's notebook or context, so it runs alone, in the model's order.
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        Concurrency::Exclusive
     }
 
     /// Describes the tool to the model.

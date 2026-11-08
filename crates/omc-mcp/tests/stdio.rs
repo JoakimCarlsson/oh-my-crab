@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use omc_mcp::config::{Origin, Server, Transport};
 use omc_mcp::{Hub, RESOURCES_TOOL};
-use omc_tools::{Spill, Tool};
+use omc_tools::{Concurrency, Spill, Tool};
 use omc_wire::Reach;
 use serde_json::json;
 
@@ -97,6 +97,10 @@ async fn tools_resources_and_restarts() {
     );
 
     let add = named(&reached.tools, "mcp__memo__add");
+    assert_eq!(add.concurrency(&json!({})), Concurrency::Shared);
+    assert!(add.needs_approval() && !add.read_only());
+    let crash = named(&reached.tools, "mcp__memo__crash");
+    assert_eq!(crash.concurrency(&json!({})), Concurrency::Exclusive);
     assert_eq!(add.call(json!({"a": 2, "b": 3})).await.unwrap().text, "5");
     let first = resources
         .call(json!({"uri": "memo://pid"}))

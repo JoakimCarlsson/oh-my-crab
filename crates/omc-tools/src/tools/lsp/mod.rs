@@ -14,8 +14,8 @@ use serde_json::{Value, json};
 use crate::language::{GRACE, Languages};
 use crate::tool::parse_args;
 use crate::{
-    Chosen, LanguageError, LanguageService, Location, Lookup, Sandbox, Spot, Tool, ToolError,
-    ToolOutput,
+    Chosen, Concurrency, LanguageError, LanguageService, Location, Lookup, Sandbox, Spot, Tool,
+    ToolError, ToolOutput,
 };
 use changes::{Moved, Pending, commit, pending, preview};
 use render::Lines;
@@ -888,6 +888,14 @@ impl Tool for Lsp {
     fn approval_scope(&self, args: &Value) -> Option<String> {
         (!self.looking && writes(args))
             .then(|| format!("lsp {}", args["action"].as_str().unwrap_or_default()))
+    }
+
+    /// Exclusive for a call that writes files, and shared for the calls that only look.
+    fn concurrency(&self, args: &Value) -> Concurrency {
+        match self.approval_scope(args) {
+            Some(_) => Concurrency::Exclusive,
+            None => Concurrency::Shared,
+        }
     }
 
     /// Shows the action, the place and, for a change, what it changes to.

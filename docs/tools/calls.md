@@ -7,6 +7,39 @@ object or list sent as JSON text, and `null` for an optional argument. When the
 arguments still do not fit, the call is turned away with every place that is
 wrong and what was expected there.
 
+## Which calls run at once
+
+When one reply asks for several calls, every call is checked, shown to the
+hooks and, when it needs approval, asked about first, in the model's order.
+Only once every question is answered do the calls run, still in the model's
+order, each tool having a class:
+
+- **Shared** calls only look and may overlap: a run of shared calls next to
+  each other runs at once.
+- **Exclusive** calls change files or have some other effect, and run alone:
+  each waits for every call before it to end and holds back every call after
+  it.
+
+So `read a`, `read b`, `edit a`, `read a` reads both files at once, then edits,
+then reads again, and the edit sees nothing the reads have not finished with.
+A call that was denied or refused never runs and holds nothing back. The
+results come back in the model's order whatever order the calls ended in.
+
+| Class     | Tools |
+| --------- | ----- |
+| Shared    | `read` (files and the web), `grep`, `glob`, `ast_grep`, `web_search`, `lsp` except the actions that write files (rename, applying a code action, format, rename_file), `memory_search`, `skill`, `wait`, `mcp_resources`, `recall`, and `task` when every subagent it starts is of a kind that only looks (or in plan mode) |
+| Exclusive | `bash`, `edit`, `write`, `ast_edit`, `lsp` renames, `debug`, `script` outside plan mode, other `task` calls, tool-server tools, and the tools that steer the conversation or talk to the reader: `ask`, `todo`, `context_notes`, `new_context`, `checkpoint`, `rewind`, `remember`, `memory_edit`, `set_title`, `exit_plan_mode` |
+
+A tool-server tool is shared when its server marks it with the `readOnlyHint`
+annotation; the hint only lets its calls overlap, and it still asks first and
+plan mode still refuses it. A `script` whose tools all only look, as in plan
+mode, is shared. The calls a script makes follow the same classes among
+themselves: shared calls started with `Promise.all` overlap, while an
+exclusive call, or one that needs approval, waits for the calls started before
+it and runs alone.
+
+## Output
+
 Long output is not lost. `bash` shows the first 4,000 and the last 26,000 bytes
 of each of stdout and stderr, and a tool server's text is cut to its first and
 last 10 KB; the whole output is saved to a file the result names, which the

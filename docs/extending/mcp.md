@@ -226,6 +226,11 @@ a deny rule stops a tool in yolo mode too. See
 [permission rules](permissions.md). Tool-server tools count as tools that change things, so plan mode
 refuses them.
 
+A tool-server tool runs alone among the calls of a reply, unless its server
+marks it with the `readOnlyHint` annotation: then its calls may overlap the
+other calls that only look. The hint changes nothing else; see
+[which calls run at once](../tools/calls.md#which-calls-run-at-once).
+
 Text longer than 20 KB is cut to its first and last 10 KB around a note of what
 was cut, and the whole text is saved to a file the result names, which the
 model can read in parts (see [How tool calls run](../tools/calls.md)). A

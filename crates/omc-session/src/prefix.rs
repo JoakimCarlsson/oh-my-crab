@@ -11,7 +11,7 @@ use omc_context::{
     environment_reminder, memory_notice, plan_mode_notice,
 };
 use omc_providers::{Message, Provider};
-use omc_tools::{Caller, Registry, Tool, ToolError, ToolOutput};
+use omc_tools::{Caller, Concurrency, Registry, Tool, ToolError, ToolOutput};
 use serde_json::Value;
 
 use crate::toolset::Toolset;
@@ -291,6 +291,12 @@ impl Tool for Gated {
     /// Whether the tool of the mode on now only looks; a refused tool does nothing.
     fn read_only(&self) -> bool {
         self.current().map_or(true, |tool| tool.read_only())
+    }
+
+    /// Whether a call with `args` of the tool of the mode on now may overlap others; a refused call does nothing, so it may.
+    fn concurrency(&self, args: &Value) -> Concurrency {
+        self.current()
+            .map_or(Concurrency::Shared, |tool| tool.concurrency(args))
     }
 
     /// Whether the tool of the mode on now checks its own arguments; a refused tool is said to, so that the call is refused with the reason rather than for its arguments.

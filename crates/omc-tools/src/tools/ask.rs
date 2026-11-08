@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::tool::parse_args;
-use crate::{Host, Tool, ToolError, ToolOutput};
+use crate::{Concurrency, Host, Tool, ToolError, ToolOutput};
 
 /// One answer a question offers.
 #[derive(Deserialize)]
@@ -93,6 +93,11 @@ impl Tool for Ask {
     /// Asking changes nothing on disk.
     fn read_only(&self) -> bool {
         true
+    }
+
+    /// Talks to the reader, so it runs alone, in the model's order.
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        Concurrency::Exclusive
     }
 
     /// Describes the tool to the model.

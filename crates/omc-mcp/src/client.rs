@@ -48,6 +48,8 @@ pub(crate) struct Offered {
     pub(crate) description: String,
     /// The schema of its arguments.
     pub(crate) schema: Value,
+    /// Whether the server says the tool changes nothing, with the `readOnlyHint` annotation.
+    pub(crate) read_only_hint: bool,
 }
 
 /// The parameters of the handshake.
@@ -228,6 +230,7 @@ impl Client {
                     name: tool["name"].as_str()?.to_owned(),
                     description: tool["description"].as_str().unwrap_or_default().to_owned(),
                     schema: tool["inputSchema"].clone(),
+                    read_only_hint: tool["annotations"]["readOnlyHint"].as_bool() == Some(true),
                 })
             })
             .collect())

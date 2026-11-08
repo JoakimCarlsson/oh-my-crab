@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use omc_tools::{Spill, Tool, ToolError, ToolOutput};
+use omc_tools::{Concurrency, Spill, Tool, ToolError, ToolOutput};
 use serde_json::Value;
 
 use crate::client::{Client, Offered};
@@ -30,6 +30,8 @@ pub(crate) struct McpTool {
     server: String,
     /// Where text too long to show is saved whole.
     spill: Spill,
+    /// Whether the server says the tool changes nothing.
+    read_only_hint: bool,
 }
 
 impl McpTool {
@@ -40,6 +42,7 @@ impl McpTool {
             name: Box::leak(name.into_boxed_str()),
             description: Box::leak(offered.description.into_boxed_str()),
             schema: offered.schema,
+            read_only_hint: offered.read_only_hint,
             remote: offered.name,
             client,
             server: server.to_owned(),
@@ -86,6 +89,17 @@ impl Tool for McpTool {
     /// Tools of other programs always ask first.
     fn needs_approval(&self) -> bool {
         true
+    }
+
+    /// Shared when the server marks the tool with the `readOnlyHint` annotation, and otherwise exclusive, since a tool of another program can do anything.
+    ///
+    /// The hint only lets calls overlap; the tool still asks first and plan mode still refuses it, since the server's word is not checked.
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        if self.read_only_hint {
+            Concurrency::Shared
+        } else {
+            Concurrency::Exclusive
+        }
     }
 
     /// The server and tool, with the arguments.

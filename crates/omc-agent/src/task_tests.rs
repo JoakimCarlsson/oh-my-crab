@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use omc_context::{AgentDefinition, Origin, builtin_agents};
 use omc_providers::{ChatModel, Message, ProviderError, Reply, Request, Sink, ToolCall};
-use omc_tools::{Jobs, Registry, Tool, ToolError};
+use omc_tools::{Concurrency, Jobs, Registry, Tool, ToolError};
 use serde_json::{Value, json};
 
 use crate::testkit::{RequestSeen, Router, call, deny_all, read_args, say, scratch};
@@ -413,6 +413,30 @@ fn a_batch_is_described_by_its_items() {
         "2 subagents: alpha, look"
     );
     assert_eq!(task.describe(&json!({"tasks": [{"task": "solo"}]})), "solo");
+}
+
+/// A call is shared when every subagent it starts is of a kind that only looks, and exclusive when any of them can write or its kind is unknown.
+#[test]
+fn only_looking_subagents_are_shared() {
+    let (task, _) = simple("task-concurrency", Router::new(|_| say("ok")));
+    let class = |args: Value| task.concurrency(&args);
+    assert_eq!(class(json!({"task": "x"})), Concurrency::Exclusive);
+    assert_eq!(
+        class(json!({"agent": "scout", "task": "x"})),
+        Concurrency::Shared
+    );
+    assert_eq!(
+        class(json!({"agent": "scout", "tasks": [{"task": "a"}, {"task": "b"}]})),
+        Concurrency::Shared
+    );
+    assert_eq!(
+        class(json!({"tasks": [{"agent": "scout", "task": "a"}, {"task": "b"}]})),
+        Concurrency::Exclusive
+    );
+    assert_eq!(
+        class(json!({"agent": "nobody", "task": "x"})),
+        Concurrency::Exclusive
+    );
 }
 
 /// A model whose subagent requests take turns with each other, recording how many are under way at once.

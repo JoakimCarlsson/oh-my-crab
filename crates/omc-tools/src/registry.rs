@@ -211,6 +211,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::Concurrency;
 
     /// A tool that echoes its `text` argument.
     struct Echo;
@@ -249,6 +250,31 @@ mod tests {
         assert!(registry.read_only().get("lsp").unwrap().read_only());
         assert!(!registry.get("lsp").unwrap().read_only());
         assert_eq!(registry.names().len(), 10);
+    }
+
+    /// The tools that only look are shared and the ones that change things exclusive; `lsp` is shared except for the actions that write files.
+    #[test]
+    fn concurrency_classes() {
+        let registry = Registry::builtin(crate::testutil::scratch("registry-concurrency")).unwrap();
+        let class = |name: &str, args: Value| registry.get(name).unwrap().concurrency(&args);
+        for name in ["read", "grep", "glob", "ast_grep", "web_search"] {
+            assert_eq!(class(name, json!({})), Concurrency::Shared, "{name}");
+        }
+        for name in ["bash", "edit", "write", "ast_edit"] {
+            assert_eq!(class(name, json!({})), Concurrency::Exclusive, "{name}");
+        }
+        assert_eq!(
+            class("lsp", json!({"action": "references"})),
+            Concurrency::Shared
+        );
+        assert_eq!(
+            class("lsp", json!({"action": "rename", "dry_run": true})),
+            Concurrency::Shared
+        );
+        assert_eq!(
+            class("lsp", json!({"action": "rename"})),
+            Concurrency::Exclusive
+        );
     }
 
     /// A registered tool runs by name and an unknown name is an error.

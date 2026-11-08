@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::tool::parse_args;
-use crate::{Tool, ToolError, ToolOutput};
+use crate::{Concurrency, Tool, ToolError, ToolOutput};
 
 /// How many results `memory_search` gives when it is not told.
 const DEFAULT_RESULTS: usize = 10;
@@ -94,6 +94,11 @@ impl Tool for Remember {
     /// Changes nothing in the project, so that plan mode allows it.
     fn read_only(&self) -> bool {
         true
+    }
+
+    /// Changes the memories, so it runs alone, in the model's order.
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        Concurrency::Exclusive
     }
 
     /// Describes the tool to the model.
@@ -317,6 +322,11 @@ impl Tool for MemoryEdit {
     /// Changes nothing in the project, so that plan mode allows it.
     fn read_only(&self) -> bool {
         true
+    }
+
+    /// Changes the memories, so it runs alone, in the model's order.
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        Concurrency::Exclusive
     }
 
     /// Describes the tool to the model.

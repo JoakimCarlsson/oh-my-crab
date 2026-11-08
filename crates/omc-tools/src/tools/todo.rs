@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::tool::parse_args;
-use crate::{Host, Tool, ToolError, ToolOutput};
+use crate::{Concurrency, Host, Tool, ToolError, ToolOutput};
 
 /// One task of a `todo` call.
 #[derive(Deserialize)]
@@ -59,6 +59,11 @@ impl Tool for Todo {
     /// Changes nothing on disk.
     fn read_only(&self) -> bool {
         true
+    }
+
+    /// Changes the list the reader sees, so it runs alone, in the model's order.
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        Concurrency::Exclusive
     }
 
     /// Describes the tool to the model.

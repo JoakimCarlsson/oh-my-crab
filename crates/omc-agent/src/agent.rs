@@ -12,10 +12,12 @@ use omc_providers::{
     ToolCall, ToolResult, ToolSpec,
 };
 use omc_tools::{
-    Caller, Checkpoint, FileChange, NoCaller, Notebook, Registry, Tool, ToolOutput, sanitize,
+    Caller, Checkpoint, Concurrency, FileChange, NoCaller, Notebook, Registry, Tool, ToolOutput,
+    sanitize,
 };
 use serde_json::Value;
 use thiserror::Error;
+use tokio::sync::{RwLockReadGuard, RwLockWriteGuard};
 
 use crate::compaction;
 use crate::hooks::{CompactTrigger, Compacting, Gate, Hooks, Permit, StopBound, with_note};
@@ -964,8 +966,11 @@ fn tool_specs(registry: &Registry) -> Vec<ToolSpec> {
 /// without running, in yolo mode too. Calls that need approval, and calls an
 /// ask rule matches, are asked about one at a time, in order, unless a hook
 /// allowed them or allow rules cover them; before the reader is asked, the hooks
-/// may decide in the reader's place. Approved calls then run one after another so edits cannot
-/// race, while calls that need no approval run concurrently. The hooks see each
+/// may decide in the reader's place, and every question is answered before
+/// any call runs. The calls that may run then run in the model's order, each
+/// run of [`Concurrency::Shared`] calls next to each other at once and each
+/// [`Concurrency::Exclusive`] call alone, so that what the calls change happens
+/// in the order the model asked for while reads overlap. The hooks see each
 /// call once more, after it ran, and may add a note to its result or replace it.
 ///
 /// A tool that runs other tools, such as `script`, runs them through a [`Nested`] caller, so that each of its calls goes through the same steps and is reported under it.
@@ -977,7 +982,7 @@ async fn run_calls(
     calls: &[ToolCall],
     events: &(dyn Fn(AgentEvent) + Send + Sync),
 ) -> (Vec<ToolResult>, Option<String>) {
-    let gate = tokio::sync::Mutex::new(());
+    let gate = tokio::sync::RwLock::new(());
     let halt = std::sync::Mutex::new(None);
     let batch = Batch {
         registry,
@@ -988,8 +993,7 @@ async fn run_calls(
         halt: &halt,
     };
     let mut slots: Vec<Option<ToolResult>> = vec![None; calls.len()];
-    let mut concurrent = Vec::new();
-    let mut sequential = Vec::new();
+    let mut admitted = Vec::new();
     for (index, call) in calls.iter().enumerate() {
         if call.name == RECALL && recall::offered(history) {
             events(AgentEvent::ToolStart {
@@ -1015,28 +1019,40 @@ async fn run_calls(
             Admitted::Ready(ready) => ready,
         };
         match batch.approve(call, &mut ready, None).await {
-            Ok(()) if ready.needed => sequential.push((index, ready)),
-            Ok(()) => concurrent.push((index, ready)),
+            Ok(()) => admitted.push((index, ready)),
             Err(message) => {
                 slots[index] = Some(finish(call, message, true, Vec::new(), events));
             }
         }
     }
-    let indices: Vec<usize> = concurrent.iter().map(|(index, ..)| *index).collect();
-    let done = join_all(
-        concurrent
-            .into_iter()
-            .map(|(index, ready)| batch.run_call(&calls[index], ready)),
-    )
-    .await;
-    for (index, result) in indices.into_iter().zip(done) {
-        slots[index] = Some(result);
-    }
-    for (index, ready) in sequential {
-        slots[index] = Some(batch.run_call(&calls[index], ready).await);
+    for wave in waves(admitted) {
+        let indices: Vec<usize> = wave.iter().map(|(index, _)| *index).collect();
+        let done = join_all(
+            wave.into_iter()
+                .map(|(index, ready)| batch.run_call(&calls[index], ready)),
+        )
+        .await;
+        for (index, result) in indices.into_iter().zip(done) {
+            slots[index] = Some(result);
+        }
     }
     let halt = halt.into_inner().unwrap_or_else(|held| held.into_inner());
     (slots.into_iter().flatten().collect(), halt)
+}
+
+/// Splits `admitted`, the calls that may run with their places in the reply, in the model's order, into the groups that run one after another: each run of shared calls next to each other is one group, run at once, and each exclusive call is a group of its own.
+fn waves(admitted: Vec<(usize, Ready<'_>)>) -> Vec<Vec<(usize, Ready<'_>)>> {
+    let mut waves: Vec<Vec<(usize, Ready<'_>)>> = Vec::new();
+    for (index, ready) in admitted {
+        let shared = |ready: &Ready<'_>| ready.concurrency == Concurrency::Shared;
+        match waves.last_mut() {
+            Some(last) if shared(&ready) && last.iter().all(|(_, earlier)| shared(earlier)) => {
+                last.push((index, ready));
+            }
+            _ => waves.push(vec![(index, ready)]),
+        }
+    }
+    waves
 }
 
 /// What the hooks said about one call before it ran.
@@ -1076,16 +1092,19 @@ struct Ready<'r> {
     allowed: bool,
     /// Whether a hook wants the reader asked about it.
     asked: bool,
+    /// Whether it may overlap other calls of the reply.
+    concurrency: Concurrency,
 }
 
 impl Ready<'_> {
-    /// Takes `arguments`, already put right against the tool's schema, in place of the call's, with what is approved and what rules look at made from them.
+    /// Takes `arguments`, already put right against the tool's schema, in place of the call's, with what is approved, what rules look at and whether the call may overlap others made from them.
     fn rewrite(&mut self, arguments: Value) {
         let scope = self.tool.approval_scope(&arguments);
         self.needed = scope.is_some();
         self.request.scope = scope.unwrap_or_else(|| self.request.tool.clone());
         self.request.subject = self.tool.subject(&arguments);
         self.request.summary = sanitize(&self.tool.describe(&arguments));
+        self.concurrency = self.tool.concurrency(&arguments);
         self.arguments = arguments;
     }
 }
@@ -1147,6 +1166,7 @@ async fn admit<'r>(
         Some((_, Err(message))) => Admitted::Ended(finish(call, message, true, Vec::new(), events)),
         Some((tool, Ok(arguments))) => Admitted::Ready(Ready {
             needed: tool.approval_scope(&arguments).is_some(),
+            concurrency: tool.concurrency(&arguments),
             request: ApprovalRequest {
                 tool: call.name.clone(),
                 scope: tool
@@ -1189,8 +1209,8 @@ struct Batch<'a> {
     hooks: Option<&'a dyn Hooks>,
     /// Where the calls are reported.
     events: &'a (dyn Fn(AgentEvent) + Send + Sync),
-    /// Held while a call made by another tool is asked about and run when it needs approval, so that such calls run one at a time across the batch, as approved calls of the model do.
-    gate: &'a tokio::sync::Mutex<()>,
+    /// Taken by each call made by another tool while it is asked about and run: alone when it needs approval, a hook wants the reader asked or it is exclusive, so that such calls run one at a time, and shared by the shared calls that need no approval, which overlap; it is handed out in the order the calls were made.
+    gate: &'a tokio::sync::RwLock<()>,
     /// Why the turn stops once the batch has ended, when a hook asked for that; the first reason given is kept.
     halt: &'a std::sync::Mutex<Option<String>>,
 }
@@ -1419,7 +1439,7 @@ impl Caller for Nested<'_> {
 
     /// Runs the tool `name` with `args` the way a call of the model runs: its arguments put right against the schema and shown to the hooks, the reader asked when it needs approval, the hooks shown its result; reported under the calling tool's call, numbered from one in the order they were made.
     ///
-    /// Calls that need approval are asked about and run one at a time; the reader is told which tool made them.
+    /// Calls that need approval or are exclusive are asked about and run one at a time, while shared calls that need no approval overlap; the reader is told which tool made them.
     async fn call(&self, name: &str, args: Value) -> Result<ToolOutput, String> {
         let number = self.made.fetch_add(1, AtomicOrdering::Relaxed) + 1;
         let call = ToolCall {
@@ -1432,9 +1452,13 @@ impl Caller for Nested<'_> {
             Admitted::Ended(result) => return Err(result.text),
             Admitted::Ready(ready) => ready,
         };
-        let _turn = match ready.needed || ready.asked {
-            true => Some(self.batch.gate.lock().await),
-            false => None,
+        let alone = ready.needed || ready.asked || ready.concurrency == Concurrency::Exclusive;
+        let _turn: (
+            Option<RwLockWriteGuard<'_, ()>>,
+            Option<RwLockReadGuard<'_, ()>>,
+        ) = match alone {
+            true => (Some(self.batch.gate.write().await), None),
+            false => (None, Some(self.batch.gate.read().await)),
         };
         ready.request.summary = format!("{} (called by {})", ready.request.summary, self.agent);
         if let Err(message) = self.batch.approve(&call, &mut ready, Some(self)).await {
