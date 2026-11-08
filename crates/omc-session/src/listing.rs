@@ -7,7 +7,7 @@ use omc_context::{Discovered, Environment, Locations};
 use omc_dap::DebugTool;
 use omc_providers::{ChatModel, ProviderError, Reply, Request, Sink};
 use omc_script::Script;
-use omc_tools::{Languages, Registry, Sandbox, Skill, Spill};
+use omc_tools::{Deferral, Languages, Registry, Sandbox, Skill, Spill};
 use omc_wire::ToolInfo;
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -59,6 +59,7 @@ pub fn tools() -> Result<Vec<ToolInfo>, String> {
     let toolset = Toolset::build(&Inputs {
         base: &base,
         denied: &[],
+        deferral: &Deferral::from_env(),
         host: Arc::new(SessionHost {
             shared: shared.clone(),
         }),
@@ -113,7 +114,7 @@ mod tests {
                 assert!(names.contains(&name), "{name} missing");
             }
         }
-        names.retain(|name| !memory.contains(name));
+        names.retain(|name| !memory.contains(name) && *name != omc_tools::LOAD_TOOLS);
         assert_eq!(
             names,
             [

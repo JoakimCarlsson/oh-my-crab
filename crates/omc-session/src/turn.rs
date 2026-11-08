@@ -9,7 +9,7 @@ use omc_extensions::{ExtensionHooks, Prompted};
 use omc_hooks::{Engine, HookEvent, Submitted};
 use omc_providers::Provider;
 use omc_providers::{ChatModel, Message, RemoteModel};
-use omc_tools::{Host, Registry};
+use omc_tools::{Deferral, Host, Registry};
 
 use crate::lifecycle::{context_of, start_notice};
 use crate::picker::SessionPicker;
@@ -145,6 +145,7 @@ impl Turn {
         let toolset = Toolset::build(&Inputs {
             base: &self.base,
             denied: &self.denied,
+            deferral: &Deferral::from_env(),
             host,
             model: model.clone(),
             models: Models {
@@ -413,6 +414,7 @@ mod tests {
 
     use async_trait::async_trait;
     use omc_providers::{ProviderError, Reply, Request, Sink, ToolCall};
+    use omc_tools::LOAD_TOOLS;
     use omc_wire::Event;
     use serde_json::json;
 
@@ -1678,8 +1680,13 @@ mod tests {
             );
         }
         let names = tool_names(&seen[0]);
-        for name in ["remember", "memory_search", "memory_edit"] {
+        for name in ["remember", "memory_search"] {
             assert!(names.contains(&name), "{name} missing");
+        }
+        if Deferral::from_env().defers("memory_edit") {
+            assert!(!names.contains(&"memory_edit") && names.contains(&LOAD_TOOLS));
+        } else {
+            assert!(names.contains(&"memory_edit"));
         }
         assert!(seen[0].system.contains("# Memory"));
         let first = seen[0].prompt.as_deref().unwrap();

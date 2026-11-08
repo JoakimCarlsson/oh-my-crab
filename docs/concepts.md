@@ -221,6 +221,9 @@ when the model changes or the `checkpoints` or `memory` setting is turned on
 or off. The system prompt holds the instruction files (`AGENTS.md`,
 `CLAUDE.md` and the like), the skills and subagent kinds, the working folder,
 the operating system and the model, and an outline of the working directory.
+A few rarely used tools are left off the tool list, named by `load_tools`
+instead, which hands their schemas over when asked; see
+[hidden tools](tools/README.md#hidden-tools).
 
 Whatever changes later reaches the model as a short notice at the start of the
 next prompt instead:

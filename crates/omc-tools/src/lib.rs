@@ -2,6 +2,7 @@
 
 mod checkpoint;
 mod coerce;
+mod deferral;
 mod error;
 mod host;
 mod jobs;
@@ -20,6 +21,7 @@ mod tools;
 mod testutil;
 
 pub use checkpoint::Checkpoint;
+pub use deferral::{DEFAULT_DEFERRED, DEFERRED_VARIABLE, Deferral};
 pub use error::ToolError;
 pub use host::Host;
 pub use jobs::{Finished, Jobs};
@@ -40,7 +42,7 @@ pub use tool::{
     parse_args, sanitize,
 };
 pub use tools::{
-    Ask, AstEdit, AstGrep, Bash, CheckpointTool, ContextNotes, Edit, ExitPlanMode, Glob, Grep, Lsp,
-    MemoryEdit, MemorySearch, NewContext, Read, Remember, Rewind, SetTitle, Skill, Todo, Wait,
-    WebSearch, Write, snapshot_tag,
+    Ask, AstEdit, AstGrep, Bash, CheckpointTool, ContextNotes, Edit, ExitPlanMode, Glob, Grep,
+    LOAD_TOOLS, LoadTools, Lsp, MemoryEdit, MemorySearch, NewContext, Read, Remember, Rewind,
+    SetTitle, Skill, Todo, Wait, WebSearch, Write, one_line_summary, snapshot_tag,
 };

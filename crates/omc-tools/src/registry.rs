@@ -1,19 +1,23 @@
 //! The registry that maps tool names to implementations.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde_json::Value;
 
 use crate::coerce::{coerce, prepare};
-use crate::tools::{AstEdit, AstGrep, Bash, Edit, Glob, Grep, Lsp, Read, WebSearch, Write};
-use crate::{Jobs, Languages, Sandbox, Tool, ToolError, ToolOutput};
+use crate::tools::{
+    AstEdit, AstGrep, Bash, Edit, Glob, Grep, LOAD_TOOLS, LoadTools, Lsp, Read, WebSearch, Write,
+};
+use crate::{Deferral, Jobs, Languages, Sandbox, Tool, ToolError, ToolOutput};
 
 /// A set of tools addressable by name.
 #[derive(Clone, Default)]
 pub struct Registry {
     /// The tools, keyed and ordered by name.
     tools: BTreeMap<&'static str, Arc<dyn Tool>>,
+    /// The names of the tools left out of the tool list until the model looks them up with `load_tools`.
+    deferred: BTreeSet<&'static str>,
 }
 
 impl Registry {
@@ -90,6 +94,46 @@ impl Registry {
         self.tools.remove(name);
     }
 
+    /// Leaves the tools `deferral` names out of the tool list until the model looks them up; they stay registered and run like any other when called.
+    ///
+    /// [`Registry::fitted`] then gives the registry the `load_tools` tool that names them and hands over their schemas.
+    pub fn defer(&mut self, deferral: &Deferral) {
+        let names: Vec<&'static str> = self
+            .tools
+            .keys()
+            .copied()
+            .filter(|name| deferral.defers(name))
+            .collect();
+        self.deferred.extend(names);
+    }
+
+    /// Leaves the tool called `name` out of the tool list until the model looks it up, when it is registered.
+    pub fn defer_named(&mut self, name: &str) {
+        if let Some((name, _)) = self.tools.get_key_value(name) {
+            self.deferred.insert(*name);
+        }
+    }
+
+    /// Whether the tool called `name` is registered and left out of the tool list until looked up.
+    pub fn is_deferred(&self, name: &str) -> bool {
+        self.deferred.contains(name) && self.tools.contains_key(name)
+    }
+
+    /// Whether any registered tool is left out of the tool list until looked up.
+    pub fn has_deferred(&self) -> bool {
+        self.deferred
+            .iter()
+            .any(|name| self.tools.contains_key(name))
+    }
+
+    /// Iterates over the tools on the tool list, the ones not left out until looked up, in name order.
+    pub fn offered(&self) -> impl Iterator<Item = &Arc<dyn Tool>> {
+        self.tools
+            .iter()
+            .filter(|(name, _)| !self.deferred.contains(*name))
+            .map(|(_, tool)| tool)
+    }
+
     /// A registry with only the tools that satisfy `keep`.
     pub fn filtered(&self, keep: impl Fn(&dyn Tool) -> bool) -> Self {
         Self {
@@ -99,6 +143,7 @@ impl Registry {
                 .filter(|(_, tool)| keep(tool.as_ref()))
                 .map(|(name, tool)| (*name, tool.clone()))
                 .collect(),
+            deferred: self.deferred.clone(),
         }
     }
 
@@ -110,18 +155,26 @@ impl Registry {
                 .iter()
                 .map(|(name, tool)| (*name, tool.foreground().unwrap_or_else(|| tool.clone())))
                 .collect(),
+            deferred: self.deferred.clone(),
         }
     }
 
-    /// The same registry with every tool that depends on what else the agent has replaced by its copy made for the tools here.
+    /// The same registry with every tool that depends on what else the agent has replaced by its copy made for the tools here, and with a `load_tools` tool naming the tools left out of the tool list when there are any, or without one when there are none.
     pub fn fitted(&self) -> Self {
-        Self {
+        let mut fitted = Self {
             tools: self
                 .tools
                 .iter()
                 .map(|(name, tool)| (*name, tool.fitted(self).unwrap_or_else(|| tool.clone())))
                 .collect(),
+            deferred: self.deferred.clone(),
+        };
+        fitted.remove(LOAD_TOOLS);
+        if fitted.has_deferred() {
+            let lookup = LoadTools::listing(&fitted);
+            fitted.register(lookup);
         }
+        fitted
     }
 
     /// A registry with only the tools that never change anything, and the copies that only look of the tools that change something in some calls only.
@@ -138,6 +191,7 @@ impl Registry {
                     }
                 })
                 .collect(),
+            deferred: self.deferred.clone(),
         }
     }
 

@@ -942,10 +942,10 @@ fn joined_focus(focus: Option<&str>, added: Option<String>) -> Option<String> {
     }
 }
 
-/// Describes every registered tool in the provider-neutral form.
+/// Describes every registered tool on the tool list in the provider-neutral form; the tools left out until the model looks them up with `load_tools` are not described, though they run like the rest when called.
 fn tool_specs(registry: &Registry) -> Vec<ToolSpec> {
     registry
-        .iter()
+        .offered()
         .map(|tool| ToolSpec {
             name: tool.name().to_string(),
             description: tool.description().to_string(),

@@ -2,6 +2,7 @@
 //!
 //! The provider's prompt cache keeps a request's prefix only while it stays byte for byte the same, and tools and system prompt come first, so a change to either costs the whole cache. They are made once for a conversation and kept; what changes later, plan mode turning on or off, the date, skills, agents and instruction files found again on disk, is told to the agent in a message at the start of the next turn, and the tools plan mode forbids are refused when they are called instead of being taken off the list.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -11,7 +12,9 @@ use omc_context::{
     environment_reminder, memory_notice, plan_mode_notice,
 };
 use omc_providers::{Message, Provider};
-use omc_tools::{Caller, Concurrency, Registry, Tool, ToolError, ToolOutput};
+use omc_tools::{
+    Caller, Concurrency, LOAD_TOOLS, LoadTools, Registry, Tool, ToolError, ToolOutput,
+};
 use serde_json::Value;
 
 use crate::toolset::Toolset;
@@ -49,8 +52,10 @@ pub(crate) struct Prefix {
     key: Key,
     /// The system prompt.
     pub(crate) system: Arc<str>,
-    /// The tools of both modes, by name.
+    /// The tools of both modes, by name, `load_tools` aside.
     specs: Vec<Spec>,
+    /// The names of the tools of `specs` left out of the tool list until the model looks them up with `load_tools`.
+    deferred: BTreeSet<&'static str>,
     /// What was found on disk when it was made, which the system prompt describes.
     discovered: Arc<Discovered>,
 }
@@ -66,12 +71,22 @@ impl Prefix {
         unnamed: bool,
     ) -> Self {
         let mut specs: Vec<Spec> = Vec::new();
+        let mut deferred = BTreeSet::new();
+        for plan in [false, true] {
+            let tools = toolset.tools(plan);
+            deferred.extend(
+                tools
+                    .iter()
+                    .map(|tool| tool.name())
+                    .filter(|name| tools.is_deferred(name)),
+            );
+        }
         for tool in toolset
             .tools(false)
             .iter()
             .chain(toolset.tools(true).iter())
         {
-            if !specs.iter().any(|spec| spec.name == tool.name()) {
+            if tool.name() != LOAD_TOOLS && !specs.iter().any(|spec| spec.name == tool.name()) {
                 specs.push(Spec {
                     name: tool.name(),
                     description: tool.description().to_owned(),
@@ -83,7 +98,11 @@ impl Prefix {
             specs.push(recall_spec());
         }
         specs.sort_by_key(|spec| spec.name);
-        let names: Vec<String> = specs.iter().map(|spec| spec.name.to_owned()).collect();
+        let mut names: Vec<String> = specs.iter().map(|spec| spec.name.to_owned()).collect();
+        if !deferred.is_empty() {
+            names.push(LOAD_TOOLS.to_owned());
+            names.sort();
+        }
         let system = build_prompt(PromptInput {
             environment,
             discovered: &discovered,
@@ -96,6 +115,7 @@ impl Prefix {
             key,
             system: Arc::from(system),
             specs,
+            deferred,
             discovered,
         }
     }
@@ -106,6 +126,8 @@ impl Prefix {
     }
 
     /// The tools to offer: every tool of the prefix, described as when it was made, each running the tool of the same name in `toolset` for the mode `planning` says is on, and refusing the call when that mode has no such tool.
+    ///
+    /// The tools the prefix leaves out of the tool list stay out of it, and `load_tools` hands over their descriptions and schemas as the prefix keeps them, so that what the model loads is what its calls are checked against, and the tool list, `load_tools` among it, is the same on every request.
     pub(crate) fn registry(&self, toolset: &Toolset, planning: &Planning) -> Registry {
         let allowed: Arc<[String]> = self.allowed_in_plan(toolset).into();
         let mut registry = Registry::new();
@@ -117,6 +139,13 @@ impl Prefix {
                 planning: planning.clone(),
                 allowed: allowed.clone(),
             });
+        }
+        for name in &self.deferred {
+            registry.defer_named(name);
+        }
+        if registry.has_deferred() {
+            let lookup = LoadTools::listing(&registry);
+            registry.register(lookup);
         }
         registry
     }

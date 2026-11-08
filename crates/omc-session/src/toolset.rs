@@ -9,7 +9,7 @@ use omc_context::{Discovered, Environment, PromptInput, build_subagent_prompt};
 use omc_memory::Memories;
 use omc_providers::{ChatModel, Effort};
 use omc_tools::{
-    Ask, Checkpoint, CheckpointTool, ContextNotes, ExitPlanMode, Host, Jobs, MemoryEdit,
+    Ask, Checkpoint, CheckpointTool, ContextNotes, Deferral, ExitPlanMode, Host, Jobs, MemoryEdit,
     MemorySearch, NewContext, Notebook, Registry, Remember, Rewind, SetTitle, Todo, Wait,
 };
 
@@ -19,6 +19,8 @@ pub(crate) struct Inputs<'a> {
     pub(crate) base: &'a Registry,
     /// The names of the tools the agent is not given.
     pub(crate) denied: &'a [String],
+    /// Which tools are left out of the tool list until the model looks them up.
+    pub(crate) deferral: &'a Deferral,
     /// The reader the tools report to.
     pub(crate) host: Arc<dyn Host>,
     /// The model subagents ask unless another is named.
@@ -78,7 +80,7 @@ impl Toolset {
     }
 }
 
-/// The tools the agent and its subagents share in plan mode when `plan` is set, and otherwise outside it: the built-in ones, or those that only look, with memory search when there are memories, less every tool the client denied.
+/// The tools the agent and its subagents share in plan mode when `plan` is set, and otherwise outside it: the built-in ones, or those that only look, with memory search when there are memories, less every tool the client denied, the ones the deferral names left out of the tool list until looked up.
 fn base_tools(inputs: &Inputs<'_>, plan: bool) -> Registry {
     let mut base = if plan {
         inputs.base.read_only()
@@ -91,6 +93,7 @@ fn base_tools(inputs: &Inputs<'_>, plan: bool) -> Registry {
     for name in inputs.denied {
         base.remove(name);
     }
+    base.defer(inputs.deferral);
     base
 }
 
@@ -156,6 +159,7 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
     for name in inputs.denied {
         registry.remove(name);
     }
+    registry.defer(inputs.deferral);
     registry.fitted()
 }
 
@@ -226,11 +230,22 @@ mod tests {
         with_inputs(denied, checkpoint, memories, Toolset::build)
     }
 
-    /// Hands `use_inputs` the inputs of a toolset for the built-in tools in a scratch folder, denying `denied`, with `checkpoint` and `memories` when they are set, and returns what it made of them.
+    /// Hands `use_inputs` the inputs of a toolset for the built-in tools in a scratch folder, denying `denied`, with `checkpoint` and `memories` when they are set, hiding no tool, and returns what it made of them.
     fn with_inputs<T>(
         denied: &[String],
         checkpoint: Option<Arc<Checkpoint>>,
         memories: Option<Arc<Memories>>,
+        use_inputs: impl FnOnce(&Inputs<'_>) -> T,
+    ) -> T {
+        with_deferral(denied, checkpoint, memories, &Deferral::none(), use_inputs)
+    }
+
+    /// Hands `use_inputs` the inputs of a toolset like [`with_inputs`], hiding the tools `deferral` names, and returns what it made of them.
+    fn with_deferral<T>(
+        denied: &[String],
+        checkpoint: Option<Arc<Checkpoint>>,
+        memories: Option<Arc<Memories>>,
+        deferral: &Deferral,
         use_inputs: impl FnOnce(&Inputs<'_>) -> T,
     ) -> T {
         let (out, _events) = tokio::sync::mpsc::unbounded_channel();
@@ -251,6 +266,7 @@ mod tests {
         use_inputs(&Inputs {
             base: &base,
             denied,
+            deferral,
             host: Arc::new(SessionHost {
                 shared: shared.clone(),
             }),
@@ -446,6 +462,78 @@ mod tests {
         assert!(tools.tools(false).get("task").is_none());
         assert!(tools.tools(false).get("bash").is_none());
         assert!(tools.tools(true).get("task").is_none());
+    }
+
+    /// The hidden tools stay in both modes and in what subagents get, marked hidden, with a `load_tools` naming them; the prefix keeps them off the tool list it offers, with the same `load_tools`, and still runs them.
+    #[tokio::test]
+    async fn hidden_tools_stay_callable_but_off_the_list() {
+        let deferral = Deferral::parse(Some("ast_grep,debug"));
+        let (tools, sub) = with_deferral(&[], None, None, &deferral, |inputs| {
+            (
+                Toolset::build(inputs),
+                subagent_tools(&base_tools(inputs, false)).fitted(),
+            )
+        });
+        for plan in [false, true] {
+            let registry = tools.tools(plan);
+            assert!(registry.is_deferred("ast_grep") && !registry.is_deferred("grep"));
+            let lookup = registry.get(omc_tools::LOAD_TOOLS).unwrap();
+            assert!(
+                lookup
+                    .description()
+                    .contains("- `ast_grep`: Search code by syntax tree")
+            );
+        }
+        assert!(sub.is_deferred("ast_grep") && sub.get(omc_tools::LOAD_TOOLS).is_some());
+        let locations = omc_context::Locations {
+            directory: std::path::PathBuf::from("/work"),
+            root: None,
+            home: None,
+            claude: None,
+            codex: None,
+            project: true,
+        };
+        let prefix = crate::prefix::Prefix::freeze(
+            crate::prefix::Key {
+                provider: omc_providers::Provider::Claude,
+                model: "m".into(),
+                checkpoints: false,
+                memory: false,
+            },
+            &tools,
+            &Environment::detect(&locations, "m"),
+            "",
+            Arc::new(Discovered::default()),
+            false,
+        );
+        let planning: crate::prefix::Planning = Arc::new(|| false);
+        let offered = prefix.registry(&tools, &planning);
+        let listed: Vec<&str> = offered.offered().map(|tool| tool.name()).collect();
+        assert!(listed.contains(&omc_tools::LOAD_TOOLS) && listed.contains(&"grep"));
+        assert!(!listed.contains(&"ast_grep"));
+        assert_eq!(
+            offered.get(omc_tools::LOAD_TOOLS).unwrap().description(),
+            prefix
+                .registry(&tools, &planning)
+                .get(omc_tools::LOAD_TOOLS)
+                .unwrap()
+                .description()
+        );
+        let loaded = offered
+            .call(
+                omc_tools::LOAD_TOOLS,
+                serde_json::json!({"names": ["ast_grep"]}),
+            )
+            .await
+            .unwrap();
+        assert!(loaded.text.contains("<tool name=\"ast_grep\">"));
+        let ran = offered
+            .call(
+                "ast_grep",
+                serde_json::json!({"pattern": "fn $NAME()", "lang": "rust"}),
+            )
+            .await;
+        assert!(!matches!(ran, Err(omc_tools::ToolError::Unknown(_))));
     }
 
     /// A tool the client denied is kept from subagents as well as from the agent, in both modes.

@@ -1,4 +1,4 @@
-//! Tests of how the calls of one reply are scheduled: shared calls next to each other overlap, exclusive calls run alone, in the model's order.
+//! Tests of how the calls of one reply are scheduled: shared calls next to each other overlap, exclusive calls run alone, in the model's order; and of hidden tools, which are left off the tool list yet run like the rest.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -202,5 +202,61 @@ async fn approved_exclusive_calls_run_in_order() {
         [
             "start r1", "end r1", "start w1", "end w1", "start w2", "end w2", "start r2", "end r2"
         ]
+    );
+}
+
+/// A hidden tool is left off every request's tool list, which stays the same and carries `load_tools`; loading it hands over its schema, and calling it asks for approval like any other call.
+#[tokio::test]
+async fn hidden_tools_are_off_the_list_but_called_like_the_rest() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = registry(&log, true);
+    registry.defer_named("change");
+    let registry = registry.fitted();
+    let model = Router::new(|seen| match seen.messages {
+        1 => crate::testkit::call("l", omc_tools::LOAD_TOOLS, json!({"names": ["change"]})),
+        3 => batch(&[("w", "change"), ("r", "look")]),
+        _ => say("done"),
+    });
+    let mut history = Vec::new();
+    run_turn(
+        &Context {
+            model: model.as_ref(),
+            registry: &registry,
+            approvals: &deny_all(),
+            system: "",
+            effort: None,
+            refresh: None,
+            notebook: None,
+            window: None,
+            checkpoint: None,
+            hooks: None,
+        },
+        &mut history,
+        "go".into(),
+        &|_: AgentEvent| {},
+    )
+    .await
+    .unwrap();
+    let seen = model.seen.lock().unwrap();
+    assert_eq!(seen.len(), 3);
+    for request in seen.iter() {
+        assert_eq!(request.tools, ["load_tools", "look"]);
+    }
+    assert_eq!(*log.lock().unwrap(), ["start r", "end r"]);
+    let Message::ToolResults(loaded) = &history[2] else {
+        panic!("no results");
+    };
+    assert!(
+        loaded[0].text.contains("<tool name=\"change\">"),
+        "{}",
+        loaded[0].text
+    );
+    let Message::ToolResults(results) = &history[4] else {
+        panic!("no results");
+    };
+    assert!(
+        results[0].is_error && results[0].text.contains("denied"),
+        "{}",
+        results[0].text
     );
 }

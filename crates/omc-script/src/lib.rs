@@ -40,6 +40,7 @@ pub const WITHHELD: &[&str] = &[
     "skill",
     "remember",
     "memory_edit",
+    omc_tools::LOAD_TOOLS,
 ];
 
 /// The wall time a script may run when the call gives no `timeout`, in seconds.
@@ -93,7 +94,7 @@ impl Script {
         Self::with_tools(spill, &Registry::new())
     }
 
-    /// The tool, saving long output in `spill`, letting scripts call the tools of `tools` that are not [`WITHHELD`].
+    /// The tool, saving long output in `spill`, letting scripts call the tools of `tools` that are not [`WITHHELD`]; the ones `tools` leaves out of the tool list are named without their signatures.
     pub fn with_tools(spill: Spill, tools: &Registry) -> Self {
         let usable: Vec<&Arc<dyn Tool>> = tools
             .iter()
@@ -101,13 +102,25 @@ impl Script {
             .collect();
         let listing: Vec<String> = usable
             .iter()
+            .filter(|tool| !tools.is_deferred(tool.name()))
             .map(|tool| signature::signature(tool.name(), &tool.schema(), tool.data_shape()))
             .collect();
-        let listing = if listing.is_empty() {
+        let hidden: Vec<String> = usable
+            .iter()
+            .filter(|tool| tools.is_deferred(tool.name()))
+            .map(|tool| format!("`{}`", tool.name()))
+            .collect();
+        let mut listing = if listing.is_empty() {
             "(none)".to_owned()
         } else {
             listing.join("\n")
         };
+        if !hidden.is_empty() {
+            listing.push_str(&format!(
+                "\n\nHidden from your tool list, callable the same way once you have loaded their parameters with `load_tools`: {}.",
+                hidden.join(", ")
+            ));
+        }
         let description = render(
             PROMPT,
             &[

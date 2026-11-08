@@ -89,6 +89,12 @@ also when the system prompt is made again for another model; the prompt says
 it is a snapshot from the start of the conversation. Subagents get the same
 outline in their own system prompts.
 
+Rarely used tools are kept off the list without changing it: they are
+[hidden until looked up](tools/README.md#hidden-tools). `load_tools`, which
+names each hidden tool with a one-line summary, is on the list from the first
+request, and loading a tool only adds a tool result to the conversation, so
+the list and everything before the new messages stay cached.
+
 Plan mode no longer takes tools off the list. The tools that change things
 stay listed, and a call to one while plan mode is on is refused with a
 message naming the tools that are allowed; it is never run and never asks for

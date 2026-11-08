@@ -15,7 +15,9 @@ approval, waits for the calls started before it and runs alone (see
 [which calls run at once](calls.md#which-calls-run-at-once)).
 The tool's description lists the tools a script can call with their arguments
 as TypeScript-like signatures, made from their schemas in name order, so the
-description stays the same from one request to the next.
+description stays the same from one request to the next. [Hidden
+tools](README.md#hidden-tools) are named without signatures; a script calls
+them the same way once the model has loaded their parameters.
 
 The program runs in QuickJS, embedded through `rquickjs`, on a thread of its
 own. It has no file system, network, process, timer or module access: `tools`,
@@ -40,7 +42,7 @@ call's number, as the work of a subagent is reported under its `task` call.
 
 Scripts never get `script` itself, `task`, `ask`, `exit_plan_mode`, `todo`,
 `context_notes`, `new_context`, `checkpoint`, `rewind`, `wait`, `set_title`,
-`submit_result`, `recall`, `skill`, `remember` or `memory_edit`: the tools that
+`submit_result`, `recall`, `skill`, `remember`, `memory_edit` or `load_tools`: the tools that
 start subagents, talk to the reader, steer the conversation or only make sense
 to the model. A denied tool is not offered to scripts either. In plan mode a
 script can only call the tools that only look. Subagents whose kind does not

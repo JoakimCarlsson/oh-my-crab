@@ -17,6 +17,10 @@ The columns:
   on the list but refuses calls to the others without running them. See
   [modes](../concepts.md#modes).
 
+A few rarely used tools are hidden: they are not on the tool list sent with
+each request, but `load_tools` names them, each with a one-line summary. See
+[hidden tools](#hidden-tools).
+
 ## Files
 
 | Tool       | What it does                                                                                     | Asks           | Plan | Detail                    |
@@ -97,6 +101,7 @@ None of the three exists with the `memory` setting off or `OMC_MEMORY=0`.
 | `set_title`      | *Sometimes.* Names the conversation; given only while it has no name                          | no   | yes  | [history](../concepts.md#history-saved-and-reopened-by-id) |
 | `exit_plan_mode` | Hands the plan to the reader for approval and ends plan mode when approved; refused outside it | no   | only | [modes](../concepts.md#modes) |
 | `skill`          | Loads a skill's instructions; listed even when there are no skills                             | no   | yes  | [skills](../extending/skills-and-agents.md#skills) |
+| `load_tools`     | *Sometimes.* Hands over the description and parameters of hidden tools so they can be called   | no   | yes  | [hidden tools](#hidden-tools) |
 | `context_notes`  | Reads or replaces the conversation's notebook, which is saved with it                          | no   | yes  | [context management](../concepts.md#context-management) |
 | `new_context`    | Starts a fresh context window holding only the notebook                                       | no   | yes  | [context management](../concepts.md#context-management) |
 | `checkpoint`     | *Sometimes.* Marks a point before a long investigation                                        | no   | yes  | [context management](../concepts.md#context-management) |
@@ -106,6 +111,46 @@ None of the three exists with the `memory` setting off or `OMC_MEMORY=0`.
 `checkpoint` and `rewind` exist with the `checkpoints` setting on. `recall`
 is on the main agent's list from the first turn, so that the list never
 changes, and answers once something has been left out.
+
+## Hidden tools
+
+Some tools are hidden from the tool list to keep it, and the prompt, short.
+A hidden tool is still the agent's: `load_tools` names every hidden tool with
+the first sentence of its description, and when the model calls it with the
+names it wants, it returns their whole descriptions and parameter schemas.
+The model then calls them by name like any other tool. Their calls are checked
+against the schema, put to the permission rules, asked about, shown to the
+hooks and scheduled exactly as calls of listed tools are; a call made without
+loading the tool first runs too, as long as its arguments fit.
+
+Hiding never changes the tool list in the middle of a conversation, so it
+keeps the [prompt cache](../long-conversations.md#prompt-cache): the hidden
+tools, and `load_tools` with its list, are fixed when the tool list is made,
+on the first turn, and loading a tool only adds a tool result to the
+conversation. `load_tools` exists only when some tool is hidden.
+
+By default these are hidden:
+
+| Tool            | Why                                                        |
+| --------------- | ---------------------------------------------------------- |
+| `ast_edit`      | Rewrites by syntax tree are rare; `edit` covers most edits |
+| `ast_grep`      | Searches by syntax tree are rare; `grep` covers most       |
+| `debug`         | Driving a debugger is rare, and its description is long    |
+| `mcp_resources` | Tool-server resources are seldom needed                    |
+| `memory_edit`   | Correcting a memory is rare                                |
+
+`OMC_DEFERRED_TOOLS` changes the set: a comma-separated list of tool names and
+of name prefixes ending in `*`, with `default` standing for the set above.
+`OMC_DEFERRED_TOOLS=default,mcp__*` hides every tool-server tool as well,
+`OMC_DEFERRED_TOOLS=debug,web_search` hides only those two, and `0` (or an
+empty value, `none`, `off`) hides nothing. `load_tools`, `exit_plan_mode` and
+`submit_result` are never hidden. See [configuration](../configuration.md).
+
+Subagents hide the same tools among the ones they get, with a `load_tools` of
+their own when any is left. A script's description gives the signatures of
+listed tools only and names the hidden ones, which a script can call once the
+model has loaded them. `crab tools` lists hidden tools with the rest, and
+`load_tools` when some are hidden.
 
 ## Tool-server tools
 
@@ -137,6 +182,6 @@ mode it is the copy that refuses changes other than dry runs.
 
 **Scripts** never get `script` itself, `task`, `ask`, `exit_plan_mode`,
 `todo`, `context_notes`, `new_context`, `checkpoint`, `rewind`, `wait`,
-`set_title`, `submit_result`, `recall`, `skill`, `remember` or
-`memory_edit`. A subagent's script calls only that subagent's tools. See
+`set_title`, `submit_result`, `recall`, `skill`, `remember`,
+`memory_edit` or `load_tools`. A subagent's script calls only that subagent's tools. See
 [scripts](script.md).
