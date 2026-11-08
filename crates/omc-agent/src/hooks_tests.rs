@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 
 use crate::testkit::{Router, call, deny_all, read_args, say, scratch};
 use crate::{
-    AgentEvent, Context, EventSink, Gate, Hooks, MAX_STOP_IN_A_ROW, Screened, Task, TaskSettings,
-    run_turn,
+    AgentEvent, Batched, Context, EventSink, Followed, Gate, Hooks, MAX_STOP_IN_A_ROW, Permit,
+    Screened, Task, TaskSettings, run_turn,
 };
 
 /// What scripted checks were shown, as who saw it, the event and the tool or answer.
@@ -26,6 +26,12 @@ struct Scripted {
     after: Option<&'static str>,
     /// The note added after every failed call, when there is one.
     failed: Option<&'static str>,
+    /// The text that replaces the result of every successful call, when there is one.
+    output: Option<&'static str>,
+    /// What every call the reader is about to be asked about is answered with, when the checks answer.
+    permit: Option<Permit>,
+    /// Why the turn stops after every batch, when it should.
+    batch_halt: Option<&'static str>,
     /// The context a subagent starts with, when there is some.
     start: Option<&'static str>,
     /// Why the turn should go on, when it should every time.
@@ -60,14 +66,13 @@ impl Hooks for Scripted {
     }
 
     /// Adds the scripted note.
-    async fn after_tool(
-        &self,
-        call: &ToolCall,
-        _arguments: &Value,
-        _output: &str,
-    ) -> Option<String> {
+    async fn after_tool(&self, call: &ToolCall, _arguments: &Value, _output: &str) -> Followed {
         self.saw("after", &call.name);
-        self.after.map(str::to_owned)
+        Followed {
+            note: self.after.map(str::to_owned),
+            output: self.output.map(str::to_owned),
+            halt: None,
+        }
     }
 
     /// Adds the scripted note to a failure, recording the error.
@@ -77,9 +82,31 @@ impl Hooks for Scripted {
         _arguments: &Value,
         error: &str,
         _took: std::time::Duration,
-    ) -> Option<String> {
+    ) -> Followed {
         self.saw("failed", &format!("{}: {error}", call.name));
-        self.failed.map(str::to_owned)
+        Followed {
+            note: self.failed.map(str::to_owned),
+            ..Followed::default()
+        }
+    }
+
+    /// Answers as scripted, recording the tool.
+    async fn permission_request(&self, call: &ToolCall, _arguments: &Value) -> Permit {
+        self.saw("permission", &call.name);
+        self.permit.clone().unwrap_or_default()
+    }
+
+    /// Stops the turn as scripted, recording how many calls the batch had.
+    async fn after_batch(
+        &self,
+        calls: &[ToolCall],
+        _results: &[omc_providers::ToolResult],
+    ) -> Batched {
+        self.saw("batch", &calls.len().to_string());
+        Batched {
+            note: None,
+            halt: self.batch_halt.map(str::to_owned),
+        }
     }
 
     /// The scripted context, for a subagent only.
@@ -101,6 +128,9 @@ impl Hooks for Scripted {
             before: self.before.clone(),
             after: self.after,
             failed: self.failed,
+            output: self.output,
+            permit: self.permit.clone(),
+            batch_halt: self.batch_halt,
             start: self.start,
             stop: self.stop,
             agent: Some((id.to_owned(), kind.to_owned())),
@@ -187,6 +217,7 @@ async fn a_rewritten_call_runs_as_rewritten() {
                 gate: Gate::Allow,
                 arguments: Some(json!({"path": "safe.txt", "content": "x"})),
                 note: Some("moved to safe.txt".into()),
+                halt: None,
             },
         )],
         ..Scripted::default()
@@ -231,6 +262,7 @@ async fn a_wrong_rewrite_fails_the_call() {
                 gate: Gate::Allow,
                 arguments: Some(json!({"nothing": true})),
                 note: None,
+                halt: None,
             },
         )],
         ..Scripted::default()
@@ -337,6 +369,7 @@ async fn subagents_run_the_hooks_as_themselves() {
             (Some("scout#t1".to_owned()), "start", String::new()),
             (Some("scout#t1".to_owned()), "before", "read".to_owned()),
             (Some("scout#t1".to_owned()), "after", "read".to_owned()),
+            (Some("scout#t1".to_owned()), "batch", "1".to_owned()),
             (
                 Some("scout#t1".to_owned()),
                 "stop",
@@ -409,4 +442,111 @@ async fn a_subagent_starts_with_the_hooks_context() {
     );
     assert!(first.contains("find alpha"));
     assert_eq!(hooks.seen.lock().unwrap()[0].1, "start");
+}
+
+/// Before the reader is asked, a check that allows with arguments of its own has the call run as rewritten without asking; one that denies has it refused with its reason; and a check that asks has the reader asked about a call that needs no approval.
+#[tokio::test]
+async fn a_permission_check_decides_for_the_reader() {
+    let dir = scratch("hooks-permission");
+    let allowing = Scripted {
+        permit: Some(Permit::Allow {
+            arguments: Some(json!({"path": "b.txt", "content": "y"})),
+            rules: Vec::new(),
+        }),
+        ..Scripted::default()
+    };
+    let history = drive(
+        &writer(json!({"path": "a.txt", "content": "x"})),
+        &dir,
+        &allowing,
+    )
+    .await;
+    let (text, failed) = result(&history, 2);
+    assert!(!failed, "{text}");
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "y");
+    assert!(!dir.join("a.txt").exists());
+    let denying = Scripted {
+        permit: Some(Permit::Deny {
+            reason: "not today".into(),
+            halt: false,
+        }),
+        ..Scripted::default()
+    };
+    let history = drive(
+        &writer(json!({"path": "c.txt", "content": "x"})),
+        &dir,
+        &denying,
+    )
+    .await;
+    let (text, failed) = result(&history, 2);
+    assert!(failed && text.contains("a hook denied this tool call: not today"));
+    assert!(!dir.join("c.txt").exists());
+    std::fs::write(dir.join("a.txt"), "alpha\n").unwrap();
+    let asking = Scripted {
+        before: vec![(
+            "read",
+            Screened {
+                gate: Gate::Ask,
+                ..Screened::default()
+            },
+        )],
+        ..Scripted::default()
+    };
+    let model = Router::new(|seen| match seen.messages {
+        1 => call("r", "read", read_args("a.txt")),
+        _ => say("done"),
+    });
+    let history = drive(&model, &dir, &asking).await;
+    let (text, failed) = result(&history, 2);
+    assert!(failed && text.contains("the user denied"), "{text}");
+}
+
+/// A check after the call can replace what the model reads as its result.
+#[tokio::test]
+async fn a_check_replaces_the_result() {
+    let dir = scratch("hooks-replace");
+    std::fs::write(dir.join("a.txt"), "secret\n").unwrap();
+    let hooks = Scripted {
+        output: Some("[redacted]"),
+        ..Scripted::default()
+    };
+    let model = Router::new(|seen| match seen.messages {
+        1 => call("r", "read", read_args("a.txt")),
+        _ => say("done"),
+    });
+    let history = drive(&model, &dir, &hooks).await;
+    let (text, failed) = result(&history, 2);
+    assert!(!failed);
+    assert_eq!(text, "[redacted]");
+}
+
+/// A check after a batch that stops the turn ends it with the results, telling the model why, without another request.
+#[tokio::test]
+async fn a_batch_check_stops_the_turn() {
+    let dir = scratch("hooks-batch");
+    std::fs::write(dir.join("a.txt"), "alpha\n").unwrap();
+    let hooks = Scripted {
+        batch_halt: Some("enough for now"),
+        ..Scripted::default()
+    };
+    let model = Router::new(|seen| match seen.messages {
+        1 => call("r", "read", read_args("a.txt")),
+        _ => say("done"),
+    });
+    let history = drive(&model, &dir, &hooks).await;
+    assert_eq!(model.seen.lock().unwrap().len(), 1);
+    assert_eq!(history.len(), 3);
+    let (text, _) = result(&history, 2);
+    assert!(
+        text.contains("A hook stopped the turn: enough for now"),
+        "{text}"
+    );
+    assert!(
+        hooks
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, event, what)| *event == "batch" && what == "1")
+    );
 }

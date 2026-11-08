@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::future::join_all;
-use omc_agent::{CompactTrigger, Compacting, Hooks, Screened};
-use omc_providers::ToolCall;
+use omc_agent::{Batched, CompactTrigger, Compacting, Followed, Hooks, Permit, Screened};
+use omc_providers::{ToolCall, ToolResult};
 use serde_json::{Map, Value, json};
 
 use crate::answer::{self, Given, Submitted};
@@ -121,6 +121,48 @@ impl Engine {
             )
             .await;
         answer::heard(&given);
+    }
+
+    /// Runs the `StopFailure` hooks whose matcher takes `error`, the kind of error that ended the turn (`rate_limit`, `overloaded`, `authentication_failed`, `billing_error`, `invalid_request`, `model_not_found`, `server_error`, `max_output_tokens` or `unknown`), telling them `details` and the error text the reader is shown as `last_assistant_message`, and waits for them; what they answer changes nothing.
+    pub async fn stop_failure(&self, error: &str, details: &str, shown: &str) {
+        let chosen = self.chosen(HookEvent::StopFailure, &[error]);
+        if chosen.is_empty() {
+            return;
+        }
+        let given = self
+            .fire(HookEvent::StopFailure, &chosen, |_| {
+                json!({ "error": error, "error_details": details, "last_assistant_message": shown })
+            })
+            .await;
+        answer::heard(&given);
+    }
+
+    /// Runs the `PreModelSwitch` hooks whose matcher takes `to`, the model the reader asked for in place of `from`, and says why the switch does not happen when they keep it from happening.
+    pub async fn model_switch(&self, from: &str, to: &str) -> Option<String> {
+        let chosen = self.chosen(HookEvent::PreModelSwitch, &[to]);
+        if chosen.is_empty() {
+            return None;
+        }
+        let given = self
+            .fire(HookEvent::PreModelSwitch, &chosen, |_| {
+                switch_fields(from, to)
+            })
+            .await;
+        answer::model_switch(&given)
+    }
+
+    /// Runs the `PostModelSwitch` hooks whose matcher takes `to`, the model that took over from `from`, and returns the context they add for the next request: their plain text and `additionalContext`, in order.
+    pub async fn model_switched(&self, from: &str, to: &str) -> Option<String> {
+        let chosen = self.chosen(HookEvent::PostModelSwitch, &[to]);
+        if chosen.is_empty() {
+            return None;
+        }
+        let given = self
+            .fire(HookEvent::PostModelSwitch, &chosen, |_| {
+                switch_fields(from, to)
+            })
+            .await;
+        answer::started(&given, true)
     }
 
     /// The hooks of `event` whose matcher takes one of `names`, each command once; at events whose matcher names nothing, every hook of the event.
@@ -238,6 +280,11 @@ impl Engine {
     }
 }
 
+/// The fields a hook of a model switch from `from` to `to` is given, as the client's `Set` command asks for a model the way an SDK host does.
+fn switch_fields(from: &str, to: &str) -> Value {
+    json!({ "from_model": from, "to_model": to, "requested_model": to, "source": "sdk" })
+}
+
 /// `arguments` as a hook from Claude Code's files expects them: with `file_path` holding `path` made absolute against `folder`, when there is a `path` and no `file_path`.
 fn claude_input(arguments: &Value, folder: &Path) -> Value {
     let mut input = arguments.clone();
@@ -286,11 +333,11 @@ impl Hooks for Engine {
         screened
     }
 
-    /// Runs the `PostToolUse` hooks that match the tool, giving them its output, and returns the note they add.
-    async fn after_tool(&self, call: &ToolCall, arguments: &Value, output: &str) -> Option<String> {
+    /// Runs the `PostToolUse` hooks that match the tool, giving them its output, and returns the note they add, the output they put in its place and whether they stop the turn.
+    async fn after_tool(&self, call: &ToolCall, arguments: &Value, output: &str) -> Followed {
         let chosen = self.chosen(HookEvent::PostToolUse, &Self::names(&call.name));
         if chosen.is_empty() {
-            return None;
+            return Followed::default();
         }
         let given = self
             .fire(HookEvent::PostToolUse, &chosen, |hook| {
@@ -305,17 +352,17 @@ impl Hooks for Engine {
         answer::after_tool(&given)
     }
 
-    /// Runs the `PostToolUseFailure` hooks that match the tool, giving them its `error`, how long it ran and that it was not interrupted, and returns the note they add.
+    /// Runs the `PostToolUseFailure` hooks that match the tool, giving them its `error`, how long it ran and that it was not interrupted, and returns the note they add and whether they stop the turn.
     async fn after_tool_failed(
         &self,
         call: &ToolCall,
         arguments: &Value,
         error: &str,
         took: Duration,
-    ) -> Option<String> {
+    ) -> Followed {
         let chosen = self.chosen(HookEvent::PostToolUseFailure, &Self::names(&call.name));
         if chosen.is_empty() {
-            return None;
+            return Followed::default();
         }
         let millis = u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
         let given = self
@@ -327,7 +374,78 @@ impl Hooks for Engine {
                 Value::Object(about)
             })
             .await;
-        answer::after_tool(&given)
+        let followed = answer::after_tool(&given);
+        Followed {
+            output: None,
+            ..followed
+        }
+    }
+
+    /// Runs the `PermissionRequest` hooks that match the tool, giving them the call as `PreToolUse` hooks get it without its id, and reads what they decided in the reader's place.
+    async fn permission_request(&self, call: &ToolCall, arguments: &Value) -> Permit {
+        let chosen = self.chosen(HookEvent::PermissionRequest, &Self::names(&call.name));
+        if chosen.is_empty() {
+            return Permit::Pass;
+        }
+        let given = self
+            .fire(HookEvent::PermissionRequest, &chosen, |hook| {
+                let mut about = self.about_call(hook, call, arguments);
+                about.remove("tool_use_id");
+                Value::Object(about)
+            })
+            .await;
+        match answer::permission(&given) {
+            Permit::Allow {
+                arguments: Some(rewritten),
+                rules,
+            } => Permit::Allow {
+                arguments: Some(crab_input(rewritten, arguments)),
+                rules,
+            },
+            other => other,
+        }
+    }
+
+    /// Runs the `PostToolBatch` hooks, giving them every call of the batch with the text its result holds, and returns the note they add and whether they stop the turn.
+    async fn after_batch(&self, calls: &[ToolCall], results: &[ToolResult]) -> Batched {
+        let chosen = self.chosen(HookEvent::PostToolBatch, &[]);
+        if chosen.is_empty() {
+            return Batched::default();
+        }
+        let given = self
+            .fire(HookEvent::PostToolBatch, &chosen, |hook| {
+                let listed: Vec<Value> = calls
+                    .iter()
+                    .map(|call| {
+                        let mut about = self.about_call(hook, call, &call.arguments);
+                        let response = results
+                            .iter()
+                            .find(|result| result.call_id == call.id)
+                            .map_or("", |result| result.text.as_str());
+                        about.insert("tool_response".into(), json!(response));
+                        Value::Object(about)
+                    })
+                    .collect();
+                json!({ "tool_calls": listed })
+            })
+            .await;
+        answer::batch(&given)
+    }
+
+    /// Runs the `PostCompact` hooks whose matcher takes the trigger's name, telling them the summary as `compact_summary`; what they answer changes nothing.
+    async fn after_compact(&self, trigger: CompactTrigger, summary: &str) {
+        let chosen = self.chosen(HookEvent::PostCompact, &[trigger.name()]);
+        if chosen.is_empty() {
+            return;
+        }
+        let given = self
+            .fire(
+                HookEvent::PostCompact,
+                &chosen,
+                |_| json!({ "trigger": trigger.name(), "compact_summary": summary }),
+            )
+            .await;
+        answer::heard(&given);
     }
 
     /// Runs the `PreCompact` hooks whose matcher takes the trigger's name, telling them the reader's `focus` as `custom_instructions`, and says whether the compaction goes on and with what instructions.
@@ -529,7 +647,7 @@ mod tests {
         let added = hooks
             .after_tool(&call("read", arguments.clone()), &arguments, "alpha\n")
             .await;
-        assert_eq!(added.as_deref(), Some("saw alpha"));
+        assert_eq!(added.note.as_deref(), Some("saw alpha"));
         assert_eq!(
             hooks.stop("done", false).await.as_deref(),
             Some("run the tests")
@@ -701,7 +819,7 @@ mod tests {
                 Duration::from_millis(42),
             )
             .await;
-        assert_eq!(note.as_deref(), Some("try make"));
+        assert_eq!(note.note.as_deref(), Some("try make"));
         let failed = written(&folder, "failed.json");
         assert_eq!(failed["hook_event_name"], "PostToolUseFailure");
         assert_eq!(failed["tool_name"], "Bash");
@@ -712,7 +830,7 @@ mod tests {
             hooks
                 .after_tool(&call("bash", arguments.clone()), &arguments, "ok")
                 .await,
-            None
+            Followed::default()
         );
         assert_eq!(
             hooks
@@ -774,5 +892,103 @@ mod tests {
             .await;
         assert!(matches!(screened.gate, Gate::Deny(reason) if reason.contains("gave no answer")));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// `PermissionRequest` hooks get the call without its id and decide for the reader; `PostToolBatch` hooks get every call with its result; `PostCompact`, `StopFailure` and the model switch hooks get their fields, and a `PreModelSwitch` hook can keep the switch from happening.
+    #[tokio::test]
+    async fn the_newer_events() {
+        let folder = scratch("engine-newer");
+        let hooks = engine(
+            &folder,
+            vec![
+                hook(
+                    HookEvent::PermissionRequest,
+                    "Bash",
+                    r#"cat > permission.json; echo '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}'"#,
+                    true,
+                ),
+                hook(
+                    HookEvent::PostToolBatch,
+                    "",
+                    r#"cat > batch.json; echo '{"hookSpecificOutput":{"hookEventName":"PostToolBatch","additionalContext":"two calls"}}'"#,
+                    false,
+                ),
+                hook(HookEvent::PostCompact, "auto", "cat > compact.json", false),
+                hook(
+                    HookEvent::StopFailure,
+                    "rate_limit",
+                    "cat > failure.json",
+                    false,
+                ),
+                hook(
+                    HookEvent::PreModelSwitch,
+                    "*opus*",
+                    "cat > switch.json; echo 'opus is too dear' >&2; exit 2",
+                    false,
+                ),
+                hook(
+                    HookEvent::PostModelSwitch,
+                    "",
+                    "echo now on a new model",
+                    false,
+                ),
+            ],
+        );
+        let arguments = json!({"command": "ls"});
+        let permit = hooks
+            .permission_request(&call("bash", arguments.clone()), &arguments)
+            .await;
+        assert_eq!(
+            permit,
+            Permit::Allow {
+                arguments: None,
+                rules: Vec::new()
+            }
+        );
+        let asked = written(&folder, "permission.json");
+        assert_eq!(asked["hook_event_name"], "PermissionRequest");
+        assert_eq!(asked["tool_name"], "Bash");
+        assert!(asked.get("tool_use_id").is_none());
+        let calls = vec![call("bash", arguments.clone())];
+        let results = vec![ToolResult {
+            call_id: "t1".into(),
+            name: "bash".into(),
+            text: "a.txt".into(),
+            is_error: false,
+            images: Vec::new(),
+        }];
+        let batched = hooks.after_batch(&calls, &results).await;
+        assert_eq!(batched.note.as_deref(), Some("two calls"));
+        let batch = written(&folder, "batch.json");
+        assert_eq!(batch["tool_calls"][0]["tool_name"], "bash");
+        assert_eq!(batch["tool_calls"][0]["tool_response"], "a.txt");
+        hooks
+            .after_compact(CompactTrigger::Auto, "we did things")
+            .await;
+        assert_eq!(
+            written(&folder, "compact.json")["compact_summary"],
+            "we did things"
+        );
+        hooks
+            .stop_failure("rate_limit", "429 Too Many Requests", "rate limited")
+            .await;
+        let failure = written(&folder, "failure.json");
+        assert_eq!(failure["error"], "rate_limit");
+        assert_eq!(failure["error_details"], "429 Too Many Requests");
+        assert_eq!(
+            hooks
+                .model_switch("claude-sonnet-5", "claude-opus-5")
+                .await
+                .as_deref(),
+            Some("opus is too dear")
+        );
+        let switch = written(&folder, "switch.json");
+        assert_eq!(switch["from_model"], "claude-sonnet-5");
+        assert_eq!(switch["to_model"], "claude-opus-5");
+        assert_eq!(hooks.model_switch("a", "claude-haiku-5").await, None);
+        assert_eq!(
+            hooks.model_switched("a", "b").await.as_deref(),
+            Some("now on a new model")
+        );
     }
 }

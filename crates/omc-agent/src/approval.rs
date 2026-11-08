@@ -65,6 +65,15 @@ pub trait Keeper: Send + Sync {
     fn keep(&self, rules: &[String], place: Place);
 }
 
+/// Where a call stands before the reader would be asked about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Standing {
+    /// No question is needed: the call may run, or is refused for the reason given.
+    Settled(Result<(), String>),
+    /// The reader is to be asked this.
+    Open(ApprovalRequest),
+}
+
 /// The approval policy of a session.
 pub struct Approvals {
     /// Whether to allow everything without asking; deny rules still apply.
@@ -155,20 +164,34 @@ impl Approvals {
         needed: bool,
         hooked: bool,
     ) -> Result<(), String> {
+        match self.standing(request, needed, hooked, false) {
+            Standing::Settled(settled) => settled,
+            Standing::Open(open) => self.ask(open).await,
+        }
+    }
+
+    /// Where the call described by `request` stands before the reader is asked: settled by a deny rule, by needing no approval, by `hooked` (a hook allowed it), by yolo mode or by an allow rule, or open, with the request the reader would be asked, the rules an "always allow" answer adds filled in. `needed` says whether the tool asks before it runs; `asked` that a hook wants the reader asked, which counts as an ask rule matching.
+    pub fn standing(
+        &self,
+        request: &ApprovalRequest,
+        needed: bool,
+        hooked: bool,
+        asked: bool,
+    ) -> Standing {
         let book = self.rules();
         let session = self.session_rules();
         let judged = book.judge(&request.tool, &request.subject, &session);
         if let Judgement::Denied(rule) = &judged {
-            return Err(format!(
+            return Standing::Settled(Err(format!(
                 "a permission rule denies this tool call: {rule}; do not try to get around it, ask the user instead"
-            ));
+            )));
         }
-        let asked = matches!(judged, Judgement::Asked(_));
+        let asked = asked || matches!(judged, Judgement::Asked(_));
         if (!needed && !asked) || hooked || self.yolo() {
-            return Ok(());
+            return Standing::Settled(Ok(()));
         }
-        if judged == Judgement::Allowed {
-            return Ok(());
+        if judged == Judgement::Allowed && !asked {
+            return Standing::Settled(Ok(()));
         }
         let mut request = request.clone();
         if asked {
@@ -178,6 +201,16 @@ impl Approvals {
             request.rules = book.propose(&request.tool, &request.subject, &session, false);
             request.everywhere = book.propose(&request.tool, &request.subject, &session, true);
         }
+        Standing::Open(request)
+    }
+
+    /// Asks the reader about `request`, a call [`Approvals::standing`] left open, and remembers or keeps the rules of an "always allow" answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason for the model when the reader refuses the call.
+    pub async fn ask(&self, mut request: ApprovalRequest) -> Result<(), String> {
+        let book = self.rules();
         let keeper = self
             .keeper
             .lock()
@@ -202,6 +235,11 @@ impl Approvals {
             }
         }
         Ok(())
+    }
+
+    /// Adds `rules`, in Claude Code's syntax, to the allow rules of the conversation, as a hook asked; a rule that cannot be read is skipped.
+    pub fn allow_for_session(&self, rules: &[String]) {
+        self.remember(rules, &self.rules());
     }
 
     /// Adds `rules` to the allow rules of the conversation, with `/path` paths read from the project root of `book`.

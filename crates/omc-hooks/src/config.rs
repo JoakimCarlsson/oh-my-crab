@@ -36,11 +36,23 @@ pub enum HookEvent {
     PostToolUseFailure,
     /// When a subagent is about to start.
     SubagentStart,
+    /// When the reader is about to be asked whether a tool call may run.
+    PermissionRequest,
+    /// After every call of a batch has its result, before the results go to the model.
+    PostToolBatch,
+    /// After the conversation was compacted.
+    PostCompact,
+    /// When a turn of the main agent ends because a model request failed for good.
+    StopFailure,
+    /// Before the model the reader asked for takes over the conversation.
+    PreModelSwitch,
+    /// After the conversation's model changed.
+    PostModelSwitch,
 }
 
 impl HookEvent {
     /// Every event, in the order they are listed.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 17] = [
         Self::PreToolUse,
         Self::PostToolUse,
         Self::UserPromptSubmit,
@@ -52,6 +64,12 @@ impl HookEvent {
         Self::Notification,
         Self::PostToolUseFailure,
         Self::SubagentStart,
+        Self::PermissionRequest,
+        Self::PostToolBatch,
+        Self::PostCompact,
+        Self::StopFailure,
+        Self::PreModelSwitch,
+        Self::PostModelSwitch,
     ];
 
     /// The event's name, as files spell it and hooks are told it.
@@ -68,6 +86,12 @@ impl HookEvent {
             Self::Notification => "Notification",
             Self::PostToolUseFailure => "PostToolUseFailure",
             Self::SubagentStart => "SubagentStart",
+            Self::PermissionRequest => "PermissionRequest",
+            Self::PostToolBatch => "PostToolBatch",
+            Self::PostCompact => "PostCompact",
+            Self::StopFailure => "StopFailure",
+            Self::PreModelSwitch => "PreModelSwitch",
+            Self::PostModelSwitch => "PostModelSwitch",
         }
     }
 
@@ -76,10 +100,10 @@ impl HookEvent {
         Self::ALL.into_iter().find(|event| event.name() == name)
     }
 
-    /// How long a hook of this event may run when its definition gives no timeout: 30 seconds for `UserPromptSubmit`, a second and a half for `SessionEnd`, which holds up closing, and 60 seconds for the rest.
+    /// How long a hook of this event may run when its definition gives no timeout: 30 seconds for `UserPromptSubmit` and `PreModelSwitch`, a second and a half for `SessionEnd`, which holds up closing, and 60 seconds for the rest.
     pub fn default_timeout(self) -> Duration {
         match self {
-            Self::UserPromptSubmit => Duration::from_secs(30),
+            Self::UserPromptSubmit | Self::PreModelSwitch => Duration::from_secs(30),
             Self::SessionEnd => Duration::from_millis(1500),
             _ => Duration::from_secs(60),
         }
@@ -93,17 +117,23 @@ impl HookEvent {
         }
     }
 
-    /// Whether the event's matcher names tools, rather than kinds of subagent, why a conversation started or ended, what started a compaction, the kind of notification, or nothing.
+    /// Whether the event's matcher names tools, rather than kinds of subagent, why a conversation started or ended, what started a compaction, the kind of notification, the kind of error, a model, or nothing.
     pub fn matches_tools(self) -> bool {
         matches!(
             self,
-            Self::PreToolUse | Self::PostToolUse | Self::PostToolUseFailure
+            Self::PreToolUse
+                | Self::PostToolUse
+                | Self::PostToolUseFailure
+                | Self::PermissionRequest
         )
     }
 
     /// Whether the event takes no matcher, so every hook of it runs whatever its matcher says.
     pub fn ignores_matcher(self) -> bool {
-        matches!(self, Self::UserPromptSubmit | Self::Stop)
+        matches!(
+            self,
+            Self::UserPromptSubmit | Self::Stop | Self::PostToolBatch
+        )
     }
 }
 
@@ -338,7 +368,7 @@ mod tests {
                         {"matcher": "Edit|Write", "hooks": [{"type": "command", "command": "  fmt  "}]}
                     ],
                     "PostToolUse": [{"hooks": [{"type": "command", "command": "echo done"}]}],
-                    "PreModelSwitch": [{"hooks": [{"type": "command", "command": "notify-send hi"}]}],
+                    "TeammateIdle": [{"hooks": [{"type": "command", "command": "notify-send hi"}]}],
                     "SessionEnd": [{"matcher": "clear", "hooks": [{"type": "command", "command": "save", "timeout": 600}]}],
                     "Notification": [{"matcher": "idle_prompt", "hooks": [{"type": "command", "command": "beep"}]}],
                     "Stop": [{"matcher": "", "hooks": [{"type": "command"}]}],

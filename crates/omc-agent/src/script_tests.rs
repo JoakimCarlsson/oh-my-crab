@@ -64,12 +64,15 @@ impl Hooks for Guard {
         call: &ToolCall,
         _arguments: &Value,
         _output: &str,
-    ) -> Option<String> {
+    ) -> crate::Followed {
         self.seen
             .lock()
             .unwrap()
             .push(format!("after:{}", call.name));
-        (call.name == "grep").then(|| "grep was watched".to_owned())
+        crate::Followed {
+            note: (call.name == "grep").then(|| "grep was watched".to_owned()),
+            ..crate::Followed::default()
+        }
     }
 
     /// Lets every turn end.

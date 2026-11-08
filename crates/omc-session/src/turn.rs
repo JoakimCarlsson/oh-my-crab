@@ -213,10 +213,10 @@ impl Turn {
                     &toolset,
                 );
                 let starting = self.shared.lifecycle.pending();
-                if let Some(starting) = &starting
-                    && let Some(context) = context_of(starting.clone()).await
-                {
-                    told.push(start_notice(&context));
+                for notice in &starting {
+                    if let Some(context) = context_of(notice.run.clone()).await {
+                        told.push(start_notice(notice.tag, &context));
+                    }
                 }
                 if let Some(memories) = memories.filter(|_| prefix.wants_memory(&self.history)) {
                     let digest = digest(memories, prompt.clone()).await;
@@ -242,8 +242,8 @@ impl Turn {
                     steering,
                 )
                 .await;
-                if let (Ok(()), Some(starting)) = (&result, &starting) {
-                    self.shared.lifecycle.settle(starting);
+                if result.is_ok() {
+                    self.shared.lifecycle.settle(&starting);
                 }
                 result
             }
@@ -260,9 +260,40 @@ impl Turn {
         };
         match result {
             Ok(()) => Ended::Done(self.history),
-            Err(error) => Ended::Failed(error.to_string()),
+            Err(error) => {
+                if let (Some(hooks), Some(kind)) = (&self.hooks, failure_kind(&error)) {
+                    let text = error.to_string();
+                    hooks.stop_failure(kind, &text, &text).await;
+                }
+                Ended::Failed(error.to_string())
+            }
         }
     }
+}
+
+/// The kind of error `error` is, as `StopFailure` hooks are told and match it, when it is a model request that failed for good; nothing for a failure of another kind, such as a compaction a hook blocked.
+fn failure_kind(error: &omc_agent::AgentError) -> Option<&'static str> {
+    use omc_agent::AgentError;
+    use omc_providers::ProviderError;
+    Some(match error {
+        AgentError::Provider(ProviderError::Status { status, .. }) => {
+            match status.split_whitespace().next().unwrap_or_default() {
+                "429" => "rate_limit",
+                "529" | "503" => "overloaded",
+                "401" | "403" => "authentication_failed",
+                "402" => "billing_error",
+                "404" => "model_not_found",
+                code if code.starts_with('4') => "invalid_request",
+                code if code.starts_with('5') => "server_error",
+                _ => "unknown",
+            }
+        }
+        AgentError::Provider(ProviderError::Credentials(_)) => "cloud_credential_error",
+        AgentError::Provider(ProviderError::NoModels) => "model_not_found",
+        AgentError::Provider(_) | AgentError::Empty => "unknown",
+        AgentError::OutputLimit => "max_output_tokens",
+        AgentError::Compaction(_) => return None,
+    })
 }
 
 impl Turn {
@@ -936,6 +967,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A model that refuses every request as malformed.
+    struct Limited;
+
+    #[async_trait]
+    impl ChatModel for Limited {
+        /// Fails with status 400.
+        async fn complete(&self, _: Request<'_>, _: &mut dyn Sink) -> Result<Reply, ProviderError> {
+            Err(ProviderError::Status {
+                status: "400 Bad Request".into(),
+                body: "bad field".into(),
+                retry_after: None,
+            })
+        }
+    }
+
+    /// A turn that ends because the model request failed for good runs the `StopFailure` hooks matching the kind of error, told what failed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_request_runs_stop_failure_hooks() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/turn-stop-failure");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (out, _events) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared::new(out);
+        shared.open(Provider::Claude, vec!["m".into()], "m".into(), Mode::Asking);
+        let mut turn = turn_in(&dir, &shared, Vec::new());
+        turn.hooks = Some(Arc::new(Engine::new(
+            vec![omc_hooks::Hook {
+                event: HookEvent::StopFailure,
+                matcher: "invalid_request".into(),
+                command: "cat > failure.json".into(),
+                timeout: None,
+                file: dir.join("hooks.json"),
+                origin: omc_hooks::HookOrigin::User,
+                claude: false,
+                plugin: None,
+            }],
+            omc_hooks::Setting {
+                session: None,
+                folder: dir.clone(),
+                mode: Arc::new(|| "default"),
+            },
+        )));
+        let Ended::Failed(reason) = turn
+            .run_with(Arc::new(Limited), Job::Prompt("hello".into()))
+            .await
+        else {
+            panic!("the turn did not fail");
+        };
+        assert!(reason.contains("400"), "{reason}");
+        let failure: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("failure.json")).unwrap())
+                .unwrap();
+        assert_eq!(failure["hook_event_name"], "StopFailure");
+        assert_eq!(failure["error"], "invalid_request");
+        assert!(
+            failure["error_details"]
+                .as_str()
+                .unwrap()
+                .contains("bad field")
+        );
+    }
+
     /// A prompt hook that blocks ends the turn before the model is asked, with its reason; one that adds context has it told before the prompt.
     #[cfg(unix)]
     #[tokio::test]
@@ -1055,7 +1150,7 @@ mod tests {
                 Ended::Failed(reason) | Ended::SignedOut(reason) => panic!("turn failed: {reason}"),
             };
         }
-        assert!(shared.lifecycle.pending().is_none());
+        assert!(shared.lifecycle.pending().is_empty());
         let seen = model.seen.lock().unwrap();
         let turns: Vec<&Sent> = seen
             .iter()

@@ -23,10 +23,11 @@ mod worktree;
 pub use agent::{
     AgentError, AgentEvent, Context, Live, compact, run_turn, run_turn_recorded, run_turn_steered,
 };
-pub use approval::{ApprovalRequest, Approvals, Decision, Keeper, Place, Prompter};
+pub use approval::{ApprovalRequest, Approvals, Decision, Keeper, Place, Prompter, Standing};
 pub use compaction::{COMPACT, context, replayed};
 pub use hooks::{
-    CompactTrigger, Compacting, Gate, Hooks, MAX_STOP_IN_A_ROW, MAX_STOP_PER_TURN, Screened,
+    Batched, CompactTrigger, Compacting, Followed, Gate, Hooks, MAX_STOP_IN_A_ROW,
+    MAX_STOP_PER_TURN, Permit, Screened,
 };
 pub use journal::{
     Branch, FIRST_BRANCH, INTERRUPTED, Journal, JournalError, Lost, Mark, Marked, STOPPED, Saved,

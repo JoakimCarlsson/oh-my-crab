@@ -18,7 +18,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::compaction;
-use crate::hooks::{CompactTrigger, Compacting, Gate, Hooks, StopBound, with_note};
+use crate::hooks::{CompactTrigger, Compacting, Gate, Hooks, Permit, StopBound, with_note};
 use crate::loop_guard::LoopGuard;
 use crate::pruning;
 use crate::recall::{self, RECALL};
@@ -27,7 +27,7 @@ use crate::shake;
 use crate::steering::{self, Steering};
 use crate::text_calls;
 use crate::todos::TodoTracker;
-use crate::{ApprovalRequest, Approvals, Scribe};
+use crate::{ApprovalRequest, Approvals, Scribe, Standing};
 
 /// Something the UI should show while a turn runs.
 #[derive(Debug, Clone, PartialEq)]
@@ -608,6 +608,9 @@ async fn drive(
             stops.tools_called();
             None
         };
+        if let Some(hooks) = context.hooks {
+            hooks.replied(&reply).await;
+        }
         history.push(Message::Assistant(reply));
         record(scribe, &history[history.len() - 1]);
         if calls.is_empty() {
@@ -640,7 +643,7 @@ async fn drive(
             }
             events(event);
         };
-        let mut results = run_calls(
+        let (mut results, mut halt) = run_calls(
             registry,
             context.approvals,
             context.hooks,
@@ -649,6 +652,24 @@ async fn drive(
             &capture,
         )
         .await;
+        if let Some(hooks) = context.hooks {
+            let batched = hooks.after_batch(&calls, &results).await;
+            if let Some(note) = batched.note {
+                append_notice(&mut results, &with_note(String::new(), &note));
+            }
+            halt = halt.or(batched.halt);
+        }
+        if let Some(reason) = halt {
+            let reason = reason.trim();
+            eprintln!("a hook stopped the turn: {reason}");
+            append_notice(
+                &mut results,
+                &with_note(String::new(), &format!("A hook stopped the turn: {reason}")),
+            );
+            history.push(Message::ToolResults(results));
+            record(scribe, &history[history.len() - 1]);
+            return Ok(());
+        }
         let changed = changed
             .into_inner()
             .unwrap_or_else(|held| held.into_inner());
@@ -890,6 +911,9 @@ async fn compact_history(
                 done.tokens_after = tokens_after;
             }
             record(scribe, &history[at]);
+            if let Some(hooks) = context.hooks {
+                hooks.after_compact(trigger, &summary).await;
+            }
             events(compaction::finished(at, summary, false));
             events(AgentEvent::Used(Tokens {
                 input: tokens_after,
@@ -928,21 +952,21 @@ fn tool_specs(registry: &Registry) -> Vec<ToolSpec> {
         .collect()
 }
 
-/// Runs the calls of one model reply and returns their results in call order.
+/// Runs the calls of one model reply and returns their results in call order, and why the turn stops after them when a hook asked for that.
 ///
 /// Every call is announced first. The arguments of a call of a registered tool
 /// are read and put right against its schema once, then shown to `hooks`, which
-/// may deny the call, let it run without asking or rewrite its arguments, which
+/// may deny the call, let it run without asking, have the reader asked or rewrite its arguments, which
 /// are put right against the schema again; only then is the call described,
 /// asked about or run, so the user approves exactly what runs. A call whose
 /// arguments cannot be read or put right fails without being asked about.
 /// Every call is put to the permission rules: one a deny rule matches fails
 /// without running, in yolo mode too. Calls that need approval, and calls an
 /// ask rule matches, are asked about one at a time, in order, unless a hook
-/// allowed them or allow rules cover them. Approved calls then run one after another so edits cannot
+/// allowed them or allow rules cover them; before the reader is asked, the hooks
+/// may decide in the reader's place. Approved calls then run one after another so edits cannot
 /// race, while calls that need no approval run concurrently. The hooks see each
-/// call that succeeded once more, after it ran, and what they say is added to
-/// its result.
+/// call once more, after it ran, and may add a note to its result or replace it.
 ///
 /// A tool that runs other tools, such as `script`, runs them through a [`Nested`] caller, so that each of its calls goes through the same steps and is reported under it.
 async fn run_calls(
@@ -952,7 +976,17 @@ async fn run_calls(
     history: &[Message],
     calls: &[ToolCall],
     events: &(dyn Fn(AgentEvent) + Send + Sync),
-) -> Vec<ToolResult> {
+) -> (Vec<ToolResult>, Option<String>) {
+    let gate = tokio::sync::Mutex::new(());
+    let halt = std::sync::Mutex::new(None);
+    let batch = Batch {
+        registry,
+        approvals,
+        hooks,
+        events,
+        gate: &gate,
+        halt: &halt,
+    };
     let mut slots: Vec<Option<ToolResult>> = vec![None; calls.len()];
     let mut concurrent = Vec::new();
     let mut sequential = Vec::new();
@@ -973,17 +1007,14 @@ async fn run_calls(
             });
             continue;
         }
-        let ready = match admit(registry, hooks, call, events).await {
+        let mut ready = match admit(&batch, call, events).await {
             Admitted::Ended(result) => {
                 slots[index] = Some(result);
                 continue;
             }
             Admitted::Ready(ready) => ready,
         };
-        match approvals
-            .check(&ready.request, ready.needed, ready.allowed)
-            .await
-        {
+        match batch.approve(call, &mut ready, None).await {
             Ok(()) if ready.needed => sequential.push((index, ready)),
             Ok(()) => concurrent.push((index, ready)),
             Err(message) => {
@@ -991,14 +1022,6 @@ async fn run_calls(
             }
         }
     }
-    let gate = tokio::sync::Mutex::new(());
-    let batch = Batch {
-        registry,
-        approvals,
-        hooks,
-        events,
-        gate: &gate,
-    };
     let indices: Vec<usize> = concurrent.iter().map(|(index, ..)| *index).collect();
     let done = join_all(
         concurrent
@@ -1012,7 +1035,8 @@ async fn run_calls(
     for (index, ready) in sequential {
         slots[index] = Some(batch.run_call(&calls[index], ready).await);
     }
-    slots.into_iter().flatten().collect()
+    let halt = halt.into_inner().unwrap_or_else(|held| held.into_inner());
+    (slots.into_iter().flatten().collect(), halt)
 }
 
 /// What the hooks said about one call before it ran.
@@ -1022,6 +1046,8 @@ struct Screening {
     denied: Option<String>,
     /// Whether it runs without the reader being asked.
     allowed: bool,
+    /// Whether the reader is asked about it whatever it needs.
+    asked: bool,
     /// A note for the model, added to the result.
     note: Option<String>,
 }
@@ -1048,22 +1074,36 @@ struct Ready<'r> {
     needed: bool,
     /// Whether a hook allowed it without asking the reader.
     allowed: bool,
+    /// Whether a hook wants the reader asked about it.
+    asked: bool,
 }
 
-/// Reads the arguments of `call`, a call of a tool in `registry`, puts them right against the tool's schema and shows them to `hooks`, which may deny the call, allow it without asking or rewrite its arguments; then announces the call through `events` and says whether it may run.
+impl Ready<'_> {
+    /// Takes `arguments`, already put right against the tool's schema, in place of the call's, with what is approved and what rules look at made from them.
+    fn rewrite(&mut self, arguments: Value) {
+        let scope = self.tool.approval_scope(&arguments);
+        self.needed = scope.is_some();
+        self.request.scope = scope.unwrap_or_else(|| self.request.tool.clone());
+        self.request.subject = self.tool.subject(&arguments);
+        self.request.summary = sanitize(&self.tool.describe(&arguments));
+        self.arguments = arguments;
+    }
+}
+
+/// Reads the arguments of `call`, a call of a tool in the registry of `batch`, puts them right against the tool's schema and shows them to the hooks of `batch`, which may deny the call, allow it without asking, have the reader asked or rewrite its arguments; then announces the call through `events` and says whether it may run.
 ///
 /// A call of an unknown tool, with arguments that cannot be read or put right, or that a hook denied, ends here with its result reported.
 async fn admit<'r>(
-    registry: &'r Registry,
-    hooks: Option<&dyn Hooks>,
+    batch: &Batch<'r>,
     call: &ToolCall,
     events: &(dyn Fn(AgentEvent) + Send + Sync),
 ) -> Admitted<'r> {
+    let registry = batch.registry;
     let mut prepared = registry
         .get(&call.name)
         .map(|tool| (tool, prepare(registry, call)));
     let mut screened = Screening::default();
-    if let (Some(hooks), Some((_, Ok(arguments)))) = (hooks, &mut prepared) {
+    if let (Some(hooks), Some((_, Ok(arguments)))) = (batch.hooks, &mut prepared) {
         let verdict = hooks.before_tool(call, arguments).await;
         if let Some(rewritten) = verdict.arguments {
             match registry.prepared(&call.name, rewritten) {
@@ -1077,9 +1117,13 @@ async fn admit<'r>(
         match verdict.gate {
             Gate::Pass => {}
             Gate::Allow => screened.allowed = true,
+            Gate::Ask => screened.asked = true,
             Gate::Deny(reason) => screened.denied = Some(reason),
         }
         screened.note = verdict.note;
+        if let Some(reason) = verdict.halt {
+            batch.stop(reason);
+        }
     }
     let summary = sanitize(&match &prepared {
         Some((tool, Ok(arguments))) => tool.describe(arguments),
@@ -1116,6 +1160,7 @@ async fn admit<'r>(
             arguments,
             note: screened.note,
             allowed: screened.allowed,
+            asked: screened.asked && !screened.allowed,
         }),
     }
 }
@@ -1146,18 +1191,89 @@ struct Batch<'a> {
     events: &'a (dyn Fn(AgentEvent) + Send + Sync),
     /// Held while a call made by another tool is asked about and run when it needs approval, so that such calls run one at a time across the batch, as approved calls of the model do.
     gate: &'a tokio::sync::Mutex<()>,
+    /// Why the turn stops once the batch has ended, when a hook asked for that; the first reason given is kept.
+    halt: &'a std::sync::Mutex<Option<String>>,
 }
 
 impl Batch<'_> {
-    /// Runs `call`, admitted as `ready`, and reports its outcome, with the note from the hooks that screened it and what the hooks say after it succeeded added to its text; the tools it runs, when it runs any, are run through a [`Nested`] caller under it.
+    /// Runs `call`, admitted as `ready`, and reports its outcome, with the note from the hooks that screened it and what the hooks say after it added to its text; the tools it runs, when it runs any, are run through a [`Nested`] caller under it.
     ///
     /// A failing tool yields a result with `is_error` set.
     async fn run_call(&self, call: &ToolCall, ready: Ready<'_>) -> ToolResult {
         let caller = Nested::new(*self, call);
         let done = perform(call, ready, self.hooks, &caller).await;
+        if let Some(reason) = done.halt {
+            self.stop(reason);
+        }
         let mut result = finish(call, done.text, done.is_error, done.changes, self.events);
         result.images = done.images.into_iter().map(image).collect();
         result
+    }
+
+    /// Keeps `reason` as why the turn stops once the batch has ended, unless an earlier reason was kept.
+    fn stop(&self, reason: String) {
+        let mut halt = self.halt.lock().unwrap_or_else(|held| held.into_inner());
+        if halt.is_none() {
+            *halt = Some(reason);
+        }
+    }
+
+    /// Settles whether `call`, admitted as `ready`, may run: the permission rules decide when they can; otherwise the hooks may decide in the reader's place, allowing it, with arguments of their own, or refusing it, and when they do not, the reader is asked through `asking`, or through the approvals of the batch when there is none.
+    ///
+    /// Arguments a hook gives are put right against the tool's schema and put to the deny rules again.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason for the model when a rule, a hook or the reader refuses the call.
+    async fn approve(
+        &self,
+        call: &ToolCall,
+        ready: &mut Ready<'_>,
+        asking: Option<&Nested<'_>>,
+    ) -> Result<(), String> {
+        let open =
+            match self
+                .approvals
+                .standing(&ready.request, ready.needed, ready.allowed, ready.asked)
+            {
+                Standing::Settled(settled) => return settled,
+                Standing::Open(open) => open,
+            };
+        if let Some(hooks) = self.hooks {
+            match hooks.permission_request(call, &ready.arguments).await {
+                Permit::Pass => {}
+                Permit::Allow { arguments, rules } => {
+                    if let Some(rewritten) = arguments {
+                        let (_, rewritten) = self
+                            .registry
+                            .prepared(&call.name, rewritten)
+                            .map_err(|error| {
+                                format!("a hook rewrote the arguments wrongly: {error}")
+                            })?;
+                        ready.rewrite(rewritten);
+                        if let Standing::Settled(Err(denied)) =
+                            self.approvals
+                                .standing(&ready.request, ready.needed, true, false)
+                        {
+                            return Err(denied);
+                        }
+                    }
+                    self.approvals.allow_for_session(&rules);
+                    return Ok(());
+                }
+                Permit::Deny { reason, halt } => {
+                    let reason = format!("a hook denied this tool call: {}", reason.trim());
+                    if halt {
+                        self.stop(reason.clone());
+                    }
+                    return Err(reason);
+                }
+            }
+        }
+        match asking {
+            Some(nested) => nested.ask(open).await,
+            None => self.approvals.ask(open).await,
+        }
     }
 }
 
@@ -1173,9 +1289,11 @@ struct Performed {
     images: Vec<omc_tools::Image>,
     /// What its text says as a value, when the tool gives one and no hook added a note to the text.
     data: Option<Value>,
+    /// Why the turn stops once the batch has ended, when a hook said so after the call.
+    halt: Option<String>,
 }
 
-/// Runs `call`, admitted as `ready`, with `caller` for the tools it runs, and adds the note from the hooks that screened it and what `hooks` say after the call, whether it succeeded or failed, to its text.
+/// Runs `call`, admitted as `ready`, with `caller` for the tools it runs, and adds the note from the hooks that screened it and what `hooks` say after the call, whether it succeeded or failed, to its text, or replaces the text with what they give in its place.
 async fn perform(
     call: &ToolCall,
     ready: Ready<'_>,
@@ -1197,6 +1315,7 @@ async fn perform(
             changes: output.changes,
             images: output.images,
             data: output.data,
+            halt: None,
         },
         Err(error) => Performed {
             text: error.to_string(),
@@ -1204,24 +1323,33 @@ async fn perform(
             changes: Vec::new(),
             images: Vec::new(),
             data: None,
+            halt: None,
         },
     };
-    if let Some(note) = note {
-        done.text = with_note(done.text, &note);
-        done.data = None;
-    }
     if let (Some(hooks), Some(arguments)) = (hooks, &shown) {
-        let note = if done.is_error {
+        let followed = if done.is_error {
             hooks
                 .after_tool_failed(call, arguments, &done.text, began.elapsed())
                 .await
         } else {
             hooks.after_tool(call, arguments, &done.text).await
         };
+        if let Some(output) = followed.output {
+            done.text = output;
+            done.data = None;
+        }
         if let Some(note) = note {
             done.text = with_note(done.text, &note);
             done.data = None;
         }
+        if let Some(note) = followed.note {
+            done.text = with_note(done.text, &note);
+            done.data = None;
+        }
+        done.halt = followed.halt;
+    } else if let Some(note) = note {
+        done.text = with_note(done.text, &note);
+        done.data = None;
     }
     done
 }
@@ -1261,19 +1389,14 @@ impl<'a> Nested<'a> {
         }
     }
 
-    /// Puts `request` to the permission rules and, when they leave it open, to the reader, timing how long the answer takes; `needed` says whether the tool asks before it runs and `hooked` whether a hook allowed the call.
+    /// Asks the reader about `request`, a call the permission rules left open, timing how long the answer takes.
     ///
     /// # Errors
     ///
-    /// Returns the reason for the model when a rule or the reader refuses the call.
-    async fn ask(
-        &self,
-        request: &ApprovalRequest,
-        needed: bool,
-        hooked: bool,
-    ) -> Result<(), String> {
+    /// Returns the reason for the model when the reader refuses the call.
+    async fn ask(&self, request: ApprovalRequest) -> Result<(), String> {
         self.lock_waiting().1 = Some(Instant::now());
-        let allowed = self.batch.approvals.check(request, needed, hooked).await;
+        let allowed = self.batch.approvals.ask(request).await;
         let mut waiting = self.lock_waiting();
         if let Some(since) = waiting.1.take() {
             waiting.0 += since.elapsed();
@@ -1305,19 +1428,16 @@ impl Caller for Nested<'_> {
             arguments: args,
         };
         let filed = |event: AgentEvent| (self.batch.events)(self.file(event));
-        let ready = match admit(self.batch.registry, self.batch.hooks, &call, &filed).await {
+        let mut ready = match admit(&self.batch, &call, &filed).await {
             Admitted::Ended(result) => return Err(result.text),
             Admitted::Ready(ready) => ready,
         };
-        let _turn = match ready.needed {
+        let _turn = match ready.needed || ready.asked {
             true => Some(self.batch.gate.lock().await),
             false => None,
         };
-        let request = ApprovalRequest {
-            summary: format!("{} (called by {})", ready.request.summary, self.agent),
-            ..ready.request.clone()
-        };
-        if let Err(message) = self.ask(&request, ready.needed, ready.allowed).await {
+        ready.request.summary = format!("{} (called by {})", ready.request.summary, self.agent);
+        if let Err(message) = self.batch.approve(&call, &mut ready, Some(self)).await {
             finish(&call, message.clone(), true, Vec::new(), &filed);
             return Err(message);
         }

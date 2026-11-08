@@ -2,9 +2,11 @@
 //!
 //! Hooks are commands the user, a plugin or a trusted project sets up to run
 //! at points of a conversation: when it starts and ends, before and after a
-//! tool call, when a prompt is submitted, when a subagent starts and ends,
-//! before a compaction, when crab waits on the reader and when a turn is about
-//! to end. Each reads a JSON payload on
+//! tool call, when the reader is about to be asked about a call, after a batch
+//! of calls, when a prompt is submitted, when a subagent starts and ends,
+//! before and after a compaction, before and after the model changes, when
+//! crab waits on the reader, when a turn is about to end and when it fails.
+//! Each reads a JSON payload on
 //! standard input and answers on standard output and with its exit code, in the
 //! format of Claude Code's hooks, so the hooks a user already has keep working.
 //! [`load`] reads their definitions, [`Engine`] runs them for the agent loop.

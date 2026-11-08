@@ -608,8 +608,8 @@ impl crate::Hooks for Guarding {
         _call: &omc_providers::ToolCall,
         _arguments: &serde_json::Value,
         _output: &str,
-    ) -> Option<String> {
-        None
+    ) -> crate::Followed {
+        crate::Followed::default()
     }
 
     /// Lets the turn end.

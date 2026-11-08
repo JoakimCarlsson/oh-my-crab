@@ -244,7 +244,7 @@ impl Session {
                 }
             }
             Command::Cancel => self.cancel(),
-            Command::Set { setting, value } => self.set(&setting, &value),
+            Command::Set { setting, value } => self.set(&setting, &value).await,
             Command::Login { provider } => self.login(&provider),
             Command::Language { ticket, answer } => {
                 self.shared.client_languages.answer(ticket, answer);
@@ -290,6 +290,7 @@ impl Session {
             return self.say(Event::Failed(format!("unknown provider: {provider}")));
         };
         self.cancel();
+        let replaced = self.open.is_some();
         self.journal = None;
         self.shared.jobs.stop_all();
         self.shared.debuggers.close().await;
@@ -441,6 +442,8 @@ impl Session {
         }
         let source = if self.journal.is_some() {
             START_RESUME
+        } else if replaced {
+            START_CLEAR
         } else {
             START_NEW
         };
@@ -910,10 +913,28 @@ impl Session {
     }
 
     /// Gives the setting `setting` the value `value` and saves the choice with the conversation; the new value applies from the next request.
-    fn set(&mut self, setting: &str, value: &str) {
+    ///
+    /// A switch to another model is put to the `PreModelSwitch` hooks first, which may keep it from happening, and the client is told why with [`Event::Failed`]; once the model changed, the `PostModelSwitch` hooks start, and their context is told to the model with the next prompt.
+    async fn set(&mut self, setting: &str, value: &str) {
+        let from = self.shared.model().map(|(_, model)| model);
+        let switching = from
+            .clone()
+            .filter(|from| setting == MODEL && self.open.is_some() && from != value);
+        if let Some(from) = &switching
+            && let Some(engine) = self.shared.lifecycle.engine()
+            && let Some(reason) = engine.model_switch(from, value).await
+        {
+            return self.say(Event::Failed(format!(
+                "a PreModelSwitch hook kept the model from changing to {value}: {}",
+                reason.trim()
+            )));
+        }
         if self.apply(setting, value) {
             self.shared.save_setting(setting, value);
             self.shared.announce();
+            if let Some(from) = switching {
+                self.shared.lifecycle.switched(from, value.to_owned());
+            }
         }
     }
 
@@ -985,6 +1006,9 @@ impl Session {
 
 /// How a conversation started, as `SessionStart` hooks are told it, when it is new.
 const START_NEW: &str = "startup";
+
+/// How a conversation started, as `SessionStart` hooks are told it, when it is new and was opened in place of another.
+const START_CLEAR: &str = "clear";
 
 /// How a conversation started, as `SessionStart` hooks are told it, when it was saved and is opened again.
 const START_RESUME: &str = "resume";

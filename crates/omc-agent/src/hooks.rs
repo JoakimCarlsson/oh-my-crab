@@ -1,4 +1,4 @@
-//! Checks the user defines around the loop: before and after each tool call, when a subagent starts, before the conversation is compacted, and when a turn is about to end.
+//! Checks the user defines around the loop: before and after each tool call, when a call needs the reader's permission, after each batch of calls, when a reply comes in, when a subagent starts, before and after the conversation is compacted, and when a turn is about to end.
 //!
 //! The loop only asks; what is checked and how is up to the [`Hooks`] it is given, such as commands the user configured.
 
@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use omc_providers::ToolCall;
+use omc_providers::{Reply, ToolCall, ToolResult};
 use serde_json::Value;
 
 /// What the checks before a tool call decided about it.
@@ -17,6 +17,8 @@ pub enum Gate {
     Pass,
     /// The call goes on without the reader being asked.
     Allow,
+    /// The reader is asked about the call, as when an ask rule matches it, even when it needs no approval.
+    Ask,
     /// The call is not run; the reason is what the model is told instead of a result.
     Deny(String),
 }
@@ -30,6 +32,50 @@ pub struct Screened {
     pub arguments: Option<Value>,
     /// A note for the model, added to the call's result.
     pub note: Option<String>,
+    /// Why the turn stops once the batch of calls this one is in has ended, when a check asked for that.
+    pub halt: Option<String>,
+}
+
+/// What the checks after a tool call came to.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Followed {
+    /// A note for the model, added to the call's result.
+    pub note: Option<String>,
+    /// The text the model reads as the call's result instead of what the tool gave, when a check replaced it.
+    pub output: Option<String>,
+    /// Why the turn stops once the batch of calls this one is in has ended, when a check asked for that.
+    pub halt: Option<String>,
+}
+
+/// What the checks said about a call the reader is about to be asked about.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum Permit {
+    /// No opinion: the reader is asked.
+    #[default]
+    Pass,
+    /// The call runs without the reader being asked.
+    Allow {
+        /// The arguments to run it with instead, when a check rewrote them.
+        arguments: Option<Value>,
+        /// Allow rules, in Claude Code's syntax, to add for the rest of the conversation.
+        rules: Vec<String>,
+    },
+    /// The call is not run.
+    Deny {
+        /// What the model is told instead of a result.
+        reason: String,
+        /// Whether the turn stops once the batch of calls has ended.
+        halt: bool,
+    },
+}
+
+/// What the checks after a whole batch of tool calls came to.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Batched {
+    /// A note for the model, added after the batch's results.
+    pub note: Option<String>,
+    /// Why the turn stops now instead of sending the results to the model, when a check asked for that.
+    pub halt: Option<String>,
 }
 
 /// What started a compaction.
@@ -73,19 +119,35 @@ pub trait Hooks: Send + Sync {
     /// Checks `call`, whose arguments were read and put right against its tool's schema as `arguments`, before it is announced, asked about or run.
     async fn before_tool(&self, call: &ToolCall, arguments: &Value) -> Screened;
 
-    /// A note for the model to read with the result of `call`, which ran with `arguments` and succeeded with `output`; nothing when there is none.
-    async fn after_tool(&self, call: &ToolCall, arguments: &Value, output: &str) -> Option<String>;
+    /// What the checks make of the result of `call`, which ran with `arguments` and succeeded with `output`: a note for the model to read with it, a replacement for it, and whether the turn stops.
+    async fn after_tool(&self, call: &ToolCall, arguments: &Value, output: &str) -> Followed;
 
-    /// A note for the model to read with the failure of `call`, which ran with `arguments` for `took` and failed with `error`; nothing when there is none, as by default.
+    /// What the checks make of the failure of `call`, which ran with `arguments` for `took` and failed with `error`; nothing, as by default.
     async fn after_tool_failed(
         &self,
         _call: &ToolCall,
         _arguments: &Value,
         _error: &str,
         _took: Duration,
-    ) -> Option<String> {
-        None
+    ) -> Followed {
+        Followed::default()
     }
+
+    /// Whether `call`, made with `arguments`, runs, is refused or is put to the reader, asked when no rule settled it and the reader is about to be asked; by default the reader is asked.
+    async fn permission_request(&self, _call: &ToolCall, _arguments: &Value) -> Permit {
+        Permit::Pass
+    }
+
+    /// What the checks make of a whole batch of `calls`, once each has its result in `results`, in the same order, and before the results go to the model; nothing, as by default.
+    async fn after_batch(&self, _calls: &[ToolCall], _results: &[ToolResult]) -> Batched {
+        Batched::default()
+    }
+
+    /// Tells the checks the model replied with `reply`, before its calls are run; by default nothing is told.
+    async fn replied(&self, _reply: &Reply) {}
+
+    /// Tells the checks the conversation was compacted, as `trigger` started it, into `summary`; by default nothing is told.
+    async fn after_compact(&self, _trigger: CompactTrigger, _summary: &str) {}
 
     /// Why the agent should go on instead of ending its turn with `answer`, or nothing to let it end; `again` says the turn already went on because of such a check since the model last called a tool.
     async fn stop(&self, answer: &str, again: bool) -> Option<String>;

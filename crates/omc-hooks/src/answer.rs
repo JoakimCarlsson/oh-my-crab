@@ -2,7 +2,7 @@
 //!
 //! Exit code 0 is an answer: standard output holding a JSON object is read for its fields, and other text is context for a prompt and ignored elsewhere. Exit code 2 blocks, with standard error as the reason. Any other exit code is a failure that lets things go on. A hook that timed out or could not start gave no answer: before a tool call that denies the call, since the check never happened, and everywhere else it lets things go on.
 
-use omc_agent::{Compacting, Gate, Screened};
+use omc_agent::{Batched, Compacting, Followed, Gate, Permit, Screened};
 use serde_json::Value;
 
 use crate::config::Hook;
@@ -36,7 +36,10 @@ impl Given<'_> {
                 code: 0, stdout, ..
             } => match stdout.trim() {
                 text if text.starts_with('{') => match serde_json::from_str::<Value>(text) {
-                    Ok(json) if json.is_object() => Said::Json(json),
+                    Ok(json) if json.is_object() => {
+                        self.tell_reader(&json);
+                        Said::Json(json)
+                    }
                     _ => Said::Text(text.to_owned()),
                 },
                 text => Said::Text(text.to_owned()),
@@ -69,6 +72,17 @@ impl Given<'_> {
     fn silence(&self) -> Option<String> {
         self.outcome.silence()
     }
+
+    /// Writes the `systemMessage` of `json`, which the hook meant for the reader, to standard error, which the client shows the reader; crab has no other way to show it.
+    fn tell_reader(&self, json: &Value) {
+        if let Some(message) = text(json, "systemMessage") {
+            eprintln!(
+                "hook message: {} ({}): {message}",
+                self.hook.label(),
+                self.hook.file.display()
+            );
+        }
+    }
 }
 
 /// The text of `key` in `json`, when it is non-empty text.
@@ -91,10 +105,17 @@ fn halts(json: &Value) -> bool {
     json.get("continue") == Some(&Value::Bool(false))
 }
 
-/// What the hooks before a tool call came to: denied when any denied, blocked or gave no answer, with every reason; allowed when one allowed and none denied; the arguments the last hook that rewrote them gave; and the notes they added, in order.
+/// Why `json` asks for everything to stop, with `continue` set to `false`: its `stopReason`, or a reason naming `hook`; nothing when it does not ask.
+fn halt_of(json: &Value, hook: &Hook) -> Option<String> {
+    halts(json).then(|| or_default(text(json, "stopReason").unwrap_or_default(), hook))
+}
+
+/// What the hooks before a tool call came to: denied when any denied, blocked or gave no answer, with every reason; the reader asked when one asked and none denied; allowed when one allowed and none denied or asked; the arguments the last hook that rewrote them gave; the notes they added, in order; and, when one said `continue: false`, the turn stopping after the batch, its call denied.
 pub(crate) fn before_tool(given: &[Given<'_>]) -> Screened {
     let mut denials = Vec::new();
     let mut allowed = false;
+    let mut asked = false;
+    let mut halt = None;
     let mut arguments = None;
     let mut notes = Vec::new();
     for one in given {
@@ -119,15 +140,14 @@ pub(crate) fn before_tool(given: &[Given<'_>]) -> Screened {
                 let reason = text(&specific, "permissionDecisionReason")
                     .or_else(|| text(&json, "reason"))
                     .unwrap_or_default();
-                if halts(&json) {
-                    denials.push(or_default(
-                        text(&json, "stopReason").unwrap_or(reason),
-                        one.hook,
-                    ));
+                if let Some(stopped) = halt_of(&json, one.hook) {
+                    denials.push(stopped.clone());
+                    halt = halt.or(Some(stopped));
                     continue;
                 }
                 match decision.as_deref() {
                     Some("deny") => denials.push(or_default(reason, one.hook)),
+                    Some("ask") => asked = true,
                     Some("allow") => allowed = true,
                     _ => {}
                 }
@@ -141,6 +161,8 @@ pub(crate) fn before_tool(given: &[Given<'_>]) -> Screened {
     }
     let gate = if !denials.is_empty() {
         Gate::Deny(denials.join("\n"))
+    } else if asked {
+        Gate::Ask
     } else if allowed {
         Gate::Allow
     } else {
@@ -150,6 +172,7 @@ pub(crate) fn before_tool(given: &[Given<'_>]) -> Screened {
         gate,
         arguments,
         note: joined(notes),
+        halt,
     }
 }
 
@@ -167,9 +190,11 @@ fn joined(parts: Vec<String>) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
-/// The note the hooks after a tool call add to its result: the reasons of those that blocked, by exit code 2 or `decision: "block"`, and the context they added, in order; nothing when there is none.
-pub(crate) fn after_tool(given: &[Given<'_>]) -> Option<String> {
+/// What the hooks after a tool call came to: the note they add to its result, the reasons of those that blocked, by exit code 2 or `decision: "block"`, and the context they added, in order; the result the last hook that replaced it gave, with `updatedToolOutput` or `updatedMCPToolOutput`, text as it is and other values as JSON; and, when one said `continue: false`, the turn stopping after the batch.
+pub(crate) fn after_tool(given: &[Given<'_>]) -> Followed {
     let mut notes = Vec::new();
+    let mut output = None;
+    let mut halt = None;
     for one in given {
         match one.said() {
             Said::Blocked(reason) => notes.extend(Some(reason).filter(|r| !r.is_empty())),
@@ -178,11 +203,169 @@ pub(crate) fn after_tool(given: &[Given<'_>]) -> Option<String> {
                     notes.extend(text(&json, "reason"));
                 }
                 notes.extend(context(&json));
+                let specific = json.get("hookSpecificOutput");
+                if let Some(replaced) = specific
+                    .and_then(|specific| {
+                        specific
+                            .get("updatedToolOutput")
+                            .or_else(|| specific.get("updatedMCPToolOutput"))
+                    })
+                    .filter(|replaced| !replaced.is_null())
+                {
+                    output = Some(match replaced {
+                        Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    });
+                }
+                halt = halt.or_else(|| halt_of(&json, one.hook));
             }
             Said::Text(_) | Said::Nothing => {}
         }
     }
-    joined(notes)
+    Followed {
+        note: joined(notes),
+        output,
+        halt,
+    }
+}
+
+/// What the hooks of a call the reader is about to be asked about came to, from the `decision` of their `hookSpecificOutput`: denied when any said `behavior: "deny"`, with every `message`, stopping the turn when one set `interrupt`; otherwise allowed when one said `"allow"`, with the arguments the last `updatedInput` gave and the allow rules of the `addRules` entries of `updatedPermissions`; otherwise the reader is asked. Exit code 2 is not honoured, as in Claude Code, and a hook that gave no answer leaves the question to the reader.
+pub(crate) fn permission(given: &[Given<'_>]) -> Permit {
+    let mut denials = Vec::new();
+    let mut interrupt = false;
+    let mut allowed = false;
+    let mut arguments = None;
+    let mut rules = Vec::new();
+    for one in given {
+        let Said::Json(json) = one.said() else {
+            continue;
+        };
+        let decision = json
+            .get("hookSpecificOutput")
+            .and_then(|specific| specific.get("decision"))
+            .cloned()
+            .unwrap_or_default();
+        match text(&decision, "behavior").as_deref() {
+            Some("deny") => {
+                denials.push(or_default(
+                    text(&decision, "message").unwrap_or_default(),
+                    one.hook,
+                ));
+                interrupt |= decision.get("interrupt") == Some(&Value::Bool(true));
+            }
+            Some("allow") => {
+                allowed = true;
+                if let Some(updated) = decision.get("updatedInput").filter(|v| v.is_object()) {
+                    arguments = Some(updated.clone());
+                }
+                rules.extend(allow_rules(&decision));
+            }
+            _ => {}
+        }
+    }
+    if !denials.is_empty() {
+        Permit::Deny {
+            reason: denials.join("\n"),
+            halt: interrupt,
+        }
+    } else if allowed {
+        Permit::Allow { arguments, rules }
+    } else {
+        Permit::Pass
+    }
+}
+
+/// The allow rules, in Claude Code's syntax, that the `addRules` entries with `behavior: "allow"` of the `updatedPermissions` of `decision` add; crab keeps them for the conversation only, whatever `destination` says.
+fn allow_rules(decision: &Value) -> Vec<String> {
+    let mut rules = Vec::new();
+    for entry in decision
+        .get("updatedPermissions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if text(entry, "type").as_deref() != Some("addRules")
+            || text(entry, "behavior").as_deref() != Some("allow")
+        {
+            continue;
+        }
+        for rule in entry
+            .get("rules")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(tool) = text(rule, "toolName") else {
+                continue;
+            };
+            rules.push(match text(rule, "ruleContent") {
+                Some(content) => format!("{tool}({content})"),
+                None => tool,
+            });
+        }
+    }
+    rules
+}
+
+/// What the hooks after a batch of tool calls came to: the context they added, in order, as a note after the results; and the turn stopping now when one blocked, by exit code 2, `decision: "block"` or `continue: false`, with every reason.
+pub(crate) fn batch(given: &[Given<'_>]) -> Batched {
+    let mut notes = Vec::new();
+    let mut stops = Vec::new();
+    for one in given {
+        match one.said() {
+            Said::Blocked(reason) => stops.push(or_default(reason, one.hook)),
+            Said::Json(json) => {
+                if let Some(stopped) = halt_of(&json, one.hook) {
+                    stops.push(stopped);
+                } else if json.get("decision").and_then(Value::as_str) == Some("block") {
+                    stops.push(or_default(
+                        text(&json, "reason").unwrap_or_default(),
+                        one.hook,
+                    ));
+                }
+                notes.extend(context(&json));
+            }
+            Said::Text(_) | Said::Nothing => {}
+        }
+    }
+    Batched {
+        note: joined(notes),
+        halt: joined(stops),
+    }
+}
+
+/// Why the hooks before a model switch keep it from happening: exit code 2, `decision: "block"`, a `permissionDecision` of `deny`, or of `ask`, which crab cannot put to the reader and so counts as a refusal, and a hook that timed out or could not start; nothing when the switch goes ahead.
+pub(crate) fn model_switch(given: &[Given<'_>]) -> Option<String> {
+    let mut blocks = Vec::new();
+    for one in given {
+        if let Some(silence) = one.silence() {
+            blocks.push(format!(
+                "the hook `{}` gave no answer: {silence}",
+                one.hook.command
+            ));
+            continue;
+        }
+        match one.said() {
+            Said::Blocked(reason) => blocks.push(or_default(reason, one.hook)),
+            Said::Json(json) => {
+                let specific = json.get("hookSpecificOutput").cloned().unwrap_or_default();
+                let refused = matches!(
+                    text(&specific, "permissionDecision").as_deref(),
+                    Some("deny" | "ask")
+                ) || json.get("decision").and_then(Value::as_str) == Some("block");
+                if refused {
+                    blocks.push(or_default(
+                        text(&specific, "permissionDecisionReason")
+                            .or_else(|| text(&json, "reason"))
+                            .unwrap_or_default(),
+                        one.hook,
+                    ));
+                }
+            }
+            Said::Text(_) | Said::Nothing => {}
+        }
+    }
+    joined(blocks)
 }
 
 /// What the hooks of a prompt came to.
@@ -419,6 +602,7 @@ mod tests {
                 hook: &check,
                 outcome,
             }])
+            .note
         };
         assert_eq!(
             note(exited(
@@ -563,5 +747,152 @@ mod tests {
             },
         ]);
         assert_eq!(ended, None);
+    }
+
+    /// One hook for `event` that ended as `outcome`, read by `read`.
+    fn alone<T>(event: HookEvent, outcome: Outcome, read: fn(&[Given<'_>]) -> T) -> T {
+        let check = hook(event, "check");
+        read(&[Given {
+            hook: &check,
+            outcome,
+        }])
+    }
+
+    /// `ask` has the reader asked, below a denial; `continue: false` before a call denies it and stops the turn; after a call `updatedToolOutput` replaces the result, as text or as JSON.
+    #[test]
+    fn asking_stopping_and_replacing() {
+        let asked = r#"{"hookSpecificOutput":{"permissionDecision":"ask"}}"#;
+        assert_eq!(
+            alone(HookEvent::PreToolUse, exited(0, asked, ""), before_tool).gate,
+            Gate::Ask
+        );
+        let stopped = alone(
+            HookEvent::PreToolUse,
+            exited(0, r#"{"continue":false,"stopReason":"build is red"}"#, ""),
+            before_tool,
+        );
+        assert_eq!(stopped.gate, Gate::Deny("build is red".into()));
+        assert_eq!(stopped.halt.as_deref(), Some("build is red"));
+        let replaced = alone(
+            HookEvent::PostToolUse,
+            exited(
+                0,
+                r#"{"hookSpecificOutput":{"updatedToolOutput":"[redacted]"}}"#,
+                "",
+            ),
+            after_tool,
+        );
+        assert_eq!(replaced.output.as_deref(), Some("[redacted]"));
+        let structured = alone(
+            HookEvent::PostToolUse,
+            exited(
+                0,
+                r#"{"hookSpecificOutput":{"updatedMCPToolOutput":{"stdout":"x"}}}"#,
+                "",
+            ),
+            after_tool,
+        );
+        assert_eq!(structured.output.as_deref(), Some(r#"{"stdout":"x"}"#));
+    }
+
+    /// A permission request: `allow` with a rewrite and rules, `deny` with a message and `interrupt`, and exit code 2 or silence leaving it to the reader.
+    #[test]
+    fn a_permission_request() {
+        let allow = json!({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {
+            "behavior": "allow",
+            "updatedInput": {"command": "npm run lint"},
+            "updatedPermissions": [{"type": "addRules", "rules": [{"toolName": "Bash", "ruleContent": "npm run *"}, {"toolName": "Read"}], "behavior": "allow", "destination": "session"}]
+        }}});
+        assert_eq!(
+            alone(
+                HookEvent::PermissionRequest,
+                exited(0, &allow.to_string(), ""),
+                permission
+            ),
+            Permit::Allow {
+                arguments: Some(json!({"command": "npm run lint"})),
+                rules: vec!["Bash(npm run *)".into(), "Read".into()],
+            }
+        );
+        let deny = r#"{"hookSpecificOutput":{"decision":{"behavior":"deny","message":"no deploys","interrupt":true}}}"#;
+        assert_eq!(
+            alone(
+                HookEvent::PermissionRequest,
+                exited(0, deny, ""),
+                permission
+            ),
+            Permit::Deny {
+                reason: "no deploys".into(),
+                halt: true
+            }
+        );
+        assert_eq!(
+            alone(
+                HookEvent::PermissionRequest,
+                exited(2, "", "nope"),
+                permission
+            ),
+            Permit::Pass
+        );
+        assert_eq!(
+            alone(
+                HookEvent::PermissionRequest,
+                Outcome::TimedOut(Duration::from_secs(1)),
+                permission
+            ),
+            Permit::Pass
+        );
+    }
+
+    /// After a batch, context becomes a note and a block stops the turn; before a model switch, exit 2, `deny`, `ask` and silence keep it from happening.
+    #[test]
+    fn a_batch_and_a_model_switch() {
+        let noted = alone(
+            HookEvent::PostToolBatch,
+            exited(
+                0,
+                r#"{"hookSpecificOutput":{"additionalContext":"run pytest"}}"#,
+                "",
+            ),
+            batch,
+        );
+        assert_eq!(noted.note.as_deref(), Some("run pytest"));
+        assert_eq!(noted.halt, None);
+        let stopped = alone(
+            HookEvent::PostToolBatch,
+            exited(0, r#"{"decision":"block","reason":"too many edits"}"#, ""),
+            batch,
+        );
+        assert_eq!(stopped.halt.as_deref(), Some("too many edits"));
+        assert_eq!(
+            alone(
+                HookEvent::PreModelSwitch,
+                exited(2, "", "stay put"),
+                model_switch
+            )
+            .as_deref(),
+            Some("stay put")
+        );
+        let ask = r#"{"hookSpecificOutput":{"permissionDecision":"ask","permissionDecisionReason":"costly"}}"#;
+        assert_eq!(
+            alone(HookEvent::PreModelSwitch, exited(0, ask, ""), model_switch).as_deref(),
+            Some("costly")
+        );
+        assert!(
+            alone(
+                HookEvent::PreModelSwitch,
+                Outcome::TimedOut(Duration::from_secs(1)),
+                model_switch
+            )
+            .is_some()
+        );
+        assert_eq!(
+            alone(
+                HookEvent::PreModelSwitch,
+                exited(0, r#"{"systemMessage":"switching"}"#, ""),
+                model_switch
+            ),
+            None
+        );
     }
 }

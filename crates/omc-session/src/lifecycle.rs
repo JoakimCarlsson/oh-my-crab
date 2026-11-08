@@ -1,6 +1,6 @@
 //! The hooks that run around a conversation rather than inside one call: when it opens, resumes or has been compacted, when it ends, and when it waits on the reader.
 //!
-//! The context `SessionStart` hooks give reaches the model as a notice at the start of the next prompt, like the other context that changes during a conversation, so the system prompt and tool list stay byte for byte the same and the provider's prompt cache keeps them.
+//! The context `SessionStart` and `PostModelSwitch` hooks give reaches the model as a notice at the start of the next prompt, like the other context that changes during a conversation, so the system prompt and tool list stay byte for byte the same and the provider's prompt cache keeps them.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,18 +12,30 @@ use tokio::sync::watch;
 pub(crate) const IDLE_AFTER: Duration = Duration::from_secs(60);
 
 /// The tag the context of `SessionStart` hooks is told to the model in.
-const START_TAG: &str = "session-start-hook";
+pub(crate) const START_TAG: &str = "session-start-hook";
 
-/// The context of a run of `SessionStart` hooks: nothing while they run, then what they added.
+/// The tag the context of `PostModelSwitch` hooks is told to the model in.
+pub(crate) const SWITCH_TAG: &str = "model-switch-hook";
+
+/// The context of a run of hooks: nothing while they run, then what they added.
 pub(crate) type Starting = watch::Receiver<Option<Option<String>>>;
 
-/// The hooks of a conversation as they stand now, and the context of the last `SessionStart` hooks that the model has not been told yet.
+/// A run of hooks whose context the model is to be told with the next prompt, under the tag it is told in.
+#[derive(Clone)]
+pub(crate) struct Notice {
+    /// The tag the context is told in, which also tells the runs apart: a later run with the same tag takes the place of an earlier one.
+    pub(crate) tag: &'static str,
+    /// The run.
+    pub(crate) run: Starting,
+}
+
+/// The hooks of a conversation as they stand now, and the context of the runs of hooks that the model has not been told yet.
 #[derive(Default)]
 pub(crate) struct Lifecycle {
     /// The hooks that run now; they change when the project's trust or its hook files do.
     engine: Mutex<Option<Arc<Engine>>>,
-    /// The last run of `SessionStart` hooks, until a turn that told the model its context ended.
-    starting: Mutex<Option<Starting>>,
+    /// The last run of hooks for each tag, until a turn that told the model its context ended.
+    starting: Mutex<Vec<Notice>>,
 }
 
 impl Lifecycle {
@@ -58,40 +70,57 @@ impl Lifecycle {
             let context = engine.session_start(source, model.as_deref()).await;
             let _ = done.send(Some(context));
         });
-        *self
-            .starting
-            .lock()
-            .unwrap_or_else(|held| held.into_inner()) = Some(starting);
+        self.keep(START_TAG, starting);
     }
 
-    /// The run of `SessionStart` hooks whose context the model has not been told yet, when there is one.
-    pub(crate) fn pending(&self) -> Option<Starting> {
+    /// Starts the `PostModelSwitch` hooks for a switch from the model `from` to `to` on a task of their own, and keeps their context for the next prompt in place of that of an earlier switch; does nothing when no hook runs at that event or there is no runtime to run them on.
+    pub(crate) fn switched(&self, from: String, to: String) {
+        let Some(engine) = self.engine_for(HookEvent::PostModelSwitch) else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let (done, switching) = watch::channel(None);
+        runtime.spawn(async move {
+            let context = engine.model_switched(&from, &to).await;
+            let _ = done.send(Some(context));
+        });
+        self.keep(SWITCH_TAG, switching);
+    }
+
+    /// Keeps `run` as the run of hooks whose context is told under `tag`, in place of any earlier one.
+    pub(crate) fn keep(&self, tag: &'static str, run: Starting) {
+        let mut starting = self
+            .starting
+            .lock()
+            .unwrap_or_else(|held| held.into_inner());
+        starting.retain(|notice| notice.tag != tag);
+        starting.push(Notice { tag, run });
+    }
+
+    /// The runs of hooks whose context the model has not been told yet, in the order they started.
+    pub(crate) fn pending(&self) -> Vec<Notice> {
         self.starting
             .lock()
             .unwrap_or_else(|held| held.into_inner())
             .clone()
     }
 
-    /// Forgets `told`, a run of `SessionStart` hooks whose context a turn that ended told the model, unless a later run took its place meanwhile.
-    pub(crate) fn settle(&self, told: &Starting) {
-        let mut starting = self
-            .starting
+    /// Forgets `told`, runs of hooks whose context a turn that ended told the model, unless later runs took their places meanwhile.
+    pub(crate) fn settle(&self, told: &[Notice]) {
+        self.starting
             .lock()
-            .unwrap_or_else(|held| held.into_inner());
-        if starting
-            .as_ref()
-            .is_some_and(|kept| kept.same_channel(told))
-        {
-            *starting = None;
-        }
+            .unwrap_or_else(|held| held.into_inner())
+            .retain(|kept| !told.iter().any(|done| done.run.same_channel(&kept.run)));
     }
 
-    /// Forgets the run of `SessionStart` hooks waiting to be told, as when another conversation is opened.
+    /// Forgets the runs of hooks waiting to be told, as when another conversation is opened.
     pub(crate) fn forget_start(&self) {
-        *self
-            .starting
+        self.starting
             .lock()
-            .unwrap_or_else(|held| held.into_inner()) = None;
+            .unwrap_or_else(|held| held.into_inner())
+            .clear();
     }
 
     /// Tells the `Notification` hooks, on a task of their own, that crab waits on the reader: `kind` is the kind of notification, `title` and `message` what it says. Does nothing when no hook runs at that event.
@@ -122,9 +151,9 @@ pub(crate) async fn context_of(mut starting: Starting) -> Option<String> {
     }
 }
 
-/// The notice that tells the model `context`, which the `SessionStart` hooks added.
-pub(crate) fn start_notice(context: &str) -> String {
-    format!("<{START_TAG}>\n{}\n</{START_TAG}>", context.trim())
+/// The notice that tells the model `context`, which the hooks of the run told under `tag` added.
+pub(crate) fn start_notice(tag: &str, context: &str) -> String {
+    format!("<{tag}>\n{}\n</{tag}>", context.trim())
 }
 
 #[cfg(all(test, unix))]
@@ -173,27 +202,28 @@ mod tests {
         let folder = scratch("lifecycle-start");
         let lifecycle = Lifecycle::default();
         lifecycle.begin("startup", None);
-        assert!(lifecycle.pending().is_none());
+        assert!(lifecycle.pending().is_empty());
         lifecycle.set_engine(Some(engine(
             &folder,
             HookEvent::SessionStart,
             "sleep 0.2; echo the secret is kiwi",
         )));
         lifecycle.begin("startup", None);
-        let first = lifecycle.pending().unwrap();
+        let first = lifecycle.pending();
         assert_eq!(
-            context_of(first.clone()).await.as_deref(),
+            context_of(first[0].run.clone()).await.as_deref(),
             Some("the secret is kiwi")
         );
-        assert!(lifecycle.pending().is_some());
+        assert_eq!(lifecycle.pending().len(), 1);
         lifecycle.begin("compact", None);
         lifecycle.settle(&first);
-        let second = lifecycle.pending().unwrap();
-        assert!(!second.same_channel(&first));
+        let second = lifecycle.pending();
+        assert_eq!(second.len(), 1);
+        assert!(!second[0].run.same_channel(&first[0].run));
         lifecycle.settle(&second);
-        assert!(lifecycle.pending().is_none());
+        assert!(lifecycle.pending().is_empty());
         assert_eq!(
-            start_notice("  kiwi \n"),
+            start_notice(START_TAG, "  kiwi \n"),
             "<session-start-hook>\nkiwi\n</session-start-hook>"
         );
     }
