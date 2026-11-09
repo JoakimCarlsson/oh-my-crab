@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::tool::parse_args;
-use crate::{Sandbox, Tool, ToolError, ToolOutput};
+use crate::{Caller, NoCaller, Sandbox, Tool, ToolError, ToolOutput};
 
 /// Results given when the caller gives no limit.
 const DEFAULT_LIMIT: usize = 8;
@@ -106,16 +106,30 @@ impl Tool for CodeSearch {
     /// The results as a list of chunks, and whether the search went by keyword alone.
     fn data_shape(&self) -> Option<&'static str> {
         Some(
-            "{ results: { path: string; start: number; end: number; text: string }[]; keyword_only: boolean }",
+            "{ results: { path: string; start: number; end: number; text: string }[]; keyword_only: boolean; hidden: number }",
         )
     }
 
-    /// Brings the index up to date and searches it.
+    /// Brings the index up to date and searches it, showing every file it finds.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`CodeSearch::call_through`] does.
+    async fn call(&self, args: Value) -> Result<ToolOutput, ToolError> {
+        self.call_through("", args, &NoCaller).await
+    }
+
+    /// Brings the index up to date and searches it, leaving out the files `caller` says the permission rules keep from the agent, as they would keep `read` and `grep` from them.
     ///
     /// # Errors
     ///
     /// Fails when the query is blank or `path` is not a valid glob, and when the index cannot be opened, read or written.
-    async fn call(&self, args: Value) -> Result<ToolOutput, ToolError> {
+    async fn call_through(
+        &self,
+        _id: &str,
+        args: Value,
+        caller: &dyn Caller,
+    ) -> Result<ToolOutput, ToolError> {
         let args: Args = parse_args(args)?;
         if args.query.trim().is_empty() {
             return Err(ToolError::InvalidArguments(
@@ -123,9 +137,9 @@ impl Tool for CodeSearch {
             ));
         }
         let limit = args.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
-        let found = self
+        let mut found = self
             .index
-            .search(&args.query, args.path.as_deref(), limit)
+            .search(&args.query, args.path.as_deref(), limit * 2)
             .await
             .map_err(|error| match error {
                 omc_index::IndexError::Glob(reason) => {
@@ -133,6 +147,13 @@ impl Tool for CodeSearch {
                 }
                 other => ToolError::Failed(other.to_string()),
             })?;
+        let root = self.index.root().to_path_buf();
+        let before = found.hits.len();
+        found
+            .hits
+            .retain(|hit| caller.may_read(&root.join(&hit.path)));
+        let hidden = before - found.hits.len();
+        found.hits.truncate(limit);
         let data = json!({
             "results": found.hits.iter().map(|hit| json!({
                 "path": hit.path,
@@ -141,14 +162,21 @@ impl Tool for CodeSearch {
                 "text": hit.text,
             })).collect::<Vec<_>>(),
             "keyword_only": found.keyword_only.is_some(),
+            "hidden": hidden,
         });
-        Ok(ToolOutput::new(shown(&found, &args.query)).with_data(data))
+        Ok(ToolOutput::new(shown(&found, hidden, &args.query)).with_data(data))
     }
 }
 
-/// What the model is shown of `found`, the results of a search for `query`: a note when the search went by keyword alone or the index stopped short, then each chunk as `path:first-last` over its best lines, numbered.
-fn shown(found: &Found, query: &str) -> String {
+/// What the model is shown of `found`, the results of a search for `query` less `hidden` ones the permission rules keep from the agent: a note when the search went by keyword alone, the index stopped short or results were left out, then each chunk as `path:first-last` over its best lines, numbered.
+fn shown(found: &Found, hidden: usize, query: &str) -> String {
     let mut notes = Vec::new();
+    if hidden > 0 {
+        let noun = if hidden == 1 { "result" } else { "results" };
+        notes.push(format!(
+            "[{hidden} {noun} left out: permission rules keep their files from you]"
+        ));
+    }
     if let Some(reason) = &found.keyword_only {
         notes.push(format!("[keyword search only: {reason}]"));
     }
@@ -337,6 +365,48 @@ mod tests {
         );
         assert!(out.text.contains("a.rs:1-1"));
         assert_eq!(out.data.unwrap()["keyword_only"], true);
+    }
+
+    /// A caller whose permission rules keep every file named `.secret` from the agent.
+    struct Rules;
+
+    #[async_trait]
+    impl Caller for Rules {
+        /// Has no tool.
+        fn has(&self, _name: &str) -> bool {
+            false
+        }
+
+        /// Fails, since there is no tool to call.
+        async fn call(&self, name: &str, _args: Value) -> Result<ToolOutput, String> {
+            Err(format!("unknown tool: {name}"))
+        }
+
+        /// Keeps files named `.secret` from the agent.
+        fn may_read(&self, path: &std::path::Path) -> bool {
+            path.file_name().is_none_or(|name| name != ".secret")
+        }
+    }
+
+    /// Files the permission rules keep from the agent are left out of the results, and the results say how many.
+    #[tokio::test]
+    async fn leaves_out_files_the_rules_deny() {
+        let (tool, root) = tool("code-search-denied", None);
+        std::fs::write(root.join(".secret"), "token = hunter2\n").unwrap();
+        std::fs::write(root.join("auth.py"), "def check_token(token):\n    pass\n").unwrap();
+        let out = tool
+            .call_through("1", json!({"query": "token"}), &Rules)
+            .await
+            .unwrap();
+        assert!(!out.text.contains("hunter2"), "{}", out.text);
+        assert!(
+            out.text
+                .starts_with("[1 result left out: permission rules keep their files from you]")
+        );
+        assert!(out.text.contains("auth.py:1-2"));
+        assert_eq!(out.data.unwrap()["hidden"], 1);
+        let open = tool.call(json!({"query": "token"})).await.unwrap();
+        assert!(open.text.contains("hunter2"));
     }
 
     /// The window of a long chunk is the one holding the most query terms.

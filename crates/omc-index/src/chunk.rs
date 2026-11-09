@@ -23,6 +23,12 @@ const WINDOW_STEP: usize = 30;
 /// The most bytes of a chunk's text that are kept, so a minified line does not make one huge chunk.
 pub const MAX_CHUNK_BYTES: usize = 4000;
 
+/// How many levels of items inside items are cut along the syntax tree; deeper ones are cut into windows of lines, so deeply nested or generated code cannot exhaust the stack.
+pub const MAX_DEPTH: usize = 32;
+
+/// The most syntax nodes looked at in one file; once they are used up, what is left to cut is cut into windows of lines.
+pub const MAX_NODES: usize = 20_000;
+
 /// The languages whose grammars cut code along its syntax tree.
 const LANGUAGES: &[SupportLang] = &[
     SupportLang::C,
@@ -101,16 +107,12 @@ fn chunk(lines: &[&str], start: usize, end: usize) -> Option<Chunk> {
 fn syntax_spans(lang: SupportLang, text: &str, count: usize) -> Vec<Span> {
     let parsed = lang.ast_grep(text);
     let root = parsed.root();
-    let items = named_children(&root);
+    let mut cutter = Cutter { budget: MAX_NODES };
+    let items = cutter.children(&root);
     if items.is_empty() {
         return windows(0, count - 1, WINDOW_STEP);
     }
-    pack(&items)
-}
-
-/// The named children of `node`, in order.
-fn named_children<'t>(node: &Node<'t, StrDoc<SupportLang>>) -> Vec<Node<'t, StrDoc<SupportLang>>> {
-    node.children().filter(Node::is_named).collect()
+    cutter.pack(&items, 0)
 }
 
 /// The lines `node` covers.
@@ -143,47 +145,83 @@ fn units<'t>(
     units
 }
 
-/// The spans that `items`, siblings in order, are packed into: neighbours share a span while it stays within [`MAX_LINES`], comments going with the item after them, and an item longer than that is cut along its own items, its first and last lines going to the first and last of their spans, or into windows when it has none.
-fn pack(items: &[Node<'_, StrDoc<SupportLang>>]) -> Vec<Span> {
-    let mut spans = Vec::new();
-    let mut current: Option<Span> = None;
-    for ((start, end), item) in units(items) {
-        if end - start + 1 > MAX_LINES {
-            spans.extend(current.take());
-            spans.extend(split(&item, start, end));
-            continue;
-        }
-        current = match current {
-            Some((first, _)) if end - first < MAX_LINES => Some((first, end)),
-            Some(full) => {
-                spans.push(full);
-                Some((start, end))
-            }
-            None => Some((start, end)),
-        };
-    }
-    spans.extend(current);
-    spans
+/// Cuts one file along its syntax tree, counting the nodes it looks at.
+struct Cutter {
+    /// How many more syntax nodes may be looked at.
+    budget: usize,
 }
 
-/// The spans of `item`, which covers the lines `start` to `end` and is too long for one: those of its own items, stretched to its first and last lines, or windows when it has none.
-fn split(item: &Node<'_, StrDoc<SupportLang>>, start: usize, end: usize) -> Vec<Span> {
-    let inner = named_children(item);
-    let mut spans = if inner.is_empty() {
-        Vec::new()
-    } else {
-        pack(&inner)
-    };
-    if spans.is_empty() {
-        return windows(start, end, MAX_LINES);
+impl Cutter {
+    /// The named children of `node`, in order, taken from the budget; nothing when they are more than is left of it, which then is used up, so that `node` is cut into windows whole rather than in part.
+    fn children<'t>(
+        &mut self,
+        node: &Node<'t, StrDoc<SupportLang>>,
+    ) -> Vec<Node<'t, StrDoc<SupportLang>>> {
+        let children: Vec<Node<'t, StrDoc<SupportLang>>> = node
+            .children()
+            .filter(Node::is_named)
+            .take(self.budget.saturating_add(1))
+            .collect();
+        if children.len() > self.budget {
+            self.budget = 0;
+            return Vec::new();
+        }
+        self.budget -= children.len();
+        children
     }
-    if let Some(first) = spans.first_mut() {
-        first.0 = first.0.min(start);
+
+    /// The spans that `items`, siblings in order and `depth` levels below the top, are packed into: neighbours share a span while it stays within [`MAX_LINES`], comments going with the item after them, and an item longer than that is cut along its own items, its first and last lines going to the first and last of their spans, or into windows when it has none, is [`MAX_DEPTH`] levels down or the node budget is used up.
+    fn pack(&mut self, items: &[Node<'_, StrDoc<SupportLang>>], depth: usize) -> Vec<Span> {
+        let mut spans = Vec::new();
+        let mut current: Option<Span> = None;
+        for ((start, end), item) in units(items) {
+            if end - start + 1 > MAX_LINES {
+                spans.extend(current.take());
+                spans.extend(self.split(&item, start, end, depth + 1));
+                continue;
+            }
+            current = match current {
+                Some((first, _)) if end - first < MAX_LINES => Some((first, end)),
+                Some(full) => {
+                    spans.push(full);
+                    Some((start, end))
+                }
+                None => Some((start, end)),
+            };
+        }
+        spans.extend(current);
+        spans
     }
-    if let Some(last) = spans.last_mut() {
-        last.1 = last.1.max(end);
+
+    /// The spans of `item`, `depth` levels below the top, which covers the lines `start` to `end` and is too long for one: those of its own items, stretched to its first and last lines, or windows when it has none, is [`MAX_DEPTH`] levels down or the node budget is used up.
+    fn split(
+        &mut self,
+        item: &Node<'_, StrDoc<SupportLang>>,
+        start: usize,
+        end: usize,
+        depth: usize,
+    ) -> Vec<Span> {
+        let inner = if depth >= MAX_DEPTH {
+            Vec::new()
+        } else {
+            self.children(item)
+        };
+        let mut spans = if inner.is_empty() {
+            Vec::new()
+        } else {
+            self.pack(&inner, depth)
+        };
+        if spans.is_empty() {
+            return windows(start, end, MAX_LINES);
+        }
+        if let Some(first) = spans.first_mut() {
+            first.0 = first.0.min(start);
+        }
+        if let Some(last) = spans.last_mut() {
+            last.1 = last.1.max(end);
+        }
+        spans
     }
-    spans
 }
 
 /// Windows of at most [`MAX_LINES`] lines over the lines `start` to `end`, each starting `step` lines after the one before.
@@ -265,6 +303,36 @@ mod tests {
         );
         assert!(chunks(Path::new("blank.txt"), "\n\n  \n").is_empty());
         assert!(chunks(Path::new("empty.rs"), "").is_empty());
+    }
+
+    /// Nesting thousands of levels deep is cut into windows below [`MAX_DEPTH`] levels, on a small stack, and still covers the whole file; each level above adds at most its own first and last line to a chunk.
+    #[test]
+    fn survives_pathological_nesting() {
+        let levels = 5000;
+        let source = format!("{}{}", "[\n".repeat(levels), "]\n".repeat(levels));
+        let found = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || chunks(Path::new("deep.json"), &source))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(found.first().unwrap().start, 1);
+        assert_eq!(found.last().unwrap().end, 2 * levels);
+        assert!(
+            found
+                .iter()
+                .all(|c| c.end - c.start < MAX_LINES + MAX_DEPTH)
+        );
+    }
+
+    /// A file with more items than the node budget is still cut whole, the rest of it into windows.
+    #[test]
+    fn caps_the_nodes_looked_at() {
+        let body: String = (0..MAX_NODES + 500).map(|n| format!("  {n},\n")).collect();
+        let source = format!("[\n{body}  0\n]\n");
+        let found = chunks(Path::new("big.json"), &source);
+        assert_eq!(found.last().unwrap().end, source.lines().count());
+        assert!(found.iter().all(|c| c.end - c.start < MAX_LINES));
     }
 
     /// A long single line is cut to the byte limit on a character boundary.

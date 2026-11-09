@@ -33,7 +33,8 @@ up to date first, so a search sees the files the agent just wrote.
 - **Which files.** The files `git` would see: `.gitignore` and the other
   ignore files are honoured, hidden files are included, `.git` is not.
   Files over 1 MiB, files that are not UTF-8 text, lockfiles such as
-  `Cargo.lock` and `package-lock.json`, and `*.min.js` are left out, and the
+  `Cargo.lock` and `package-lock.json`, `*.min.js` and files that commonly
+  hold secrets (see [below](#permissions-and-secrets)) are left out, and the
   index stops at 50,000 files, saying so in the result.
 - **Chunks.** Code in Rust, Go, TypeScript, TSX, JavaScript, Python, C, C++,
   Java, Lua, CSS, HTML and JSON is cut along its syntax tree, with the same
@@ -41,7 +42,10 @@ up to date first, so a search sees the files the agent just wrote.
   chunks of at most 40 lines, the comments before an item staying with it,
   and an item longer than that is cut along the items inside it, such as the
   methods of an `impl` or a class. Other files are cut into windows of 40
-  lines that overlap by 10. A chunk keeps at most 4,000 bytes.
+  lines that overlap by 10. A chunk keeps at most 4,000 bytes. Items nested
+  more than 32 levels deep, and every item once 20,000 syntax nodes of a file
+  have been looked at, are cut into windows instead, so deeply nested or
+  generated code costs no more than plain text.
 - **Words.** Each chunk's path, text and the pieces of its `camelCase` and
   `PascalCase` identifiers go into an SQLite FTS5 table, ranked by BM25 with
   the path counting double. A query word of three letters or more also
@@ -71,6 +75,30 @@ named after the folder and a hash of its path, so a linked worktree gets an
 index of its own. Several conversations can share one: SQLite's locks keep
 their refreshes apart. Deleting the folder only costs the next search the time
 to build it again.
+
+## Permissions and secrets
+
+`code_search` answers to [permission rules](../extending/permissions.md)
+written for `Grep` and `Read` as well as to its own name: a deny rule without
+a path, such as `Grep` or `Read`, stops it. Rules with a path cannot stop a
+search, since it does not know beforehand which files it will find; instead
+every result whose file a `Read` or `Grep` deny rule touches is left out, as
+is, outside yolo mode, every one an ask rule touches. The result starts with
+`[N results left out: permission rules keep their files from you]` when any
+were, and a script sees the count as `hidden`. So with `Read(.env)` denied,
+`code_search` never shows `.env`, just as `read` never reads it. The same holds
+when a script calls it.
+
+Files that commonly hold secrets are never indexed at all, whatever the rules
+say, and are dropped from an index built before: `.env` and `.env.*`,
+`.envrc`, `.netrc`, `.npmrc`, `.pypirc`, `.pgpass`, `.htpasswd`,
+`.git-credentials`, `id_rsa`, `id_dsa`, `id_ecdsa` and `id_ed25519` with
+anything after a `.` or `_`, `credentials`, `credentials.json`,
+`secrets.json`, `secrets.yaml`, `secrets.yml`, `service-account.json`, and
+files ending in `.pem`, `.key`, `.crt`, `.cer`, `.der`, `.p12`, `.pfx`,
+`.jks`, `.keystore`, `.kdbx`, `.gpg`, `.asc`, `.ovpn`, `.tfstate` or
+`.tfvars`, in any case. `read` and `grep` can still open them, under the
+permission rules.
 
 ## Configuration
 

@@ -30,9 +30,15 @@ Claude Code's names stand for the crab tools that do the same job: `Bash` for
 `bash`; `Edit` for `edit`, `write` and `ast_edit`; `MultiEdit` for `edit`;
 `Write` for `write`; `Read` for reading files with `read`; `WebFetch` for
 reading web pages and GitHub with `read`; `WebSearch` for `web_search`;
-`Grep`, `Glob`, `Task` and `Agent`, `TodoWrite`, `Skill`. Crab's own names
-work too, such as `bash`, `debug` or `ast_edit`, and a crab name with no
-specifier matches every call of the tool.
+`Grep`, `Glob`, `Task` and `Agent`, `TodoWrite`, `Skill`; `Grep` and `Read`
+for `code_search`. Crab's own names work too, such as `bash`, `debug` or
+`ast_edit`, and a crab name with no specifier matches every call of the tool.
+
+`code_search` finds its files itself, so a rule with a path cannot stop the
+call; instead it leaves out of its results every file a `Read` or `Grep` deny
+rule touches, and, outside yolo mode, every file an ask rule touches, and says
+how many it left out. With `Read(.env)` denied, it never shows `.env`. See
+[searching code by meaning](../tools/code-search.md#permissions-and-secrets).
 
 Paths are read like this:
 

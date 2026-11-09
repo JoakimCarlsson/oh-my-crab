@@ -52,6 +52,38 @@ const SKIPPED_NAMES: &[&str] = &[
     "go.sum",
 ];
 
+/// Names of files that commonly hold secrets, never indexed: a name equal to one, or starting with one followed by `.` or `_` (`.env.local`, `id_rsa.pub`).
+const SECRET_NAMES: &[&str] = &[
+    ".env",
+    ".envrc",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".pgpass",
+    ".htpasswd",
+    ".git-credentials",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+];
+
+/// Whole names of files that commonly hold secrets, never indexed.
+const SECRET_FILES: &[&str] = &[
+    "credentials",
+    "credentials.json",
+    "secrets.json",
+    "secrets.yaml",
+    "secrets.yml",
+    "service-account.json",
+];
+
+/// Extensions of files that commonly hold keys, certificates or secrets, never indexed.
+const SECRET_EXTENSIONS: &[&str] = &[
+    "pem", "key", "crt", "cer", "der", "p12", "pfx", "jks", "keystore", "kdbx", "gpg", "asc",
+    "ovpn", "tfstate", "tfvars",
+];
+
 /// One chunk a search found.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hit {
@@ -612,7 +644,7 @@ fn walk(root: &Path) -> impl Iterator<Item = (PathBuf, String)> + '_ {
         .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
         .filter(|entry| {
             let name = entry.file_name().to_string_lossy();
-            !SKIPPED_NAMES.contains(&name.as_ref()) && !name.ends_with(".min.js")
+            !SKIPPED_NAMES.contains(&name.as_ref()) && !name.ends_with(".min.js") && !secret(&name)
         })
         .filter_map(move |entry| {
             let relative = entry.path().strip_prefix(root).ok()?;
@@ -622,6 +654,23 @@ fn walk(root: &Path) -> impl Iterator<Item = (PathBuf, String)> + '_ {
                 .collect();
             Some((entry.path().to_path_buf(), parts.join("/")))
         })
+}
+
+/// Whether a file called `name` commonly holds secrets: its name is one of [`SECRET_FILES`] or [`SECRET_NAMES`], or one of the latter followed by `.` or `_` and more, or its extension is one of [`SECRET_EXTENSIONS`]; case is ignored.
+fn secret(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let named = SECRET_FILES.contains(&name.as_str())
+        || SECRET_NAMES.iter().any(|secret| {
+            name == *secret
+                || name
+                    .strip_prefix(secret)
+                    .is_some_and(|rest| rest.starts_with(['.', '_']))
+        });
+    let extension = Path::new(&name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| SECRET_EXTENSIONS.contains(&extension));
+    named || extension
 }
 
 /// The text of the file at `path`, when it can be read and is UTF-8 text without NUL bytes.
@@ -857,6 +906,54 @@ mod tests {
         let other = Other(Words::new());
         assert_eq!(index.refresh(Some(&other)).unwrap().embedded, 1);
         assert!(!index.has_vectors_of(&words).unwrap());
+    }
+
+    /// Files that commonly hold secrets are never indexed, and one indexed before is dropped; look-alike names are kept.
+    #[test]
+    fn leaves_secret_files_out() {
+        for name in [
+            ".env",
+            ".env.local",
+            ".ENV.production",
+            "id_rsa",
+            "id_ed25519.pub",
+            "server.pem",
+            "tls.key",
+            "cert.P12",
+            ".npmrc",
+            "credentials",
+            "prod.tfvars",
+        ] {
+            assert!(secret(name), "{name}");
+        }
+        for name in [
+            "environment.rs",
+            "keys.rs",
+            "envelope.ts",
+            "main.rs",
+            "credentials.rs",
+        ] {
+            assert!(!secret(name), "{name}");
+        }
+        let (root, database) = project("index-secrets");
+        put(&root, ".env", "API_TOKEN=hunter2\n");
+        put(
+            &root,
+            "certs/server.pem",
+            "-----BEGIN PRIVATE KEY----- hunter2\n",
+        );
+        put(
+            &root,
+            "src/app.rs",
+            "fn token() -> &'static str { \"none\" }\n",
+        );
+        let mut index = Index::open(&database, &root).unwrap();
+        assert_eq!(index.refresh(None).unwrap().files, 1);
+        assert!(index.search("hunter2", None, None, 10).unwrap().is_empty());
+        assert_eq!(
+            paths(&index.search("token", None, None, 10).unwrap()),
+            ["src/app.rs"]
+        );
     }
 
     /// Each project gets a database of its own, named after its folder.
