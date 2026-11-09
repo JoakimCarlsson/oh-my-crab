@@ -243,11 +243,6 @@ pub trait Caller: Send + Sync {
     fn waited(&self) -> std::time::Duration {
         std::time::Duration::ZERO
     }
-
-    /// Whether the permission rules let the agent see what the file at `path`, an absolute path, holds, as `read` and `grep` would: a tool that shows the contents of files it finds itself leaves out those it may not. Every file may be seen by default.
-    fn may_read(&self, _path: &std::path::Path) -> bool {
-        true
-    }
 }
 
 /// A [`Caller`] that has no tools, for running a tool outside the agent loop.

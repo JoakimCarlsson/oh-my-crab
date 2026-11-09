@@ -1277,7 +1277,6 @@ mod tests {
                 "ast_edit",
                 "ast_grep",
                 "bash",
-                "code_search",
                 "edit",
                 "glob",
                 "grep",

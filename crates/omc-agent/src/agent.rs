@@ -1430,40 +1430,11 @@ impl<'a> Nested<'a> {
     }
 }
 
-/// The caller of a call another tool made: it runs no tools, as [`NoCaller`] does, but tells the tool which files the permission rules let it show.
-struct Guard<'a> {
-    /// What is allowed without asking.
-    approvals: &'a Approvals,
-}
-
-#[async_trait]
-impl Caller for Guard<'_> {
-    /// Has no tool.
-    fn has(&self, _name: &str) -> bool {
-        false
-    }
-
-    /// Fails, since a call made by another tool runs no tools of its own.
-    async fn call(&self, name: &str, args: Value) -> Result<ToolOutput, String> {
-        NoCaller.call(name, args).await
-    }
-
-    /// Whether the permission rules let the agent see the file at `path`.
-    fn may_read(&self, path: &std::path::Path) -> bool {
-        self.approvals.may_read(path)
-    }
-}
-
 #[async_trait]
 impl Caller for Nested<'_> {
     /// Whether the agent has a tool called `name`.
     fn has(&self, name: &str) -> bool {
         self.batch.registry.get(name).is_some()
-    }
-
-    /// Whether the permission rules let the agent see the file at `path`.
-    fn may_read(&self, path: &std::path::Path) -> bool {
-        self.batch.approvals.may_read(path)
     }
 
     /// Runs the tool `name` with `args` the way a call of the model runs: its arguments put right against the schema and shown to the hooks, the reader asked when it needs approval, the hooks shown its result; reported under the calling tool's call, numbered from one in the order they were made.
@@ -1494,10 +1465,7 @@ impl Caller for Nested<'_> {
             finish(&call, message.clone(), true, Vec::new(), &filed);
             return Err(message);
         }
-        let guard = Guard {
-            approvals: self.batch.approvals,
-        };
-        let done = perform(&call, ready, self.batch.hooks, &guard).await;
+        let done = perform(&call, ready, self.batch.hooks, &NoCaller).await;
         finish(
             &call,
             done.text.clone(),

@@ -201,7 +201,6 @@ fn claude_names(tool: &str, subject: &Subject) -> &'static [&'static str] {
         "read" if matches!(subject, Subject::Site(_)) => &["WebFetch"],
         "read" => &["Read"],
         "grep" => &["Grep"],
-        "code_search" => &["Grep", "Read"],
         "glob" => &["Glob"],
         "web_search" => &["WebSearch"],
         "task" => &["Task", "Agent"],

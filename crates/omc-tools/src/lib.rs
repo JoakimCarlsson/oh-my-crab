@@ -42,7 +42,7 @@ pub use tool::{
     parse_args, sanitize,
 };
 pub use tools::{
-    Ask, AstEdit, AstGrep, Bash, CheckpointTool, CodeSearch, ContextNotes, Edit, ExitPlanMode,
-    Glob, Grep, LOAD_TOOLS, LoadTools, Lsp, MemoryEdit, MemorySearch, NewContext, Read, Remember,
-    Rewind, SetTitle, Skill, Todo, Wait, WebSearch, Write, one_line_summary, snapshot_tag,
+    Ask, AstEdit, AstGrep, Bash, CheckpointTool, ContextNotes, Edit, ExitPlanMode, Glob, Grep,
+    LOAD_TOOLS, LoadTools, Lsp, MemoryEdit, MemorySearch, NewContext, Read, Remember, Rewind,
+    SetTitle, Skill, Todo, Wait, WebSearch, Write, one_line_summary, snapshot_tag,
 };
