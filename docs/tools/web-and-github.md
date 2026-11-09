@@ -64,23 +64,40 @@ one fails the next is asked and the result notes the failure:
 | ---------- | ----------------------------------------------- |
 | Brave      | `BRAVE_API_KEY` or `BRAVE_SEARCH_API_KEY`       |
 | Tavily     | `TAVILY_API_KEY`; also writes an answer         |
-| Exa        | `EXA_API_KEY`                                   |
+| Exa        | `EXA_API_KEY`, or nothing                       |
 | Perplexity | `PERPLEXITY_API_KEY` or `PPLX_API_KEY`          |
 | Kagi       | `KAGI_API_KEY`                                  |
+| Parallel   | `PARALLEL_API_KEY`, or nothing                  |
+| Jina       | `JINA_API_KEY`                                  |
+| Firecrawl  | `FIRECRAWL_API_KEY`, or nothing                 |
+| TinyFish   | `TINYFISH_API_KEY`                              |
+| Kimi       | `MOONSHOT_SEARCH_API_KEY` or `KIMI_SEARCH_API_KEY`, a Kimi Code key |
+| DeepSeek   | `DEEPSEEK_API_KEY`                              |
+| Synthetic  | `SYNTHETIC_API_KEY`                             |
+| Ollama     | `OLLAMA_API_KEY` or `OLLAMA_CLOUD_API_KEY`      |
+| Keenable   | `KEENABLE_API_KEY`, or nothing                  |
 | SearXNG    | `SEARXNG_URL` or `OMC_SEARXNG_URL`, an instance with JSON output on |
 | DuckDuckGo | nothing                                         |
 
-Without `OMC_SEARCH`, every service that is set up is tried in that order,
-with DuckDuckGo last. `OMC_SEARCH` names the services to try and their order,
-as in `OMC_SEARCH=tavily,searxng`; a service it names that is not set up is
-skipped and noted, and leaving `duckduckgo` out of it means no search runs
-without a key. When no service can be asked, the error lists the variables to
-set. DuckDuckGo has no search API, so its no-script results page is read
-instead: it needs no account, but its markup can change and it sometimes
-answers automated searches with a challenge page, which counts as a failure.
-Set a key for searches that must work. Perplexity is asked through its Search
-API, which returns results without an answer. `recency` limits results to the
-last day, week, month or year where the service can: SearXNG has no week and
-widens it to a month, and Kagi has no year and ignores it. Each service gets
-20 seconds. A search sends the query off the machine, so it asks for approval
+Each service is one module under `crates/omc-tools/src/tools/web_search/engines`.
+Without `OMC_SEARCH`, every service that has its key is tried in that order,
+then the services that answer without one: Parallel, Exa, Keenable, Firecrawl
+and DuckDuckGo, each unless it was already tried with a key. Without a key,
+Parallel and Exa are asked through their public MCP servers, Keenable through
+its public endpoint and Firecrawl through its usual one; each has a lower rate
+limit than with a key, and Firecrawl refuses addresses that look like a VPN or
+proxy. `OMC_SEARCH` names the services to try and their order, as in
+`OMC_SEARCH=tavily,searxng`; a service it names without its key is asked
+without one when it can be, and otherwise skipped and noted. When no service
+can be asked, the error lists the variables to set. DuckDuckGo has no search
+API, so its no-script results page is read instead: it needs no account, but
+its markup can change and it sometimes answers automated searches with a
+challenge page, which counts as a failure. Set a key for searches that must
+work. Perplexity is asked through its Search API, which returns results
+without an answer. `recency` limits results to the last day, week, month or
+year where the service can: SearXNG has no week and widens it to a month, Kagi
+has no year and ignores it, Parallel and Exa without a key and DeepSeek get an
+`after:` date in the query, and Jina, TinyFish, Kimi, Synthetic and Ollama
+ignore it. Each service gets 20 seconds. A search sends the query off the
+machine, so it asks for approval
 outside yolo mode, under one scope for all searches.

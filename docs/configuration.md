@@ -52,7 +52,7 @@ starts `crab`. A switch that is off when set to `0` is also off with `false`,
 | `OMC_DEFERRED_TOOLS` | The tools hidden from the tool list until the model loads them with `load_tools`: comma-separated names and name prefixes ending in `*`, `default` for the built-in set; `0`, `none` or an empty value hides nothing. | `ast_edit`, `ast_grep`, `debug`, `mcp_resources`, `memory_edit` | [Hidden tools](tools/README.md#hidden-tools) |
 | `OMC_BASH_CONDENSE`  | Set to `0` to show `bash` output as it is instead of condensing known noisy commands.                       | on                            | [How tool calls run](tools/calls.md)                       |
 | `OMC_BASH_INTERCEPT` | Set to `0` to run every command instead of turning away shell uses a dedicated tool does better.            | on                            | [How tool calls run](tools/calls.md)                       |
-| `OMC_SEARCH`         | The search services `web_search` tries, in order, comma separated: `brave`, `tavily`, `exa`, `perplexity`, `kagi`, `searxng` (or `searx`), `duckduckgo` (or `ddg`). | every service set up, DuckDuckGo last | [Reading the web and GitHub](tools/web-and-github.md) |
+| `OMC_SEARCH`         | The search services `web_search` tries, in order, comma separated: `brave`, `tavily`, `exa`, `perplexity` (or `pplx`), `kagi`, `parallel`, `jina`, `firecrawl`, `tinyfish`, `kimi`, `deepseek`, `synthetic`, `ollama`, `keenable`, `searxng` (or `searx`), `duckduckgo` (or `ddg`). | every service with a key, then those that need none | [Reading the web and GitHub](tools/web-and-github.md) |
 | `OMC_SEARXNG_URL`    | The SearXNG instance `web_search` asks, when `SEARXNG_URL` is not set.                                      | unset                         | [Reading the web and GitHub](tools/web-and-github.md)      |
 | `OMC_MODELS_REFRESH` | Set to `0` to stop `crab serve` from downloading the model catalog into `<cache>/models.json` once a day; the bundled snapshot and any copy already cached are still used. | on                            | [Model catalog](providers/supported.md#model-catalog)      |
 | `OMC_MODELS_URL`     | Where the model catalog is downloaded from, in the models.dev format.                                       | `https://models.dev/api.json` | [Model catalog](providers/supported.md#model-catalog)      |
@@ -124,6 +124,15 @@ picked up without signing in again.
 | `EXA_API_KEY`                           | Key for Exa search.                                                  | [Reading the web and GitHub](tools/web-and-github.md) |
 | `PERPLEXITY_API_KEY`, `PPLX_API_KEY`    | Key for Perplexity search.                                           | [Reading the web and GitHub](tools/web-and-github.md) |
 | `KAGI_API_KEY`                          | Key for Kagi search.                                                 | [Reading the web and GitHub](tools/web-and-github.md) |
+| `PARALLEL_API_KEY`                      | Key for Parallel search; without it Parallel's public MCP server is asked. | [Reading the web and GitHub](tools/web-and-github.md) |
+| `JINA_API_KEY`                          | Key for Jina search.                                                 | [Reading the web and GitHub](tools/web-and-github.md) |
+| `FIRECRAWL_API_KEY`                     | Key for Firecrawl search.                                            | [Reading the web and GitHub](tools/web-and-github.md) |
+| `TINYFISH_API_KEY`                      | Key for TinyFish search.                                             | [Reading the web and GitHub](tools/web-and-github.md) |
+| `MOONSHOT_SEARCH_API_KEY`, `KIMI_SEARCH_API_KEY` | Kimi Code key for Kimi search.                              | [Reading the web and GitHub](tools/web-and-github.md) |
+| `DEEPSEEK_API_KEY`                      | Key for DeepSeek search.                                             | [Reading the web and GitHub](tools/web-and-github.md) |
+| `SYNTHETIC_API_KEY`                     | Key for Synthetic search.                                            | [Reading the web and GitHub](tools/web-and-github.md) |
+| `OLLAMA_API_KEY`, `OLLAMA_CLOUD_API_KEY` | Key for Ollama's web search.                                        | [Reading the web and GitHub](tools/web-and-github.md) |
+| `KEENABLE_API_KEY`                      | Key for Keenable search; without it Keenable's public endpoint is asked. | [Reading the web and GitHub](tools/web-and-github.md) |
 | `SEARXNG_URL`                           | The SearXNG instance to ask; wins over `OMC_SEARXNG_URL`.            | [Reading the web and GitHub](tools/web-and-github.md) |
 | `GH_TOKEN`, `GITHUB_TOKEN`              | Token for GitHub's API when the `gh` tool is not installed and signed in; without one GitHub is asked anonymously. | [Reading the web and GitHub](tools/web-and-github.md) |
 

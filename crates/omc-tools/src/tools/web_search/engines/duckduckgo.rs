@@ -5,8 +5,60 @@
 //! DuckDuckGo answers automated searches it suspects with a challenge page
 //! instead of results, which is reported as a failure.
 
-use super::backend::{Found, Hit, plain};
+use super::super::backend::{Backend, Call, Found, Hit, Recency, Spec, plain};
 use crate::tools::read::html;
+
+/// DuckDuckGo's no-script results page.
+pub(in crate::tools::web_search) const SPEC: Spec = Spec {
+    name: "duckduckgo",
+    aliases: &["ddg"],
+    variables: &[],
+    base: "https://html.duckduckgo.com/html/",
+    open_base: Some("https://html.duckduckgo.com/html/"),
+    call,
+    parse: read,
+};
+
+/// A form POST to `url` of `query` and, as its first letter, the recency.
+///
+/// # Errors
+///
+/// Never fails.
+fn call(
+    _: &Backend,
+    url: reqwest::Url,
+    query: &str,
+    _: usize,
+    recency: Option<Recency>,
+) -> Result<Call, String> {
+    let mut form =
+        reqwest::Url::parse("http://form.invalid/").map_err(|error| error.to_string())?;
+    {
+        let mut pairs = form.query_pairs_mut();
+        pairs.append_pair("q", query);
+        if let Some(recency) = recency {
+            pairs.append_pair("df", &recency.word()[..1]);
+        }
+    }
+    Ok(Call {
+        post: true,
+        url,
+        headers: vec![("Accept", "text/html".to_owned())],
+        body: Some((
+            "application/x-www-form-urlencoded",
+            form.query().unwrap_or_default().to_owned(),
+        )),
+    })
+}
+
+/// Reads the results page `body` with [`parse`].
+///
+/// # Errors
+///
+/// Returns the reason [`parse`] gives.
+fn read(_: &Backend, body: &[u8]) -> Result<Found, String> {
+    parse(&String::from_utf8_lossy(body))
+}
 
 /// Reads the results out of the DuckDuckGo results page `page`, leaving out
 /// ads and unwrapping DuckDuckGo's redirect links.
@@ -15,7 +67,7 @@ use crate::tools::read::html;
 ///
 /// Returns the reason when the page is a challenge rather than results, or is
 /// not a results page at all.
-pub(super) fn parse(page: &str) -> Result<Found, String> {
+fn parse(page: &str) -> Result<Found, String> {
     let tree = html::parse(page).ok_or("the results page did not parse")?;
     let challenged = html::find(&tree, &|node| {
         html::attr(node, "id").as_deref() == Some("challenge-form")
@@ -89,7 +141,7 @@ mod tests {
     /// redirect links unwrapped and snippets as plain text.
     #[test]
     fn reads_results() {
-        let found = parse(include_str!("fixtures/duckduckgo.html")).unwrap();
+        let found = parse(include_str!("../fixtures/duckduckgo.html")).unwrap();
         let urls: Vec<&str> = found.hits.iter().map(|hit| hit.url.as_str()).collect();
         assert_eq!(
             urls,

@@ -6,7 +6,8 @@
 //! is noted and the next is asked.
 
 mod backend;
-mod duckduckgo;
+mod engines;
+mod mcp;
 
 use std::time::Duration;
 
@@ -175,11 +176,10 @@ async fn search(
         }
     }
     let mut message = format!("every web search service failed: {}", failures.join("; "));
-    if plan
-        .backends
-        .iter()
-        .all(|backend| backend.engine == Engine::DuckDuckGo)
-    {
+    if plan.backends.iter().all(|backend| {
+        backend.engine != Engine::Searxng
+            && (backend.key.is_empty() || backend.engine.variables().is_empty())
+    }) {
         message.push_str(&format!("; {}", setup_hint()));
     }
     Err(ToolError::Failed(message))
@@ -189,7 +189,7 @@ async fn search(
 fn setup_hint() -> String {
     let keys: Vec<&str> = Engine::ALL
         .iter()
-        .filter(|engine| **engine != Engine::Searxng)
+        .filter(|engine| !matches!(engine, Engine::Searxng | Engine::DuckDuckGo))
         .filter_map(|engine| engine.variables().first().copied())
         .collect();
     format!(
@@ -206,7 +206,8 @@ fn unconfigured(skipped: &[String]) -> String {
         message.push_str(&format!(" ({})", skipped.join("; ")));
     }
     message.push_str(&format!(
-        ": {}; or add duckduckgo, which needs no key, to {}",
+        ": {}; or add parallel, exa, keenable, firecrawl or duckduckgo, which answer \
+         without a key, to {}",
         setup_hint(),
         backend::ORDER_VARIABLE
     ));
@@ -266,6 +267,7 @@ async fn ask(
         let said = String::from_utf8_lossy(&body[..body.len().min(300)]);
         let said = backend::plain(&said);
         return Err(match status.as_u16() {
+            401 | 403 if backend.key.is_empty() => format!("{status}, refused: {said}"),
             401 | 403 => format!(
                 "{status}, the key in {} was refused: {said}",
                 backend

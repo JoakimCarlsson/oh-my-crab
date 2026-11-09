@@ -1,14 +1,16 @@
 //! The search services `web_search` can ask, how each is chosen from the
-//! environment, and how each one's request is made and answer read.
+//! environment, and what every service shares: the request it is asked with,
+//! the results it answers and the helpers that read them.
 //!
-//! Every service is asked over HTTPS with its documented API, except
-//! DuckDuckGo, which has no search API and is read from its HTML results page.
+//! Each service lives in its own module under `engines`, described there by a
+//! [`Spec`]: its name, the variables that set it up, where it is asked, and
+//! how its request is made and its answer read.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
-use super::duckduckgo;
+use super::engines;
 use crate::tools::read::html;
 
 /// The variable that picks and orders the services, as a comma-separated list
@@ -22,12 +24,31 @@ pub(super) enum Engine {
     Brave,
     /// Tavily's search API, which also writes a short answer.
     Tavily,
-    /// Exa's search API.
+    /// Exa's search API, or without a key its public MCP server.
     Exa,
     /// Perplexity's Search API.
     Perplexity,
     /// Kagi's Search API.
     Kagi,
+    /// Parallel's Search API, or without a key its public MCP server.
+    Parallel,
+    /// Jina's search API.
+    Jina,
+    /// Firecrawl's search API, which also answers without a key from most
+    /// addresses.
+    Firecrawl,
+    /// TinyFish's search API.
+    TinyFish,
+    /// Kimi Code's search API.
+    Kimi,
+    /// DeepSeek's search API.
+    DeepSeek,
+    /// Synthetic's search API.
+    Synthetic,
+    /// Ollama's web search API.
+    Ollama,
+    /// Keenable's search API, or without a key its public endpoint.
+    Keenable,
     /// A SearXNG instance the user runs, with JSON output turned on.
     Searxng,
     /// DuckDuckGo's HTML results page, which needs no key.
@@ -35,67 +56,109 @@ pub(super) enum Engine {
 }
 
 impl Engine {
-    /// Every service, in the order they are tried when the user names none.
-    pub(super) const ALL: [Engine; 7] = [
+    /// Every service, in the order they are tried with their key, or for
+    /// SearXNG its address, when the user names none.
+    pub(super) const ALL: [Engine; 16] = [
         Engine::Brave,
         Engine::Tavily,
         Engine::Exa,
         Engine::Perplexity,
         Engine::Kagi,
+        Engine::Parallel,
+        Engine::Jina,
+        Engine::Firecrawl,
+        Engine::TinyFish,
+        Engine::Kimi,
+        Engine::DeepSeek,
+        Engine::Synthetic,
+        Engine::Ollama,
+        Engine::Keenable,
         Engine::Searxng,
         Engine::DuckDuckGo,
     ];
 
+    /// The services that answer without a key, in the order they are tried
+    /// after the services that have one, when the user names none.
+    pub(super) const OPEN: [Engine; 5] = [
+        Engine::Parallel,
+        Engine::Exa,
+        Engine::Keenable,
+        Engine::Firecrawl,
+        Engine::DuckDuckGo,
+    ];
+
+    /// The description of the service, from its module.
+    pub(super) fn spec(self) -> &'static Spec {
+        match self {
+            Engine::Brave => &engines::brave::SPEC,
+            Engine::Tavily => &engines::tavily::SPEC,
+            Engine::Exa => &engines::exa::SPEC,
+            Engine::Perplexity => &engines::perplexity::SPEC,
+            Engine::Kagi => &engines::kagi::SPEC,
+            Engine::Parallel => &engines::parallel::SPEC,
+            Engine::Jina => &engines::jina::SPEC,
+            Engine::Firecrawl => &engines::firecrawl::SPEC,
+            Engine::TinyFish => &engines::tinyfish::SPEC,
+            Engine::Kimi => &engines::kimi::SPEC,
+            Engine::DeepSeek => &engines::deepseek::SPEC,
+            Engine::Synthetic => &engines::synthetic::SPEC,
+            Engine::Ollama => &engines::ollama::SPEC,
+            Engine::Keenable => &engines::keenable::SPEC,
+            Engine::Searxng => &engines::searxng::SPEC,
+            Engine::DuckDuckGo => &engines::duckduckgo::SPEC,
+        }
+    }
+
     /// The name the service goes by in `OMC_SEARCH` and in results.
     pub(super) fn name(self) -> &'static str {
-        match self {
-            Engine::Brave => "brave",
-            Engine::Tavily => "tavily",
-            Engine::Exa => "exa",
-            Engine::Perplexity => "perplexity",
-            Engine::Kagi => "kagi",
-            Engine::Searxng => "searxng",
-            Engine::DuckDuckGo => "duckduckgo",
-        }
+        self.spec().name
     }
 
     /// The variables the service's key, or for SearXNG its address, is read
-    /// from, in order; none for a service that needs nothing.
+    /// from, in order; none for a service that never takes a key.
     pub(super) fn variables(self) -> &'static [&'static str] {
-        match self {
-            Engine::Brave => &["BRAVE_API_KEY", "BRAVE_SEARCH_API_KEY"],
-            Engine::Tavily => &["TAVILY_API_KEY"],
-            Engine::Exa => &["EXA_API_KEY"],
-            Engine::Perplexity => &["PERPLEXITY_API_KEY", "PPLX_API_KEY"],
-            Engine::Kagi => &["KAGI_API_KEY"],
-            Engine::Searxng => &["SEARXNG_URL", "OMC_SEARXNG_URL"],
-            Engine::DuckDuckGo => &[],
-        }
+        self.spec().variables
     }
 
-    /// The address requests go to, when the user did not give one.
-    fn default_base(self) -> &'static str {
-        match self {
-            Engine::Brave => "https://api.search.brave.com/res/v1/web/search",
-            Engine::Tavily => "https://api.tavily.com/search",
-            Engine::Exa => "https://api.exa.ai/search",
-            Engine::Perplexity => "https://api.perplexity.ai/search",
-            Engine::Kagi => "https://kagi.com/api/v1/search",
-            Engine::Searxng => "",
-            Engine::DuckDuckGo => "https://html.duckduckgo.com/html/",
-        }
-    }
-
-    /// The service called `name`, ignoring case and surrounding spaces.
+    /// The service called `name`, or by one of its other names, ignoring case
+    /// and surrounding spaces.
     pub(super) fn named(name: &str) -> Option<Engine> {
         let name = name.trim().to_ascii_lowercase();
-        let name = match name.as_str() {
-            "ddg" => "duckduckgo",
-            "searx" => "searxng",
-            other => other,
-        };
-        Engine::ALL.into_iter().find(|engine| engine.name() == name)
+        Engine::ALL.into_iter().find(|engine| {
+            let spec = engine.spec();
+            spec.name == name || spec.aliases.contains(&name.as_str())
+        })
     }
+}
+
+/// Builds the request asking a backend, at the parsed address of its base,
+/// for a number of results for a query, limited to a recency when the service
+/// can be.
+pub(super) type Builder =
+    fn(&Backend, reqwest::Url, &str, usize, Option<Recency>) -> Result<Call, String>;
+
+/// What a service is and how it is asked, as its module describes it.
+pub(super) struct Spec {
+    /// The name the service goes by in `OMC_SEARCH` and in results.
+    pub(super) name: &'static str,
+    /// Other names `OMC_SEARCH` accepts for it, in lowercase.
+    pub(super) aliases: &'static [&'static str],
+    /// The variables its key, or for SearXNG its address, is read from, in
+    /// order; empty for a service that never takes a key.
+    pub(super) variables: &'static [&'static str],
+    /// Where requests signed with a key go; empty for SearXNG, whose address
+    /// the user gives.
+    pub(super) base: &'static str,
+    /// Where requests without a key go, for a service that answers without
+    /// one; `None` for a service that needs a key.
+    pub(super) open_base: Option<&'static str>,
+    /// Builds the request asking the backend, at the parsed address of its
+    /// base, for a number of results for the query, limited to the recency
+    /// when the service can be; the backend's key is empty when it is asked
+    /// without one.
+    pub(super) call: Builder,
+    /// Reads the answer the backend gave into results.
+    pub(super) parse: fn(&Backend, &[u8]) -> Result<Found, String>,
 }
 
 /// How recent results must be.
@@ -124,7 +187,7 @@ impl Recency {
     }
 
     /// The word for the recency: `day`, `week`, `month` or `year`.
-    fn word(self) -> &'static str {
+    pub(super) fn word(self) -> &'static str {
         match self {
             Recency::Day => "day",
             Recency::Week => "week",
@@ -133,23 +196,15 @@ impl Recency {
         }
     }
 
-    /// The relative time Kagi filters by for the recency; Kagi has none for a
-    /// year.
-    fn kagi(self) -> Option<&'static str> {
-        match self {
-            Recency::Year => None,
-            other => Some(other.word()),
-        }
-    }
-
-    /// How many days back the recency reaches.
-    fn days(self) -> u64 {
-        match self {
+    /// The date the recency starts at, as `YYYY-MM-DD`.
+    pub(super) fn since(self) -> String {
+        let days = match self {
             Recency::Day => 1,
             Recency::Week => 7,
             Recency::Month => 31,
             Recency::Year => 365,
-        }
+        };
+        days_ago(days)
     }
 }
 
@@ -160,7 +215,8 @@ pub(super) struct Backend {
     pub(super) engine: Engine,
     /// Where requests go.
     pub(super) base: String,
-    /// The key requests are signed with; empty for services that need none.
+    /// The key requests are signed with; empty when the service is asked
+    /// without one.
     pub(super) key: String,
 }
 
@@ -178,66 +234,65 @@ pub(super) struct Plan {
 impl Plan {
     /// The plan the environment, read through `get`, sets up.
     ///
-    /// `OMC_SEARCH` names the services to try, in order; without it every
+    /// `OMC_SEARCH` names the services to try, in order; a named service
+    /// without its key is asked without one when it can be. Without it every
     /// service that has its key, or for SearXNG its address, is tried in the
-    /// order of [`Engine::ALL`], DuckDuckGo last.
+    /// order of [`Engine::ALL`], then the services of [`Engine::OPEN`] not
+    /// already asked with a key.
     pub(super) fn from_env(get: impl Fn(&str) -> Option<String>) -> Self {
         let value = |name: &str| get(name).map(|value| value.trim().to_owned());
-        let order = value(ORDER_VARIABLE).filter(|order| !order.is_empty());
-        let mut plan = Plan::default();
-        let named: Vec<(String, Option<Engine>)> = match &order {
-            Some(order) => order
-                .split(',')
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(|name| (name.to_owned(), Engine::named(name)))
-                .collect(),
-            None => Engine::ALL
-                .into_iter()
-                .map(|engine| (engine.name().to_owned(), Some(engine)))
-                .collect(),
+        let found = |engine: Engine| {
+            engine
+                .variables()
+                .iter()
+                .find_map(|variable| value(variable).filter(|value| !value.is_empty()))
         };
-        for (name, engine) in named {
-            let Some(engine) = engine else {
+        let mut plan = Plan::default();
+        let Some(order) = value(ORDER_VARIABLE).filter(|order| !order.is_empty()) else {
+            for engine in Engine::ALL {
+                if let Some(backend) = found(engine).and_then(|key| Backend::keyed(engine, key)) {
+                    plan.add(backend);
+                }
+            }
+            for engine in Engine::OPEN {
+                let asked = plan.backends.iter().any(|backend| backend.engine == engine);
+                if let Some(backend) = Backend::open(engine).filter(|_| !asked) {
+                    plan.add(backend);
+                }
+            }
+            return plan;
+        };
+        for name in order
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            let Some(engine) = Engine::named(name) else {
                 plan.skipped.push(format!(
                     "{name} is not a search service {ORDER_VARIABLE} knows"
                 ));
                 continue;
             };
-            let found = engine
-                .variables()
-                .iter()
-                .find_map(|variable| value(variable).filter(|value| !value.is_empty()));
-            let backend = match (engine, found) {
-                (Engine::DuckDuckGo, _) => Some(Backend {
-                    engine,
-                    base: engine.default_base().to_owned(),
-                    key: String::new(),
-                }),
-                (Engine::Searxng, Some(address)) => Some(Backend {
-                    engine,
-                    base: format!("{}/search", address.trim_end_matches('/')),
-                    key: String::new(),
-                }),
-                (_, Some(key)) => Some(Backend {
-                    engine,
-                    base: engine.default_base().to_owned(),
-                    key,
-                }),
-                (_, None) => None,
-            };
+            let backend = found(engine)
+                .and_then(|key| Backend::keyed(engine, key))
+                .or_else(|| Backend::open(engine));
             match backend {
-                Some(backend) if !plan.backends.contains(&backend) => plan.backends.push(backend),
-                Some(_) => {}
-                None if order.is_some() => plan.skipped.push(format!(
+                Some(backend) => plan.add(backend),
+                None => plan.skipped.push(format!(
                     "{} needs {}",
                     engine.name(),
                     engine.variables().join(" or ")
                 )),
-                None => {}
             }
         }
         plan
+    }
+
+    /// Adds `backend` unless the plan already asks it.
+    fn add(&mut self, backend: Backend) {
+        if !self.backends.contains(&backend) {
+            self.backends.push(backend);
+        }
     }
 }
 
@@ -276,8 +331,104 @@ pub(super) struct Call {
     pub(super) body: Option<(&'static str, String)>,
 }
 
+impl Call {
+    /// A GET of `url` with `headers`.
+    pub(super) fn get(url: reqwest::Url, headers: Vec<(&'static str, String)>) -> Call {
+        Call {
+            post: false,
+            url,
+            headers,
+            body: None,
+        }
+    }
+
+    /// A POST of the JSON `body` to `url` with `headers`.
+    pub(super) fn post_json(
+        url: reqwest::Url,
+        headers: Vec<(&'static str, String)>,
+        body: &Value,
+    ) -> Call {
+        Call {
+            post: true,
+            url,
+            headers,
+            body: Some(("application/json", body.to_string())),
+        }
+    }
+}
+
+impl Backend {
+    /// The backend asking `engine` signed with `key`, or for SearXNG at the
+    /// address `key`; `None` for a service that never takes a key.
+    fn keyed(engine: Engine, key: String) -> Option<Backend> {
+        if engine.variables().is_empty() {
+            return None;
+        }
+        if engine == Engine::Searxng {
+            return Some(Backend {
+                engine,
+                base: format!("{}/search", key.trim_end_matches('/')),
+                key: String::new(),
+            });
+        }
+        Some(Backend {
+            engine,
+            base: engine.spec().base.to_owned(),
+            key,
+        })
+    }
+
+    /// The backend asking `engine` without a key; `None` for a service that
+    /// needs one.
+    fn open(engine: Engine) -> Option<Backend> {
+        engine.spec().open_base.map(|base| Backend {
+            engine,
+            base: base.to_owned(),
+            key: String::new(),
+        })
+    }
+
+    /// The `Authorization` header signing a request with the key as a bearer
+    /// token.
+    pub(super) fn bearer(&self) -> (&'static str, String) {
+        ("Authorization", format!("Bearer {}", self.key))
+    }
+
+    /// The request that asks this service for `limit` results for `query`,
+    /// limited to `recency` when the service can be.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when the service's address is not a URL, or its
+    /// module cannot build the request.
+    pub(super) fn call(
+        &self,
+        query: &str,
+        limit: usize,
+        recency: Option<Recency>,
+    ) -> Result<Call, String> {
+        let url = reqwest::Url::parse(&self.base)
+            .map_err(|error| format!("{} is not a URL: {error}", self.base))?;
+        (self.engine.spec().call)(self, url, query, limit, recency)
+    }
+
+    /// Reads the service's answer `body` into results, at most `limit`, and
+    /// drops results without an address.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when the answer is not what the service sends, or
+    /// says that the search was refused.
+    pub(super) fn parse(&self, body: &[u8], limit: usize) -> Result<Found, String> {
+        let mut found = (self.engine.spec().parse)(self, body)?;
+        found.hits.retain(|hit| !hit.url.is_empty());
+        found.hits.truncate(limit);
+        Ok(found)
+    }
+}
+
 /// The date `days` days before now, as `YYYY-MM-DD`.
-pub(super) fn days_ago(days: u64) -> String {
+fn days_ago(days: u64) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -304,252 +455,31 @@ fn civil_date(days: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-impl Backend {
-    /// The request that asks this service for `limit` results for `query`,
-    /// limited to `recency` when the service can be.
-    ///
-    /// # Errors
-    ///
-    /// Returns the reason when the service's address is not a URL.
-    pub(super) fn call(
-        &self,
-        query: &str,
-        limit: usize,
-        recency: Option<Recency>,
-    ) -> Result<Call, String> {
-        let mut url = reqwest::Url::parse(&self.base)
-            .map_err(|error| format!("{} is not a URL: {error}", self.base))?;
-        let bearer = || vec![("Authorization", format!("Bearer {}", self.key))];
-        let json_body = |body: Value| Some(("application/json", body.to_string()));
-        let call = match self.engine {
-            Engine::Brave => {
-                let mut pairs = url.query_pairs_mut();
-                pairs.append_pair("q", query);
-                pairs.append_pair("count", &limit.min(20).to_string());
-                if let Some(recency) = recency {
-                    let freshness = match recency {
-                        Recency::Day => "pd",
-                        Recency::Week => "pw",
-                        Recency::Month => "pm",
-                        Recency::Year => "py",
-                    };
-                    pairs.append_pair("freshness", freshness);
-                }
-                drop(pairs);
-                Call {
-                    post: false,
-                    url,
-                    headers: vec![
-                        ("X-Subscription-Token", self.key.clone()),
-                        ("Accept", "application/json".to_owned()),
-                    ],
-                    body: None,
-                }
-            }
-            Engine::Tavily => {
-                let mut body = json!({
-                    "query": query,
-                    "max_results": limit.min(20),
-                    "search_depth": "basic",
-                    "include_answer": "basic",
-                });
-                if let Some(recency) = recency {
-                    body["time_range"] = json!(recency.word());
-                }
-                Call {
-                    post: true,
-                    url,
-                    headers: bearer(),
-                    body: json_body(body),
-                }
-            }
-            Engine::Exa => {
-                let mut body = json!({
-                    "query": query,
-                    "numResults": limit.min(100),
-                    "type": "auto",
-                    "contents": { "highlights": { "maxCharacters": 600 } },
-                });
-                if let Some(recency) = recency {
-                    body["startPublishedDate"] =
-                        json!(format!("{}T00:00:00.000Z", days_ago(recency.days())));
-                }
-                Call {
-                    post: true,
-                    url,
-                    headers: vec![("x-api-key", self.key.clone())],
-                    body: json_body(body),
-                }
-            }
-            Engine::Perplexity => {
-                let mut body = json!({ "query": query, "max_results": limit.min(20) });
-                if let Some(recency) = recency {
-                    body["search_recency_filter"] = json!(recency.word());
-                }
-                Call {
-                    post: true,
-                    url,
-                    headers: bearer(),
-                    body: json_body(body),
-                }
-            }
-            Engine::Kagi => {
-                let mut body = json!({ "query": query, "limit": limit });
-                if let Some(relative) = recency.and_then(Recency::kagi) {
-                    body["lens"] = json!({ "time_relative": relative });
-                }
-                Call {
-                    post: true,
-                    url,
-                    headers: bearer(),
-                    body: json_body(body),
-                }
-            }
-            Engine::Searxng => {
-                let mut pairs = url.query_pairs_mut();
-                pairs.append_pair("q", query);
-                pairs.append_pair("format", "json");
-                if let Some(recency) = recency {
-                    let range = match recency {
-                        Recency::Day => "day",
-                        Recency::Week | Recency::Month => "month",
-                        Recency::Year => "year",
-                    };
-                    pairs.append_pair("time_range", range);
-                }
-                drop(pairs);
-                Call {
-                    post: false,
-                    url,
-                    headers: vec![("Accept", "application/json".to_owned())],
-                    body: None,
-                }
-            }
-            Engine::DuckDuckGo => {
-                let mut form = reqwest::Url::parse("http://form.invalid/")
-                    .map_err(|error| error.to_string())?;
-                let mut pairs = form.query_pairs_mut();
-                pairs.append_pair("q", query);
-                if let Some(recency) = recency {
-                    pairs.append_pair("df", &recency.word()[..1]);
-                }
-                drop(pairs);
-                Call {
-                    post: true,
-                    url,
-                    headers: vec![("Accept", "text/html".to_owned())],
-                    body: Some((
-                        "application/x-www-form-urlencoded",
-                        form.query().unwrap_or_default().to_owned(),
-                    )),
-                }
-            }
-        };
-        Ok(call)
-    }
+/// The answer `body` read as JSON.
+///
+/// # Errors
+///
+/// Returns the reason when it is not JSON.
+pub(super) fn json(body: &[u8]) -> Result<Value, String> {
+    serde_json::from_slice(body).map_err(|error| format!("the answer is not JSON: {error}"))
+}
 
-    /// Reads the service's answer `body` into results, at most `limit`.
-    ///
-    /// # Errors
-    ///
-    /// Returns the reason when the answer is not what the service sends, or
-    /// says that the search was refused.
-    pub(super) fn parse(&self, body: &[u8], limit: usize) -> Result<Found, String> {
-        if self.engine == Engine::DuckDuckGo {
-            let mut found = duckduckgo::parse(&String::from_utf8_lossy(body))?;
-            found.hits.truncate(limit);
-            return Ok(found);
-        }
-        let value: Value = serde_json::from_slice(body)
-            .map_err(|error| format!("the answer is not JSON: {error}"))?;
-        let list = |value: &Value| value.as_array().cloned().unwrap_or_default();
-        let (answer, hits) = match self.engine {
-            Engine::Brave => (
-                None,
-                list(&value["web"]["results"])
-                    .iter()
-                    .map(|item| hit(item, "title", "url", &["description"], &["page_age", "age"]))
-                    .collect(),
-            ),
-            Engine::Tavily => (
-                text(&value["answer"]),
-                list(&value["results"])
-                    .iter()
-                    .map(|item| hit(item, "title", "url", &["content"], &["published_date"]))
-                    .collect(),
-            ),
-            Engine::Exa => (
-                None,
-                list(&value["results"])
-                    .iter()
-                    .map(|item| {
-                        let mut found = hit(item, "title", "url", &["summary"], &["publishedDate"]);
-                        let highlights: Vec<String> =
-                            list(&item["highlights"]).iter().filter_map(text).collect();
-                        if !highlights.is_empty() {
-                            found.snippet = plain(&highlights.join(" … "));
-                        } else if found.snippet.is_empty() {
-                            found.snippet = plain(item["text"].as_str().unwrap_or_default());
-                        }
-                        found
-                    })
-                    .collect(),
-            ),
-            Engine::Perplexity => (
-                None,
-                list(&value["results"])
-                    .iter()
-                    .map(|item| {
-                        hit(
-                            item,
-                            "title",
-                            "url",
-                            &["snippet"],
-                            &["date", "last_updated"],
-                        )
-                    })
-                    .collect(),
-            ),
-            Engine::Kagi => {
-                if let Some(error) = value["error"].as_array().and_then(|errors| errors.first()) {
-                    return Err(format!(
-                        "Kagi refused the search: {}",
-                        text(&error["message"])
-                            .or_else(|| text(&error["code"]))
-                            .unwrap_or_default()
-                    ));
-                }
-                (
-                    None,
-                    list(&value["data"]["search"])
-                        .iter()
-                        .map(|item| hit(item, "title", "url", &["snippet"], &["time"]))
-                        .collect(),
-                )
-            }
-            Engine::Searxng => (
-                list(&value["answers"])
-                    .iter()
-                    .filter_map(|answer| text(answer).or_else(|| text(&answer["answer"])))
-                    .reduce(|all, next| format!("{all}\n{next}")),
-                list(&value["results"])
-                    .iter()
-                    .map(|item| hit(item, "title", "url", &["content"], &["publishedDate"]))
-                    .collect(),
-            ),
-            Engine::DuckDuckGo => (None, Vec::new()),
-        };
-        let mut hits: Vec<Hit> = hits
-            .into_iter()
-            .filter(|hit: &Hit| !hit.url.is_empty())
-            .collect();
-        hits.truncate(limit);
-        Ok(Found { answer, hits })
-    }
+/// The items of the JSON array `value`; none when it is not an array.
+pub(super) fn list(value: &Value) -> Vec<Value> {
+    value.as_array().cloned().unwrap_or_default()
+}
+
+/// The results in the JSON array `items`, each read with [`hit`] from its
+/// `title` and `url` and the snippet and date keys given.
+pub(super) fn hits(items: &Value, snippets: &[&str], dates: &[&str]) -> Vec<Hit> {
+    list(items)
+        .iter()
+        .map(|item| hit(item, "title", "url", snippets, dates))
+        .collect()
 }
 
 /// The non-empty text of the string `value`, trimmed.
-fn text(value: &Value) -> Option<String> {
+pub(super) fn text(value: &Value) -> Option<String> {
     value
         .as_str()
         .map(str::trim)
@@ -559,7 +489,7 @@ fn text(value: &Value) -> Option<String> {
 
 /// The result in the JSON object `item`, with its title, address, snippet and
 /// date under the keys given; the first snippet and date key with text wins.
-fn hit(item: &Value, title: &str, url: &str, snippets: &[&str], dates: &[&str]) -> Hit {
+pub(super) fn hit(item: &Value, title: &str, url: &str, snippets: &[&str], dates: &[&str]) -> Hit {
     Hit {
         title: plain(item[title].as_str().unwrap_or_default()),
         url: item[url].as_str().unwrap_or_default().trim().to_owned(),
@@ -610,7 +540,7 @@ mod tests {
     }
 
     /// Without `OMC_SEARCH`, every service with a key is asked in the default
-    /// order, DuckDuckGo last.
+    /// order, then the services that answer without one.
     #[test]
     fn plans_from_keys() {
         let plan = Plan::from_env(env(&[
@@ -618,11 +548,25 @@ mod tests {
             ("BRAVE_SEARCH_API_KEY", "b"),
             ("SEARXNG_URL", "http://localhost:8888/"),
         ]));
-        assert_eq!(names(&plan), ["brave", "exa", "searxng", "duckduckgo"]);
+        assert_eq!(
+            names(&plan),
+            [
+                "brave",
+                "exa",
+                "searxng",
+                "parallel",
+                "keenable",
+                "firecrawl",
+                "duckduckgo"
+            ]
+        );
         assert_eq!(plan.backends[0].key, "b");
         assert_eq!(plan.backends[2].base, "http://localhost:8888/search");
         assert!(plan.skipped.is_empty());
-        assert_eq!(names(&Plan::from_env(env(&[]))), ["duckduckgo"]);
+        assert_eq!(
+            names(&Plan::from_env(env(&[]))),
+            ["parallel", "exa", "keenable", "firecrawl", "duckduckgo"]
+        );
     }
 
     /// `OMC_SEARCH` picks and orders the services and says which it cannot use.
@@ -650,7 +594,7 @@ mod tests {
             engine,
             base: match engine {
                 Engine::Searxng => "https://searx.example/search".to_owned(),
-                other => other.default_base().to_owned(),
+                other => other.spec().base.to_owned(),
             },
             key: "k".to_owned(),
         }
