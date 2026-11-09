@@ -67,7 +67,7 @@ pub fn builtin_agents() -> Vec<AgentDefinition> {
     .collect()
 }
 
-/// The agent kinds available for work in `locations`: the project's, then the reader's, then those Claude Code plugins bring, then the built-in ones; a name found twice keeps its first, and names in `disabled` are skipped.
+/// The agent kinds available for work in `locations`: the project's, then the reader's, crab's own folders before Claude Code's and Codex's in each, then those Claude Code plugins bring, then the built-in ones; a name found twice keeps its first, and names in `disabled` are skipped.
 pub(crate) fn find(locations: &Locations, disabled: &[String]) -> Vec<AgentDefinition> {
     let mut found: Vec<AgentDefinition> = Vec::new();
     for place in AGENTS {
@@ -247,6 +247,7 @@ mod tests {
             home: Some(base.join("home")),
             claude: Some(base.join("home/.claude")),
             codex: Some(base.join("home/.codex")),
+            crab: Some(base.join("config/oh-my-crab")),
             project: true,
         };
         put(
@@ -271,6 +272,75 @@ mod tests {
         assert_eq!(found[2].origin, Origin::User);
         assert_eq!(found[3].origin, Origin::Plugin);
         assert_eq!(found[4].origin, Origin::BuiltIn);
+    }
+
+    /// Crab's own definitions win a name over Claude Code's in the same scope, a project's over the reader's, and the project's are left out while it is not read.
+    #[test]
+    fn native_definitions_come_first() {
+        let base = scratch("agents-native");
+        let agent = |text: &str| format!("---\ndescription: {text}\n---\nWork.");
+        put(
+            &base,
+            "repo/.claude/agents/doc.md",
+            &agent("project claude"),
+        );
+        put(
+            &base,
+            "repo/.oh-my-crab/agents/doc.md",
+            &agent("project crab"),
+        );
+        put(&base, "home/.claude/agents/fix.md", &agent("user claude"));
+        put(
+            &base,
+            "config/oh-my-crab/agents/fix.md",
+            &agent("user crab"),
+        );
+        put(
+            &base,
+            "config/oh-my-crab/agents/doc.md",
+            &agent("user crab doc"),
+        );
+        let mut locations = Locations {
+            directory: base.join("repo"),
+            root: Some(base.join("repo")),
+            home: Some(base.join("home")),
+            claude: Some(base.join("home/.claude")),
+            codex: None,
+            crab: Some(base.join("config/oh-my-crab")),
+            project: true,
+        };
+        let found = |locations: &Locations| -> Vec<(String, String, Origin)> {
+            find(locations, &[])
+                .into_iter()
+                .filter(|agent| agent.origin != Origin::BuiltIn)
+                .map(|agent| (agent.name, agent.description, agent.origin))
+                .collect()
+        };
+        let seen = |name: &str, description: &str, origin| {
+            (name.to_owned(), description.to_owned(), origin)
+        };
+        assert_eq!(
+            found(&locations),
+            vec![
+                seen("doc", "project crab", Origin::Project),
+                seen("fix", "user crab", Origin::User),
+            ]
+        );
+        locations.project = false;
+        assert_eq!(
+            found(&locations),
+            vec![
+                seen("doc", "user crab doc", Origin::User),
+                seen("fix", "user crab", Origin::User),
+            ]
+        );
+        assert_eq!(
+            find(&locations, &[])
+                .iter()
+                .find(|agent| agent.name == "fix")
+                .and_then(|agent| agent.path.clone()),
+            Some(base.join("config/oh-my-crab/agents/fix.md"))
+        );
     }
 
     /// A definition may declare the schema of its result as JSON in its front matter, on one line or indented below the key.

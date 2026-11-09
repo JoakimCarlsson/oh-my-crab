@@ -357,7 +357,7 @@ impl Session {
         register_skills(&mut registry, &discovered.skills);
         let hub = omc_mcp::Hub::new(
             spill.clone(),
-            omc_mcp::Tokens::locate(self.shared.home().as_deref()),
+            omc_mcp::Tokens::locate(),
             sign_in_listener(&self.shared),
         );
         let user_servers = user_servers_for(&locations);
@@ -1548,6 +1548,7 @@ mod tests {
             home: None,
             claude: None,
             codex: None,
+            crab: None,
             project: true,
         };
         let assessment = assess(&locations, None, store.as_ref(), vouched, &[]);
@@ -1586,6 +1587,7 @@ mod tests {
             home: None,
             claude: None,
             codex: None,
+            crab: None,
             project: true,
         };
         let (out, mut events) = unbounded_channel();
@@ -2497,6 +2499,7 @@ mod tests {
             home: None,
             claude: None,
             codex: None,
+            crab: None,
             project: true,
         };
         let (out, events) = unbounded_channel();

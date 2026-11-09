@@ -1,10 +1,12 @@
-//! Where instructions, skills and agent definitions are read from: the union of what Claude Code and Codex read.
+//! Where instructions, skills and agent definitions are read from: crab's own folders first, then the union of what Claude Code and Codex read.
 
 /// The folder a place is found under.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Root {
     /// A folder of the project, from the working folder up to the repository root.
     Project,
+    /// Crab's own config folder.
+    Crab,
     /// Claude Code's own config folder.
     Claude,
     /// Codex's own config folder.
@@ -44,10 +46,14 @@ const fn at(root: Root, path: &'static str, shape: Shape) -> Place {
 
 /// Where instruction files are read from.
 pub(crate) const INSTRUCTIONS: &[Place] = &[
+    at(Root::Crab, "AGENTS.md", Shape::File),
+    at(Root::Crab, "rules", Shape::Files(".md")),
     at(Root::Claude, "CLAUDE.md", Shape::File),
     at(Root::Claude, "rules", Shape::Files(".md")),
     at(Root::Codex, "AGENTS.md", Shape::File),
     at(Root::Codex, "AGENTS.override.md", Shape::File),
+    at(Root::Project, ".oh-my-crab/AGENTS.md", Shape::File),
+    at(Root::Project, ".oh-my-crab/rules", Shape::Files(".md")),
     at(Root::Project, "CLAUDE.md", Shape::File),
     at(Root::Project, ".claude/CLAUDE.md", Shape::File),
     at(Root::Project, "CLAUDE.local.md", Shape::File),
@@ -58,9 +64,11 @@ pub(crate) const INSTRUCTIONS: &[Place] = &[
 
 /// Where skills are read from.
 pub(crate) const SKILLS: &[Place] = &[
+    at(Root::Project, ".oh-my-crab/skills", Shape::Skills),
     at(Root::Project, ".claude/skills", Shape::Skills),
     at(Root::Project, ".codex/skills", Shape::Skills),
     at(Root::Project, ".agents/skills", Shape::Skills),
+    at(Root::Crab, "skills", Shape::Skills),
     at(Root::Claude, "skills", Shape::Skills),
     at(Root::Codex, "skills", Shape::Skills),
     at(Root::Home, ".agents/skills", Shape::Skills),
@@ -68,8 +76,10 @@ pub(crate) const SKILLS: &[Place] = &[
 
 /// Where agent definitions are read from.
 pub(crate) const AGENTS: &[Place] = &[
+    at(Root::Project, ".oh-my-crab/agents", Shape::Files(".md")),
     at(Root::Project, ".claude/agents", Shape::Files(".md")),
     at(Root::Project, ".codex/agents", Shape::Toml),
+    at(Root::Crab, "agents", Shape::Files(".md")),
     at(Root::Claude, "agents", Shape::Files(".md")),
     at(Root::Codex, "agents", Shape::Toml),
 ];
@@ -96,13 +106,23 @@ pub fn agent_places() -> Vec<String> {
 /// How a reader is told that installed Claude Code plugins are read too.
 const PLUGINS: &str = "installed Claude Code plugins";
 
-/// `places` written for a reader: a path in the project, or one under `~`.
+/// Crab's own config folder as a reader on this system most likely knows it, ending in a separator.
+pub(crate) const CRAB_DESCRIBED: &str = if cfg!(target_os = "macos") {
+    "~/Library/Application Support/oh-my-crab/"
+} else if cfg!(windows) {
+    "%APPDATA%\\oh-my-crab\\"
+} else {
+    "~/.config/oh-my-crab/"
+};
+
+/// `places` written for a reader: a path in the project, or one under `~` or crab's own config folder.
 fn described(places: &[Place]) -> Vec<String> {
     places
         .iter()
         .map(|place| {
             let folder = match place.root {
                 Root::Project => "",
+                Root::Crab => CRAB_DESCRIBED,
                 Root::Claude => "~/.claude/",
                 Root::Codex => "~/.codex/",
                 Root::Home => "~/",
@@ -123,6 +143,7 @@ impl crate::Locations {
         match root {
             Root::Project if self.project => self.ancestors(),
             Root::Project => Vec::new(),
+            Root::Crab => self.crab.iter().cloned().collect(),
             Root::Claude => self.claude.iter().cloned().collect(),
             Root::Codex => self.codex.iter().cloned().collect(),
             Root::Home => self.home.iter().cloned().collect(),
@@ -150,4 +171,34 @@ pub(crate) fn files_under(folder: &std::path::Path, suffix: &str) -> Vec<std::pa
         }
     }
     found
+}
+
+#[cfg(test)]
+/// Tests for the places.
+mod tests {
+    use super::*;
+
+    /// Crab's own places are described first in each scope, under its config folder or `.oh-my-crab`.
+    #[test]
+    fn native_places_are_described_first() {
+        let skills = skill_places();
+        assert_eq!(skills[0], ".oh-my-crab/skills/<name>/SKILL.md");
+        assert_eq!(skills[4], format!("{CRAB_DESCRIBED}skills/<name>/SKILL.md"));
+        assert_eq!(skills[5], "~/.claude/skills/<name>/SKILL.md");
+        let agents = agent_places();
+        assert_eq!(agents[0], ".oh-my-crab/agents/<name>.md");
+        assert_eq!(agents[3], format!("{CRAB_DESCRIBED}agents/<name>.md"));
+        let instructions = instruction_places();
+        assert_eq!(
+            &instructions[..2],
+            &[
+                format!("{CRAB_DESCRIBED}AGENTS.md"),
+                format!("{CRAB_DESCRIBED}rules/<name>.md")
+            ]
+        );
+        assert!(instructions.contains(&".oh-my-crab/rules/<name>.md".to_owned()));
+        if cfg!(target_os = "linux") {
+            assert_eq!(CRAB_DESCRIBED, "~/.config/oh-my-crab/");
+        }
+    }
 }

@@ -26,6 +26,8 @@ Main agent verifies once after all subagents land; parallel runs storm the CPU a
 
 {{environment}}
 
+{{append}}
+
 <critical>
 - Changes complete → finish; verification is main agent's job. NEVER run it yourself unless your assignment explicitly instructs it.
 </critical>

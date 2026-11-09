@@ -6,6 +6,15 @@ use crate::{Discovered, Environment, environment_reminder};
 /// The main agent's prompt.
 const SYSTEM: &str = include_str!("prompts/system.md");
 
+/// The main agent's prompt when a [`crate::SYSTEM_FILE`] replaces crab's built-in instructions.
+const REPLACED: &str = include_str!("prompts/system_replaced.md");
+
+/// The skills and the tool inventory, part of the main agent's prompt whether or not its instructions are replaced.
+const RUNTIME: &str = include_str!("prompts/runtime.md");
+
+/// What the main agent's prompt says while the conversation has no name.
+const UNNAMED: &str = include_str!("prompts/unnamed.md");
+
 /// The prompt of a subagent.
 const SUBAGENT: &str = include_str!("prompts/subagent.md");
 
@@ -34,7 +43,7 @@ pub struct PromptInput<'a> {
 
 /// The system prompt of the main agent for `input`.
 ///
-/// It holds nothing that changes from day to day, so that the provider's prompt cache keeps it; the date and the branch go to the agent in [`crate::environment_reminder`] instead.
+/// A [`crate::SYSTEM_FILE`] that was found takes the place of crab's built-in instructions, ahead of the skills, the tool inventory, the project and the rules of plan mode, which stay; an [`crate::APPEND_SYSTEM_FILE`] goes after the project, before the rules of plan mode. It holds nothing that changes from day to day, so that the provider's prompt cache keeps it; the date and the branch go to the agent in [`crate::environment_reminder`] instead.
 pub fn build_prompt(input: PromptInput<'_>) -> String {
     let flags = flags(input.tools);
     let project = project(&input);
@@ -46,17 +55,37 @@ pub fn build_prompt(input: PromptInput<'_>) -> String {
     };
     let tools = inventory(input.tools);
     let mut vars = flags_ref(&flags);
+    vars.extend([("skills", skills.as_str()), ("tools", tools.as_str())]);
+    let runtime = render(RUNTIME, &vars);
+    let unnamed = if input.unnamed { UNNAMED } else { "" };
+    let append = appended(input.discovered);
+    let base = input
+        .discovered
+        .system
+        .as_ref()
+        .map(|file| file.content.trim());
     vars.extend([
-        ("skills", skills.as_str()),
-        ("unnamed", if input.unnamed { "1" } else { "" }),
+        ("runtime", runtime.as_str()),
+        ("unnamed", unnamed),
         ("project", project.as_str()),
+        ("append", append),
         ("plan", plan.as_str()),
-        ("tools", tools.as_str()),
+        ("base", base.unwrap_or_default()),
     ]);
-    render(SYSTEM, &vars)
+    render(if base.is_some() { REPLACED } else { SYSTEM }, &vars)
+}
+
+/// The text of the [`crate::APPEND_SYSTEM_FILE`] found, trimmed, or nothing.
+fn appended(discovered: &Discovered) -> &str {
+    discovered
+        .append_system
+        .as_ref()
+        .map_or("", |file| file.content.trim())
 }
 
 /// The system prompt of a subagent whose role is `role`, for `input`; a subagent lives for one task, so its prompt carries the date and the branch itself.
+///
+/// An [`crate::APPEND_SYSTEM_FILE`] that was found goes after the environment; a [`crate::SYSTEM_FILE`] does not apply, since the role takes the place of crab's built-in instructions.
 pub fn build_subagent_prompt(input: PromptInput<'_>, role: &str) -> String {
     let flags = flags(input.tools);
     let project = project(&input);
@@ -72,6 +101,7 @@ pub fn build_subagent_prompt(input: PromptInput<'_>, role: &str) -> String {
         ("agent", role),
         ("project", project.as_str()),
         ("environment", environment.as_str()),
+        ("append", appended(input.discovered)),
         ("plan", plan.as_str()),
         ("tools", tools.as_str()),
     ]);
@@ -196,6 +226,7 @@ mod tests {
             home: Some(base.join("home")),
             claude: Some(base.join("home/.claude")),
             codex: Some(base.join("home/.codex")),
+            crab: None,
             project: true,
         };
         let discovered = discover(&locations, &[]);
@@ -236,6 +267,7 @@ mod tests {
             home: None,
             claude: None,
             codex: None,
+            crab: None,
             project: true,
         };
         let discovered = Discovered::default();
@@ -267,6 +299,7 @@ mod tests {
             home: None,
             claude: None,
             codex: None,
+            crab: None,
             project: true,
         };
         let discovered = Discovered::default();
@@ -300,6 +333,7 @@ mod tests {
             home: None,
             claude: None,
             codex: None,
+            crab: None,
             project: true,
         };
         let tree = crate::workspace_tree(&base);
@@ -331,6 +365,7 @@ mod tests {
             home: None,
             claude: None,
             codex: None,
+            crab: None,
             project: true,
         };
         let discovered = Discovered::default();
@@ -346,5 +381,77 @@ mod tests {
         };
         assert!(build_prompt(input(true)).contains("call `set_title` once"));
         assert!(!build_prompt(input(false)).contains("call `set_title` once"));
+    }
+
+    /// A `SYSTEM.md` replaces crab's built-in instructions but keeps the skills, the tools, the project and plan mode; an `APPEND_SYSTEM.md` follows the project in the main prompt and the environment in a subagent's, which never takes the `SYSTEM.md`.
+    #[test]
+    fn system_files_shape_the_prompt() {
+        let base = scratch("system-files");
+        put(&base, "repo/AGENTS.md", "Use tabs.");
+        put(
+            &base,
+            "repo/.claude/skills/pdf/SKILL.md",
+            "---\ndescription: Reads PDFs\n---\nbody",
+        );
+        put(
+            &base,
+            "repo/.oh-my-crab/SYSTEM.md",
+            "You are a {{pirate}}.\n",
+        );
+        put(
+            &base,
+            "config/oh-my-crab/APPEND_SYSTEM.md",
+            "Answer in French.",
+        );
+        let locations = Locations {
+            directory: base.join("repo"),
+            root: None,
+            home: None,
+            claude: None,
+            codex: None,
+            crab: Some(base.join("config/oh-my-crab")),
+            project: true,
+        };
+        let discovered = discover(&locations, &[]);
+        let environment = Environment::detect(&locations, "m");
+        let tools: Vec<String> = ["read", "task", "set_title"].map(String::from).to_vec();
+        let input = PromptInput {
+            environment: &environment,
+            discovered: &discovered,
+            tools: &tools,
+            plan: true,
+            unnamed: true,
+            tree: "",
+        };
+        let prompt = build_prompt(input);
+        assert!(prompt.starts_with("You are a {{pirate}}.\n"));
+        assert!(!prompt.contains("crab's trusted coding assistant"));
+        assert!(!prompt.contains("# Delegation"));
+        assert!(prompt.contains("- pdf: Reads PDFs"));
+        assert!(prompt.contains("- `task`"));
+        assert!(prompt.contains("call `set_title` once"));
+        assert!(prompt.contains("Use tabs."));
+        assert!(prompt.contains("Plan mode active"));
+        let append = prompt.find("Answer in French.").unwrap();
+        assert!(prompt.find("</project-context>").unwrap() < append);
+        assert!(append < prompt.find("Plan mode active").unwrap());
+        let builtin = build_prompt(PromptInput {
+            discovered: &Discovered {
+                system: None,
+                ..discovered.clone()
+            },
+            ..input
+        });
+        assert!(builtin.contains("crab's trusted coding assistant"));
+        let append = builtin.find("Answer in French.").unwrap();
+        assert!(builtin.find("</project-context>").unwrap() < append);
+        assert!(append < builtin.find("Plan mode active").unwrap());
+        let subagent = build_subagent_prompt(input, "Be a scout.");
+        assert!(subagent.starts_with("§ Role\nBe a scout."));
+        assert!(!subagent.contains("pirate"));
+        assert!(
+            subagent.find(&environment_reminder(&environment)).unwrap()
+                < subagent.find("Answer in French.").unwrap()
+        );
     }
 }

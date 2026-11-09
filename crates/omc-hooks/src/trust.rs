@@ -347,15 +347,25 @@ fn is_home(root: &Path, home: Option<&Path>) -> bool {
         .is_some_and(|home| home == root)
 }
 
-/// What `all` holds that `kept` does not: instruction files by path, skills and agent definitions by name and file.
+/// What `all` holds that `kept` does not: instruction and system prompt files by path, skills and agent definitions by name and file.
 fn left_out(all: &Discovered, kept: &Discovered) -> Vec<Skipped> {
     let mut skipped = Vec::new();
-    for file in &all.instructions {
-        if !kept.instructions.iter().any(|kept| kept.path == file.path) {
+    let files = |found: &Discovered| -> Vec<std::path::PathBuf> {
+        found
+            .instructions
+            .iter()
+            .chain(&found.system)
+            .chain(&found.append_system)
+            .map(|file| file.path.clone())
+            .collect()
+    };
+    let held = files(kept);
+    for path in files(all) {
+        if !held.contains(&path) {
             skipped.push(Skipped {
                 kind: Input::Instruction,
-                name: file.path.display().to_string(),
-                path: file.path.clone(),
+                name: path.display().to_string(),
+                path,
             });
         }
     }
@@ -422,6 +432,7 @@ mod tests {
             home: Some(base.join("home")),
             claude: Some(base.join("home/.claude")),
             codex: None,
+            crab: None,
             project: true,
         }
     }
@@ -433,7 +444,7 @@ mod tests {
         )
     }
 
-    /// An untrusted project's hooks, instruction files and skills are left out and listed, while the user's hooks run; trusting it brings them in, for every linked worktree of the repository.
+    /// An untrusted project's hooks, instruction files, system prompt files and skills are left out and listed, while the user's hooks run; trusting it brings them in, for every linked worktree of the repository.
     #[test]
     fn trust_gates_the_project_and_worktrees_share_it() {
         let base = scratch("trust-gate");
@@ -443,6 +454,7 @@ mod tests {
         for folder in [&main, &base.join("linked")] {
             put(folder, ".claude/settings.json", &pre("./no-rm.sh"));
             put(folder, "AGENTS.md", "Do as the project says.");
+            put(folder, ".oh-my-crab/SYSTEM.md", "You serve the project.");
             put(
                 folder,
                 ".claude/skills/setup/SKILL.md",
@@ -468,6 +480,9 @@ mod tests {
             .collect();
         assert_eq!(kinds[0], (Input::Hook, "PreToolUse Bash: ./no-rm.sh"));
         assert!(kinds.iter().any(|(kind, _)| *kind == Input::Instruction));
+        assert!(untrusted.skipped.iter().any(|skipped| {
+            skipped.kind == Input::Instruction && skipped.path == main.join(".oh-my-crab/SYSTEM.md")
+        }));
         assert!(kinds.contains(&(Input::Skill, "setup")));
         store
             .set(&untrusted.project, true, untrusted.project_hooks.clone())

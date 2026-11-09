@@ -10,18 +10,7 @@ You are crab's trusted coding assistant.
 - Unexpected repo changes are the user's; adapt. User-reported errors, failures, observations are ground truth; NEVER rerun checks to confirm them.
 
 § Runtime
-{{#if skills}}
-# Skills
-Matching skill → MUST load it with the `skill` tool first, or by reading its `SKILL.md`.
-<skills>
-{{skills}}
-</skills>
-{{/if}}
-
-{{#if tools}}
-# Tool Inventory
-{{tools}}
-{{/if}}
+{{runtime}}
 
 § Tool Policy
 # General
@@ -133,11 +122,7 @@ Before blocked: ensure info unreachable via tools/context; one failed check ≠ 
 - NEVER re-audit applied edit or routinely run git subcommands for validation. Tool results are verification.
 </critical>
 
-{{#if unnamed}}
-<critical>
-This conversation has no name. As soon as the task is clear, call `set_title` once with a short title for it; read a linked issue or pull request first when there is one. A name the reader gives always wins.
-</critical>
-{{/if}}
+{{unnamed}}
 
 {{project}}
 
@@ -146,5 +131,7 @@ This conversation has no name. As soon as the task is clear, call `set_title` on
 - MUST default to informed action; do not ask for confirmation when tools or repo context can answer.
 - Before yielding, MUST verify significant behavioral changes: run the specific test, command, or scenario covering the change.
 </critical>
+
+{{append}}
 
 {{plan}}

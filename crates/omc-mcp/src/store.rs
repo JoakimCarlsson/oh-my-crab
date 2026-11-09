@@ -1,4 +1,4 @@
-//! Sign-ins to tool servers, kept in `mcp-auth.json` beside crab's own logins, readable by the user alone.
+//! Sign-ins to tool servers, kept in `mcp-auth.json` in crab's config folder, readable by the user alone, and shared by every account a client signs in with.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// The variable that names the file sign-ins to tool servers are kept in, instead of `mcp-auth.json` beside `auth.json`.
+/// The variable that names the file sign-ins to tool servers are kept in, instead of `mcp-auth.json` in crab's config folder.
 pub const MCP_AUTH_FILE_VARIABLE: &str = "OMC_MCP_AUTH_FILE";
 
 /// What is kept about signing in to one tool server.
@@ -69,15 +69,14 @@ impl Tokens {
         Self { path: path.into() }
     }
 
-    /// The store in the file [`MCP_AUTH_FILE_VARIABLE`] names, or `mcp-auth.json` in `home` when the client keeps its logins there, or in crab's config folder; nothing when there is no config folder.
-    pub fn locate(home: Option<&Path>) -> Option<Self> {
+    /// The store in the file [`MCP_AUTH_FILE_VARIABLE`] names, or `mcp-auth.json` in crab's config folder; nothing when there is no config folder.
+    ///
+    /// It does not follow the folder a client keeps a provider login in: a tool server is signed in to once, and every account of every provider uses that sign-in.
+    pub fn locate() -> Option<Self> {
         match std::env::var_os(MCP_AUTH_FILE_VARIABLE) {
             Some(path) if !path.is_empty() => Some(Self::new(path)),
-            _ => match home {
-                Some(home) => Some(Self::new(home.join("mcp-auth.json"))),
-                None => dirs::config_dir()
-                    .map(|base| Self::new(base.join("oh-my-crab").join("mcp-auth.json"))),
-            },
+            _ => dirs::config_dir()
+                .map(|base| Self::new(base.join("oh-my-crab").join("mcp-auth.json"))),
         }
     }
 

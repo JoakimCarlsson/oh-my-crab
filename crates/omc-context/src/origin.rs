@@ -21,7 +21,7 @@ impl From<Root> for Origin {
     fn from(root: Root) -> Self {
         match root {
             Root::Project => Self::Project,
-            Root::Claude | Root::Codex | Root::Home => Self::User,
+            Root::Crab | Root::Claude | Root::Codex | Root::Home => Self::User,
         }
     }
 }

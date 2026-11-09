@@ -2,6 +2,14 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::Origin;
+
+/// The environment variable that moves crab's own folder for instructions, skills, agent definitions and system prompt files; an empty value counts as unset.
+pub const CONFIG_DIR_VARIABLE: &str = "OMC_CONFIG_DIR";
+
+/// The folder under a project folder that holds crab's own customizations for that project.
+pub const PROJECT_FOLDER: &str = ".oh-my-crab";
+
 /// The folders a conversation's instructions, skills and agents are read from.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Locations {
@@ -15,6 +23,8 @@ pub struct Locations {
     pub claude: Option<PathBuf>,
     /// Codex's own config folder, when known.
     pub codex: Option<PathBuf>,
+    /// Crab's own config folder, read for the user's instructions, skills, agent definitions and system prompt files, when known.
+    pub crab: Option<PathBuf>,
     /// Whether the project's own folders are read: off while the project is not trusted, which leaves out its instruction files, skills and agent definitions, and the plugins its settings switch on or off.
     pub project: bool,
 }
@@ -22,7 +32,7 @@ pub struct Locations {
 impl Locations {
     /// The locations for work in `directory`, with the user folders taken from the environment and the project's own folders read.
     ///
-    /// `CLAUDE_CONFIG_DIR` and `CODEX_HOME` move the products' own folders; otherwise they are `~/.claude` and `~/.codex`.
+    /// `CLAUDE_CONFIG_DIR` and `CODEX_HOME` move the products' own folders; otherwise they are `~/.claude` and `~/.codex`. Crab's own folder is the one [`crab_folder`] gives.
     pub fn detect(directory: &Path) -> Self {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let own = |variable: &str, folder: &str| {
@@ -35,8 +45,20 @@ impl Locations {
             root: git_root(directory),
             claude: own("CLAUDE_CONFIG_DIR", ".claude"),
             codex: own("CODEX_HOME", ".codex"),
+            crab: crab_folder(),
             home,
             project: true,
+        }
+    }
+
+    /// The folder crab's own customizations of `scope` are written to: [`Locations::crab`] for the user's, `.oh-my-crab` in the working folder for the project's, whether the project is read or not; nothing for a plugin's or a built-in one, or when crab's own folder is not known.
+    ///
+    /// Instruction files go in it as `AGENTS.md` or `rules/<name>.md`, skills as `skills/<name>/SKILL.md`, agent definitions as `agents/<name>.md`, and system prompt files as `SYSTEM.md` and `APPEND_SYSTEM.md`.
+    pub fn native_folder(&self, scope: Origin) -> Option<PathBuf> {
+        match scope {
+            Origin::User => self.crab.clone(),
+            Origin::Project => Some(self.directory.join(PROJECT_FOLDER)),
+            Origin::Plugin | Origin::BuiltIn => None,
         }
     }
 
@@ -53,6 +75,19 @@ impl Locations {
             folders.truncate(1);
         }
         folders
+    }
+}
+
+/// Crab's own config folder: the one [`CONFIG_DIR_VARIABLE`] names, else `oh-my-crab` in the user's config folder; nothing when neither is known.
+pub fn crab_folder() -> Option<PathBuf> {
+    chosen_folder(std::env::var_os(CONFIG_DIR_VARIABLE), dirs::config_dir())
+}
+
+/// Crab's own config folder when [`CONFIG_DIR_VARIABLE`] holds `named` and the user's config folder is `config`: `named` unless it is missing or empty, else `oh-my-crab` in `config`.
+fn chosen_folder(named: Option<std::ffi::OsString>, config: Option<PathBuf>) -> Option<PathBuf> {
+    match named {
+        Some(path) if !path.is_empty() => Some(PathBuf::from(path)),
+        _ => config.map(|base| base.join("oh-my-crab")),
     }
 }
 
@@ -98,8 +133,53 @@ mod tests {
             home: None,
             claude: None,
             codex: None,
+            crab: None,
             project: true,
         };
         assert_eq!(locations.ancestors(), vec![base]);
+    }
+
+    /// The variable names crab's own folder unless it is empty; otherwise it is `oh-my-crab` in the user's config folder.
+    #[test]
+    fn crab_folder_follows_the_variable() {
+        let config = Some(PathBuf::from("/c"));
+        assert_eq!(
+            chosen_folder(Some("/mine".into()), config.clone()),
+            Some(PathBuf::from("/mine"))
+        );
+        assert_eq!(
+            chosen_folder(Some("".into()), config.clone()),
+            Some(PathBuf::from("/c/oh-my-crab"))
+        );
+        assert_eq!(
+            chosen_folder(None, config),
+            Some(PathBuf::from("/c/oh-my-crab"))
+        );
+        assert_eq!(chosen_folder(None, None), None);
+    }
+
+    /// The user's native folder is crab's own and the project's is `.oh-my-crab` in the working folder, even while the project is not read; plugins and built-ins have none.
+    #[test]
+    fn native_folders_by_scope() {
+        let base = scratch("scope-native");
+        let locations = Locations {
+            directory: base.join("repo"),
+            root: None,
+            home: None,
+            claude: None,
+            codex: None,
+            crab: Some(base.join("config/oh-my-crab")),
+            project: false,
+        };
+        assert_eq!(
+            locations.native_folder(Origin::User),
+            Some(base.join("config/oh-my-crab"))
+        );
+        assert_eq!(
+            locations.native_folder(Origin::Project),
+            Some(base.join("repo/.oh-my-crab"))
+        );
+        assert_eq!(locations.native_folder(Origin::Plugin), None);
+        assert_eq!(locations.native_folder(Origin::BuiltIn), None);
     }
 }

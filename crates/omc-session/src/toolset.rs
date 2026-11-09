@@ -278,6 +278,7 @@ mod tests {
             home: None,
             claude: None,
             codex: None,
+            crab: None,
             project: true,
         };
         use_inputs(&Inputs {
@@ -509,6 +510,7 @@ mod tests {
             home: None,
             claude: None,
             codex: None,
+            crab: None,
             project: true,
         };
         let prefix = crate::prefix::Prefix::freeze(

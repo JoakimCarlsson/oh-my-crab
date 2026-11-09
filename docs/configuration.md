@@ -3,7 +3,10 @@
 Everything a user can configure in crab, in one place: environment variables,
 files and the settings of a conversation. Each row links to the page that
 says more. Crab has no settings file of its own for its general behaviour;
-what is not set here is chosen per conversation by the client.
+what is not set here is chosen per conversation by the client. Its
+instructions, skills, agent definitions and system prompt files have folders
+of their own, `<config>` for the user and `.oh-my-crab` in a project, read
+before Claude Code's and Codex's.
 
 ## Folders
 
@@ -32,6 +35,7 @@ starts `crab`. A switch that is off when set to `0` is also off with `false`,
 
 | Variable             | What it does                                                                                                | Default                       | Details                                                    |
 | -------------------- | ----------------------------------------------------------------------------------------------------------- | ----------------------------- | ---------------------------------------------------------- |
+| `OMC_CONFIG_DIR`     | The folder the user's own instruction files, skills, agent definitions and system prompt files for crab are read from. Crab's other files in `<config>` keep their own variables. | `<config>`                    | [Skills and agents](extending/skills-and-agents.md)        |
 | `OMC_PROVIDERS_FILE` | The file custom providers are read from.                                                                    | `<config>/providers.json`     | [Custom endpoints](providers/custom-endpoints.md)          |
 | `OMC_<ID>_URL`       | The address of a built-in provider, such as `OMC_OLLAMA_URL`; listed per provider below.                     | the provider's own address    | [Supported providers](providers/supported.md)              |
 | `OMC_HOOKS_FILE`     | The file the user's own hooks for crab are read from.                                                       | `<config>/hooks.json`         | [Hooks](extending/hooks.md)                                |
@@ -59,7 +63,7 @@ starts `crab`. A switch that is off when set to `0` is also off with `false`,
 | `OMC_MODELS_REFRESH` | Set to `0` to stop `crab serve` from downloading the model catalog into `<cache>/models.json` once a day; the bundled snapshot and any copy already cached are still used. | on                            | [Model catalog](providers/supported.md#model-catalog)      |
 | `OMC_MODELS_URL`     | Where the model catalog is downloaded from, in the models.dev format.                                       | `https://models.dev/api.json` | [Model catalog](providers/supported.md#model-catalog)      |
 
-An empty `OMC_PROVIDERS_FILE`, `OMC_HOOKS_FILE`, `OMC_TRUST_FILE`,
+An empty `OMC_CONFIG_DIR`, `OMC_PROVIDERS_FILE`, `OMC_HOOKS_FILE`, `OMC_TRUST_FILE`,
 `OMC_PERMISSIONS_FILE`, `OMC_MEMORY_DIR`, `OMC_DEBUGGERS_FILE`, `OMC_MCP_FILE`,
 `OMC_EXTENSIONS_FILE` or `OMC_MCP_AUTH_FILE` counts as unset. An empty or blank
 `OMC_<ID>_URL` does too, and a trailing `/` is dropped.
@@ -170,8 +174,12 @@ Crab does not read these; it sets them for the hook commands it runs.
 | `<config>/hooks.json`                                         | The user's own hooks. Moved by `OMC_HOOKS_FILE`.                                                         | the user                            | [Hooks](extending/hooks.md)                       |
 | `<config>/mcp.json`                                           | The user's own tool servers, in the shape of `.mcp.json`. Read when a conversation opens. Moved by `OMC_MCP_FILE`. | the user                  | [Tool servers](extending/mcp.md)                  |
 | `<config>/extensions.json`                                    | The user's own extensions. Read when a conversation opens. Moved by `OMC_EXTENSIONS_FILE`.               | the user                            | [Extensions](extending/extensions.md)             |
-| `<config>/mcp-auth.json`                                      | Sign-ins to tool servers: client registrations and tokens, by server address, readable by the user alone. `<home>/mcp-auth.json` for a conversation opened with a `home` folder. Moved by `OMC_MCP_AUTH_FILE`. | crab, when signing in to a tool server | [Tool servers](extending/mcp.md#signing-in) |
+| `<config>/mcp-auth.json`                                      | Sign-ins to tool servers: client registrations and tokens, by server address, readable by the user alone. Shared by every conversation, including those opened with their own `home` folder for a provider login. Moved by `OMC_MCP_AUTH_FILE`. | crab, when signing in to a tool server | [Tool servers](extending/mcp.md#signing-in) |
 | `<config>/permissions.json`                                   | Permission rules: the user's under `permissions`, each project's under `projects`, and the "always allow" answers kept for the project or every project. Moved by `OMC_PERMISSIONS_FILE`. | crab, on an "always allow" kept beyond the conversation or `crab permissions`; the user | [Permission rules](extending/permissions.md) |
+| `<config>/AGENTS.md`, `<config>/rules/<name>.md`              | The user's own instruction files, before Claude Code's and Codex's. This and the three rows below are moved by `OMC_CONFIG_DIR`. | the user, or a client | [Skills and agents](extending/skills-and-agents.md) |
+| `<config>/skills/<name>/SKILL.md`                             | The user's own skills; one keeps its name over Claude Code's and Codex's.                                | the user, or a client               | [Skills and agents](extending/skills-and-agents.md) |
+| `<config>/agents/<name>.md`                                   | The user's own agent definitions; one wins its name over Claude Code's and Codex's.                      | the user, or a client               | [Skills and agents](extending/skills-and-agents.md) |
+| `<config>/SYSTEM.md`, `<config>/APPEND_SYSTEM.md`             | Text that replaces crab's built-in instructions in the main agent's system prompt, and text added to the end of every system prompt, unless the project has its own. | the user, or a client | [The system prompt](extending/skills-and-agents.md#the-system-prompt) |
 | `<config>/debuggers.json`                                     | Changes to the known debug adapters, and others added. Moved by `OMC_DEBUGGERS_FILE`.                    | the user                            | [Debugging](tools/debug.md)                       |
 | `<data>/conversations/<id>.jsonl`                             | The saved history of the conversation `<id>`. A client can keep them elsewhere by opening the conversation with a `history` folder. | crab                | [Commands and conversations](usage.md)            |
 | `<data>/conversations/<id>.plans/plan-<n>.md`                 | Each plan the agent of the conversation `<id>` submitted, numbered in order, beside its history, readable by the user alone. | crab             | [Plans](concepts.md#plans)                        |
@@ -210,9 +218,10 @@ repository), except where noted.
 
 | Path                                                                       | What                                                            | Details                                     |
 | -------------------------------------------------------------------------- | --------------------------------------------------------------- | ------------------------------------------- |
-| `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, `.claude/CLAUDE.md`, `CLAUDE.local.md`, `.claude/rules/<name>.md` | Instruction files.  | [Skills and agents](extending/skills-and-agents.md) |
-| `.claude/skills/<name>/SKILL.md`, `.codex/skills/<name>/SKILL.md`, `.agents/skills/<name>/SKILL.md` | Skills.                           | [Skills and agents](extending/skills-and-agents.md) |
-| `.claude/agents/<name>.md`, `.codex/agents/<name>.toml`                    | Agent definitions.                                              | [Skills and agents](extending/skills-and-agents.md) |
+| `.oh-my-crab/AGENTS.md`, `.oh-my-crab/rules/<name>.md`, `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, `.claude/CLAUDE.md`, `CLAUDE.local.md`, `.claude/rules/<name>.md` | Instruction files.  | [Skills and agents](extending/skills-and-agents.md) |
+| `.oh-my-crab/skills/<name>/SKILL.md`, `.claude/skills/<name>/SKILL.md`, `.codex/skills/<name>/SKILL.md`, `.agents/skills/<name>/SKILL.md` | Skills; crab's own keep their names first. | [Skills and agents](extending/skills-and-agents.md) |
+| `.oh-my-crab/agents/<name>.md`, `.claude/agents/<name>.md`, `.codex/agents/<name>.toml` | Agent definitions; crab's own win their names first. | [Skills and agents](extending/skills-and-agents.md) |
+| `.oh-my-crab/SYSTEM.md`, `.oh-my-crab/APPEND_SYSTEM.md`                    | The system prompt's replaced instructions and added text; the nearest folder wins, then `<config>`'s. | [The system prompt](extending/skills-and-agents.md#the-system-prompt) |
 | `.oh-my-crab/hooks.json`, `.claude/settings.json`, `.claude/settings.local.json` | Hooks.                                                    | [Hooks](extending/hooks.md)                 |
 | `.claude/settings.json`, `.claude/settings.local.json` of the working folder only | The plugins `enabledPlugins` switches on or off.         | [Project trust](extending/project-trust.md) |
 | `.oh-my-crab/mcp.json`, `.mcp.json`                                        | Tool servers; in each folder the first wins, and the nearer folder wins. | [Tool servers](extending/mcp.md)            |

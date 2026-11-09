@@ -35,7 +35,7 @@ impl Skill {
     }
 }
 
-/// The skills available for work in `locations`: the project's nearest first, then the reader's, then those installed Claude Code plugins bring; names in `disabled` are left out.
+/// The skills available for work in `locations`: the project's nearest first, then the reader's, crab's own folders before Claude Code's and Codex's in each, then those installed Claude Code plugins bring; names in `disabled` are left out.
 ///
 /// The first skill found under a name keeps it. A later one with the same front matter and body is dropped; a later one that differs is named `<namespace>/<name>`, after its plugin or the folder its skills are in, with `~2`, `~3` and on added when that is taken too. Names are settled before `disabled` is applied, so turning one skill off never renames another.
 pub(crate) fn find(locations: &Locations, disabled: &[String]) -> Vec<Skill> {
@@ -197,6 +197,7 @@ mod tests {
             home: Some(base.join("home")),
             claude: Some(base.join("home/.claude")),
             codex: Some(base.join("home/.codex")),
+            crab: Some(base.join("config/oh-my-crab")),
             project: true,
         }
     }
@@ -247,6 +248,67 @@ mod tests {
         assert_eq!(found[3].origin, Origin::User);
         assert_eq!(found[3].description, "user copy");
         assert_eq!(found[0].body().unwrap(), "Use pdftotext.");
+    }
+
+    /// Crab's own skills keep their names over Claude Code's and Codex's in the same scope, a project's over the reader's, and the project's are left out while it is not read.
+    #[test]
+    fn native_skills_come_first() {
+        let base = scratch("skills-native");
+        let skill = |text: &str| format!("---\ndescription: {text}\n---\nx");
+        put(
+            &base,
+            "repo/.claude/skills/pdf/SKILL.md",
+            &skill("project claude"),
+        );
+        put(
+            &base,
+            "repo/.oh-my-crab/skills/pdf/SKILL.md",
+            &skill("project crab"),
+        );
+        put(
+            &base,
+            "home/.claude/skills/lint/SKILL.md",
+            &skill("user claude"),
+        );
+        put(
+            &base,
+            "config/oh-my-crab/skills/lint/SKILL.md",
+            &skill("user crab"),
+        );
+        put(
+            &base,
+            "config/oh-my-crab/skills/pdf/SKILL.md",
+            &skill("user crab pdf"),
+        );
+        let mut locations = locations(&base);
+        let found = |locations: &Locations| -> Vec<(String, String, Origin)> {
+            find(locations, &[])
+                .into_iter()
+                .map(|skill| (skill.name, skill.description, skill.origin))
+                .collect()
+        };
+        let seen = |name: &str, description: &str, origin| {
+            (name.to_owned(), description.to_owned(), origin)
+        };
+        assert_eq!(
+            found(&locations),
+            vec![
+                seen("pdf", "project crab", Origin::Project),
+                seen("claude/pdf", "project claude", Origin::Project),
+                seen("lint", "user crab", Origin::User),
+                seen("oh-my-crab/pdf", "user crab pdf", Origin::User),
+                seen("claude/lint", "user claude", Origin::User),
+            ]
+        );
+        locations.project = false;
+        assert_eq!(
+            found(&locations),
+            vec![
+                seen("lint", "user crab", Origin::User),
+                seen("pdf", "user crab pdf", Origin::User),
+                seen("claude/lint", "user claude", Origin::User),
+            ]
+        );
     }
 
     /// Disabled names are skipped and hidden skills are marked.

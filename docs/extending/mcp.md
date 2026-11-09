@@ -167,9 +167,9 @@ unavailable, `waiting for the reader to sign in`, until then. When the
 sign-in fails, crab writes `tool server sign-in failed: <name>: <reason>` to
 standard error.
 
-Tokens are kept in `mcp-auth.json` beside crab's logins (`<config>`, or the
-`home` the client opened the conversation with), or in the file
-`OMC_MCP_AUTH_FILE` names, by the server's address, readable by the user alone
+Tokens are kept in `mcp-auth.json` in `<config>`, or in the file
+`OMC_MCP_AUTH_FILE` names, shared by every conversation whatever `home` its
+provider login is kept in, by the server's address, readable by the user alone
 on systems with file modes. A kept token is sent with every request to its
 server; one that has expired is refreshed first, and one the server turns away
 is refreshed and the request sent once more. A token that cannot be refreshed

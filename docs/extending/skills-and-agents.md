@@ -2,12 +2,22 @@
 
 Crab reads three kinds of context from disk: instruction files the agent must
 follow, skills it loads when a task matches, and agent definitions that add
-kinds of subagent. It reads them where Claude Code and Codex keep theirs, so a
-user's existing files keep working. What a project folder brings is used only
-once the project is trusted (see [Project trust](project-trust.md)); the
-user's own folders are always read. `~/.claude` stands for Claude Code's
-config folder, which `CLAUDE_CONFIG_DIR` moves, and `~/.codex` for Codex's,
-which `CODEX_HOME` moves.
+kinds of subagent. It reads them from folders of its own first, then where
+Claude Code and Codex keep theirs, so a user's existing files keep working and
+a file meant for crab alone changes neither of the other tools. What a project
+folder brings is used only once the project is trusted (see
+[Project trust](project-trust.md)); the user's own folders are always read.
+`<config>` stands for crab's config folder (`~/.config/oh-my-crab` on Linux,
+see [Folders](../configuration.md#folders)), which `OMC_CONFIG_DIR` moves;
+`~/.claude` for Claude Code's config folder, which `CLAUDE_CONFIG_DIR` moves;
+and `~/.codex` for Codex's, which `CODEX_HOME` moves.
+
+Crab's own files are kept in `.oh-my-crab` in a project folder and in
+`<config>` for the user, laid out the same way in both: `AGENTS.md` and
+`rules/<name>.md` for instruction files, `skills/<name>/SKILL.md` for skills,
+`agents/<name>.md` for agent definitions, and `SYSTEM.md` and
+`APPEND_SYSTEM.md` for the [system prompt](#the-system-prompt). A client that
+writes a new one for crab writes it there.
 
 The project's folders are the folders from the working folder up to the root
 of the repository it is in, nearest first. Outside a repository only the
@@ -19,6 +29,9 @@ working folder counts. A repository root is the nearest folder holding a
 In each of the project's folders, nearest first, crab reads these, in this
 order:
 
+- `.oh-my-crab/AGENTS.md`
+- every `.md` file under `.oh-my-crab/rules`, folders inside it included, in
+  name order
 - `CLAUDE.md`
 - `.claude/CLAUDE.md`
 - `CLAUDE.local.md`
@@ -27,7 +40,8 @@ order:
 - `AGENTS.md`
 - `AGENTS.override.md`
 
-Then the user's own: `~/.claude/CLAUDE.md`, every `.md` file under
+Then the user's own: `<config>/AGENTS.md`, every `.md` file under
+`<config>/rules`, `~/.claude/CLAUDE.md`, every `.md` file under
 `~/.claude/rules`, `~/.codex/AGENTS.md` and `~/.codex/AGENTS.override.md`.
 Every file found is used; `AGENTS.override.md` is read alongside `AGENTS.md`,
 not instead of it. A file that is empty or only whitespace is skipped, a file
@@ -44,9 +58,11 @@ for them.
 
 A skill is a folder holding a `SKILL.md`. Crab looks for skill folders in:
 
-- `.claude/skills`, `.codex/skills` and `.agents/skills` in each of the
-  project's folders, nearest first, one location at a time
-- `~/.claude/skills`, `~/.codex/skills` and `~/.agents/skills`
+- `.oh-my-crab/skills`, `.claude/skills`, `.codex/skills` and
+  `.agents/skills` in each of the project's folders, nearest first, one
+  location at a time
+- `<config>/skills`, `~/.claude/skills`, `~/.codex/skills` and
+  `~/.agents/skills`
 - installed Claude Code plugins (see below)
 
 Only the folders directly inside a skills folder are skills; one whose name
@@ -73,7 +89,11 @@ skill of the same name whose front matter and body are identical is dropped;
 one that differs is offered as `<namespace>/<name>`, the namespace being the
 plugin's name or the name of the folder that holds the skills folder without
 its leading dot (`claude/pdf` for a second `pdf` in `~/.claude/skills`), with
-`~2`, `~3` and so on added when that is taken too.
+`~2`, `~3` and so on added when that is taken too. Since crab's own folders
+come first in each scope, a skill in `.oh-my-crab/skills` keeps its name over
+one in the same project's `.claude/skills`, and one in `<config>/skills` over
+one in `~/.claude/skills`; a project's skill still keeps its name over the
+user's.
 
 The system prompt lists each skill that is not hidden as `- name:
 description` and tells the model to load a matching skill before it starts.
@@ -98,16 +118,18 @@ filled in. A prompt naming no known skill is sent as it is.
 Agent definitions add kinds of subagent to the `task` tool (see
 [Subagents](../tools/subagents.md)). Crab reads them from:
 
-- every `.md` file under `.claude/agents` and every `.toml` file under
-  `.codex/agents`, in each of the project's folders, nearest first
-- every `.md` file under `~/.claude/agents` and every `.toml` file under
-  `~/.codex/agents`
+- every `.md` file under `.oh-my-crab/agents` and `.claude/agents` and every
+  `.toml` file under `.codex/agents`, in each of the project's folders,
+  nearest first
+- every `.md` file under `<config>/agents` and `~/.claude/agents` and every
+  `.toml` file under `~/.codex/agents`
 - every `.md` file under the `agents` folder of each installed Claude Code
   plugin
 - the built-in kinds `task`, `scout` and `reviewer`, last
 
 The first definition of a name wins, so a project's `reviewer.md` replaces the
-built-in `reviewer`. A markdown definition has front matter and a body, which
+built-in `reviewer`, and one in `.oh-my-crab/agents` or `<config>/agents`
+replaces Claude Code's of the same name in the same scope. A markdown definition has front matter and a body, which
 becomes the subagent's role:
 
 ```markdown
@@ -150,6 +172,27 @@ Other keys are ignored. A TOML definition reads the top-level strings `name`,
 one of), `output_schema`, `isolated` and `model`, stopping at the first table;
 it cannot limit tools.
 
+## The system prompt
+
+Two files change the main agent's system prompt itself. Crab looks for each in
+`.oh-my-crab` in the project's folders, nearest first and only once the
+project is trusted, then in `<config>`; the first one found that is not empty
+or only whitespace is used, cut at 64 KiB.
+
+- `SYSTEM.md` replaces crab's built-in instructions: its role, its engineering
+  and tool policy, its workflow and delivery rules. What crab builds for the
+  conversation still follows it: the skills, the tool inventory, the request
+  to name an unnamed conversation, the workstation, the outline of the working
+  directory, the instruction files and, in plan mode, its rules. The text is
+  used as written; nothing in it is filled in.
+- `APPEND_SYSTEM.md` is added after the project part, built-in instructions
+  or `SYSTEM.md` alike, before the rules of plan mode.
+
+A subagent's prompt starts from its own role, so `SYSTEM.md` does not reach
+it; `APPEND_SYSTEM.md` does, after its environment. Both files are turned off
+by path in `disabled`, like instruction files, and, as for the rest of the
+system prompt, a change to them is used the next time the prompt is made.
+
 ## Claude Code plugins
 
 Crab reads the plugins Claude Code installed from
@@ -178,7 +221,8 @@ named `<plugin>/<name>` only when that name is taken.
 ## Turning things off
 
 The client can leave out what the user turned off with the `disabled` list of
-`Open`: instruction files by path (as found, or with links resolved), and
+`Open`: instruction files and `SYSTEM.md` or `APPEND_SYSTEM.md` by path (as
+found, or with links resolved), and
 skills and agent kinds by name, built-in kinds included:
 
 ```json

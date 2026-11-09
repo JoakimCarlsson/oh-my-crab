@@ -11,14 +11,21 @@ pub struct Discovered {
     pub skills: Vec<Skill>,
     /// The agent kinds, built-in ones last.
     pub agents: Vec<AgentDefinition>,
+    /// The [`crate::SYSTEM_FILE`] in force, whose text replaces crab's built-in instructions in the main agent's prompt.
+    pub system: Option<Instruction>,
+    /// The [`crate::APPEND_SYSTEM_FILE`] in force, whose text ends the prompt of the main agent and of every subagent.
+    pub append_system: Option<Instruction>,
 }
 
-/// Finds what there is for work in `locations`, leaving out instruction files by path, and skills and agents by name, as `disabled` lists them.
+/// Finds what there is for work in `locations`, leaving out instruction and system prompt files by path, and skills and agents by name, as `disabled` lists them.
 pub fn discover(locations: &Locations, disabled: &[String]) -> Discovered {
+    let (system, append_system) = instructions::system_texts(locations, disabled);
     Discovered {
         instructions: instructions::find(locations, disabled),
         skills: skills::find(locations, disabled),
         agents: agents::find(locations, disabled),
+        system,
+        append_system,
     }
 }
 
@@ -45,6 +52,7 @@ mod tests {
             "---\nname: helper\ndescription: Helps\n---\nHelp.",
         );
         put(&base, "home/.claude/CLAUDE.md", "Be brief.");
+        put(&base, "repo/.oh-my-crab/SYSTEM.md", "Obey the project.");
         put(
             &base,
             "home/.claude/skills/mine/SKILL.md",
@@ -56,12 +64,14 @@ mod tests {
             home: Some(base.join("home")),
             claude: Some(base.join("home/.claude")),
             codex: None,
+            crab: None,
             project: true,
         };
         let trusted = discover(&locations, &[]);
         assert_eq!(trusted.instructions.len(), 2);
         assert!(trusted.skills.iter().any(|skill| skill.name == "setup"));
         assert!(trusted.agents.iter().any(|agent| agent.name == "helper"));
+        assert!(trusted.system.is_some());
         locations.project = false;
         let untrusted = discover(&locations, &[]);
         let paths: Vec<_> = untrusted
@@ -77,5 +87,6 @@ mod tests {
             .collect();
         assert_eq!(skills, vec!["mine"]);
         assert!(!untrusted.agents.iter().any(|agent| agent.name == "helper"));
+        assert_eq!(untrusted.system, None);
     }
 }

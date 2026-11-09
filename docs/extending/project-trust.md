@@ -4,8 +4,9 @@ A freshly cloned repository can steer the agent, so what a project folder
 brings is not used until the reader trusts the project: its hooks, the tool
 servers of its `.mcp.json` and `.oh-my-crab/mcp.json`, the
 [extensions](extensions.md) of its `.oh-my-crab/extensions.json`, its
-instruction files (`AGENTS.md`, `CLAUDE.md`, `.claude/rules` and the like),
-its skills and agent definitions, the Claude Code plugins its settings
+instruction files (`AGENTS.md`, `CLAUDE.md`, `.claude/rules`,
+`.oh-my-crab/rules` and the like), its `.oh-my-crab/SYSTEM.md` and
+`.oh-my-crab/APPEND_SYSTEM.md`, its skills and agent definitions, the Claude Code plugins its settings
 switch on or off, and the allow rules of its Claude Code settings; the deny
 and ask rules there are used either way, since they only take away (see
 [permission rules](permissions.md)). The user's own folders (`~/.claude`, `~/.codex`,

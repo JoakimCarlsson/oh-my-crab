@@ -25,7 +25,9 @@ pub use agents::{AgentDefinition, READ_ONLY_TOOLS, builtin_agents};
 pub use discovery::{Discovered, discover};
 pub use environment::{Environment, timestamp};
 pub use frontmatter::{Parsed, parse as parse_frontmatter};
-pub use instructions::Instruction;
+pub use instructions::{
+    APPEND_SYSTEM_FILE, Instruction, SYSTEM_FILE, SystemFiles, native_system_files, system_files,
+};
 pub use invoke::{
     expand_skill, plan_abandoned, plan_approved, plan_approved_fresh, plan_fresh, plan_rejected,
     seeded_plan, skill_invocation, subagent_assignment, subagent_plan,
@@ -34,7 +36,7 @@ pub use notices::{Notice, context_changes, environment_reminder, memory_notice, 
 pub use origin::Origin;
 pub use place::{agent_places, instruction_places, skill_places};
 pub use plugins::plugin_folders;
-pub use scope::Locations;
+pub use scope::{CONFIG_DIR_VARIABLE, Locations, PROJECT_FOLDER, crab_folder};
 pub use skills::Skill;
 pub use system::{PromptInput, build_prompt, build_subagent_prompt};
 pub use template::render;

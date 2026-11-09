@@ -467,6 +467,7 @@ mod tests {
             home: Some(base.join("home")),
             claude: Some(base.join("home/.claude")),
             codex: None,
+            crab: None,
             project: true,
         };
         let own = base.join("config/hooks.json");
@@ -515,6 +516,7 @@ mod tests {
             home: None,
             claude: Some(base.join("home/.claude")),
             codex: None,
+            crab: None,
             project: false,
         };
         assert!(

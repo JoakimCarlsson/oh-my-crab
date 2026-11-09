@@ -198,6 +198,7 @@ mod tests {
             home: Some(base.join("home")),
             claude: Some(base.join("home/.claude")),
             codex: None,
+            crab: None,
             project: true,
         }
     }

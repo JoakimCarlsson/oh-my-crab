@@ -246,6 +246,7 @@ mod tests {
             home: None,
             claude: None,
             codex: None,
+            crab: None,
             project: true,
         };
         let before = discover(&locations, &[]);
@@ -285,6 +286,7 @@ mod tests {
             home: None,
             claude: None,
             codex: None,
+            crab: None,
             project: true,
         };
         let before = discover(&locations, &[]);
