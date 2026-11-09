@@ -23,8 +23,9 @@ const MIN_OUTPUT_TOKENS: u64 = 50;
 /// The most tokens the messages after a superseded read may take for it to be left out between prunings, since the provider reads everything after it again without its prompt cache.
 const STALE_SUFFIX_TOKENS: u64 = 8_000;
 
-/// The tools whose outputs are never left out as old: instructions and notes the model works from.
-pub(crate) const KEPT_TOOLS: [&str; 3] = ["skill", "context_notes", "todo"];
+/// The tools whose outputs are never left out as old: instructions, notes and the plan the model works from.
+pub(crate) const KEPT_TOOLS: [&str; 4] =
+    ["skill", "context_notes", "todo", crate::plans::EXIT_PLAN];
 
 /// One tool output in the history that may be left out.
 struct Candidate<'h> {

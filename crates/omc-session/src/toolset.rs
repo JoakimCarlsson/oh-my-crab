@@ -5,13 +5,16 @@ use std::sync::Arc;
 use omc_agent::{
     Approvals, EventSink, Hooks, Isolation, Models, Nesting, Task, TaskSettings, Throttle,
 };
-use omc_context::{Discovered, Environment, PromptInput, build_subagent_prompt};
+use omc_context::{Discovered, Environment, PromptInput, build_subagent_prompt, subagent_plan};
 use omc_memory::Memories;
 use omc_providers::{ChatModel, Effort};
 use omc_tools::{
     Ask, Checkpoint, CheckpointTool, ContextNotes, Deferral, ExitPlanMode, Host, Jobs, MemoryEdit,
     MemorySearch, NewContext, Notebook, Registry, Remember, Rewind, SetTitle, Todo, Wait,
 };
+
+/// Gives the plan the reader approved while it is being carried out, which the subagents started meanwhile are told of; nothing while there is none or a new plan is being made.
+pub(crate) type PlanSource = dyn Fn() -> Option<Arc<str>> + Send + Sync;
 
 /// What the tools and prompts of a turn are built from.
 pub(crate) struct Inputs<'a> {
@@ -55,6 +58,8 @@ pub(crate) struct Inputs<'a> {
     pub(crate) memories: Option<Arc<Memories>>,
     /// The hooks subagents run, when there are any.
     pub(crate) hooks: Option<Arc<dyn Hooks>>,
+    /// The plan being carried out, which subagents are told of.
+    pub(crate) approved_plan: Arc<PlanSource>,
 }
 
 /// The tools of a turn in each mode.
@@ -124,11 +129,14 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
     }
     if plan {
         let todo = !inputs.denied.iter().any(|name| name == "todo");
-        registry.register(ExitPlanMode::new(inputs.host.clone(), todo));
+        registry.register(
+            ExitPlanMode::new(inputs.host.clone(), todo).with_notebook(inputs.notebook.clone()),
+        );
     }
     let discovered = inputs.discovered.clone();
     let environment = inputs.environment.clone();
     let tree = inputs.tree.clone();
+    let approved_plan = inputs.approved_plan.clone();
     registry.register(Task::new(TaskSettings {
         model: inputs.model.clone(),
         models: inputs.models.clone(),
@@ -139,7 +147,7 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
         effort: inputs.effort,
         prompt: Arc::new(move |agent, tools, apart, model| {
             let own = subagent_environment(&environment, apart, model);
-            build_subagent_prompt(
+            let prompt = build_subagent_prompt(
                 PromptInput {
                     environment: own.as_ref().unwrap_or(&environment),
                     discovered: &discovered,
@@ -149,7 +157,8 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
                     tree: &tree,
                 },
                 &agent.prompt,
-            )
+            );
+            with_plan(prompt, approved_plan().as_deref())
         }),
         jobs: inputs.jobs.clone(),
         isolation: inputs.isolation.clone(),
@@ -161,6 +170,14 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
     }
     registry.defer(inputs.deferral);
     registry.fitted()
+}
+
+/// `prompt`, a subagent's system prompt, followed by `plan`, the plan being carried out, when there is one.
+fn with_plan(prompt: String, plan: Option<&str>) -> String {
+    match plan {
+        Some(plan) => format!("{prompt}\n\n{}", subagent_plan(plan)),
+        None => prompt,
+    }
 }
 
 /// The environment a subagent's prompt tells of, when it differs from the main agent's `environment`: the folder `apart` it works in when it works in a worktree of its own, with no branch, and the `model` it asks when that is known and another.
@@ -286,6 +303,7 @@ mod tests {
             isolation: None,
             memories,
             hooks: None,
+            approved_plan: Arc::new(|| None),
         })
     }
 

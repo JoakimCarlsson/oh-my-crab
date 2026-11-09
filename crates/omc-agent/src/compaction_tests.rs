@@ -700,3 +700,46 @@ async fn a_blocked_automatic_compaction_lets_the_turn_go_on() {
             .any(|message| matches!(message, Message::Compaction(_)))
     );
 }
+
+/// A plan approved before the part a compaction summarizes is restated whole after the summary, so the model keeps working from it.
+#[tokio::test]
+async fn an_approved_plan_survives_a_compaction() {
+    let model = Script::new(vec![say("answered")], Vec::new());
+    let registry = Registry::new();
+    let approvals = deny_all();
+    let mut history = vec![
+        Message::User("plan it".into()),
+        calling(
+            "p",
+            "exit_plan_mode",
+            serde_json::json!({"plan": "# Plan\n1. the step to keep"}),
+        ),
+        Message::ToolResults(vec![omc_providers::ToolResult {
+            call_id: "p".into(),
+            name: "exit_plan_mode".into(),
+            text: "Plan approved.".into(),
+            is_error: false,
+            images: Vec::new(),
+        }]),
+    ];
+    history.extend(earlier_turns(500, 900));
+    run_turn(
+        &context_on(&model, &registry, &approvals, Some(1_000)),
+        &mut history,
+        "next".into(),
+        &|_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(model.summary_requests(), 1);
+    let requests = model.turn_requests();
+    let summary = first_text(&requests[0]);
+    assert!(
+        summary.contains("<summary>\nsummary 1\n</summary>"),
+        "{summary}"
+    );
+    assert!(
+        summary.contains("<active-plan>") && summary.contains("1. the step to keep"),
+        "{summary}"
+    );
+}

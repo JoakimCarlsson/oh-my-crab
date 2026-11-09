@@ -431,6 +431,7 @@ fn every_variable_is_documented() {
     let read = variables_read();
     for sure in [
         "OMC_PROVIDERS_FILE",
+        "OMC_PLANS_DIR",
         "GROQ_API_KEY",
         "CLAUDE_CONFIG_DIR",
         "GH_TOKEN",
@@ -451,6 +452,70 @@ fn every_variable_is_documented() {
         "docs/configuration.md does not mention these environment variables:\n{}",
         missing.join("\n")
     );
+}
+
+/// The ids of the conversation settings `source`, the text of the session's settings module, declares: the value of every string constant whose documentation starts with "The id of the setting".
+fn setting_ids(source: &str) -> Vec<String> {
+    let lines: Vec<&str> = source.lines().map(str::trim).collect();
+    lines
+        .windows(2)
+        .filter(|pair| pair[0].starts_with("/// The id of the setting"))
+        .filter_map(|pair| {
+            let declared = pair[1].strip_prefix("pub(crate) const ")?;
+            let (_, value) = declared.split_once("= \"")?;
+            Some(value.strip_suffix("\";")?.to_owned())
+        })
+        .collect()
+}
+
+/// The rows of the conversation settings table of `page`, the configuration page: its part from the `## Conversation settings` heading to the next heading of that level.
+fn settings_section(page: &str) -> &str {
+    let start = page
+        .find("## Conversation settings")
+        .expect("docs/configuration.md has a Conversation settings section");
+    let rest = &page[start + 2..];
+    let end = rest.find("\n## ").map_or(rest.len(), |at| at + 2);
+    &page[start..start + end]
+}
+
+/// Every setting a conversation offers has a row in the conversation settings table of the configuration page.
+#[test]
+fn every_setting_is_documented() {
+    let page = std::fs::read_to_string(workspace().join("docs/configuration.md"))
+        .expect("docs/configuration.md exists");
+    let source = std::fs::read_to_string(workspace().join("crates/omc-session/src/settings.rs"))
+        .expect("the settings module exists");
+    let ids = setting_ids(&source);
+    for sure in [
+        "model",
+        "mode",
+        "plan_model",
+        "plan_autosave",
+        "checkpoints",
+    ] {
+        assert!(
+            ids.iter().any(|id| id == sure),
+            "the scan should find the setting {sure}; it found {ids:?}"
+        );
+    }
+    let section = settings_section(&page);
+    let missing: Vec<&String> = ids
+        .iter()
+        .filter(|id| !section.contains(&format!("| `{id}`")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the conversation settings table of docs/configuration.md has no row for these settings: {missing:?}"
+    );
+}
+
+/// Setting ids are read from the constants documented as such, and nothing else.
+#[test]
+fn setting_ids_are_recognized() {
+    let source = "/// The id of the setting that picks the model.\npub(crate) const MODEL: &str = \"model\";\n\n/// The value that turns it on.\npub(crate) const ON: &str = \"on\";\n";
+    assert_eq!(setting_ids(source), ["model"]);
+    let page = "## Conversation settings\n| `a` |\n## Next\n| `b` |";
+    assert_eq!(settings_section(page), "## Conversation settings\n| `a` |");
 }
 
 /// Code under `#[cfg(test)]` is left out of the scan, whether a module, a function or a field, and test modules declared by name are reported.

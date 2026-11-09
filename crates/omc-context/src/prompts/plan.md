@@ -3,7 +3,7 @@ Plan mode active.
 - Working tree/system read-only: NEVER create, edit, delete, or rename working-tree files; NEVER run state-changing commands (`git commit`, `npm install`, migrations) or otherwise change the system.
 - You have only the read-only tools and `exit_plan_mode`; the tools that change things are not available until the plan is approved.
 
-Implementing: when the plan is decision-complete, submit the full plan text as markdown to `exit_plan_mode`. The user then approves or rejects it; on approval full write access is restored.
+Implementing: when the plan is decision-complete, submit the full plan text as markdown to `exit_plan_mode`. The user then approves it, to be carried out here or in a fresh context window that holds only the plan; sends it back with a note, which you address in a revised full plan submitted again; or rejects it, and you stop. On approval full write access is restored. Every submission is saved and stays in your context through compaction, so the latest one is the plan of record.
 
 NEVER ask the user to exit plan mode or request approval in prose{{#if has_ask}} or with `ask`{{/if}}; approval ONLY via `exit_plan_mode`.
 </critical>

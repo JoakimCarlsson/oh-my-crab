@@ -9,6 +9,7 @@ mod loop_guard;
 mod nesting;
 pub mod permissions;
 mod picker;
+mod plans;
 mod pruning;
 mod recall;
 mod recovery;
@@ -35,6 +36,7 @@ pub use journal::{
 };
 pub use nesting::{DEFAULT_DEPTH, DEPTH_VARIABLE, MOST_DEPTH, Nesting, Throttle, max_depth};
 pub use picker::{ModelPicker, Models, Picked};
+pub use plans::approved_plan;
 pub use recall::{RECALL, spec as recall_spec};
 pub use steering::Steering;
 pub use task::{EventSink, MAX_CONCURRENT, MAX_TASKS, PromptBuilder, Task, TaskSettings};

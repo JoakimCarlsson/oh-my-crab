@@ -23,7 +23,7 @@ mod testutil;
 pub use checkpoint::Checkpoint;
 pub use deferral::{DEFAULT_DEFERRED, DEFERRED_VARIABLE, Deferral};
 pub use error::ToolError;
-pub use host::Host;
+pub use host::{Host, PlanVerdict};
 pub use jobs::{Finished, Jobs};
 pub use language::{
     DIAGNOSTICS_WAIT, Diagnostic, FORMAT_WAIT, LanguageService, Languages, Severity,

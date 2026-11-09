@@ -201,6 +201,8 @@ The settings crab offers today:
 | `cache`         | `cache`         | `5m`, `1h`                                | the provider offers a cache lifetime       |
 | `cache_warming` | `cache_warming` | `on`, `off`                               | the provider's cache can be kept warm      |
 | `memory`        | `memory`        | `on`, `off`                               | memory is not turned off for the process   |
+| `plan_model`    | `plan_model`    | `same`, the provider's models, or any model as `model` or `provider/model` | always            |
+| `plan_autosave` | `plan_autosave` | `on`, `off`                               | always                                     |
 | `checkpoints`   | `checkpoints`   | `on`, `off`                               | always                                     |
 
 A client should not hard-code this list: show what `Settings` offers. `yolo`
@@ -411,6 +413,7 @@ Answers an `Ask` under `ticket`.
 | -------- | ------- | -------- | ---------------------------------------------------------- |
 | `ticket` | integer | required | The `Ask` being answered.                                  |
 | `option` | string  | optional | The `id` of the `Choice` picked; `null` declines.          |
+| `note`   | string  | optional | What the reader wrote along with the choice. Only a plan's choices pass it on to the agent; it is ignored for a tool call. |
 
 `allow` lets the call run once. `always` lets it run and adds the permission
 rules the `Ask` named for the rest of the conversation; `always-project` and
@@ -424,6 +427,7 @@ just more entries in `choices`. See
 ```json
 {"Choose":{"ticket":1,"option":"allow"}}
 {"Choose":{"ticket":1,"option":null}}
+{"Choose":{"ticket":3,"option":"reject","note":"Split the second step in two."}}
 ```
 
 ### `Answer`
@@ -897,8 +901,21 @@ The first `Always` choice is always `always`. `always-project` and
 `always-user` are offered only when crab has a permissions file to keep rules
 in. No `Always` choice is offered when no rule can cover the call: a command
 line crab will not take apart, one that writes a file, or a call an ask rule
-matched. A plan offers `allow` ("Approve and start") and `reject` ("Keep
-planning").
+matched. A plan offers, in this order:
+
+- `allow`, verdict `Allow`, "Approve and execute": plan mode ends and the
+  agent carries the plan out in the same turn;
+- `fresh`, verdict `Allow`, "Approve and execute in a fresh context": the
+  same, in a fresh context window that starts with the plan and the note;
+- `reject`, verdict `Reject`, "Keep planning": the agent revises the plan,
+  told the `note` of the `Choose`;
+- `discard`, verdict `Reject`, "Reject the plan": the agent is told the plan
+  is rejected, with the note, stays in plan mode and ends its turn.
+
+`null`, and any choice besides these and the tool call's allowing ones, keeps
+the agent planning as `reject` does; `always`, `always-project` and
+`always-user` approve a plan as `allow` does. A client that only knows
+`allow` and `reject` keeps working as before. See [plans](concepts.md#plans).
 
 From real runs, an edit and a command:
 

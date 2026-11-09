@@ -7,6 +7,7 @@ use omc_providers::{Elided, Elision, Excised, Message, Pruning};
 use crate::compaction::{
     elision_note, estimate, excision_note, hidden, live, result_tokens, shown,
 };
+use crate::plans;
 use crate::pruning::{KEPT_TOOLS, seen};
 
 /// The fewest tokens a shake must save to be worth breaking the provider's prompt cache for.
@@ -18,7 +19,7 @@ const MIN_OUTPUT_TOKENS: u64 = 100;
 /// The fewest tokens a fenced block must take to be cut out.
 const MIN_BLOCK_TOKENS: u64 = 400;
 
-/// The shake that makes room in `history`, keeping about `keep` tokens of the most recent messages as they are: every tool output of at least [`MIN_OUTPUT_TOKENS`] tokens older than those that the model has seen and that is not from one of [`KEPT_TOOLS`], and every fenced block of at least [`MIN_BLOCK_TOKENS`] tokens in an older prompt or reply. Nothing when that saves less than [`MIN_SAVINGS`] tokens.
+/// The shake that makes room in `history`, keeping about `keep` tokens of the most recent messages as they are: every tool output of at least [`MIN_OUTPUT_TOKENS`] tokens older than those that the model has seen and that is not from one of [`KEPT_TOOLS`], and every fenced block of at least [`MIN_BLOCK_TOKENS`] tokens in an older prompt or reply, except the first message of a fresh context window opened for an approved plan, which holds the plan. Nothing when that saves less than [`MIN_SAVINGS`] tokens.
 pub(crate) fn shake(history: &[Message], keep: u64) -> Option<Pruning> {
     let live = live(history);
     let hidden = hidden(history);
@@ -56,6 +57,7 @@ pub(crate) fn shake(history: &[Message], keep: u64) -> Option<Pruning> {
                     });
                 }
             }
+            Message::User(_) if plans::seeds_plan(&history[at]) => {}
             Message::User(text) => saved += blocks(text, at, &hidden, &mut excised),
             Message::Assistant(reply) => saved += blocks(&reply.text, at, &hidden, &mut excised),
             _ => {}
@@ -227,6 +229,30 @@ mod tests {
         );
         assert_eq!(given[10], history[10]);
         assert_eq!(shake(&shaken, 5_000), None, "nothing left worth shaking");
+    }
+
+    /// The plan is never shaken out: not the output of a submission, nor the blocks of the first message of a fresh context window opened for an approved plan, while other old content is.
+    #[test]
+    fn the_plan_is_never_shaken() {
+        let plan = format!("# Plan\n{}", with_block(200));
+        let history = vec![
+            Message::User(omc_context::plan_fresh(&plan, false, None)),
+            call("p", "exit_plan_mode"),
+            output("p", "exit_plan_mode", 400),
+            call("a", "bash"),
+            output("a", "bash", 400),
+            Message::User("more".into()),
+            call("b", "bash"),
+            output("b", "bash", 600),
+        ];
+        let pruning = shake(&history, 5_000).expect("enough to save");
+        let ids: Vec<&str> = pruning
+            .elided
+            .iter()
+            .map(|elided| elided.call_id.as_str())
+            .collect();
+        assert_eq!(ids, ["a"]);
+        assert!(pruning.excised.is_empty());
     }
 
     /// Too little to cut out is left alone.

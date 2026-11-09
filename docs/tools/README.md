@@ -99,7 +99,7 @@ None of the three exists with the `memory` setting off or `OMC_MEMORY=0`.
 | `ask`            | Asks the reader a form of questions and waits for the answers                                 | no   | yes  | [`Inquire`](../wire-protocol.md#inquire) |
 | `todo`           | Keeps the todo list the reader sees, sent to the client as `Plan`                              | no   | yes  | [troubleshooting](../troubleshooting.md) |
 | `set_title`      | *Sometimes.* Names the conversation; given only while it has no name                          | no   | yes  | [history](../concepts.md#history-saved-and-reopened-by-id) |
-| `exit_plan_mode` | Hands the plan to the reader for approval and ends plan mode when approved; refused outside it | no   | only | [modes](../concepts.md#modes) |
+| `exit_plan_mode` | Hands the plan to the reader for approval and ends plan mode when approved, in the same context or a fresh one; saves every plan; refused outside it | no   | only | [plans](../concepts.md#plans) |
 | `skill`          | Loads a skill's instructions; listed even when there are no skills                             | no   | yes  | [skills](../extending/skills-and-agents.md#skills) |
 | `load_tools`     | *Sometimes.* Hands over the description and parameters of hidden tools so they can be called   | no   | yes  | [hidden tools](#hidden-tools) |
 | `context_notes`  | Reads or replaces the conversation's notebook, which is saved with it                          | no   | yes  | [context management](../concepts.md#context-management) |

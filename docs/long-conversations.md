@@ -100,6 +100,12 @@ stay listed, and a call to one while plan mode is on is refused with a
 message naming the tools that are allowed; it is never run and never asks for
 approval. Outside plan mode `exit_plan_mode` is refused the same way.
 
+The plan the agent submits is kept in its context through all of this: an
+`exit_plan_mode` output is never pruned or shaken out, and a compaction that
+summarizes the part holding the latest plan restates it whole after the
+summary. A plan approved with `fresh` starts a fresh context window seeded
+with the plan, which is never shaken out either. See [plans](concepts.md#plans).
+
 Two settings shape the cache on Claude:
 
 - `cache` (`5m` or `1h`) is how long cached context lives after each request.

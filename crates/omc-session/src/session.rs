@@ -23,7 +23,8 @@ use crate::lifecycle::IDLE_AFTER;
 use crate::permissions::{self, FileKeeper, PermissionsFile};
 use crate::prompt::compose;
 use crate::settings::{
-    CACHE, CHECKPOINTS, EFFORT, MEMORY, MODE, MODEL, Mode, OFF, ON, WARMING, parse_retention,
+    CACHE, CHECKPOINTS, EFFORT, MEMORY, MODE, MODEL, Mode, OFF, ON, PLAN_AUTOSAVE, PLAN_MODEL,
+    WARMING, parse_retention,
 };
 use crate::shared::Shared;
 use crate::turn::{Ended, Job, Turn};
@@ -237,8 +238,14 @@ impl Session {
                 let told = format!("{}{}", context.unwrap_or_default(), compose(&text, &files));
                 self.prompt(told, turn, text, names);
             }
-            Command::Choose { ticket, option } => {
-                self.shared.questions.answer(ticket, option.as_deref());
+            Command::Choose {
+                ticket,
+                option,
+                note,
+            } => {
+                self.shared
+                    .questions
+                    .answer(ticket, option.as_deref(), note.as_deref());
             }
             Command::Answer { ticket, replies } => self.shared.questions.reply(ticket, replies),
             Command::Rename { title } => {
@@ -432,6 +439,7 @@ impl Session {
         self.shared
             .set_memories(memories_for(&directory, conversation.clone()));
         self.shared.open(provider, models, model, mode);
+        self.shared.plans.set_directory(directory.clone());
         let chosen = self
             .journal
             .as_ref()
@@ -998,6 +1006,14 @@ impl Session {
             MEMORY => match value {
                 ON | OFF => {
                     self.shared.set_memory(value == ON);
+                    true
+                }
+                _ => false,
+            },
+            PLAN_MODEL if self.open.is_some() => self.shared.set_plan_model(value),
+            PLAN_AUTOSAVE => match value {
+                ON | OFF => {
+                    self.shared.plans.set_autosave(value == ON);
                     true
                 }
                 _ => false,
