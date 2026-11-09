@@ -2,13 +2,14 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use omc_agent::{Chained, Context, EventSink, Hooks, Models, Scribe, compact, run_turn_steered};
 use omc_auth::AuthError;
 use omc_context::{Discovered, Environment, Locations};
 use omc_extensions::{ExtensionHooks, Prompted};
 use omc_hooks::{Engine, HookEvent, Submitted};
-use omc_providers::Provider;
-use omc_providers::{ChatModel, Message, RemoteModel};
+use omc_providers::{ChatModel, Effort, Message, RemoteModel};
+use omc_providers::{Provider, ProviderError, Reply, Request, Sink};
 use omc_tools::{Deferral, Host, Registry};
 
 use crate::lifecycle::{context_of, start_notice};
@@ -28,6 +29,70 @@ pub(crate) enum Ended {
     SignedOut(String),
     /// It failed for this reason.
     Failed(String),
+}
+
+/// The model a turn sends its requests to while plan mode is on, when the plan model setting names one other than the conversation's.
+pub(crate) struct Planner {
+    /// The model.
+    pub(crate) model: Arc<dyn ChatModel>,
+    /// The provider that serves it.
+    pub(crate) provider: Provider,
+    /// Its id with that provider.
+    pub(crate) id: String,
+    /// How hard it is asked to think; nothing when it does not think.
+    pub(crate) effort: Option<Effort>,
+}
+
+/// A model that sends each request to the plan model while plan mode is on, with that model's effort, and to the conversation's model otherwise, so that a plan approved in the middle of a turn is carried out by the conversation's model.
+struct Switch {
+    /// The conversation's model.
+    main: Arc<dyn ChatModel>,
+    /// The plan model.
+    plan: Arc<dyn ChatModel>,
+    /// How hard the plan model is asked to think.
+    effort: Option<Effort>,
+    /// Whether plan mode is on now.
+    planning: Planning,
+}
+
+impl Switch {
+    /// The model `request` goes to now, and the request as it is sent to it.
+    fn route<'r>(&self, request: Request<'r>) -> (&dyn ChatModel, Request<'r>) {
+        if (self.planning)() {
+            (
+                self.plan.as_ref(),
+                Request {
+                    effort: self.effort,
+                    ..request
+                },
+            )
+        } else {
+            (self.main.as_ref(), request)
+        }
+    }
+}
+
+#[async_trait]
+impl ChatModel for Switch {
+    /// Sends `request` to the model of the mode on now.
+    async fn complete(
+        &self,
+        request: Request<'_>,
+        sink: &mut dyn Sink,
+    ) -> Result<Reply, ProviderError> {
+        let (model, request) = self.route(request);
+        model.complete(request, sink).await
+    }
+
+    /// Sends `request` to the model of the mode on now, asking it to write nothing to its prompt cache.
+    async fn complete_uncached(
+        &self,
+        request: Request<'_>,
+        sink: &mut dyn Sink,
+    ) -> Result<Reply, ProviderError> {
+        let (model, request) = self.route(request);
+        model.complete_uncached(request, sink).await
+    }
 }
 
 /// What a turn is asked to do.
@@ -82,7 +147,36 @@ impl Turn {
             model: self.model.clone(),
             retention: self.shared.retention(),
         };
-        self.run_with(Arc::new(model), job).await
+        let planner = self.planner().await;
+        self.run_planned(Arc::new(model), planner, job).await
+    }
+
+    /// The model the plan model setting names, when plan mode is on and it names one other than the conversation's; when it cannot be used, the client is told why and the conversation's model plans.
+    async fn planner(&self) -> Option<Planner> {
+        let wanted = self
+            .shared
+            .plan_model()
+            .filter(|_| self.shared.mode() == Mode::Plan)?;
+        let picker = SessionPicker {
+            shared: self.shared.clone(),
+            provider: self.provider,
+            effort: self.shared.effort_now(),
+        };
+        match picker.locate(&wanted).await {
+            Ok((provider, id, picked)) => Some(Planner {
+                model: picked.model,
+                provider,
+                id,
+                effort: picked.effort,
+            }),
+            Err(reason) => {
+                self.shared.say(omc_wire::Event::Failed(format!(
+                    "the plan model {wanted} cannot be used, so {} plans: {reason}",
+                    self.model
+                )));
+                None
+            }
+        }
     }
 
     /// The workstation as it is now; in tests, on the date the conversation pins, when it pins one.
@@ -105,11 +199,47 @@ impl Turn {
         environment
     }
 
-    /// Does `job` with `model` and says how it ended; a prompt takes in the prompts the client queued meanwhile at each safe point.
+    /// Does `job` with `model` and says how it ended, as [`Turn::run_planned`] does without a plan model.
+    #[cfg(test)]
+    pub(crate) async fn run_with(self, model: Arc<dyn ChatModel>, job: Job) -> Ended {
+        self.run_planned(model, None, job).await
+    }
+
+    /// Does `job` with `model`, or with `planner` while plan mode is on when there is one, and says how it ended; a prompt takes in the prompts the client queued meanwhile at each safe point. The context window is the smaller of the two models' windows, so that the history fits whichever is asked.
+    ///
+    /// The plan the history says the reader approved is the one subagents are told of while it is carried out.
     ///
     /// Every request of the turn is sent with the conversation's system prompt and tool list, made by its first turn, so that the provider's prompt cache keeps them: a prompt starts with notices of what changed since, among them the context the `SessionStart` hooks gave when the conversation opened or was last compacted, and the tools the mode on now lacks are refused when called. A compaction starts the `SessionStart` hooks again. The last request of the main loop is kept warm.
-    pub(crate) async fn run_with(mut self, model: Arc<dyn ChatModel>, job: Job) -> Ended {
+    pub(crate) async fn run_planned(
+        mut self,
+        model: Arc<dyn ChatModel>,
+        planner: Option<Planner>,
+        job: Job,
+    ) -> Ended {
         let window = omc_providers::context_window(self.provider, &self.model);
+        let window = planner.as_ref().map_or(window, |planner| {
+            window.min(omc_providers::context_window(planner.provider, &planner.id))
+        });
+        self.shared
+            .plans
+            .set_approved(omc_agent::approved_plan(&self.history).as_deref());
+        let shared = self.shared.clone();
+        let planning: Planning = Arc::new(move || shared.mode() == Mode::Plan);
+        let shared = self.shared.clone();
+        let approved_plan: Arc<crate::toolset::PlanSource> = Arc::new(move || {
+            (shared.mode() != Mode::Plan)
+                .then(|| shared.plans.approved())
+                .flatten()
+        });
+        let subagent_model: Arc<dyn ChatModel> = match &planner {
+            Some(planner) => Arc::new(Switch {
+                main: model.clone(),
+                plan: planner.model.clone(),
+                effort: planner.effort,
+                planning: planning.clone(),
+            }),
+            None => model.clone(),
+        };
         let effort = self.shared.effort_now();
         let out = self.shared.out.clone();
         let lifecycle = self.shared.lifecycle.clone();
@@ -147,7 +277,7 @@ impl Turn {
             denied: &self.denied,
             deferral: &Deferral::from_env(),
             host,
-            model: model.clone(),
+            model: subagent_model,
             models: Models {
                 current: self.model.clone(),
                 picker: Some(Arc::new(SessionPicker {
@@ -170,6 +300,7 @@ impl Turn {
             isolation: self.isolation.clone(),
             memories: memories.clone(),
             hooks: checks.clone(),
+            approved_plan,
         });
         let key = Key {
             provider: self.provider,
@@ -187,19 +318,32 @@ impl Turn {
                 unnamed,
             )
         });
-        let shared = self.shared.clone();
-        let planning: Planning = Arc::new(move || shared.mode() == Mode::Plan);
         let registry = prefix.registry(&toolset, &planning);
         let _running = self.shared.warmer.running();
-        let recorder = Recorder {
+        let recorder: Arc<dyn ChatModel> = Arc::new(Recorder {
             inner: model.clone(),
             shared: self.shared.clone(),
             provider: self.provider,
             model: self.model.clone(),
             checkpoints: checkpoint.is_some(),
+        });
+        let asked: Arc<dyn ChatModel> = match planner {
+            Some(planner) => Arc::new(Switch {
+                main: recorder,
+                plan: Arc::new(Recorder {
+                    inner: planner.model,
+                    shared: self.shared.clone(),
+                    provider: planner.provider,
+                    model: planner.id,
+                    checkpoints: checkpoint.is_some(),
+                }),
+                effort: planner.effort,
+                planning: planning.clone(),
+            }),
+            None => recorder,
         };
         let context = Context {
-            model: &recorder,
+            model: asked.as_ref(),
             registry: &registry,
             approvals: &self.shared.approvals,
             system: &prefix.system,
@@ -533,7 +677,7 @@ mod tests {
             }
         };
         assert!(!dir.join("made.txt").exists());
-        shared.questions.answer(ticket, Some("allow"));
+        shared.questions.answer(ticket, Some("allow"), None);
         let Ended::Done(history) = running.await.unwrap() else {
             panic!("turn failed");
         };
@@ -1259,9 +1403,280 @@ mod tests {
         let Some(Event::Ask(asked)) = events.recv().await else {
             panic!("no question");
         };
-        shared.questions.answer(asked.ticket, Some("reject"));
-        assert!(!asking.await.unwrap());
+        shared
+            .questions
+            .answer(asked.ticket, Some("reject"), Some("smaller steps"));
+        assert_eq!(
+            asking.await.unwrap(),
+            omc_tools::PlanVerdict::Refine(Some("smaller steps".into()))
+        );
         assert_eq!(shared.mode(), Mode::Plan);
+        assert_eq!(shared.plans.approved(), None);
+    }
+
+    /// A model that, in plan mode, submits a plan, and once a fresh window opens writes a file and answers, keeping what each request carried.
+    struct FreshPlanner {
+        /// The messages of each request.
+        seen: Mutex<Vec<Vec<Message>>>,
+    }
+
+    #[async_trait]
+    impl ChatModel for FreshPlanner {
+        /// Plans, then writes, then says it is done.
+        async fn complete(
+            &self,
+            request: Request<'_>,
+            _: &mut dyn Sink,
+        ) -> Result<Reply, ProviderError> {
+            let mut seen = self.seen.lock().unwrap();
+            seen.push(request.messages.to_vec());
+            Ok(match seen.len() {
+                1 => calling(
+                    "exit_plan_mode",
+                    json!({"plan": "# Plan\n1. write made.txt"}),
+                ),
+                2 => calling("write", json!({"path": "made.txt", "content": "x"})),
+                _ => Reply {
+                    text: "implemented".into(),
+                    ..Reply::default()
+                },
+            })
+        }
+    }
+
+    /// Approving a plan for a fresh context window carries it out in the same turn, in a window that starts with the plan and the reader's note alone; the plan is saved in the project while autosave is on and becomes the approved one.
+    #[tokio::test]
+    async fn a_plan_approved_for_a_fresh_window_starts_from_the_plan() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/turn-plan-fresh");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (out, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared::new(out);
+        shared.open(Provider::Claude, vec!["m".into()], "m".into(), Mode::Yolo);
+        shared.plans.set_directory(dir.clone());
+        shared.plans.set_autosave(true);
+        shared.set_mode(Mode::Plan);
+        let earlier = vec![
+            Message::User("old question".into()),
+            Message::Assistant(Reply {
+                text: "old answer".into(),
+                ..Reply::default()
+            }),
+        ];
+        let turn = turn_in(&dir, &shared, earlier);
+        let model = Arc::new(FreshPlanner {
+            seen: Mutex::new(Vec::new()),
+        });
+        let running = tokio::spawn(turn.run_with(model.clone(), Job::Prompt("plan it".into())));
+        let ticket = loop {
+            match events.recv().await {
+                Some(Event::Ask(asked)) => break asked.ticket,
+                Some(_) => {}
+                None => panic!("no plan was proposed"),
+            }
+        };
+        shared
+            .questions
+            .answer(ticket, Some("fresh"), Some("keep it short"));
+        let Ended::Done(history) = running.await.unwrap() else {
+            panic!("turn failed");
+        };
+        assert!(dir.join("made.txt").exists());
+        assert_eq!(shared.mode(), Mode::Yolo);
+        let seen = model.seen.lock().unwrap();
+        let Message::User(opening) = &seen[1][0] else {
+            panic!("the fresh window does not start with the plan");
+        };
+        assert_eq!(seen[1].len(), 1);
+        assert_eq!(
+            omc_context::seeded_plan(opening),
+            Some("# Plan\n1. write made.txt")
+        );
+        assert!(opening.contains("keep it short"));
+        assert_eq!(history[0], seen[1][0]);
+        assert_eq!(
+            omc_agent::approved_plan(&history).as_deref(),
+            Some("# Plan\n1. write made.txt")
+        );
+        assert_eq!(
+            shared.plans.approved().as_deref(),
+            Some("# Plan\n1. write made.txt")
+        );
+        let saved = dir.join(".oh-my-crab/plans/plan.md");
+        assert_eq!(
+            std::fs::read_to_string(saved).unwrap(),
+            "# Plan\n1. write made.txt\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A model that answers every request with `reply` and counts the requests and the efforts they were sent with.
+    struct Counting {
+        /// What it answers.
+        reply: fn(usize) -> Reply,
+        /// The effort of each request it was sent.
+        efforts: Mutex<Vec<Option<Effort>>>,
+    }
+
+    #[async_trait]
+    impl ChatModel for Counting {
+        /// Records the request and answers with the reply for its number.
+        async fn complete(
+            &self,
+            request: Request<'_>,
+            _: &mut dyn Sink,
+        ) -> Result<Reply, ProviderError> {
+            let mut efforts = self.efforts.lock().unwrap();
+            efforts.push(request.effort);
+            Ok((self.reply)(efforts.len()))
+        }
+    }
+
+    /// While plan mode is on the plan model is asked, with its own effort, and once the plan is approved in the middle of the turn the conversation's model carries it out.
+    #[tokio::test]
+    async fn the_plan_model_plans_and_the_model_executes() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/turn-plan-model");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (out, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared::new(out);
+        shared.open(Provider::Claude, vec!["m".into()], "m".into(), Mode::Asking);
+        shared.set_mode(Mode::Plan);
+        let planner = Arc::new(Counting {
+            reply: |_| calling("exit_plan_mode", json!({"plan": "# Plan\n1. x"})),
+            efforts: Mutex::new(Vec::new()),
+        });
+        let main = Arc::new(Counting {
+            reply: |_| Reply {
+                text: "implemented".into(),
+                ..Reply::default()
+            },
+            efforts: Mutex::new(Vec::new()),
+        });
+        let turn = turn_in(&dir, &shared, Vec::new());
+        let running = tokio::spawn(turn.run_planned(
+            main.clone(),
+            Some(super::Planner {
+                model: planner.clone(),
+                provider: Provider::Claude,
+                id: "p".into(),
+                effort: Some(Effort::High),
+            }),
+            Job::Prompt("plan it".into()),
+        ));
+        let ticket = loop {
+            match events.recv().await {
+                Some(Event::Ask(asked)) => break asked.ticket,
+                Some(_) => {}
+                None => panic!("no plan was proposed"),
+            }
+        };
+        shared.questions.answer(ticket, Some("allow"), None);
+        let Ended::Done(_) = running.await.unwrap() else {
+            panic!("turn failed");
+        };
+        assert_eq!(*planner.efforts.lock().unwrap(), [Some(Effort::High)]);
+        assert_eq!(main.efforts.lock().unwrap().len(), 1);
+        assert_eq!(shared.mode(), Mode::Asking);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A model that starts one subagent and then answers, and keeps the system prompt each subagent was given.
+    struct Delegating {
+        /// The system prompts of the subagents' requests.
+        subagents: Mutex<Vec<String>>,
+        /// How many requests of the main agent it has seen.
+        main: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl ChatModel for Delegating {
+        /// Answers a subagent at once; has the main agent start one subagent, then answer.
+        async fn complete(
+            &self,
+            request: Request<'_>,
+            _: &mut dyn Sink,
+        ) -> Result<Reply, ProviderError> {
+            if request.system.contains("assigned to you by the main agent") {
+                self.subagents
+                    .lock()
+                    .unwrap()
+                    .push(request.system.to_owned());
+                return Ok(Reply {
+                    text: "step done".into(),
+                    ..Reply::default()
+                });
+            }
+            let mut main = self.main.lock().unwrap();
+            *main += 1;
+            Ok(if *main == 1 {
+                calling("task", json!({"agent": "task", "task": "do step 1"}))
+            } else {
+                Reply {
+                    text: "done".into(),
+                    ..Reply::default()
+                }
+            })
+        }
+    }
+
+    /// Subagents started while an approved plan is carried out are told of the plan in their system prompt; while a new plan is being made they are not.
+    #[tokio::test]
+    async fn subagents_are_told_the_approved_plan() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/turn-plan-subagents");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (out, _events) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared::new(out);
+        shared.open(Provider::Claude, vec!["m".into()], "m".into(), Mode::Yolo);
+        let approved = vec![
+            Message::User("plan it".into()),
+            Message::Assistant(calling(
+                "exit_plan_mode",
+                json!({"plan": "# Plan\n1. the shared step"}),
+            )),
+            Message::ToolResults(vec![omc_providers::ToolResult {
+                call_id: "exit_plan_mode".into(),
+                name: "exit_plan_mode".into(),
+                text: "Plan approved.".into(),
+                is_error: false,
+                images: Vec::new(),
+            }]),
+            Message::Assistant(Reply {
+                text: "planned".into(),
+                ..Reply::default()
+            }),
+        ];
+        for (mode, told) in [(Mode::Yolo, true), (Mode::Plan, false)] {
+            shared.set_mode(mode);
+            let mut turn = turn_in(&dir, &shared, approved.clone());
+            turn.discovered = Arc::new(Discovered {
+                agents: omc_context::builtin_agents(),
+                ..Discovered::default()
+            });
+            let model = Arc::new(Delegating {
+                subagents: Mutex::new(Vec::new()),
+                main: Mutex::new(0),
+            });
+            let Ended::Done(_) = turn
+                .run_with(model.clone(), Job::Prompt("carry on".into()))
+                .await
+            else {
+                panic!("turn failed");
+            };
+            let subagents = model.subagents.lock().unwrap();
+            assert_eq!(subagents.len(), 1);
+            assert_eq!(
+                subagents[0].contains("<parent-plan>")
+                    && subagents[0].contains("1. the shared step"),
+                told,
+                "{mode:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A model that reads a file, edits two lines with the tag it was given, then repeats the edit with that same tag.

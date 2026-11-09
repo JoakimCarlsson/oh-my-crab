@@ -82,6 +82,7 @@ pub fn tools() -> Result<Vec<ToolInfo>, String> {
             .flatten()
             .map(Arc::new),
         hooks: None,
+        approved_plan: Arc::new(|| None),
     });
     let mut listed: Vec<ToolInfo> = Vec::new();
     for plan in [false, true] {

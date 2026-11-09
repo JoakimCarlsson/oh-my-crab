@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use omc_agent::{ApprovalRequest, Decision, Place, Prompter};
+use omc_tools::PlanVerdict;
 use omc_wire::{Choice, Event, Inquiry, Permission, Question, Reply, Verdict};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
@@ -24,8 +25,48 @@ const ALWAYS_PROJECT: &str = "always-project";
 /// The id of the choice that lets a call run and keeps its rules for every conversation in every project.
 const ALWAYS_USER: &str = "always-user";
 
-/// The id of the choice that refuses a call.
+/// The id of the choice that refuses a call; for a plan, the one that keeps the agent planning, minding the note sent with it.
 const REJECT: &str = "reject";
+
+/// The id of the choice that approves a plan to be carried out in a fresh context window that starts from the plan.
+const FRESH: &str = "fresh";
+
+/// The id of the choice that rejects a plan outright, which has the agent stop and wait.
+const DISCARD: &str = "discard";
+
+/// What the reader picked in answer to a question: the id of the choice, or nothing when they declined, and what they wrote along with it.
+#[derive(Debug, Default)]
+struct Picked {
+    /// The id of the choice, or nothing when the question was declined.
+    option: Option<String>,
+    /// What the reader wrote along with it, when they wrote anything.
+    note: Option<String>,
+}
+
+impl Picked {
+    /// The decision about a permission the choice amounts to: refusing for any choice besides the allowing ones.
+    fn decision(&self) -> Decision {
+        match self.option.as_deref() {
+            Some(ALLOW) => Decision::AllowOnce,
+            Some(ALWAYS) => Decision::AllowAlways,
+            Some(ALWAYS_PROJECT) => Decision::AllowAndKeep(Place::Project),
+            Some(ALWAYS_USER) => Decision::AllowAndKeep(Place::User),
+            _ => Decision::Deny,
+        }
+    }
+
+    /// The verdict about a plan the choice amounts to, with the note: any allowing choice approves it in the window it was made in, as a client that only knows `allow` and `reject` expects; a declined question or an unknown choice keeps the agent planning.
+    fn verdict(self) -> PlanVerdict {
+        let allowed = self.decision() != Decision::Deny;
+        let note = self.note.filter(|note| !note.trim().is_empty());
+        match self.option.as_deref() {
+            Some(FRESH) => PlanVerdict::Approved { fresh: true, note },
+            Some(DISCARD) => PlanVerdict::Rejected(note),
+            _ if allowed => PlanVerdict::Approved { fresh: false, note },
+            _ => PlanVerdict::Refine(note),
+        }
+    }
+}
 
 /// The kind of notification the hooks are told when crab asks the reader to allow something.
 const PERMISSION: &str = "permission_prompt";
@@ -38,7 +79,7 @@ pub(crate) struct Questions {
     /// Where the questions go.
     out: UnboundedSender<Event>,
     /// The questions still waiting, by ticket.
-    pending: Mutex<HashMap<u64, oneshot::Sender<Decision>>>,
+    pending: Mutex<HashMap<u64, oneshot::Sender<Picked>>>,
     /// The forms still waiting, by ticket.
     forms: Mutex<HashMap<u64, oneshot::Sender<Vec<Reply>>>>,
     /// The ticket the next question is put under.
@@ -74,16 +115,13 @@ impl Questions {
         }
     }
 
-    /// Answers the question under `ticket` with the choice `option`, or declines it; a ticket nobody waits on is ignored.
-    pub(crate) fn answer(&self, ticket: u64, option: Option<&str>) {
+    /// Answers the question under `ticket` with the choice `option`, or declines it, with `note`, what the reader wrote along with it, which only a plan passes on to the agent; a ticket nobody waits on is ignored.
+    pub(crate) fn answer(&self, ticket: u64, option: Option<&str>, note: Option<&str>) {
         let waiting = self.pending.lock().ok().and_then(|mut p| p.remove(&ticket));
         if let Some(waiting) = waiting {
-            let _ = waiting.send(match option {
-                Some(ALLOW) => Decision::AllowOnce,
-                Some(ALWAYS) => Decision::AllowAlways,
-                Some(ALWAYS_PROJECT) => Decision::AllowAndKeep(Place::Project),
-                Some(ALWAYS_USER) => Decision::AllowAndKeep(Place::User),
-                _ => Decision::Deny,
+            let _ = waiting.send(Picked {
+                option: option.map(str::to_owned),
+                note: note.map(str::to_owned),
             });
         }
     }
@@ -112,36 +150,30 @@ impl Questions {
         answer.await.ok()
     }
 
-    /// Puts `plan` to the client for approval and waits; whether it was approved.
-    pub(crate) async fn propose(&self, plan: &str) -> bool {
+    /// Puts `plan` to the client for approval and waits; what the reader decided, with what they wrote along with it. A question that cannot be put, or that is declined, keeps the agent planning.
+    pub(crate) async fn propose(&self, plan: &str) -> PlanVerdict {
         let ticket = self.next.fetch_add(1, Ordering::Relaxed);
         let (reply, answer) = oneshot::channel();
         match self.pending.lock() {
             Ok(mut pending) => pending.insert(ticket, reply),
-            Err(_) => return false,
+            Err(_) => return PlanVerdict::Refine(None),
         };
         let asked = Event::Ask(Permission {
             ticket,
             title: "Plan ready for review".to_owned(),
             command: None,
             plan: Some(plan.to_owned()),
-            choices: vec![
-                choice(ALLOW, "Approve and start", Verdict::Allow),
-                choice(REJECT, "Keep planning", Verdict::Reject),
-            ],
+            choices: plan_choices(),
         });
         if self.out.send(asked).is_err() {
-            return false;
+            return PlanVerdict::Refine(None);
         }
         self.notify(
             PERMISSION,
             "Plan ready for review",
             "crab has a plan ready for your review",
         );
-        matches!(
-            answer.await,
-            Ok(Decision::AllowOnce | Decision::AllowAlways | Decision::AllowAndKeep(_))
-        )
+        answer.await.unwrap_or_default().verdict()
     }
 
     /// Declines every question and abandons every form still waiting.
@@ -181,8 +213,24 @@ impl Prompter for Questions {
             "Permission needed",
             &format!("crab needs your permission to use {}", request.tool),
         );
-        answer.await.unwrap_or(Decision::Deny)
+        answer
+            .await
+            .map_or(Decision::Deny, |picked| picked.decision())
     }
+}
+
+/// The answers a plan offers: carrying it out in the window it was made in, which a client that only knows `allow` takes, carrying it out in a fresh context window, sending it back to be revised with the note the reader writes, which a client that only knows `reject` takes, and rejecting it outright.
+fn plan_choices() -> Vec<Choice> {
+    vec![
+        choice(ALLOW, "Approve and execute", Verdict::Allow),
+        choice(
+            FRESH,
+            "Approve and execute in a fresh context",
+            Verdict::Allow,
+        ),
+        choice(REJECT, "Keep planning", Verdict::Reject),
+        choice(DISCARD, "Reject the plan", Verdict::Reject),
+    ]
 }
 
 /// The first line of `text`.
@@ -262,7 +310,7 @@ mod tests {
         let Some(Event::Ask(asked)) = seen.recv().await else {
             panic!("no question");
         };
-        questions.answer(asked.ticket, Some(ALWAYS));
+        questions.answer(asked.ticket, Some(ALWAYS), None);
         assert_eq!(asking.await.unwrap(), Decision::AllowAlways);
     }
 
@@ -313,7 +361,7 @@ mod tests {
                     (REJECT, "Reject"),
                 ]
             );
-            questions.answer(asked.ticket, Some(option));
+            questions.answer(asked.ticket, Some(option), None);
             assert_eq!(asking.await.unwrap(), decision);
         }
     }
@@ -362,7 +410,7 @@ mod tests {
         };
         assert_eq!(asked.title, "ast_edit: f($X) → g($X)");
         assert_eq!(asked.command.as_deref(), Some(summary));
-        questions.answer(asked.ticket, None);
+        questions.answer(asked.ticket, None, None);
         assert_eq!(asking.await.unwrap(), Decision::Deny);
     }
 
@@ -414,12 +462,46 @@ mod tests {
         assert_eq!(asking.await.unwrap(), None);
     }
 
-    /// A plan is shown in a permission question and the choice decides.
+    /// A plan is shown in a permission question offering four choices, each of which, with the note sent along, decides the verdict; `allow` and `reject` mean what they meant before there were more, and a declined question keeps the agent planning.
     #[tokio::test]
-    async fn plans_are_approved_or_rejected() {
+    async fn plans_are_approved_sent_back_or_rejected() {
         let (out, mut seen) = tokio::sync::mpsc::unbounded_channel();
         let questions = std::sync::Arc::new(Questions::new(out));
-        for (option, approved) in [(ALLOW, true), (REJECT, false)] {
+        let note = || Some("mind the tests".to_owned());
+        for (option, sent, verdict) in [
+            (
+                Some(ALLOW),
+                None,
+                PlanVerdict::Approved {
+                    fresh: false,
+                    note: None,
+                },
+            ),
+            (
+                Some(FRESH),
+                Some("mind the tests"),
+                PlanVerdict::Approved {
+                    fresh: true,
+                    note: note(),
+                },
+            ),
+            (
+                Some(REJECT),
+                Some("mind the tests"),
+                PlanVerdict::Refine(note()),
+            ),
+            (Some(REJECT), Some("  "), PlanVerdict::Refine(None)),
+            (Some(DISCARD), None, PlanVerdict::Rejected(None)),
+            (None, None, PlanVerdict::Refine(None)),
+            (
+                Some(ALWAYS),
+                None,
+                PlanVerdict::Approved {
+                    fresh: false,
+                    note: None,
+                },
+            ),
+        ] {
             let asking = {
                 let questions = questions.clone();
                 tokio::spawn(async move { questions.propose("the plan").await })
@@ -428,10 +510,48 @@ mod tests {
                 panic!("no question");
             };
             assert_eq!(asked.plan.as_deref(), Some("the plan"));
-            assert_eq!(asked.choices.len(), 2);
-            questions.answer(asked.ticket, Some(option));
-            assert_eq!(asking.await.unwrap(), approved);
+            let offered: Vec<(&str, Verdict)> = asked
+                .choices
+                .iter()
+                .map(|choice| (choice.id.as_str(), choice.verdict))
+                .collect();
+            assert_eq!(
+                offered,
+                [
+                    (ALLOW, Verdict::Allow),
+                    (FRESH, Verdict::Allow),
+                    (REJECT, Verdict::Reject),
+                    (DISCARD, Verdict::Reject),
+                ]
+            );
+            questions.answer(asked.ticket, option, sent);
+            assert_eq!(asking.await.unwrap(), verdict);
         }
+    }
+
+    /// A note sent with an answer to a permission question changes nothing about the decision.
+    #[tokio::test]
+    async fn a_note_leaves_a_permission_alone() {
+        let (out, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let questions = std::sync::Arc::new(Questions::new(out));
+        let asking = {
+            let questions = questions.clone();
+            tokio::spawn(async move {
+                questions
+                    .ask(&ApprovalRequest {
+                        tool: "bash".into(),
+                        scope: "bash".into(),
+                        summary: "ls".into(),
+                        ..ApprovalRequest::default()
+                    })
+                    .await
+            })
+        };
+        let Some(Event::Ask(asked)) = seen.recv().await else {
+            panic!("no question");
+        };
+        questions.answer(asked.ticket, Some(FRESH), Some("why"));
+        assert_eq!(asking.await.unwrap(), Decision::Deny);
     }
 
     /// A permission question tells the `Notification` hooks that crab needs the reader's permission, naming the tool.
@@ -487,7 +607,7 @@ mod tests {
         let note: serde_json::Value = serde_json::from_str(&note).unwrap();
         assert_eq!(note["notification_type"], "permission_prompt");
         assert_eq!(note["message"], "crab needs your permission to use bash");
-        questions.answer(asked.ticket, Some(REJECT));
+        questions.answer(asked.ticket, Some(REJECT), None);
         assert_eq!(asking.await.unwrap(), Decision::Deny);
         let _ = std::fs::remove_dir_all(&dir);
     }

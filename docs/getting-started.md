@@ -103,7 +103,7 @@ line on standard output. Open the conversation:
 
 ```json
 > {"Open":{"directory":"/path/to/hello","provider":"claude","model":null,"yolo":false,"conversation":"first-chat"}}
-< {"Settings":[{"id":"model","category":"model","name":"Model","current":"claude-haiku-5-5","picks":[…]},{"id":"mode","category":"mode","name":"Mode","current":"default","picks":[{"value":"default","name":"Ask",…},{"value":"yolo","name":"Run freely",…},{"value":"plan","name":"Plan",…}]},{"id":"effort",…},{"id":"cache",…},{"id":"cache_warming",…},{"id":"memory",…},{"id":"checkpoints",…}]}
+< {"Settings":[{"id":"model","category":"model","name":"Model","current":"claude-haiku-5-5","picks":[…]},{"id":"mode","category":"mode","name":"Mode","current":"default","picks":[{"value":"default","name":"Ask",…},{"value":"yolo","name":"Run freely",…},{"value":"plan","name":"Plan",…}]},{"id":"effort",…},{"id":"cache",…},{"id":"cache_warming",…},{"id":"memory",…},{"id":"plan_model",…},{"id":"plan_autosave",…},{"id":"checkpoints",…}]}
 < {"Commands":[{"name":"compact","description":"Summarize the older part of the conversation to free up context; …"},…]}
 < {"Resumed":{"title":null,"settings":[],"turns":[],"offered":[…],"commands":[…],"window":1000000}}
 < {"Trust":{"ticket":1,"root":"/path/to/hello","standing":"Unknown","skipped":[{"kind":"Instruction","name":"/path/to/hello/AGENTS.md","path":"/path/to/hello/AGENTS.md"}]}}
@@ -223,14 +223,23 @@ them:
 < {"Started":"Thinking"}
 …
 < {"Tool":{"id":"toolu_01XsCGhgB92oGsMdZuHkfF8f","title":"exit_plan_mode","kind":"Other","state":"Running","target":"Context",…}}
-< {"Ask":{"ticket":1,"title":"Plan ready for review","command":null,"plan":"## Context\n\n`greet.py` currently only defines `greet(name)`, …","choices":[{"id":"allow","name":"Approve and start","verdict":"Allow"},{"id":"reject","name":"Keep planning","verdict":"Reject"}]}}
+< {"Ask":{"ticket":1,"title":"Plan ready for review","command":null,"plan":"## Context\n\n`greet.py` currently only defines `greet(name)`, …","choices":[{"id":"allow","name":"Approve and execute","verdict":"Allow"},{"id":"fresh","name":"Approve and execute in a fresh context","verdict":"Allow"},{"id":"reject","name":"Keep planning","verdict":"Reject"},{"id":"discard","name":"Reject the plan","verdict":"Reject"}]}}
 ```
 
 In plan mode the agent can read, search and ask, but a call to a tool that
 changes things is refused without running. It finishes by handing its plan to
-`exit_plan_mode`, which you see as an `Ask` with a `plan`. Approving it ends
-plan mode and returns to the mode before it, here `default`, and the agent
-starts on the plan in the same turn:
+`exit_plan_mode`, which you see as an `Ask` with a `plan`. `reject` ("Keep
+planning") sends it back to be revised, and a `note` sent with the choice
+says what should change:
+
+```json
+> {"Choose":{"ticket":1,"option":"reject","note":"Keep the default greeting when --name is missing."}}
+```
+
+`fresh` approves it to be carried out in a fresh context window that starts
+from the plan alone, and `discard` rejects it outright. Approving it with
+`allow` ends plan mode and returns to the mode before it, here `default`, and
+the agent starts on the plan in the same turn:
 
 ```json
 > {"Choose":{"ticket":1,"option":"allow"}}

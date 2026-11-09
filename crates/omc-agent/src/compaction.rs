@@ -11,7 +11,7 @@ use omc_providers::{
 
 use crate::AgentEvent;
 use crate::recall::RECALL;
-use crate::{recovery, todos};
+use crate::{plans, recovery, todos};
 
 /// The fewest tokens kept free below the context window for the next request and its reply, on a window large enough to spare them.
 const RESERVE_TOKENS: u64 = 16_384;
@@ -71,6 +71,10 @@ pub fn context(history: &[Message]) -> Cow<'_, [Message]> {
     let mut messages: Vec<Message> = compacted
         .map(|(_, compaction)| {
             let mut text = summary_message(compaction);
+            if let Some(plan) = plans::restated(history, compaction.first_kept) {
+                text.push_str("\n\n");
+                text.push_str(&plan);
+            }
             if let Some(todos) = todos::restated(history, compaction.first_kept) {
                 text.push_str("\n\n");
                 text.push_str(&todos);

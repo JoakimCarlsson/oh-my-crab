@@ -120,20 +120,70 @@ The `mode` setting says how much the agent asks:
 - **`plan`** only looks. A call to a tool that changes things is refused
   without running and without asking, with a message naming the tools that
   are allowed. The agent ends by handing its plan to `exit_plan_mode`, which
-  the reader sees as an `Ask` with a `plan`: "Approve and start" ends plan
-  mode, returning to the mode it began in, and the agent carries on in the
-  same turn; "Keep planning" keeps it in plan mode.
+  the reader sees as an `Ask` with a `plan` (see [plans](#plans)).
+  "Approve and execute" ends plan mode, returning to the mode it began in,
+  and the agent carries on in the same turn; "Approve and execute in a fresh
+  context" does the same in a fresh context window that holds only the plan;
+  "Keep planning" keeps it in plan mode, passing on what the reader wrote;
+  "Reject the plan" keeps it in plan mode and has the agent stop.
 - **`yolo`** ("Run freely") runs everything without asking, except what a
   deny rule stops.
 
 `"yolo": true` in `Open` starts in yolo mode. The [tool index](tools/README.md)
 marks which tools plan mode allows.
 
+## Plans
+
+The agent submits its plan whole, as markdown, each time it calls
+`exit_plan_mode`; a revision is a new submission, never a diff. The reader
+answers the `Ask` with one of four choices, and may send a `note` with any of
+them, which the agent is told:
+
+| Choice    | Verdict  | What happens                                                                                                     |
+| --------- | -------- | ---------------------------------------------------------------------------------------------------------------- |
+| `allow`   | `Allow`  | Plan mode ends and the agent carries the plan out in the same turn, in the context it planned in.               |
+| `fresh`   | `Allow`  | Plan mode ends, and once the batch of calls the approval is in ends, a fresh context window opens that starts with the plan, the note and the notebook, as `new_context` does; the planning conversation stays in the history but the model no longer sees it. |
+| `reject`  | `Reject` | Plan mode goes on; the agent revises the plan, minding the note, and submits it again.                           |
+| `discard` | `Reject` | Plan mode goes on; the agent is told the plan is rejected and ends its turn to wait for the reader.            |
+
+A client that only knows `allow` and `reject` keeps working: they mean what
+they always meant, and any other allowing choice approves the plan as `allow`
+does.
+
+Every submitted plan is saved as markdown beside the conversation's history,
+in `<id>.plans/plan-<n>.md`, numbered in the order they were submitted, when
+the conversation is saved. With the `plan_autosave` setting on, it is also
+saved in the project, as `.oh-my-crab/plans/<title>.md` under the working
+folder, a plan of the same title replacing the earlier one; `OMC_PLANS_DIR`
+names another folder.
+
+The plan lives in the history itself, as the `exit_plan_mode` call that
+submitted it or the first message of the fresh window opened for it, so a
+reopened conversation and every [branch](#branches) keep the plan they hold.
+That plan is never left out of the context to make room: the output of an
+`exit_plan_mode` call is never pruned or shaken out, nor is the first message
+of a fresh window opened for a plan, and when a compaction summarizes the part
+that holds the latest plan, the plan is restated whole after the summary,
+marked approved or not.
+
+While an approved plan is being carried out, every subagent `task` starts is
+told of it in its system prompt, so it does its part as the plan describes it.
+Subagents started in plan mode, while a new plan is made, are not.
+
+The `plan_model` setting picks a model to plan with: while plan mode is on,
+every request, and every subagent's, goes to that model, and once the plan is
+approved, even in the middle of a turn, the conversation's `model` carries it
+out. It takes a model of the conversation's provider, or of another signed-in
+provider as `provider/model`; `same`, the default, plans with `model`. When
+the plan model cannot be used, the client is told with a `Failed` event and
+`model` plans.
+
 ## Settings
 
 A `Settings` event lists what the client can change, with the value each has
 now: `model`, `mode`, `effort` (when the model takes one), `cache` and
-`cache_warming` (when the provider offers them), `memory` and `checkpoints`.
+`cache_warming` (when the provider offers them), `memory`, `plan_model`,
+`plan_autosave` and `checkpoints`.
 The client changes one with `Set`, and `crab` answers with a new `Settings`
 event. A new value applies from the next request.
 

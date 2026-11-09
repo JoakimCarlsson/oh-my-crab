@@ -6,16 +6,17 @@ use async_trait::async_trait;
 use omc_agent::Approvals;
 use omc_providers::Effort;
 use omc_providers::{Provider, Retention};
-use omc_tools::{Checkpoint, Host, Jobs, LanguageService, Languages, Notebook};
+use omc_tools::{Checkpoint, Host, Jobs, LanguageService, Languages, Notebook, PlanVerdict};
 use omc_wire::{Event, PlanStep, Question, Reply};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::bridge::Questions;
 use crate::languages::ClientLanguages;
 use crate::lifecycle::Lifecycle;
+use crate::plans::Plans;
 use crate::prefix::{Key, Prefix};
 use crate::queue::Queue;
-use crate::settings::{Mode, Offer, default_effort, offered};
+use crate::settings::{Mode, Offer, SAME, default_effort, offered};
 use crate::warmer::Warmer;
 
 /// What can be set, and how it stands.
@@ -28,6 +29,8 @@ struct State {
     models: Vec<String>,
     /// The model in use.
     model: String,
+    /// The model used while plan mode is on, when it is another than `model`.
+    plan_model: Option<String>,
     /// The mode in use.
     mode: Mode,
     /// The mode that returns when plan mode ends.
@@ -60,6 +63,8 @@ pub(crate) struct Shared {
     pub(crate) notebook: Arc<Notebook>,
     /// The checkpoint the agent marks, and its request to rewind to it.
     pub(crate) checkpoint: Arc<Checkpoint>,
+    /// The plans the agent submitted: where they are saved, and the one the reader approved.
+    pub(crate) plans: Arc<Plans>,
     /// The commands and subagents running in the background.
     pub(crate) jobs: Arc<Jobs>,
     /// The seats subagents take to run, shared by every level of subagents and every turn, so that only so many run at once.
@@ -132,6 +137,7 @@ impl Shared {
             lifecycle,
             notebook: Arc::new(Notebook::new()),
             checkpoint: Arc::new(Checkpoint::new()),
+            plans: Arc::new(Plans::default()),
             jobs: Arc::new(Jobs::new(move |run| {
                 let _ = announce.send(Event::Background(run));
             })),
@@ -144,6 +150,7 @@ impl Shared {
                 provider: None,
                 models: Vec::new(),
                 model: String::new(),
+                plan_model: None,
                 mode: Mode::Asking,
                 resume: Mode::Asking,
                 effort: None,
@@ -322,9 +329,12 @@ impl Shared {
             state.provider = Some(provider);
             state.models = models;
             state.model = model;
+            state.plan_model = None;
             state.mode = mode;
             state.resume = mode;
         });
+        self.plans.set_approved(None);
+        self.plans.set_autosave(false);
         self.approvals.set_yolo(mode == Mode::Yolo);
     }
 
@@ -336,6 +346,8 @@ impl Shared {
             Some(offered(&Offer {
                 models: &state.models,
                 model: &state.model,
+                plan_model: state.plan_model.as_deref(),
+                autosave: self.plans.autosave(),
                 mode: state.mode,
                 efforts: &efforts,
                 effort: state.effort,
@@ -393,6 +405,39 @@ impl Shared {
                 .provider
                 .map(|provider| (provider, state.model.clone()))
         })
+    }
+
+    /// The model used while plan mode is on, when one other than the model in use is set.
+    pub(crate) fn plan_model(&self) -> Option<String> {
+        self.state(|state| {
+            state
+                .plan_model
+                .clone()
+                .filter(|planner| *planner != state.model)
+        })
+    }
+
+    /// Uses `value` while plan mode is on from the next request, or the model in use when it is [`SAME`] or empty; whether it was taken, which it always is. Another model stops warming the last request when plan mode is on, since the next one goes to the new model.
+    pub(crate) fn set_plan_model(&self, value: &str) -> bool {
+        let value = value.trim();
+        let wanted = (!value.is_empty() && value != SAME).then(|| value.to_owned());
+        let changed = self.state(|state| {
+            let changed = state.plan_model != wanted;
+            state.plan_model = wanted;
+            changed && state.mode == Mode::Plan
+        });
+        if changed {
+            self.warmer.stop();
+        }
+        true
+    }
+
+    /// Saves `plan`, as the agent submitted it, beside the conversation's history when it is saved and in the project when autosave is on, and tells the client when it could not be saved.
+    pub(crate) fn save_plan(&self, plan: &str) {
+        let history = self.journal().map(|journal| journal.path().to_path_buf());
+        if let Err(error) = self.plans.save(plan, history.as_deref()) {
+            self.say(Event::Failed(error));
+        }
     }
 
     /// The models the provider listed when the conversation was opened, best first.
@@ -528,13 +573,15 @@ impl Host for SessionHost {
         self.shared.questions.inquire(questions).await
     }
 
-    /// Puts the plan to the client; when it is approved, plan mode ends and the settings are announced.
-    async fn approve_plan(&self, plan: &str) -> bool {
-        let approved = self.shared.questions.propose(plan).await;
-        if approved {
+    /// Saves the plan and puts it to the client; when it is approved, it becomes the plan subagents are told of, plan mode ends and the settings are announced.
+    async fn approve_plan(&self, plan: &str) -> PlanVerdict {
+        self.shared.save_plan(plan);
+        let verdict = self.shared.questions.propose(plan).await;
+        if verdict.approved() {
+            self.shared.plans.set_approved(Some(plan.trim()));
             self.shared.leave_plan();
         }
-        approved
+        verdict
     }
 }
 
@@ -706,6 +753,52 @@ mod tests {
             settings.iter().find(|s| s.id == "mode").unwrap().current,
             "yolo"
         );
+    }
+
+    /// The plan model is used only when it is another than the model in use, `same` clears it, and opening the conversation again forgets it.
+    #[tokio::test]
+    async fn the_plan_model_is_another_model_or_none() {
+        let (shared, mut events) = opened();
+        assert_eq!(shared.plan_model(), None);
+        assert!(shared.set_plan_model("n"));
+        assert_eq!(shared.plan_model().as_deref(), Some("n"));
+        shared.announce();
+        let settings = announced(&mut events);
+        let setting = settings.iter().find(|s| s.id == "plan_model").unwrap();
+        assert_eq!(setting.current, "n");
+        shared.set_model("n");
+        assert_eq!(shared.plan_model(), None);
+        shared.set_model("m");
+        shared.set_mode(Mode::Plan);
+        shared.warmer.arm();
+        assert!(shared.set_plan_model("same"));
+        assert!(!shared.warmer.armed());
+        assert_eq!(shared.plan_model(), None);
+        shared.set_plan_model("n");
+        shared.open(Provider::Claude, Vec::new(), "m".into(), Mode::Asking);
+        assert_eq!(shared.plan_model(), None);
+    }
+
+    /// A submitted plan is saved beside the conversation's history, numbered.
+    #[test]
+    fn plans_are_saved_with_the_conversation() {
+        let folder = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/shared-plans");
+        let _ = std::fs::remove_dir_all(&folder);
+        let (shared, _events) = opened();
+        shared.save_plan("# Unsaved");
+        let (journal, _) = omc_agent::Journal::open(&folder.join("c.jsonl"), None).unwrap();
+        shared.attach(Some(journal));
+        shared.save_plan("# One");
+        shared.save_plan("# Two");
+        let plans = folder.join("c.plans");
+        assert_eq!(
+            std::fs::read_to_string(plans.join("plan-2.md")).unwrap(),
+            "# Two\n"
+        );
+        assert!(!plans.join("plan-3.md").exists());
+        shared.attach(None);
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     /// The agent names an unnamed conversation once and the reader's name replaces it; both are saved and told to the client.

@@ -41,7 +41,18 @@ its model's default: medium when it offers that, else its lightest.
 
 A subagent's system prompt names the model it asks. Its own model requests do
 not count towards the conversation's context use: its `Used` events are not
-sent, whichever model it asks.
+sent, whichever model it asks. In plan mode, a subagent that would ask the
+main agent's model asks the `plan_model` instead, when one is set.
+
+## The approved plan
+
+While the main agent carries out a plan the reader approved, every subagent
+it starts, at every level, gets the plan at the end of its system prompt, in
+a `<parent-plan>` block that tells it its assignment is one part of that plan.
+The plan is the latest approved one in the conversation's history, so it
+follows a reopened conversation and the branch it is on. Subagents started in
+plan mode, while a new plan is made, get none. See
+[plans](../concepts.md#plans).
 
 ## Nesting
 

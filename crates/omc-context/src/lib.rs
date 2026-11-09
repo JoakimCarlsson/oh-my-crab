@@ -27,7 +27,8 @@ pub use environment::{Environment, timestamp};
 pub use frontmatter::{Parsed, parse as parse_frontmatter};
 pub use instructions::Instruction;
 pub use invoke::{
-    expand_skill, plan_approved, plan_rejected, skill_invocation, subagent_assignment,
+    expand_skill, plan_abandoned, plan_approved, plan_approved_fresh, plan_fresh, plan_rejected,
+    seeded_plan, skill_invocation, subagent_assignment, subagent_plan,
 };
 pub use notices::{Notice, context_changes, environment_reminder, memory_notice, plan_mode_notice};
 pub use origin::Origin;

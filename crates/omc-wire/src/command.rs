@@ -81,6 +81,9 @@ pub enum Command {
         ticket: u64,
         /// The choice made, or nothing to decline.
         option: Option<String>,
+        /// What the reader wrote along with the choice, which the agent is told; only a plan's choices pass it on, and a client that never sends it leaves it out.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
     /// Answers the form under `ticket` with `replies`, or abandons it.
     Answer {
@@ -146,6 +149,30 @@ mod tests {
         assert_eq!(opening.conversation, None);
         assert_eq!(opening.history, None);
         assert_eq!(opening.keep, None);
+    }
+
+    /// A choice without a note, as a client written before notes sends it, still reads, and one with a note keeps it through a trip through a line.
+    #[test]
+    fn a_choice_reads_with_or_without_a_note() {
+        let bare: Command = crate::decode(r#"{"Choose":{"ticket":1,"option":"allow"}}"#).unwrap();
+        assert_eq!(
+            bare,
+            Command::Choose {
+                ticket: 1,
+                option: Some("allow".to_owned()),
+                note: None
+            }
+        );
+        assert!(!crate::encode(&bare).unwrap().contains("note"));
+        let noted = Command::Choose {
+            ticket: 2,
+            option: Some("reject".to_owned()),
+            note: Some("split step 2".to_owned()),
+        };
+        assert_eq!(
+            crate::decode::<Command>(&crate::encode(&noted).unwrap()).unwrap(),
+            noted
+        );
     }
 
     /// A trust answer and a trust request each survive a trip through a line, in the shape a client writes and reads.

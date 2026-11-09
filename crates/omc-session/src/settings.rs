@@ -6,6 +6,15 @@ use omc_wire::{Pick, Setting};
 /// The id of the setting that picks the model.
 pub(crate) const MODEL: &str = "model";
 
+/// The id of the setting that picks the model used while plan mode is on.
+pub(crate) const PLAN_MODEL: &str = "plan_model";
+
+/// The value of the plan model setting that plans with the model in use.
+pub(crate) const SAME: &str = "same";
+
+/// The id of the setting that turns saving each plan in the project too on or off; it takes [`ON`] and [`OFF`].
+pub(crate) const PLAN_AUTOSAVE: &str = "plan_autosave";
+
 /// The id of the setting that picks how much the agent asks before acting.
 pub(crate) const MODE: &str = "mode";
 
@@ -89,6 +98,10 @@ pub(crate) struct Offer<'a> {
     pub(crate) models: &'a [String],
     /// The model in use.
     pub(crate) model: &'a str,
+    /// The model used while plan mode is on, when one is set.
+    pub(crate) plan_model: Option<&'a str>,
+    /// Whether each plan is saved in the project too.
+    pub(crate) autosave: bool,
     /// The mode in use.
     pub(crate) mode: Mode,
     /// The effort levels the model in use accepts.
@@ -119,6 +132,15 @@ pub(crate) fn offered(offer: &Offer<'_>) -> Vec<Setting> {
     if !names.contains(&offer.model) {
         names.insert(0, offer.model);
     }
+    let mut planners = vec![pick(
+        SAME,
+        "Same as the model",
+        "Plan with the model in use",
+    )];
+    if let Some(planner) = offer.plan_model.filter(|planner| !names.contains(planner)) {
+        planners.push(pick(planner, planner, ""));
+    }
+    planners.extend(names.iter().map(|name| pick(name, name, "")));
     let mut settings = vec![
         Setting {
             id: MODEL.to_owned(),
@@ -222,6 +244,31 @@ pub(crate) fn offered(offer: &Offer<'_>) -> Vec<Setting> {
         });
     }
     settings.push(Setting {
+        id: PLAN_MODEL.to_owned(),
+        category: PLAN_MODEL.to_owned(),
+        name: "Plan model".to_owned(),
+        current: offer.plan_model.unwrap_or(SAME).to_owned(),
+        picks: planners,
+    });
+    settings.push(Setting {
+        id: PLAN_AUTOSAVE.to_owned(),
+        category: PLAN_AUTOSAVE.to_owned(),
+        name: "Save plans in the project".to_owned(),
+        current: if offer.autosave { ON } else { OFF }.to_owned(),
+        picks: vec![
+            pick(
+                OFF,
+                "Off",
+                "Plans are saved with the conversation only",
+            ),
+            pick(
+                ON,
+                "On",
+                "Each plan is also saved as markdown in the project, under .oh-my-crab/plans unless OMC_PLANS_DIR names another folder",
+            ),
+        ],
+    });
+    settings.push(Setting {
         id: CHECKPOINTS.to_owned(),
         category: CHECKPOINTS.to_owned(),
         name: "Checkpoints".to_owned(),
@@ -266,6 +313,8 @@ mod tests {
         Offer {
             models,
             model: "b",
+            plan_model: None,
+            autosave: false,
             mode: Mode::Asking,
             efforts,
             effort,
@@ -294,6 +343,8 @@ mod tests {
                 "cache",
                 "cache_warming",
                 "memory",
+                "plan_model",
+                "plan_autosave",
                 "checkpoints"
             ]
         );
@@ -321,7 +372,7 @@ mod tests {
     /// Effort is hidden when the model takes none, and otherwise falls back to medium.
     #[test]
     fn effort_follows_the_model() {
-        assert_eq!(offered(&offer(&[], &[], None)).len(), 3);
+        assert_eq!(offered(&offer(&[], &[], None)).len(), 5);
         let settings = offered(&offer(&[], &Effort::ALL, None));
         let effort = &settings[2];
         assert_eq!(
@@ -334,6 +385,33 @@ mod tests {
         assert_eq!(picked[2].current, "high");
         let narrowed = offered(&offer(&[], &[Effort::Low, Effort::High], Some(Effort::Max)));
         assert_eq!(narrowed[2].current, "low");
+    }
+
+    /// The plan model plans with the model in use until another is picked, offers every model and one picked that was not listed, and autosave is off until it is turned on.
+    #[test]
+    fn plan_settings_default_to_the_model_and_off() {
+        let models = ["a".to_owned(), "b".to_owned()];
+        let mut offer = offer(&models, &[], None);
+        let settings = offered(&offer);
+        let find = |settings: &[Setting], id: &str| {
+            settings
+                .iter()
+                .find(|setting| setting.id == id)
+                .cloned()
+                .unwrap()
+        };
+        let planner = find(&settings, PLAN_MODEL);
+        assert_eq!(planner.current, SAME);
+        let values: Vec<&str> = planner.picks.iter().map(|p| p.value.as_str()).collect();
+        assert_eq!(values, [SAME, "a", "b"]);
+        assert_eq!(find(&settings, PLAN_AUTOSAVE).current, OFF);
+        offer.plan_model = Some("other/big");
+        offer.autosave = true;
+        let settings = offered(&offer);
+        let planner = find(&settings, PLAN_MODEL);
+        assert_eq!(planner.current, "other/big");
+        assert_eq!(planner.picks[1].value, "other/big");
+        assert_eq!(find(&settings, PLAN_AUTOSAVE).current, ON);
     }
 
     /// The checkpoints setting is last, off unless it was turned on.

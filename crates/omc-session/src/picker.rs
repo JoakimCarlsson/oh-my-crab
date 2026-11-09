@@ -33,6 +33,17 @@ impl ModelPicker for SessionPicker {
     ///
     /// Fails, saying why, when no model of the provider matches, the other provider is not signed in, or its models cannot be listed.
     async fn pick(&self, wanted: &str) -> Result<Picked, String> {
+        self.locate(wanted).await.map(|(_, _, picked)| picked)
+    }
+}
+
+impl SessionPicker {
+    /// The model `wanted` names, as [`ModelPicker::pick`] finds it, with the provider that serves it and its id there.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`ModelPicker::pick`].
+    pub(crate) async fn locate(&self, wanted: &str) -> Result<(Provider, String, Picked), String> {
         let wanted = wanted.trim();
         let listed = self.shared.models_listed();
         let exact = listed.iter().any(|id| id.eq_ignore_ascii_case(wanted));
@@ -59,11 +70,11 @@ impl ModelPicker for SessionPicker {
         } else {
             format!("{}/{id}", provider.def().id)
         };
-        Ok(Picked {
+        let picked = Picked {
             model: Arc::new(RemoteModel {
                 provider,
                 credentials,
-                model: id,
+                model: id.clone(),
                 retention: if same {
                     self.shared.retention()
                 } else {
@@ -72,11 +83,10 @@ impl ModelPicker for SessionPicker {
             }),
             name,
             effort,
-        })
+        };
+        Ok((provider, id, picked))
     }
-}
 
-impl SessionPicker {
     /// The id `rest` names among the models of `provider`, another provider than the conversation's, which are listed for it.
     ///
     /// # Errors

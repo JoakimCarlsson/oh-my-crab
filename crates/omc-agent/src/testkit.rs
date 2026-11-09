@@ -151,9 +151,16 @@ impl Host for Reader {
         true
     }
 
-    /// Answers with the scripted verdict.
-    async fn approve_plan(&self, _plan: &str) -> bool {
-        *self.approve.lock().unwrap()
+    /// Answers with the scripted verdict: approved, in the window the plan was made in, or sent back.
+    async fn approve_plan(&self, _plan: &str) -> omc_tools::PlanVerdict {
+        if *self.approve.lock().unwrap() {
+            omc_tools::PlanVerdict::Approved {
+                fresh: false,
+                note: None,
+            }
+        } else {
+            omc_tools::PlanVerdict::Refine(None)
+        }
     }
 }
 

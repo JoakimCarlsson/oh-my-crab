@@ -14,6 +14,7 @@ mod listing;
 mod memory;
 mod permissions;
 mod picker;
+mod plans;
 mod prefix;
 mod prompt;
 mod providers;

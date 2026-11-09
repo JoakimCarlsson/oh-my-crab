@@ -26,8 +26,10 @@ pub struct RecordingHost {
     pub plans_proposed: std::sync::Mutex<Vec<String>>,
     /// The name the agent gave the conversation.
     pub named: std::sync::Mutex<Option<String>>,
-    /// Whether the reader approves plans.
+    /// Whether the reader approves plans, in the window they were made in, when no verdict is scripted.
     pub approve: std::sync::Mutex<bool>,
+    /// The verdict the reader gives plans, which wins over `approve` when it is set.
+    pub verdict: std::sync::Mutex<Option<crate::PlanVerdict>>,
 }
 
 #[async_trait::async_trait]
@@ -54,9 +56,19 @@ impl crate::Host for RecordingHost {
     }
 
     /// Records `plan` and answers with the scripted verdict.
-    async fn approve_plan(&self, plan: &str) -> bool {
+    async fn approve_plan(&self, plan: &str) -> crate::PlanVerdict {
         self.plans_proposed.lock().unwrap().push(plan.to_owned());
-        *self.approve.lock().unwrap()
+        if let Some(verdict) = self.verdict.lock().unwrap().clone() {
+            return verdict;
+        }
+        if *self.approve.lock().unwrap() {
+            crate::PlanVerdict::Approved {
+                fresh: false,
+                note: None,
+            }
+        } else {
+            crate::PlanVerdict::Refine(None)
+        }
     }
 }
 
