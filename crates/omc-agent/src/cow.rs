@@ -85,12 +85,13 @@ mod imp {
     use std::fs::{self, File, FileTimes, FileType};
     use std::io;
     use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
     use std::path::Path;
 
     /// The `FICLONE` ioctl request, `_IOW(0x94, 9, int)`.
     const FICLONE: u32 = 0x4004_9409;
 
-    /// Clones the file, folder or symbolic link `from`, of the kind `kind`, as `to`, which must not exist: a folder is made and filled entry by entry, then given `from`'s permissions and modification time.
+    /// Clones the file, folder or symbolic link `from`, of the kind `kind`, as `to`, which must not exist: a folder is made readable by its owner only and filled entry by entry, then given `from`'s permissions and modification time.
     ///
     /// # Errors
     ///
@@ -102,7 +103,7 @@ mod imp {
         if kind.is_file() {
             return clone_file(from, to);
         }
-        fs::create_dir(to)?;
+        fs::DirBuilder::new().mode(0o700).create(to)?;
         super::clone_entries(from, to, &[])?;
         let meta = fs::symlink_metadata(from)?;
         fs::set_permissions(to, meta.permissions())?;
@@ -110,7 +111,7 @@ mod imp {
         Ok(())
     }
 
-    /// Clones the regular file `from` as the new file `to`, with `from`'s permissions and times; `to` is removed again when cloning fails.
+    /// Clones the regular file `from` as the new file `to`, made readable by its owner only and then given `from`'s permissions and times; `to` is removed again when cloning fails.
     ///
     /// # Errors
     ///
@@ -120,6 +121,7 @@ mod imp {
         let target = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(to)?;
         let status = unsafe {
             libc::ioctl(
