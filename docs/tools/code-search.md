@@ -83,9 +83,9 @@ written for `Grep` and `Read` as well as to its own name: a deny rule without
 a path, such as `Grep` or `Read`, stops it. Rules with a path cannot stop a
 search, since it does not know beforehand which files it will find; instead
 every result whose file a `Read` or `Grep` deny rule touches is left out, as
-is, outside yolo mode, every one an ask rule touches. The result starts with
-`[N results left out: permission rules keep their files from you]` when any
-were, and a script sees the count as `hidden`. So with `Read(.env)` denied,
+is, outside yolo mode, every one an ask rule touches. Nothing in the result
+says that any were left out, so a search cannot tell whether a hidden file
+matched. So with `Read(.env)` denied,
 `code_search` never shows `.env`, just as `read` never reads it. The same holds
 when a script calls it.
 

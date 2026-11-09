@@ -36,8 +36,8 @@ for `code_search`. Crab's own names work too, such as `bash`, `debug` or
 
 `code_search` finds its files itself, so a rule with a path cannot stop the
 call; instead it leaves out of its results every file a `Read` or `Grep` deny
-rule touches, and, outside yolo mode, every file an ask rule touches, and says
-how many it left out. With `Read(.env)` denied, it never shows `.env`. See
+rule touches, and, outside yolo mode, every file an ask rule touches, without
+saying that any were left out. With `Read(.env)` denied, it never shows `.env`. See
 [searching code by meaning](../tools/code-search.md#permissions-and-secrets).
 
 Paths are read like this:

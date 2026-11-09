@@ -106,7 +106,7 @@ impl Tool for CodeSearch {
     /// The results as a list of chunks, and whether the search went by keyword alone.
     fn data_shape(&self) -> Option<&'static str> {
         Some(
-            "{ results: { path: string; start: number; end: number; text: string }[]; keyword_only: boolean; hidden: number }",
+            "{ results: { path: string; start: number; end: number; text: string }[]; keyword_only: boolean }",
         )
     }
 
@@ -148,11 +148,9 @@ impl Tool for CodeSearch {
                 other => ToolError::Failed(other.to_string()),
             })?;
         let root = self.index.root().to_path_buf();
-        let before = found.hits.len();
         found
             .hits
             .retain(|hit| caller.may_read(&root.join(&hit.path)));
-        let hidden = before - found.hits.len();
         found.hits.truncate(limit);
         let data = json!({
             "results": found.hits.iter().map(|hit| json!({
@@ -162,21 +160,14 @@ impl Tool for CodeSearch {
                 "text": hit.text,
             })).collect::<Vec<_>>(),
             "keyword_only": found.keyword_only.is_some(),
-            "hidden": hidden,
         });
-        Ok(ToolOutput::new(shown(&found, hidden, &args.query)).with_data(data))
+        Ok(ToolOutput::new(shown(&found, &args.query)).with_data(data))
     }
 }
 
-/// What the model is shown of `found`, the results of a search for `query` less `hidden` ones the permission rules keep from the agent: a note when the search went by keyword alone, the index stopped short or results were left out, then each chunk as `path:first-last` over its best lines, numbered.
-fn shown(found: &Found, hidden: usize, query: &str) -> String {
+/// What the model is shown of `found`, the results of a search for `query` less the ones the permission rules keep from the agent, which leave no trace: a note when the search went by keyword alone or the index stopped short, then each chunk as `path:first-last` over its best lines, numbered.
+fn shown(found: &Found, query: &str) -> String {
     let mut notes = Vec::new();
-    if hidden > 0 {
-        let noun = if hidden == 1 { "result" } else { "results" };
-        notes.push(format!(
-            "[{hidden} {noun} left out: permission rules keep their files from you]"
-        ));
-    }
     if let Some(reason) = &found.keyword_only {
         notes.push(format!("[keyword search only: {reason}]"));
     }
@@ -388,7 +379,7 @@ mod tests {
         }
     }
 
-    /// Files the permission rules keep from the agent are left out of the results, and the results say how many.
+    /// Files the permission rules keep from the agent are left out of the results without a trace.
     #[tokio::test]
     async fn leaves_out_files_the_rules_deny() {
         let (tool, root) = tool("code-search-denied", None);
@@ -399,12 +390,9 @@ mod tests {
             .await
             .unwrap();
         assert!(!out.text.contains("hunter2"), "{}", out.text);
-        assert!(
-            out.text
-                .starts_with("[1 result left out: permission rules keep their files from you]")
-        );
+        assert!(!out.text.contains("left out"), "{}", out.text);
         assert!(out.text.contains("auth.py:1-2"));
-        assert_eq!(out.data.unwrap()["hidden"], 1);
+        assert!(out.data.unwrap().get("hidden").is_none());
         let open = tool.call(json!({"query": "token"})).await.unwrap();
         assert!(open.text.contains("hunter2"));
     }
