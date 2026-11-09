@@ -144,6 +144,19 @@ impl Approvals {
         *self.keeper.lock().unwrap_or_else(|held| held.into_inner()) = keeper;
     }
 
+    /// Whether the permission rules let the agent see what the file at `path`, an absolute path, holds without asking: no deny rule of `read` or `grep` touches it, nor, outside yolo mode, an ask rule, since a tool that finds the file itself cannot ask about each one.
+    pub fn may_read(&self, path: &std::path::Path) -> bool {
+        let book = self.rules();
+        let subject = Subject::Files(vec![path.to_path_buf()]);
+        ["read", "grep"]
+            .iter()
+            .all(|tool| match book.judge(tool, &subject, &[]) {
+                Judgement::Denied(_) => false,
+                Judgement::Asked(_) => self.yolo(),
+                Judgement::Allowed | Judgement::Open => true,
+            })
+    }
+
     /// Returns whether the call described by `request`, a call that needs approval, may run.
     ///
     /// See [`Approvals::check`]; this is it for a call that needs approval and that no hook allowed.
@@ -366,6 +379,25 @@ mod tests {
         assert!(approvals.allows(&site("a.example")).await);
         assert!(!approvals.allows(&site("localhost")).await);
         assert_eq!(*prompter.asked.lock().unwrap(), 2);
+    }
+
+    /// A file a deny rule of `read` or `grep` touches may not be read, nor one an ask rule touches outside yolo mode; others may.
+    #[test]
+    fn may_read_follows_deny_and_ask_rules() {
+        let approvals = Approvals::new(Scripted::new(&[]), false);
+        approvals.set_rules(book(
+            &[],
+            &["Read(/secrets/**)"],
+            &["Read(.env)", "Grep(*.pem)"],
+        ));
+        assert!(!approvals.may_read(std::path::Path::new("/w/.env")));
+        assert!(!approvals.may_read(std::path::Path::new("/w/sub/.env")));
+        assert!(!approvals.may_read(std::path::Path::new("/w/certs/a.pem")));
+        assert!(!approvals.may_read(std::path::Path::new("/w/secrets/x.txt")));
+        assert!(approvals.may_read(std::path::Path::new("/w/src/main.rs")));
+        approvals.set_yolo(true);
+        assert!(approvals.may_read(std::path::Path::new("/w/secrets/x.txt")));
+        assert!(!approvals.may_read(std::path::Path::new("/w/.env")));
     }
 
     /// Allow-once asks every time and deny blocks.

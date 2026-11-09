@@ -7,7 +7,8 @@ use serde_json::Value;
 
 use crate::coerce::{coerce, prepare};
 use crate::tools::{
-    AstEdit, AstGrep, Bash, Edit, Glob, Grep, LOAD_TOOLS, LoadTools, Lsp, Read, WebSearch, Write,
+    AstEdit, AstGrep, Bash, CodeSearch, Edit, Glob, Grep, LOAD_TOOLS, LoadTools, Lsp, Read,
+    WebSearch, Write,
 };
 use crate::{Deferral, Jobs, Languages, Sandbox, Tool, ToolError, ToolOutput};
 
@@ -61,8 +62,13 @@ impl Registry {
     }
 
     /// Creates a registry holding every built-in tool, confined to `sandbox` and saving long output where it says, in which `bash` can start background runs in `jobs` when they are given, and `edit` and `write` have the files they write formatted by `languages` and report what it says is wrong with them.
+    ///
+    /// `code_search` is among them unless the code index is turned off or there is no cache folder to keep it in.
     pub fn builtin_for(sandbox: Sandbox, jobs: Option<Arc<Jobs>>, languages: Languages) -> Self {
         let mut registry = Self::new();
+        if let Some(search) = CodeSearch::for_sandbox(&sandbox) {
+            registry.register(search);
+        }
         registry.register(Read::new(sandbox.clone()));
         registry.register(Grep::new(sandbox.clone()));
         registry.register(Glob::new(sandbox.clone()));
@@ -299,11 +305,19 @@ mod tests {
         let registry = Registry::builtin(crate::testutil::scratch("registry-read-only")).unwrap();
         assert_eq!(
             registry.read_only().names(),
-            vec!["ast_grep", "glob", "grep", "lsp", "read", "web_search"]
+            vec![
+                "ast_grep",
+                "code_search",
+                "glob",
+                "grep",
+                "lsp",
+                "read",
+                "web_search"
+            ]
         );
         assert!(registry.read_only().get("lsp").unwrap().read_only());
         assert!(!registry.get("lsp").unwrap().read_only());
-        assert_eq!(registry.names().len(), 10);
+        assert_eq!(registry.names().len(), 11);
     }
 
     /// The tools that only look are shared and the ones that change things exclusive; `lsp` is shared except for the actions that write files.

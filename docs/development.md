@@ -30,6 +30,7 @@ Every text file is checked out with LF line endings on every system, as
 | `omc-tools`     | The tool trait, the registry and the built-in tools.                              |
 | `omc-context`   | The system prompt and what goes into it: instruction files, skills, agents, notices. |
 | `omc-memory`    | Memory across conversations.                                                      |
+| `omc-index`     | The local code index: chunks, embeddings, FTS5 and sqlite-vec, hybrid ranking.    |
 | `omc-hooks`     | Hooks and project trust.                                                          |
 | `omc-mcp`       | Tool servers as tools of the agent: their files, resources and OAuth sign-ins.    |
 | `omc-lsp`       | Language servers crab starts itself.                                              |

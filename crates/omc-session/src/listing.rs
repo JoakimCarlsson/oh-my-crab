@@ -123,6 +123,7 @@ mod tests {
                 "ast_edit",
                 "ast_grep",
                 "bash",
+                "code_search",
                 "context_notes",
                 "debug",
                 "edit",

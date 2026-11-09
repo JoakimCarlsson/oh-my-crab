@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use omc_index::{Embed, Embedder};
 use omc_memory::{Memories, Memory, MemoryError, Scope};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -15,6 +16,9 @@ const DEFAULT_RESULTS: usize = 10;
 
 /// The most results `memory_search` gives.
 const MOST_RESULTS: usize = 50;
+
+/// How close in meaning, as the cosine of their vectors, a memory must come to the query for the meaning alone to find it.
+const MEANING_FLOOR: f32 = 0.25;
 
 /// Runs `work` on the memories on a thread for blocking work, since it waits for file locks and reads and writes files.
 ///
@@ -182,13 +186,62 @@ struct SearchArgs {
 pub struct MemorySearch {
     /// The memories of the conversation.
     memories: Arc<Memories>,
+    /// The embedding model of the code index, which finds memories by meaning too once it is on disk.
+    embedder: Option<Arc<Embedder>>,
 }
 
 impl MemorySearch {
-    /// The tool, searching `memories`.
+    /// The tool, searching `memories` by their words and, once the code index's embedding model is on disk, by their meaning too.
     pub fn new(memories: Arc<Memories>) -> Self {
-        Self { memories }
+        Self::with_embedder(memories, Embedder::shared())
     }
+
+    /// The tool, searching `memories` by their words and, when `embedder` is given and its model can be had without downloading, by their meaning too.
+    pub fn with_embedder(memories: Arc<Memories>, embedder: Option<Arc<Embedder>>) -> Self {
+        Self { memories, embedder }
+    }
+}
+
+/// The memories of `candidates` that match `query` and carry every tag of `tags`, best first: those [`omc_memory::search`] finds by their words fused by reciprocal rank with those whose meaning, as `model` embeds it, comes within [`MEANING_FLOOR`] of the query's, closest first.
+fn hybrid(candidates: Vec<Memory>, query: &str, tags: &[String], model: &dyn Embed) -> Vec<Memory> {
+    let keyword = omc_memory::search(candidates.clone(), query, tags);
+    let wanted: Vec<String> = tags.iter().map(|tag| tag.trim().to_lowercase()).collect();
+    let tagged: Vec<Memory> = candidates
+        .into_iter()
+        .filter(|memory| wanted.iter().all(|tag| memory.tags.contains(tag)))
+        .collect();
+    let mut texts = vec![query.to_owned()];
+    texts.extend(
+        tagged
+            .iter()
+            .map(|memory| format!("{}\n{}", memory.text, memory.tags.join(" "))),
+    );
+    let vectors = model.embed(&texts);
+    let Some((asked, rest)) = vectors.split_first() else {
+        return keyword;
+    };
+    let mut close: Vec<(f32, &Memory)> = tagged
+        .iter()
+        .zip(rest)
+        .map(|(memory, vector)| (omc_index::cosine(asked, vector), memory))
+        .filter(|(closeness, _)| *closeness >= MEANING_FLOOR)
+        .collect();
+    close.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let key = |memory: &Memory| (memory.scope.as_str(), memory.id.clone());
+    let rankings = [
+        keyword.iter().map(key).collect::<Vec<_>>(),
+        close.iter().map(|(_, memory)| key(memory)).collect(),
+    ];
+    let fused = omc_index::fuse(&rankings);
+    fused
+        .into_iter()
+        .filter_map(|((scope, id), _)| {
+            tagged
+                .iter()
+                .find(|memory| memory.scope.as_str() == scope && memory.id == id)
+                .cloned()
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -258,12 +311,19 @@ impl Tool for MemorySearch {
         };
         let limit = args.limit.unwrap_or(DEFAULT_RESULTS).clamp(1, MOST_RESULTS);
         let (query, tags) = (args.query, args.tags);
+        let embedder = self.embedder.clone();
         let found = on_disk(&self.memories, move |memories| {
             let candidates = match only {
                 Some(scope) => memories.shelf(scope).list()?,
                 None => memories.all()?,
             };
-            Ok(omc_memory::search(candidates, &query, &tags))
+            let model = embedder
+                .filter(|_| !omc_index::query_terms(&query).is_empty())
+                .and_then(|embedder| embedder.loaded());
+            Ok(match model {
+                Some(model) => hybrid(candidates, &query, &tags, model.as_ref()),
+                None => omc_memory::search(candidates, &query, &tags),
+            })
         })
         .await?;
         if found.is_empty() {
@@ -412,7 +472,7 @@ mod tests {
         let memories = Arc::new(Memories::new(&store, project, Some("c1".to_owned())));
         (
             Remember::new(memories.clone()),
-            MemorySearch::new(memories.clone()),
+            MemorySearch::with_embedder(memories.clone(), None),
             MemoryEdit::new(memories),
         )
     }
@@ -458,6 +518,78 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// An embedder that knows a few concepts: each text points along the concepts any of whose words it holds.
+    struct Concepts;
+
+    impl Embed for Concepts {
+        /// Names the test model.
+        fn model(&self) -> &str {
+            "concepts"
+        }
+
+        /// One number per concept.
+        fn dimensions(&self) -> usize {
+            3
+        }
+
+        /// Marks the concepts each text mentions.
+        fn embed(&self, texts: &[String]) -> Vec<Vec<f32>> {
+            let concepts: [&[&str]; 3] = [
+                &["database", "postgres", "sql"],
+                &["docker", "containers"],
+                &["deploys", "ship", "production"],
+            ];
+            texts
+                .iter()
+                .map(|text| {
+                    let lower = text.to_lowercase();
+                    concepts
+                        .iter()
+                        .map(|words| f32::from(u8::from(words.iter().any(|w| lower.contains(w)))))
+                        .collect()
+                })
+                .collect()
+        }
+    }
+
+    /// With a model, a memory is found by its meaning though it shares no word with the query, keyword matches still come, tags still filter, and an unrelated query finds nothing.
+    #[tokio::test]
+    async fn search_by_meaning_with_a_model() {
+        let (remember, _, _) = tools("memory-tools-meaning");
+        let memories = remember.memories.clone();
+        let search = MemorySearch::with_embedder(
+            memories,
+            Some(Arc::new(Embedder::with_model(Arc::new(Concepts)))),
+        );
+        for (text, tags) in [
+            ("The staging database listens on port 6543.", vec!["db"]),
+            ("Integration tests need Docker running.", vec![]),
+            ("Deploys go through the release workflow.", vec![]),
+        ] {
+            remember
+                .call(json!({"text": text, "tags": tags}))
+                .await
+                .unwrap();
+        }
+        let postgres = search.call(json!({"query": "postgres"})).await.unwrap();
+        assert!(postgres.text.contains("6543"), "{}", postgres.text);
+        assert_eq!(postgres.text.matches("(project, ").count(), 1);
+        let both = search
+            .call(json!({"query": "ship containers"}))
+            .await
+            .unwrap();
+        assert!(both.text.contains("Docker") && both.text.contains("Deploys"));
+        let keyword = search.call(json!({"query": "integration"})).await.unwrap();
+        assert!(keyword.text.contains("Docker"));
+        let tagged = search
+            .call(json!({"query": "containers", "tags": ["db"]}))
+            .await
+            .unwrap();
+        assert_eq!(tagged.text, "No memories match.");
+        let none = search.call(json!({"query": "kubernetes"})).await.unwrap();
+        assert_eq!(none.text, "No memories match.");
     }
 
     /// A search over more matches than its limit says how many more there are.

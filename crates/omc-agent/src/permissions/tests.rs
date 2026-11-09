@@ -222,6 +222,17 @@ fn rules_name_tools() {
     assert!(!book(&["Read"], &[], &[]).covered("read", &Subject::Site("a.example".into()), &[]));
 }
 
+/// `Grep` and `Read` rules about the whole tool stand for `code_search` too, and its own name works; rules about other tools do not touch it.
+#[test]
+fn code_search_answers_to_grep_and_read() {
+    let judged = |deny: &[&str]| book(&[], &[], deny).judge("code_search", &Subject::Whole, &[]);
+    assert!(matches!(judged(&["Grep"]), Judgement::Denied(_)));
+    assert!(matches!(judged(&["Read"]), Judgement::Denied(_)));
+    assert!(matches!(judged(&["code_search"]), Judgement::Denied(_)));
+    assert_eq!(judged(&["Glob", "Bash"]), Judgement::Open);
+    assert_eq!(judged(&["Read(.env)"]), Judgement::Open);
+}
+
 /// MCP rules name a server's tools all at once, one tool, or a pattern.
 #[test]
 fn mcp_rules() {
