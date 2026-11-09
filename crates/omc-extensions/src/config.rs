@@ -300,7 +300,10 @@ mod tests {
         );
         assert_eq!(found.extensions.len(), 1);
         let guard = &found.extensions[0];
-        assert_eq!(guard.program, "/p/./guard.py");
+        assert_eq!(
+            guard.program,
+            Path::new("/p").join("./guard.py").display().to_string()
+        );
         assert_eq!(guard.args, vec!["--strict"]);
         assert_eq!(guard.env, vec![("LEVEL".to_owned(), "2".to_owned())]);
         assert_eq!(guard.folder.as_deref(), Some(Path::new("/p")));

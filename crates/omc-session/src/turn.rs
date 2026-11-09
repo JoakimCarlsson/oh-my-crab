@@ -1029,8 +1029,10 @@ mod tests {
     }
 
     /// A model that refuses every request as malformed.
+    #[cfg(unix)]
     struct Limited;
 
+    #[cfg(unix)]
     #[async_trait]
     impl ChatModel for Limited {
         /// Fails with status 400.
