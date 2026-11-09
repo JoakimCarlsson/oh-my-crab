@@ -1465,7 +1465,7 @@ dependencies = [
 
 [[package]]
 name = "omc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "omc-providers",
@@ -1477,7 +1477,7 @@ dependencies = [
 
 [[package]]
 name = "omc-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1494,7 +1494,7 @@ dependencies = [
 
 [[package]]
 name = "omc-auth"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.23.1",
  "dirs",
@@ -1510,14 +1510,14 @@ dependencies = [
 
 [[package]]
 name = "omc-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "omc-wire",
 ]
 
 [[package]]
 name = "omc-context"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ignore",
  "serde_json",
@@ -1525,7 +1525,7 @@ dependencies = [
 
 [[package]]
 name = "omc-dap"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "dirs",
@@ -1537,7 +1537,7 @@ dependencies = [
 
 [[package]]
 name = "omc-extensions"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "dirs",
@@ -1552,7 +1552,7 @@ dependencies = [
 
 [[package]]
 name = "omc-hooks"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "dirs",
@@ -1574,7 +1574,7 @@ dependencies = [
 
 [[package]]
 name = "omc-lsp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "omc-tools",
@@ -1584,7 +1584,7 @@ dependencies = [
 
 [[package]]
 name = "omc-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "dirs",
@@ -1602,7 +1602,7 @@ dependencies = [
 
 [[package]]
 name = "omc-memory"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dirs",
  "omc-context",
@@ -1613,7 +1613,7 @@ dependencies = [
 
 [[package]]
 name = "omc-providers"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -1634,7 +1634,7 @@ dependencies = [
 
 [[package]]
 name = "omc-script"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1648,7 +1648,7 @@ dependencies = [
 
 [[package]]
 name = "omc-session"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "dirs",
@@ -1673,7 +1673,7 @@ dependencies = [
 
 [[package]]
 name = "omc-tools"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ast-grep-core",
  "ast-grep-language",
@@ -1711,7 +1711,7 @@ dependencies = [
 
 [[package]]
 name = "omc-wire"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",

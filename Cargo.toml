@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/JoakimCarlsson/oh-my-crab"
@@ -11,13 +11,13 @@ homepage = "https://github.com/JoakimCarlsson/oh-my-crab"
 readme = "README.md"
 
 [workspace.dependencies]
-omc-agent = { version = "0.1.0", path = "crates/omc-agent" }
-omc-extensions = { version = "0.1.0", path = "crates/omc-extensions" }
-omc-auth = { version = "0.1.0", path = "crates/omc-auth" }
-omc-providers = { version = "0.1.0", path = "crates/omc-providers" }
-omc-script = { version = "0.1.0", path = "crates/omc-script" }
-omc-tools = { version = "0.1.0", path = "crates/omc-tools" }
-omc-wire = { version = "0.1.0", path = "crates/omc-wire" }
-omc-mcp = { version = "0.1.0", path = "crates/omc-mcp" }
-omc-session = { version = "0.1.0", path = "crates/omc-session" }
-omc-client = { version = "0.1.0", path = "crates/omc-client" }
+omc-agent = { version = "0.1.1", path = "crates/omc-agent" }
+omc-extensions = { version = "0.1.1", path = "crates/omc-extensions" }
+omc-auth = { version = "0.1.1", path = "crates/omc-auth" }
+omc-providers = { version = "0.1.1", path = "crates/omc-providers" }
+omc-script = { version = "0.1.1", path = "crates/omc-script" }
+omc-tools = { version = "0.1.1", path = "crates/omc-tools" }
+omc-wire = { version = "0.1.1", path = "crates/omc-wire" }
+omc-mcp = { version = "0.1.1", path = "crates/omc-mcp" }
+omc-session = { version = "0.1.1", path = "crates/omc-session" }
+omc-client = { version = "0.1.1", path = "crates/omc-client" }
