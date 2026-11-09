@@ -11,6 +11,7 @@ homepage.workspace = true
 omc-context = { version = "0.1.1", path = "../omc-context" }
 omc-wire = { version = "0.1.1", path = "../omc-wire" }
 omc-memory = { version = "0.1.1", path = "../omc-memory" }
+omc-index = { version = "0.1.1", path = "../omc-index" }
 ast-grep-core = "0.51.1"
 ast-grep-language = { version = "0.51.1", default-features = false, features = [
     "tree-sitter-c",

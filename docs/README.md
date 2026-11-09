@@ -22,6 +22,8 @@
 - [How tool calls run](tools/calls.md): argument repair, long output, approvals.
 - [Reading files](tools/files.md): outlines, conflicts, generated files,
   images, databases, archives and JSON.
+- [Searching code by meaning](tools/code-search.md): `code_search` and its
+  local index.
 - [Reading the web and GitHub](tools/web-and-github.md) and `web_search`.
 - [Subagents](tools/subagents.md), including worktree isolation.
 - [Scripts](tools/script.md).

@@ -46,6 +46,8 @@ starts `crab`. A switch that is off when set to `0` is also off with `false`,
 | `OMC_PERMISSIONS_FILE` | The file permission rules and kept "always allow" answers are read from and written to.                  | `<config>/permissions.json`   | [Permission rules](extending/permissions.md)               |
 | `OMC_MEMORY`         | Set to `0` to turn memory off for every conversation; the `memory` setting is then not offered.             | on                            | [Memory](memory.md)                                        |
 | `OMC_MEMORY_DIR`     | The folder memories are kept in.                                                                            | `<data>/memory`               | [Memory](memory.md)                                        |
+| `OMC_CODE_INDEX`     | Set to `0` to turn the code index off: no `code_search`, and `memory_search` goes by words alone.           | on                            | [Searching code by meaning](tools/code-search.md)          |
+| `OMC_INDEX_DIR`      | The folder the code indexes and their embedding model are kept in.                                          | `<cache>/index`               | [Searching code by meaning](tools/code-search.md)          |
 | `OMC_DEBUGGERS_FILE` | The file that changes the known debug adapters and adds others.                                             | `<config>/debuggers.json`     | [Debugging](tools/debug.md)                                |
 | `OMC_DAP_<ID>`       | Replaces the command of the debug adapter `<ID>`, uppercased with `-` and `.` as `_`: `OMC_DAP_LLDB_DAP`, `OMC_DAP_CODELLDB`, `OMC_DAP_GDB`, `OMC_DAP_DLV`, `OMC_DAP_DEBUGPY`. | the adapter's own search | [Debugging](tools/debug.md) |
 | `OMC_SUBAGENT_DEPTH` | How many levels of subagents may run below the main agent: `1` lets no subagent start subagents of its own, and at most `8`. Anything that is not a whole number from 1 counts as unset. | `2`                           | [Subagents](tools/subagents.md#nesting)                    |
@@ -58,7 +60,7 @@ starts `crab`. A switch that is off when set to `0` is also off with `false`,
 | `OMC_MODELS_URL`     | Where the model catalog is downloaded from, in the models.dev format.                                       | `https://models.dev/api.json` | [Model catalog](providers/supported.md#model-catalog)      |
 
 An empty `OMC_PROVIDERS_FILE`, `OMC_HOOKS_FILE`, `OMC_TRUST_FILE`,
-`OMC_PERMISSIONS_FILE`, `OMC_MEMORY_DIR`, `OMC_DEBUGGERS_FILE`, `OMC_MCP_FILE`,
+`OMC_PERMISSIONS_FILE`, `OMC_MEMORY_DIR`, `OMC_INDEX_DIR`, `OMC_DEBUGGERS_FILE`, `OMC_MCP_FILE`,
 `OMC_EXTENSIONS_FILE` or `OMC_MCP_AUTH_FILE` counts as unset. An empty or blank
 `OMC_<ID>_URL` does too, and a trailing `/` is dropped.
 
@@ -177,6 +179,8 @@ Crab does not read these; it sets them for the hook commands it runs.
 | `<data>/trust.json`                                           | Trust decisions per project, with the hook commands each was trusted with. Moved by `OMC_TRUST_FILE`.    | crab, on a `Trust` command or `crab trust` | [Project trust](extending/project-trust.md) |
 | `<cache>/output/<conversation id>/`                           | The whole output of tool calls that were cut short; `run-<pid>-<seconds>` for a conversation without an id. Removed after seven days unwritten. | crab               | [How tool calls run](tools/calls.md)              |
 | `<cache>/models.json`                                         | The model catalog downloaded from models.dev: context windows, output limits, efforts, input kinds and prices. Its providers replace those of the snapshot compiled into crab. Downloaded again when a day old, unless `OMC_MODELS_REFRESH` is `0`. | crab | [Model catalog](providers/supported.md#model-catalog) |
+| `<cache>/index/projects/<name>-<hash>.sqlite3`                | A project's code index: its files, their chunks, an FTS5 table of their words and a sqlite-vec table of their vectors. Built by the first `code_search` and brought up to date by each. Safe to delete. Moved by `OMC_INDEX_DIR`. | crab | [Searching code by meaning](tools/code-search.md) |
+| `<cache>/index/models/potion-code-16M/`                       | The embedding model of the code index and of `memory_search`, downloaded once from Hugging Face: `config.json`, `tokenizer.json` and `model.safetensors`, 64 MB. Moved by `OMC_INDEX_DIR`. | crab | [Searching code by meaning](tools/code-search.md) |
 | `<cache>/worktrees/<conversation id>/`                        | The git worktrees of isolated subagents, named like the conversation's output folder. Removed a day after they were made. | crab                     | [Subagents](tools/subagents.md)                   |
 
 On Unix the memory and output folders and their files are readable by the

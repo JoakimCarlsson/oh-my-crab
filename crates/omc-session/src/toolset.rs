@@ -362,6 +362,7 @@ mod tests {
             vec![
                 "ask",
                 "ast_grep",
+                "code_search",
                 "context_notes",
                 "exit_plan_mode",
                 "glob",
@@ -384,6 +385,7 @@ mod tests {
                 "ast_edit",
                 "ast_grep",
                 "bash",
+                "code_search",
                 "context_notes",
                 "edit",
                 "glob",

@@ -35,11 +35,16 @@ to the result; see [language services](../language-services.md).
 
 ## Search
 
-| Tool       | What it does                                                         | Asks | Plan |
-| ---------- | -------------------------------------------------------------------- | ---- | ---- |
-| `grep`     | Searches file contents with a regular expression                     | no   | yes  |
-| `glob`     | Finds files by glob pattern                                          | no   | yes  |
-| `ast_grep` | Searches code by syntax tree, ignoring formatting and comments       | no   | yes  |
+| Tool          | What it does                                                         | Asks | Plan |
+| ------------- | -------------------------------------------------------------------- | ---- | ---- |
+| `code_search` | Searches the project's code by meaning and keyword at once, through a local index | no   | yes  |
+| `grep`        | Searches file contents with a regular expression                     | no   | yes  |
+| `glob`        | Finds files by glob pattern                                          | no   | yes  |
+| `ast_grep`    | Searches code by syntax tree, ignoring formatting and comments       | no   | yes  |
+
+`code_search` keeps a local index of the project, built on its first call and
+brought up to date on each one; it is absent with `OMC_CODE_INDEX=0`. See
+[searching code by meaning](code-search.md).
 
 ## Code intelligence
 
