@@ -199,8 +199,9 @@ The `task` tool hands self-contained assignments to subagents, each running
 a loop of its own and handing back its final message, or JSON checked
 against a schema. The kinds are `task`, `scout` and `reviewer`, plus the
 agent definitions found on disk. One call runs up to 32, and at most 32 run at once
-across the conversation, and each can work in a git worktree of its own whose
-changes are applied back as a patch when it ends. A subagent asks the main
+across the conversation, and each can work in a copy of its own of the working
+tree, a copy-on-write clone or a git worktree, whose changes are applied back
+as a patch when it ends. A subagent asks the main
 agent's model unless its definition or the call names another, such as
 `haiku`. Their tool calls reach the client as `Tool` events whose `parent` is
 the `task` call.

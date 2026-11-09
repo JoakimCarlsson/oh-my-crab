@@ -1,6 +1,6 @@
-//! Tests of subagents working in git worktrees of their own, against real repositories.
+//! Tests of subagents working in copies of their own, git worktrees checked out or copy-on-write clones, against real repositories and folders.
 //!
-//! They run in a test program of their own: the git processes they start would otherwise briefly hold the file locks of the conversation files other tests open and reopen.
+//! They run in a test program of their own: the git processes they start would otherwise briefly hold the file locks of the conversation files other tests open and reopen. The tests of clones pass on a host whose file system cannot clone only by skipping, which they say they do.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use omc_agent::{
-    AgentEvent, ApprovalRequest, Approvals, Decision, EventSink, Isolation, LOCK_REASON, Merge,
-    Prompter, Task, TaskSettings, prune_worktrees,
+    AgentEvent, ApprovalRequest, Approvals, Backend, Decision, EventSink, Isolation, LOCK_REASON,
+    Merge, Prompter, Task, TaskSettings, prune_worktrees,
 };
 use omc_context::{AgentDefinition, Origin, builtin_agents};
 use omc_providers::{ChatModel, ProviderError, Reply, Request, Sink};
@@ -100,13 +100,14 @@ fn bench(name: &str) -> Bench {
     }
 }
 
-/// How subagents of a main agent working in `directory` get worktrees in `bench`'s store.
-fn isolation(directory: &Path, bench: &Bench) -> Arc<Isolation> {
+/// How subagents of a main agent working in `directory` get copies in `bench`'s store, made as `backend` says.
+fn isolation(directory: &Path, bench: &Bench, backend: Backend) -> Arc<Isolation> {
     Arc::new(Isolation {
         directory: directory.to_path_buf(),
         store: bench.store.clone(),
         patches: Spill::new(&bench.patches),
         tools: Arc::new(|folder: &Path| Registry::builtin(folder)),
+        backend,
     })
 }
 
@@ -225,7 +226,7 @@ async fn an_isolated_subagent_hands_its_edits_back_to_a_linked_worktree() {
         &bench.linked,
         model.clone(),
         builtin_agents(),
-        Some(isolation(&bench.linked, &bench)),
+        Some(isolation(&bench.linked, &bench, Backend::Worktree)),
     );
     let done = task
         .call_as("t1", json!({"task": "edit a.txt", "isolated": true}))
@@ -294,7 +295,40 @@ fn told(seen: &RequestSeen) -> &str {
 /// Siblings are applied in the order of the list: the first applies, and the second, which changed the same lines, is not applied at all, not even its file that does not conflict; its patch is saved and the result names the file that conflicts and where the patch is.
 #[tokio::test]
 async fn a_conflicting_sibling_is_kept_as_a_patch() {
-    let bench = bench("isolated-conflict");
+    conflicting_siblings(&bench("isolated-conflict"), Backend::Worktree).await;
+}
+
+/// The same holds for clones in a repository.
+#[tokio::test]
+async fn a_conflicting_cloned_sibling_is_kept_as_a_patch() {
+    conflicting_siblings(&bench("cloned-conflict"), Backend::Cow).await;
+}
+
+/// The same holds for clones of a folder outside any repository, whose changes are taken and checked file by file.
+#[tokio::test]
+async fn a_conflicting_sibling_outside_a_repository_is_kept_as_a_patch() {
+    conflicting_siblings(&plain_bench("plain-conflict"), Backend::Auto).await;
+}
+
+/// A folder in no git repository, in a scratch folder called `name`, holding `a.txt` as the linked worktree of [`bench`] has it, with folders for copies and patches beside it.
+fn plain_bench(name: &str) -> Bench {
+    let root = scratch(name);
+    stop_git_above(root.parent().unwrap());
+    let plain = root.join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::write(plain.join("a.txt"), "alpha\nlocal\n").unwrap();
+    std::fs::write(plain.join(".gitignore"), "*.log\n").unwrap();
+    std::fs::write(plain.join("ignored.log"), "noise\n").unwrap();
+    Bench {
+        main: plain.clone(),
+        linked: plain.canonicalize().unwrap(),
+        store: root.join("cache/worktrees/conversation"),
+        patches: root.join("cache/output/conversation"),
+    }
+}
+
+/// Runs two siblings in copies made as `backend` says from `bench`'s linked folder, the second of which conflicts with the first, and checks that only the first is applied.
+async fn conflicting_siblings(bench: &Bench, backend: Backend) {
     let model = Router::new(|seen: &RequestSeen| {
         let second = told(seen).contains("second");
         match seen.messages {
@@ -316,7 +350,7 @@ async fn a_conflicting_sibling_is_kept_as_a_patch() {
         &bench.linked,
         model,
         builtin_agents(),
-        Some(isolation(&bench.linked, &bench)),
+        Some(isolation(&bench.linked, bench, backend)),
     );
     let done = task
         .call_as(
@@ -350,7 +384,9 @@ async fn a_conflicting_sibling_is_kept_as_a_patch() {
     assert!(done.text.contains("did NOT apply cleanly"));
     assert!(done.text.contains(&patch.display().to_string()));
     assert!(done.text.contains("first done") && done.text.contains("second done"));
-    assert!(!listed(&bench.main).contains(LOCK_REASON));
+    if bench.main.join(".git").exists() {
+        assert!(!listed(&bench.main).contains(LOCK_REASON));
+    }
 }
 
 /// Has git, run by this process, stop looking for a repository when it reaches `ceiling`, so that a scratch folder inside this project's own checkout counts as being in none; repositories inside `ceiling` are found as before.
@@ -386,7 +422,7 @@ async fn isolation_outside_a_repository_is_refused() {
         &plain,
         model.clone(),
         agents.clone(),
-        Some(isolation(&plain, &bench)),
+        Some(isolation(&plain, &bench, Backend::Worktree)),
     );
     let refused = task
         .call_as("t1", json!({"task": "x", "isolated": true}))
@@ -464,7 +500,7 @@ async fn worktrees_left_behind_are_pruned() {
         &bench.linked,
         Arc::new(Stuck),
         builtin_agents(),
-        Some(isolation(&bench.linked, &bench)),
+        Some(isolation(&bench.linked, &bench, Backend::Worktree)),
     );
     let (call, folder) = started(&task, &log).await;
     std::mem::forget(call);
@@ -487,7 +523,7 @@ async fn a_stopped_subagent_has_its_worktree_removed() {
         &bench.linked,
         Arc::new(Stuck),
         builtin_agents(),
-        Some(isolation(&bench.linked, &bench)),
+        Some(isolation(&bench.linked, &bench, Backend::Worktree)),
     );
     let (call, folder) = started(&task, &log).await;
     drop(call);
@@ -512,7 +548,7 @@ async fn a_failed_subagent_has_its_changes_held() {
         &bench.linked,
         model,
         builtin_agents(),
-        Some(isolation(&bench.linked, &bench)),
+        Some(isolation(&bench.linked, &bench, Backend::Worktree)),
     );
     let schema = json!({"type": "object", "required": ["n"]});
     let failed = task
@@ -548,7 +584,7 @@ async fn a_background_subagent_hands_back_typed_results_and_edits() {
     let task = task_tool_with(
         &bench.linked,
         model,
-        isolation(&bench.linked, &bench),
+        isolation(&bench.linked, &bench, Backend::Worktree),
         jobs.clone(),
     );
     let schema = json!({
@@ -582,7 +618,18 @@ async fn a_background_subagent_hands_back_typed_results_and_edits() {
 /// An isolated subagent's own isolated subagent starts from its parent's worktree, sees what the parent changed there, and hands its edits back to that worktree; the parent then hands both its own edits and its child's back to the main agent's working tree.
 #[tokio::test]
 async fn a_nested_isolated_subagent_merges_into_its_parents_worktree() {
-    let bench = bench("isolated-nested");
+    nested("isolated-nested", Backend::Worktree).await;
+}
+
+/// The same holds for clones: the child's clone is made from its parent's clone.
+#[tokio::test]
+async fn a_nested_cloned_subagent_merges_into_its_parents_clone() {
+    nested("cloned-nested", Backend::Cow).await;
+}
+
+/// A subagent in a copy made as `backend` says, in a bench called `name`, starts an isolated subagent, whose change lands in its parent's copy and then, with the parent's own, in the main agent's working tree.
+async fn nested(name: &str, backend: Backend) {
+    let bench = bench(name);
     let model = Router::new(|seen: &RequestSeen| {
         let child = told(seen).contains("child work");
         match (child, seen.messages) {
@@ -600,7 +647,7 @@ async fn a_nested_isolated_subagent_merges_into_its_parents_worktree() {
         &bench.linked,
         model.clone(),
         builtin_agents(),
-        Some(isolation(&bench.linked, &bench)),
+        Some(isolation(&bench.linked, &bench, backend)),
     );
     let done = task
         .call_as("t1", json!({"task": "parent job", "isolated": true}))
@@ -646,4 +693,219 @@ async fn a_nested_isolated_subagent_merges_into_its_parents_worktree() {
         .unwrap();
     assert!(read_by_child.contains('p'), "{read_by_child}");
     assert!(!listed(&bench.main).contains(LOCK_REASON));
+}
+
+/// The text of every tool call the log says a subagent's tools answered, in order.
+fn tool_outputs(log: &Log) -> Vec<String> {
+    log.lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Nested { event, .. } => match event.as_ref() {
+                AgentEvent::ToolDone { text, .. } => Some(text.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// A subagent in a clone of a linked worktree sees its uncommitted, untracked and ignored files, works outside it, and its edits come back uncommitted, while what it changed in an ignored file does not; the clone is gone afterwards and git lists no worktree of it.
+#[tokio::test]
+async fn a_cloned_subagent_sees_ignored_files_and_hands_its_edits_back() {
+    let bench = bench("cloned-linked");
+    let model = Router::new(|seen: &RequestSeen| match seen.messages {
+        1 => calls(&[
+            ("read", json!({"path": "c.txt"})),
+            ("read", json!({"path": "ignored.log"})),
+        ]),
+        3 => calls(&[
+            (
+                "write",
+                json!({"path": "a.txt", "content": "alpha\nlocal\nsub\n"}),
+            ),
+            ("write", json!({"path": "new.txt", "content": "made\n"})),
+            (
+                "write",
+                json!({"path": "ignored.log", "content": "changed\n"}),
+            ),
+        ]),
+        _ => say("edited"),
+    });
+    let (task, log) = task_tool(
+        &bench.linked,
+        model.clone(),
+        builtin_agents(),
+        Some(isolation(&bench.linked, &bench, Backend::Cow)),
+    );
+    let done = task
+        .call_as("t1", json!({"task": "edit a.txt", "isolated": true}))
+        .await
+        .unwrap();
+    assert!(
+        done.text.starts_with("edited\n\n# Changes\n"),
+        "{}",
+        done.text
+    );
+    assert_eq!(
+        std::fs::read_to_string(bench.linked.join("a.txt")).unwrap(),
+        "alpha\nlocal\nsub\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(bench.linked.join("new.txt")).unwrap(),
+        "made\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(bench.linked.join("ignored.log")).unwrap(),
+        "noise\n"
+    );
+    assert!(!bench.main.join("new.txt").exists());
+    let status = git(&bench.linked, &["status", "--porcelain"]);
+    assert!(status.contains(" M a.txt") && status.contains("?? new.txt"));
+    let events = worktree_events(&log);
+    assert_eq!(events.len(), 2);
+    let path = &events[0].1;
+    assert!(path.starts_with(&bench.store) && !path.starts_with(&bench.linked));
+    assert_eq!(
+        events[1].2,
+        Some(Merge::Applied(vec!["a.txt".into(), "new.txt".into()]))
+    );
+    let seen = model.seen.lock().unwrap();
+    assert!(told(&seen[0]).contains("copy-on-write clone"));
+    drop(seen);
+    let outputs = tool_outputs(&log);
+    assert!(outputs[0].contains("untracked words"));
+    assert!(outputs[1].contains("noise"), "{}", outputs[1]);
+    assert!(!path.exists());
+    assert!(!listed(&bench.main).contains(LOCK_REASON));
+}
+
+/// A subagent in a clone of a folder outside any repository has its changed, added and removed files applied to the folder, its ignored ones left alone.
+#[tokio::test]
+async fn a_cloned_subagent_outside_a_repository_hands_its_edits_back() {
+    let bench = plain_bench("plain-linked");
+    std::fs::write(bench.linked.join("gone.txt"), "bye\n").unwrap();
+    let model = Router::new(|seen: &RequestSeen| match seen.messages {
+        1 => calls(&[
+            ("read", json!({"path": "ignored.log"})),
+            (
+                "write",
+                json!({"path": "a.txt", "content": "alpha\nlocal\nsub\n"}),
+            ),
+            (
+                "write",
+                json!({"path": "deep/new.txt", "content": "made\n"}),
+            ),
+            (
+                "write",
+                json!({"path": "ignored.log", "content": "changed\n"}),
+            ),
+            ("bash", json!({"command": "rm gone.txt"})),
+        ]),
+        _ => say("edited"),
+    });
+    let (task, log) = task_tool(
+        &bench.linked,
+        model.clone(),
+        builtin_agents(),
+        Some(isolation(&bench.linked, &bench, Backend::Auto)),
+    );
+    let done = task
+        .call_as("t1", json!({"task": "edit a.txt", "isolated": true}))
+        .await
+        .unwrap();
+    assert!(done.text.contains("Files changed"), "{}", done.text);
+    assert_eq!(
+        std::fs::read_to_string(bench.linked.join("a.txt")).unwrap(),
+        "alpha\nlocal\nsub\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(bench.linked.join("deep/new.txt")).unwrap(),
+        "made\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(bench.linked.join("ignored.log")).unwrap(),
+        "noise\n"
+    );
+    assert!(!bench.linked.join("gone.txt").exists());
+    let events = worktree_events(&log);
+    assert_eq!(
+        events[1].2,
+        Some(Merge::Applied(vec![
+            "a.txt".into(),
+            "deep/new.txt".into(),
+            "gone.txt".into()
+        ]))
+    );
+    assert!(!events[0].1.exists());
+    assert!(tool_outputs(&log)[0].contains("noise"));
+}
+
+/// Outside a repository, `worktree` refuses isolation as before, while `cow` clones.
+#[tokio::test]
+async fn outside_a_repository_only_clones_isolate() {
+    let bench = plain_bench("plain-backends");
+    let model = Router::new(|_: &RequestSeen| say("worked"));
+    let (task, _) = task_tool(
+        &bench.linked,
+        model.clone(),
+        builtin_agents(),
+        Some(isolation(&bench.linked, &bench, Backend::Worktree)),
+    );
+    let refused = task
+        .call_as("t1", json!({"task": "x", "isolated": true}))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("is not in a git working tree"),
+        "{refused}"
+    );
+    let (task, _) = task_tool(
+        &bench.linked,
+        model,
+        builtin_agents(),
+        Some(isolation(&bench.linked, &bench, Backend::Cow)),
+    );
+    let done = task
+        .call_as("t2", json!({"task": "x", "isolated": true}))
+        .await
+        .unwrap();
+    assert!(done.text.contains("It changed no files."), "{}", done.text);
+}
+
+/// A clone left behind by a run that crashed is removed, and forgotten by git, when its conversation opens again; one whose subagent is stopped is removed at once.
+#[tokio::test]
+async fn clones_left_behind_are_pruned_and_stopped_ones_removed() {
+    let bench = bench("cloned-prune");
+    let (task, log) = task_tool(
+        &bench.linked,
+        Arc::new(Stuck),
+        builtin_agents(),
+        Some(isolation(&bench.linked, &bench, Backend::Cow)),
+    );
+    let (call, folder) = started(&task, &log).await;
+    std::mem::forget(call);
+    assert!(folder.join("ignored.log").exists());
+    assert!(listed(&bench.main).contains(LOCK_REASON));
+    let root = bench.store.parent().unwrap();
+    prune_worktrees(root, Some("conversation"), Duration::from_secs(3600));
+    assert!(!folder.exists());
+    assert!(!listed(&bench.main).contains(LOCK_REASON));
+
+    let (task, log) = task_tool(
+        &bench.linked,
+        Arc::new(Stuck),
+        builtin_agents(),
+        Some(isolation(&bench.linked, &bench, Backend::Cow)),
+    );
+    let (call, folder) = started(&task, &log).await;
+    drop(call);
+    for _ in 0..400 {
+        if !folder.exists() && !listed(&bench.main).contains(LOCK_REASON) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the clone at {} was not removed", folder.display());
 }

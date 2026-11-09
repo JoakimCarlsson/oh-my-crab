@@ -13,10 +13,14 @@ omc-tools.workspace = true
 omc-context = { version = "0.1.1", path = "../omc-context" }
 async-trait = "0.1.92"
 futures-util = "0.3.34"
-serde = { version = "1.0.229", features = ["derive"] }
+ignore = "0.4.34"
+serde ={ version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt", "macros", "sync", "time", "process"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
 
 [dev-dependencies]
 omc-wire = { version = "0.1.1", path = "../omc-wire" }

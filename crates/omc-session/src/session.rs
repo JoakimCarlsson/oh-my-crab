@@ -1198,7 +1198,7 @@ fn memories_for(directory: &Path, id: Option<String>) -> Option<Arc<omc_memory::
 /// How long the worktrees of other conversations are kept after they were made, before they are taken to be left behind by a run that stopped or crashed.
 const WORKTREE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// How the subagents of the conversation `id`, working in `directory`, get git worktrees of their own: made in a folder named like its folder of saved output `spill` under the harness's cache folder, after clearing away the worktrees runs left behind, with the tools that touch files confined to the worktree and asking the harness's own language servers, started for the worktree, when `own_languages` says the conversation uses those; nothing when there is no cache folder.
+/// How the subagents of the conversation `id`, working in `directory`, get copies of their own, made as [`omc_agent::ISOLATION_VARIABLE`] says: made in a folder named like its folder of saved output `spill` under the harness's cache folder, after clearing away the worktrees runs left behind, with the tools that touch files confined to the worktree and asking the harness's own language servers, started for the worktree, when `own_languages` says the conversation uses those; nothing when there is no cache folder.
 ///
 /// The language services of a client or of a program embedding the harness are not asked about files in a worktree, since they work on the main working tree.
 fn isolation_for(
@@ -1224,6 +1224,7 @@ fn isolation_for(
             });
             Ok(Registry::builtin_for(sandbox, None, languages))
         }),
+        backend: omc_agent::isolation_backend(),
     }))
 }
 

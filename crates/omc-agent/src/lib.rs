@@ -2,7 +2,10 @@
 
 mod agent;
 mod approval;
+mod backend;
 mod compaction;
+mod cow;
+mod files;
 mod hooks;
 mod journal;
 mod loop_guard;
@@ -24,6 +27,7 @@ pub use agent::{
     AgentError, AgentEvent, Context, Live, compact, run_turn, run_turn_recorded, run_turn_steered,
 };
 pub use approval::{ApprovalRequest, Approvals, Decision, Keeper, Place, Prompter, Standing};
+pub use backend::{Backend, ISOLATION_VARIABLE, isolation_backend};
 pub use compaction::{COMPACT, context, replayed};
 pub use hooks::{
     Batched, Chained, CompactTrigger, Compacting, Followed, Gate, Hooks, MAX_STOP_IN_A_ROW,

@@ -763,7 +763,7 @@ The agent started using a tool, or said more about one it is using. Carries a
 | `output`   | string      | optional | What it returned to the model.                                                          |
 | `parent`   | string      | optional | The subagent call whose work this is.                                                   |
 | `agent`    | string      | optional | The kind of subagent this call starts, or that made a nested call.                      |
-| `worktree` | `Worktree`  | optional | The git worktree an isolated subagent works in, and what became of its changes.         |
+| `worktree` | `Worktree`  | optional | The copy an isolated subagent works in, a git worktree or a clone, and what became of its changes. |
 
 `Kind` is one of `Read`, `Edit`, `Search`, `Execute`, `Fetch` and `Other`.
 `read` of a web address is `Fetch`; `debug` is `Execute` when it launches,

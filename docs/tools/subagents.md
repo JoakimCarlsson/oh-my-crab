@@ -65,17 +65,44 @@ at every level, as are the hooks, which see each subagent under its own id.
 
 ## Worktrees
 
-A subagent can work in a git worktree of its own, so that subagents editing at
-once never trample each other's files or the main agent's. The call sets
-`isolated: true`, for every assignment or for one item of `tasks`, or a
-definition sets `isolated: true` in its front matter, which a call can turn off
-with `isolated: false`. The worktree is made from the working tree `crab` runs
-in, whether that is the repository's own checkout or a linked worktree, such as
-the one an editor gives each agent session, and it starts from that tree as it
-is: uncommitted changes and new files are copied in, ignored files are not. The
-state is written into a commit no branch points at, through an index of its
-own so the main agent's index is untouched, and the worktree checks it out on a
-detached head, so no branch name is taken. Worktrees are made under
+A subagent can work in a copy of its own of the working tree, so that
+subagents editing at once never trample each other's files or the main
+agent's. The call sets `isolated: true`, for every assignment or for one item
+of `tasks`, or a definition sets `isolated: true` in its front matter, which a
+call can turn off with `isolated: false`. The copy is made from the working
+tree `crab` runs in, whether that is the repository's own checkout, a linked
+worktree, such as the one an editor gives each agent session, or a folder
+outside any repository, and it starts from that tree as it is, uncommitted
+changes and new files included.
+
+### Clones and checkouts
+
+`OMC_ISOLATION` picks how the copy is made:
+
+| Value      | Inside a git repository                                                        | Outside one                |
+| ---------- | ------------------------------------------------------------------------------ | -------------------------- |
+| `auto`     | A copy-on-write clone where the file system can make one, else a checkout. The default. | A copy-on-write clone, or refused. |
+| `cow`      | A copy-on-write clone, or refused.                                              | A copy-on-write clone, or refused. |
+| `worktree` | A checkout, as before clones were made.                                         | Refused.                   |
+
+A copy-on-write clone shares the storage of the files it was made from until
+either side writes, so it is made in moments whatever the tree holds, and it
+holds everything the tree does, ignored files included: installed
+dependencies such as `node_modules` and build output such as `target` are
+there, so the subagent can build and run tests at once. Changes to ignored
+files are not handed back. Clones are made with `clonefile(2)` on APFS
+(macOS), and with the `FICLONE` ioctl on Linux file systems that share
+extents (btrfs, XFS, bcachefs, OCFS2); clones need the cache folder on the
+same volume as the working tree. A checkout writes every file anew from the
+repository and leaves ignored files out. Under `auto` a working tree that
+cannot be cloned is checked out instead, without saying so; the subagent is
+told which it got.
+
+Inside a repository, either way, the state is written into a commit no branch
+points at, through an index of its own so the main agent's index is untouched,
+and the copy is a git worktree on a detached head at that commit, so no branch
+name is taken. A clone is a worktree registered without a checkout and filled
+with clones of the working tree's own files, its `.git` left out. Worktrees are made under
 `oh-my-crab/worktrees/<conversation id>` in the user's cache folder, never
 inside the working tree, so its status, searches and file watchers never see
 them, and they are locked with the reason `oh-my-crab task worktree`, which
@@ -101,9 +128,28 @@ failed are saved the same way and not applied. Every result ends with a
 `worktree` field. A worktree whose subagent is stopped is removed at once; one
 left behind by a crash is removed when its conversation opens again, and other
 conversations' worktrees made more than a day before are removed then too.
-Isolation needs `git` and a git working tree; a call asking for it anywhere
-else is refused with the reason and starts nothing, rather than running the
-subagents unisolated.
+A clone is moved aside and forgotten by git at once when its subagent ends,
+and its files are deleted in the background, so a clone holding many ignored
+files does not hold the result up.
+
+### Outside a repository
+
+Outside a git repository, where `git` is not installed too, the folder is
+cloned once, untouched, as the state the subagents of a call start from, and
+each subagent works in a clone of that. When one ends, its clone is compared
+with the untouched one file by file: a file whose size and modification time
+are the same is taken as unchanged, any other is compared byte for byte, and
+files a `.gitignore` names are left out on both sides. The changed, added and
+removed files are applied to the folder only if every one of them is there
+still as it was when the subagent started, or already as the subagent left
+it; otherwise none is applied, and they are saved in the conversation's output
+folder as a unified diff, which `git apply` and `patch -p1` read, with the
+files that conflict named, just as a patch that does not apply is inside a
+repository. Where clones cannot be made, or with `OMC_ISOLATION=worktree`, a
+call asking for isolation outside a repository is refused with the reason and
+starts nothing, rather than running the subagents unisolated.
+
+### Nesting
 
 Isolation composes with nesting. A subagent working in a worktree of its own
 that starts an isolated subagent has that subagent's worktree made from its

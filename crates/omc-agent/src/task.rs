@@ -389,7 +389,8 @@ impl Run {
                 ISOLATED,
                 &[
                     ("directory", shown.as_str()),
-                    ("submodules", submodules.as_str())
+                    ("submodules", submodules.as_str()),
+                    ("cloned", if lease.cloned() { "yes" } else { "" })
                 ]
             )
         );
@@ -791,6 +792,7 @@ impl Task {
                     store: isolation.store.clone(),
                     patches: isolation.patches.clone(),
                     tools: isolation.tools.clone(),
+                    backend: isolation.backend,
                 })),
                 _ => self.settings.isolation.clone(),
             };
@@ -955,7 +957,7 @@ impl Tool for Task {
         });
         let isolated = json!({
             "type": "boolean",
-            "description": "Run the subagent in a git worktree of its own, a copy of your working tree; its changes are applied to yours as a patch when it ends."
+            "description": "Run the subagent in a copy of your working tree of its own (a copy-on-write clone, or a git worktree); its changes are applied to yours as a patch when it ends."
         });
         let model = json!({
             "type": "string",
