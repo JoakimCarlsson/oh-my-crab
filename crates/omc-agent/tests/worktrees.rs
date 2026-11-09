@@ -67,6 +67,35 @@ struct Bench {
     patches: PathBuf,
 }
 
+/// Whether the file system of the scratch folders can make copy-on-write clones, tried with a file in a scratch folder called `name`; says on standard error that the test calling it is skipped when it cannot.
+fn clones_here(name: &str) -> bool {
+    let root = scratch(name);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("probe"), "probe\n").unwrap();
+    let cloned = if cfg!(target_os = "macos") {
+        Command::new("cp")
+            .args(["-c", "probe", "probe-clone"])
+            .current_dir(&root)
+            .status()
+            .is_ok_and(|status| status.success())
+    } else if cfg!(target_os = "linux") {
+        Command::new("cp")
+            .args(["--reflink=always", "probe", "probe-clone"])
+            .current_dir(&root)
+            .status()
+            .is_ok_and(|status| status.success())
+    } else {
+        false
+    };
+    if !cloned {
+        eprintln!(
+            "skipped: the file system of {} cannot make copy-on-write clones",
+            root.display()
+        );
+    }
+    cloned
+}
+
 /// A repository in a scratch folder called `name`, holding `a.txt` committed, with a linked worktree on a detached head under `.pandemonium/worktrees` in which `a.txt` has an uncommitted change and `c.txt` is untracked, and `ignored.log` is ignored.
 fn bench(name: &str) -> Bench {
     let root = scratch(name);
@@ -301,12 +330,18 @@ async fn a_conflicting_sibling_is_kept_as_a_patch() {
 /// The same holds for clones in a repository.
 #[tokio::test]
 async fn a_conflicting_cloned_sibling_is_kept_as_a_patch() {
+    if !clones_here("cloned-conflict-probe") {
+        return;
+    }
     conflicting_siblings(&bench("cloned-conflict"), Backend::Cow).await;
 }
 
 /// The same holds for clones of a folder outside any repository, whose changes are taken and checked file by file.
 #[tokio::test]
 async fn a_conflicting_sibling_outside_a_repository_is_kept_as_a_patch() {
+    if !clones_here("plain-conflict-probe") {
+        return;
+    }
     conflicting_siblings(&plain_bench("plain-conflict"), Backend::Auto).await;
 }
 
@@ -624,6 +659,9 @@ async fn a_nested_isolated_subagent_merges_into_its_parents_worktree() {
 /// The same holds for clones: the child's clone is made from its parent's clone.
 #[tokio::test]
 async fn a_nested_cloned_subagent_merges_into_its_parents_clone() {
+    if !clones_here("cloned-nested-probe") {
+        return;
+    }
     nested("cloned-nested", Backend::Cow).await;
 }
 
@@ -713,6 +751,9 @@ fn tool_outputs(log: &Log) -> Vec<String> {
 /// A subagent in a clone of a linked worktree sees its uncommitted, untracked and ignored files, works outside it, and its edits come back uncommitted, while what it changed in an ignored file does not; the clone is gone afterwards and git lists no worktree of it.
 #[tokio::test]
 async fn a_cloned_subagent_sees_ignored_files_and_hands_its_edits_back() {
+    if !clones_here("cloned-linked-probe") {
+        return;
+    }
     let bench = bench("cloned-linked");
     let model = Router::new(|seen: &RequestSeen| match seen.messages {
         1 => calls(&[
@@ -783,6 +824,9 @@ async fn a_cloned_subagent_sees_ignored_files_and_hands_its_edits_back() {
 /// A subagent in a clone of a folder outside any repository has its changed, added and removed files applied to the folder, its ignored ones left alone.
 #[tokio::test]
 async fn a_cloned_subagent_outside_a_repository_hands_its_edits_back() {
+    if !clones_here("plain-linked-probe") {
+        return;
+    }
     let bench = plain_bench("plain-linked");
     std::fs::write(bench.linked.join("gone.txt"), "bye\n").unwrap();
     let model = Router::new(|seen: &RequestSeen| match seen.messages {
@@ -844,6 +888,9 @@ async fn a_cloned_subagent_outside_a_repository_hands_its_edits_back() {
 /// Outside a repository, `worktree` refuses isolation as before, while `cow` clones.
 #[tokio::test]
 async fn outside_a_repository_only_clones_isolate() {
+    if !clones_here("plain-backends-probe") {
+        return;
+    }
     let bench = plain_bench("plain-backends");
     let model = Router::new(|_: &RequestSeen| say("worked"));
     let (task, _) = task_tool(
@@ -877,6 +924,9 @@ async fn outside_a_repository_only_clones_isolate() {
 /// A clone left behind by a run that crashed is removed, and forgotten by git, when its conversation opens again; one whose subagent is stopped is removed at once.
 #[tokio::test]
 async fn clones_left_behind_are_pruned_and_stopped_ones_removed() {
+    if !clones_here("cloned-prune-probe") {
+        return;
+    }
     let bench = bench("cloned-prune");
     let (task, log) = task_tool(
         &bench.linked,

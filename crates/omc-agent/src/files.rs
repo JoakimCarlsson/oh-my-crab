@@ -412,6 +412,20 @@ fn hunk(out: &mut String, old: &str, new: &str) {
 mod tests {
     use super::*;
 
+    /// Dates every file under `folder` back to 2001, as a clone keeps the times of what it was made from, so that a file written afterwards differs in time even where the file system's clock is coarse.
+    fn age(folder: &Path) {
+        let then = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        for entry in std::fs::read_dir(folder).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                age(&path);
+            } else {
+                let file = std::fs::File::options().write(true).open(&path).unwrap();
+                file.set_modified(then).unwrap();
+            }
+        }
+    }
+
     /// Changed, added and removed files are found, ignored and untouched ones are not, and they apply to a folder that is still as it was.
     #[test]
     fn changes_are_found_and_applied() {
@@ -423,6 +437,7 @@ mod tests {
             std::fs::write(folder.join("a.txt"), "one\ntwo\n").unwrap();
             std::fs::write(folder.join("sub/gone.txt"), "bye\n").unwrap();
             std::fs::write(folder.join(".gitignore"), "*.log\n").unwrap();
+            age(folder);
         }
         std::fs::write(clone.join("a.txt"), "one\nTWO\n").unwrap();
         std::fs::write(clone.join("new.txt"), "made").unwrap();
@@ -464,6 +479,7 @@ mod tests {
             std::fs::create_dir_all(folder).unwrap();
             std::fs::write(folder.join("a.txt"), "one\n").unwrap();
             std::fs::write(folder.join("b.txt"), "bee\n").unwrap();
+            age(folder);
         }
         std::fs::write(clone.join("a.txt"), "sub\n").unwrap();
         std::fs::write(clone.join("b.txt"), "sub bee\n").unwrap();
