@@ -185,9 +185,10 @@ async fn a_slow_extension_refuses_the_call() {
     let log = dir.join("log.jsonl");
     let (host, _) = started(
         &dir,
-        guard(&log, &[("GUARD_SLOW", "3")], Duration::from_millis(500)),
+        guard(&log, &[("GUARD_SLOW", "10")], Duration::from_secs(2)),
     )
     .await;
+    assert!(host.wants("tool_call"), "the extension did not start");
     let hooks = ExtensionHooks::new(host.clone());
     let (call, arguments) = bash("echo hi");
     let began = std::time::Instant::now();
@@ -195,6 +196,6 @@ async fn a_slow_extension_refuses_the_call() {
         panic!("a slow extension let the call through");
     };
     assert!(reason.contains("gave no answer"), "{reason}");
-    assert!(began.elapsed() < Duration::from_secs(3));
+    assert!(began.elapsed() < Duration::from_secs(8));
     host.shutdown().await;
 }
