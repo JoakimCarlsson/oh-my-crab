@@ -212,6 +212,7 @@ fn every_example_reads_back() {
                 || reads_as::<omc_wire::Event>(line)
                 || reads_as::<Vec<omc_wire::ProviderInfo>>(line)
                 || reads_as::<Vec<omc_wire::ToolInfo>>(line)
+                || reads_as::<Vec<omc_wire::Limits>>(line)
                 || reads_as::<omc_wire::MemoryListing>(line)
                 || reads_as::<omc_wire::Imported>(line)
                 || reads_as::<omc_wire::Conversation>(line))

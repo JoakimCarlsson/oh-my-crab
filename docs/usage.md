@@ -5,6 +5,7 @@ crab serve                      hold a conversation over standard input and outp
 crab tools                      print the tools the agent can have, as a JSON list
 crab providers                  print the providers, as a JSON list of id, name and sign-in
 crab account <p> [folder]       print who provider <p> is signed in as, or nothing
+crab limits [p] [--json]        print how much of its subscription allowance each signed-in provider has used
 crab history <id> [folder]      print a saved conversation: title, settings, turns and branches
 crab rename <id> <folder> <t>   name a saved conversation nobody has open
 crab import <id> <folder>       save a conversation a client kept itself, read as JSON
@@ -27,6 +28,13 @@ one prints it as an error.
   or the end of standard input. It holds one conversation at a time; an `Open`
   for another one replaces it. [Getting started](getting-started.md) walks
   through a session.
+- **`limits [provider] [--json] [--folder <folder>]`** asks each signed-in
+  provider that meters a subscription allowance how much of it the account has
+  used, or only `provider`, and prints a bar, a share and the time to the reset
+  for each window. `--json` prints a list of `Limits` instead, see the
+  [wire protocol](wire-protocol.md#limits-limit-and-limitunit). `--folder` reads
+  the logins kept in another folder. A provider that cannot be asked, or whose
+  account has no plan, is reported on standard error and left out.
 - **`tools`** lists the built-in tools by name with the first sentence of
   each description, in name order. Tool-server tools are not listed, since
   the client configures them, and neither are the tools that only appear in

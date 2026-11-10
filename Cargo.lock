@@ -1626,6 +1626,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "omc-auth",
+ "omc-wire",
  "reqwest 0.13.5",
  "ring",
  "serde",

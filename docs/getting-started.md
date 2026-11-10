@@ -63,6 +63,16 @@ $ crab account claude
 you@example.com
 ```
 
+`crab limits` shows how much of a subscription's allowance (the five-hour and
+weekly windows, the month's premium requests) a signed-in account has used:
+
+```console
+$ crab limits claude
+Claude
+  5 hour   [#######-------------]   37%  resets in 2h 14m
+  7 day    [##------------------]   12%  resets in 3d 9h
+```
+
 [Providers](providers/overview.md) lists every provider, its key variable and
 its default model.
 

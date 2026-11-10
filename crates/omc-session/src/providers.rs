@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use omc_auth::Auth;
 use omc_providers::Provider;
-use omc_wire::{KeySource, ProviderInfo, SignIn};
+use omc_wire::{KeySource, Limits, ProviderInfo, SignIn};
 
 /// How `auth` is signed in to, as a client is told: a cloud provider that takes a key is offered as one, and one that takes none as needing no sign-in, since its credentials are found where the cloud's own tools keep them.
 fn sign_in(auth: &Auth) -> SignIn {
@@ -98,6 +98,35 @@ pub fn save_key(id: &str, key: Option<&str>, home: Option<PathBuf>) -> Result<()
         return Err(format!("{} takes no API key", provider.def().label));
     }
     omc_auth::save_key(id, key, home).map_err(|error| error.to_string())
+}
+
+/// The ids of the providers whose subscription allowance [`limits`] can read, in the order of [`providers`].
+pub fn limits_providers() -> Vec<String> {
+    Provider::all()
+        .into_iter()
+        .filter(|provider| omc_providers::limits_supported(*provider))
+        .map(|provider| provider.def().id.to_owned())
+        .collect()
+}
+
+/// What the account the provider `id` is signed in as has used of its subscription allowance, asked of the provider, with the logins kept in `home` or in the harness's own folder when there is none.
+///
+/// Nothing is returned when the provider meters no allowance that can be read, or the account has none to show, as for an API key or an account without a plan.
+///
+/// # Errors
+///
+/// Fails with the reason when the provider is unknown, nothing is stored for it, its login cannot be renewed, or the provider cannot be reached or refuses the request.
+pub async fn limits(id: &str, home: Option<PathBuf>) -> Result<Option<Limits>, String> {
+    let provider = Provider::from_id(id).ok_or_else(|| format!("no provider is called {id}"))?;
+    omc_auth::with_home(home, async {
+        let credentials = omc_providers::credentials_for(provider)
+            .await
+            .map_err(|error| error.to_string())?;
+        omc_providers::fetch_limits(provider, &credentials)
+            .await
+            .map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[cfg(test)]

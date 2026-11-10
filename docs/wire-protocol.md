@@ -1297,6 +1297,41 @@ the variable's `name`) or `saved`:
 [{"name":"ask","description":"Asks the user questions during execution and waits for the answers."},...]
 ```
 
+### `Limits`, `Limit` and `LimitUnit`
+
+`crab limits --json` prints a list of `Limits`, one for each provider asked:
+Claude (the five-hour and weekly windows, a weekly cap for a model that has its
+own, and extra usage), Codex (the plan's windows, those of extra metered
+features and a credit cap), GitHub Copilot (the month's premium requests, chat
+and completions), Kimi Code, Z.ai and MiniMax. The providers publish no
+documentation for these endpoints, so a field the provider leaves out is left
+out here too.
+
+| Field           | Type            | Presence | Meaning                                              |
+| --------------- | --------------- | -------- | ---------------------------------------------------- |
+| `provider`      | string          | required | The provider's id, such as `claude`.                 |
+| `plan`          | string          | optional | The plan the account is on, when the provider says.  |
+| `fetched_at_ms` | integer         | required | When the provider was asked, as Unix milliseconds.   |
+| `limits`        | list of `Limit` | required | The windows and quotas, in the order to show them.   |
+
+| `Limit` field   | Type      | Presence | Meaning                                                                 |
+| --------------- | --------- | -------- | ----------------------------------------------------------------------- |
+| `label`         | string    | required | The name to show, such as `5 hour`.                                     |
+| `window`        | string    | optional | A stable name for the window's length: `5h`, `7d`, `monthly`.           |
+| `unit`          | `LimitUnit` | default | `percent`, `requests`, `tokens`, `credits`, `usd` or `unknown`.        |
+| `used_fraction` | number    | optional | How much is used, from 0 to 1.                                          |
+| `used`          | number    | optional | How much is used, in `unit`.                                            |
+| `limit`         | number    | optional | The cap, in `unit`; absent when there is none or it is not reported.    |
+| `resets_at_ms`  | integer   | optional | When the window resets, as Unix milliseconds.                           |
+| `unlimited`     | bool      | default  | Whether there is no cap.                                                |
+
+```json
+[{"provider":"claude","fetched_at_ms":1794308000000,"limits":[{"label":"5 hour","window":"5h","unit":"percent","used_fraction":0.37,"used":37.0,"limit":100.0,"resets_at_ms":1794312000000}]}]
+```
+
+From Rust, `omc_session::limits(id, home)` asks one provider and
+`omc_session::limits_providers()` lists those that can be asked.
+
 ### `MemoryListing` and `MemoryEntry`
 
 `crab memory [folder]` prints a `MemoryListing`:

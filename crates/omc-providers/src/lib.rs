@@ -6,6 +6,7 @@ mod cloud;
 mod custom;
 mod error;
 mod identity;
+mod limits;
 mod models;
 mod prompt;
 mod provider;
@@ -21,6 +22,7 @@ pub use chat::{
 };
 pub use custom::{Custom, custom_providers_path};
 pub use error::ProviderError;
+pub use limits::{fetch as fetch_limits, supported as limits_supported};
 pub use models::{
     ModelInfo, Pricing, Retention, cache_ttl, context_window, efforts, model_info, pricing,
     warmable,

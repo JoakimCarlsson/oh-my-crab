@@ -10,6 +10,7 @@ mod edits;
 mod hooks;
 mod languages;
 mod lifecycle;
+mod limits;
 mod listing;
 mod memory;
 mod permissions;
@@ -29,12 +30,15 @@ mod turn;
 mod warmer;
 
 pub use hooks::{hooks, trust};
+pub use limits::render as render_limits;
 pub use listing::tools;
 pub use memory::memory;
 pub use permissions::{
     FILE_VARIABLE as PERMISSIONS_FILE_VARIABLE, add_permission, permissions, remove_permission,
 };
-pub use providers::{account, key_source, providers, save_key, signed_in};
+pub use providers::{
+    account, key_source, limits, limits_providers, providers, save_key, signed_in,
+};
 pub use serve::serve;
 pub use session::{Options, run, run_with};
 pub use session::{fork, history, import, rename};
