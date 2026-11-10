@@ -55,7 +55,7 @@ impl Task {
     ///
     /// # Errors
     ///
-    /// Fails when the files cannot be copied or the patch does not apply to them. The patch is given to git as a plain absolute path, since git on Windows cannot open a `\\?\` path.
+    /// Fails when the files cannot be copied or the patch does not apply to them. The patch is given to git as a plain absolute path, since git on Windows cannot open a `\\?\` path, and git is told to keep line endings as they are, since Windows git would otherwise turn them into CRLF.
     pub(crate) fn settle(&mut self, scratch: &Path) -> Result<(), String> {
         let Some(patch) = &self.patch else {
             return Ok(());
@@ -67,7 +67,7 @@ impl Task {
         let patch = std::path::absolute(patch)
             .map_err(|error| format!("could not find {}: {error}", patch.display()))?;
         let applied = Process::new("git")
-            .args(["apply", "--whitespace=nowarn"])
+            .args(["-c", "core.autocrlf=false", "apply", "--whitespace=nowarn"])
             .arg(&patch)
             .current_dir(&after)
             .output()
