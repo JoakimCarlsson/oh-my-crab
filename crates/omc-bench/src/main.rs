@@ -86,8 +86,8 @@ fn benchmark(options: &Options) -> Result<(), String> {
         .any(|contender| matches!(contender, Contender::Crab(_)));
     let setup = Setup {
         tools: options.tools.clone(),
-        denied: if measures_crab {
-            denied(&crab, &options.tools)?
+        offered: if measures_crab {
+            offered(&crab, &options.tools, &tasks)?
         } else {
             Vec::new()
         },
@@ -181,6 +181,7 @@ fn unmade(
         context: 0,
         requests: 0,
         tokens: 0,
+        written: 0,
         seconds: 0.0,
     }
 }
@@ -195,12 +196,12 @@ fn nearest_crab() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(name))
 }
 
-/// The names of the tools `crab` offers that are not in `allowed`, which the model is then not given.
+/// The names of the tools `crab` offers.
 ///
 /// # Errors
 ///
-/// Fails when `crab tools` cannot be run or read, or `allowed` names a tool `crab` does not offer.
-fn denied(crab: &Path, allowed: &[String]) -> Result<Vec<String>, String> {
+/// Fails when `crab tools` cannot be run or read, or `usual` or one of `tasks` names a tool `crab` does not offer.
+fn offered(crab: &Path, usual: &[String], tasks: &[Task]) -> Result<Vec<String>, String> {
     let listed = Process::new(crab)
         .arg("tools")
         .output()
@@ -212,27 +213,22 @@ fn denied(crab: &Path, allowed: &[String]) -> Result<Vec<String>, String> {
             String::from_utf8_lossy(&listed.stderr).trim()
         ));
     }
-    let offered: Vec<omc_wire::ToolInfo> =
+    let listed: Vec<omc_wire::ToolInfo> =
         serde_json::from_slice(&listed.stdout).map_err(|error| {
             format!(
                 "could not read what {} tools printed: {error}",
                 crab.display()
             )
         })?;
-    if let Some(unknown) = allowed
-        .iter()
-        .find(|name| !offered.iter().any(|tool| &tool.name == *name))
-    {
+    let offered: Vec<String> = listed.into_iter().map(|tool| tool.name).collect();
+    let wanted = tasks.iter().flat_map(|task| task.tools(usual)).chain(usual);
+    if let Some(unknown) = wanted.into_iter().find(|name| !offered.contains(name)) {
         return Err(format!(
             "{} offers no tool called {unknown}",
             crab.display()
         ));
     }
-    Ok(offered
-        .into_iter()
-        .map(|tool| tool.name)
-        .filter(|name| !allowed.contains(name))
-        .collect())
+    Ok(offered)
 }
 
 /// The seconds since 1970 as text, which names the output folder of a run that was given none.

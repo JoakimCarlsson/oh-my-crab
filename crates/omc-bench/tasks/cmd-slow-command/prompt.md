@@ -1,0 +1,1 @@
+Run `python3 build.py`. It takes a little over two minutes and then prints a line with a build id. Write that build id, alone on one line, to a new file called `BUILD_ID` in this folder. Do not change any other file.

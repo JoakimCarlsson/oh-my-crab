@@ -29,6 +29,10 @@ pub(crate) struct Tally {
     requests: u32,
     /// The tokens the model was sent, added up over the requests.
     sent: u64,
+    /// The tokens the model wrote, added up over its replies.
+    written: u64,
+    /// What each `Used` event of the wire said: the tokens the conversation held and the tokens the model wrote. Crab sends one after each reply, and one that wrote nothing after a pruning or a compaction, which is no request.
+    measured: Vec<(u64, u64)>,
     /// The ids of the requests counted so far, for a harness that reports one more than once.
     counted: HashSet<String>,
     /// Whether the model has said, thought or called anything yet.
@@ -48,7 +52,10 @@ impl Tally {
                     self.failed(&tool.id);
                 }
             }
-            Event::Used(usage) => self.request(usage.used),
+            Event::Used(usage) => {
+                self.measured.push((usage.used, usage.written));
+                self.context = self.context.max(usage.used);
+            }
             Event::Started(_) | Event::Said(_) | Event::Thought(_) => self.active = true,
             _ => {}
         }
@@ -87,14 +94,32 @@ impl Tally {
         }
     }
 
+    /// Counts `tokens` more tokens the model wrote.
+    pub(crate) fn wrote(&mut self, tokens: u64) {
+        self.written += tokens;
+    }
+
+    /// The `Used` events of the wire that stand for a request: the ones after a reply, which wrote something, or all of them when none says what was written, as from a crab that predates the figure.
+    fn replies(&self) -> impl Iterator<Item = &(u64, u64)> {
+        let known = self.measured.iter().any(|(_, written)| *written > 0);
+        self.measured
+            .iter()
+            .filter(move |(_, written)| !known || *written > 0)
+    }
+
+    /// The tokens the model wrote, added up over its replies.
+    pub(crate) fn written(&self) -> u64 {
+        self.written + self.replies().map(|(_, written)| written).sum::<u64>()
+    }
+
     /// How many requests the model was sent.
     pub(crate) fn requests(&self) -> u32 {
-        self.requests
+        self.requests + self.replies().count() as u32
     }
 
     /// The tokens the model was sent, added up over the requests.
     pub(crate) fn sent(&self) -> u64 {
-        self.sent
+        self.sent + self.replies().map(|(used, _)| used).sum::<u64>()
     }
 
     /// Whether the model has said, thought or called anything yet.
@@ -163,10 +188,17 @@ mod tests {
             Event::Used(Usage {
                 used: 900,
                 size: 1000,
+                written: 70,
             }),
             Event::Used(Usage {
                 used: 400,
                 size: 1000,
+                written: 30,
+            }),
+            Event::Used(Usage {
+                used: 200,
+                size: 1000,
+                written: 0,
             }),
         ] {
             tally.take(&event);
@@ -174,6 +206,7 @@ mod tests {
         assert!(tally.active());
         assert_eq!(tally.context(), 900);
         assert_eq!((tally.requests(), tally.sent()), (2, 1300));
+        assert_eq!(tally.written(), 100);
         let tools = tally.into_tools();
         assert_eq!(
             tools["read"],

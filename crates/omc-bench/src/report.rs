@@ -27,6 +27,8 @@ struct Sum {
     requests: u32,
     /// The tokens the model was sent, added up.
     tokens: u64,
+    /// The tokens the model wrote, added up.
+    written: u64,
     /// How long the runs took together, in seconds.
     seconds: f64,
 }
@@ -46,6 +48,7 @@ impl Sum {
             sum.errors += u32::from(outcome.error.is_some());
             sum.requests += outcome.requests;
             sum.tokens += outcome.tokens;
+            sum.written += outcome.written;
             sum.seconds += outcome.seconds;
         }
         sum
@@ -82,16 +85,16 @@ fn contenders(outcomes: &[Outcome]) -> Vec<&str> {
     contenders
 }
 
-/// The table of `outcomes` by contender: how many runs passed and passed cleanly, what a run took in requests, tool calls, tokens sent and time, how many edit calls failed, and how many runs ended badly.
+/// The table of `outcomes` by contender: how many runs passed and passed cleanly, what a run took in requests, tool calls, tokens sent, tokens written and time, how many edit calls failed, and how many runs ended badly.
 fn by_contender(outcomes: &[Outcome]) -> String {
     let mut table = String::from(
-        "| contender | runs | passed | clean | requests / run | tool calls / run | failed edit calls | tokens sent / run | seconds / run | errors |\n|---|---|---|---|---|---|---|---|---|---|\n",
+        "| contender | runs | passed | clean | requests / run | tool calls / run | failed edit calls | tokens sent / run | tokens written / run | seconds / run | errors |\n|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for contender in contenders(outcomes) {
         let sum = Sum::of(outcomes.iter().filter(|outcome| outcome.model == contender));
         let _ = writeln!(
             table,
-            "| {contender} | {} | {} | {} | {:.1} | {:.1} | {} | {} | {:.0} | {} |",
+            "| {contender} | {} | {} | {} | {:.1} | {:.1} | {} | {} | {:.0} | {:.0} | {} |",
             sum.runs,
             share(sum.passed, sum.runs),
             share(sum.clean, sum.runs),
@@ -99,6 +102,7 @@ fn by_contender(outcomes: &[Outcome]) -> String {
             sum.each(f64::from(sum.calls)),
             share(sum.failed, sum.edits),
             thousands(sum.each(sum.tokens as f64)),
+            sum.each(sum.written as f64),
             sum.each(sum.seconds),
             sum.errors,
         );
@@ -197,6 +201,7 @@ mod tests {
             context: 1000,
             requests: calls + 2,
             tokens: 2500,
+            written: 300,
             seconds: 10.0,
         }
     }
@@ -213,11 +218,11 @@ mod tests {
         let rows: Vec<&str> = report.lines().collect();
         assert_eq!(
             rows[2],
-            "| b | 2 | 100% | 50% | 4.0 | 3.0 | 25% | 2.5k | 10 | 0 |"
+            "| b | 2 | 100% | 50% | 4.0 | 3.0 | 25% | 2.5k | 300 | 10 | 0 |"
         );
         assert_eq!(
             rows[3],
-            "| a | 1 | 0% | 0% | 4.0 | 3.0 | 100% | 2.5k | 10 | 0 |"
+            "| a | 1 | 0% | 0% | 4.0 | 3.0 | 100% | 2.5k | 300 | 10 | 0 |"
         );
         assert!(report.contains("| task | b | a |"));
         assert!(

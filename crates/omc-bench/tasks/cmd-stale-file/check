@@ -1,0 +1,12 @@
+git diff --quiet HEAD -- tools && python3 -c '
+import sys
+sys.path.insert(0, "tools")
+import normalize
+import subprocess
+before = subprocess.run(["git", "show", "HEAD:config/app.conf"], capture_output=True, text=True, check=True).stdout
+wanted = normalize.parse(before)
+wanted["server"]["timeout"] = "45"
+wanted["client"]["retries"] = "3"
+found = open("config/app.conf").read()
+sys.exit(0 if found.strip() == normalize.render(wanted).strip() else 1)
+'

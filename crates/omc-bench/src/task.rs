@@ -22,6 +22,12 @@ const FIXTURES: &str = "fixtures";
 /// The file in a task's folder that holds the change the model should make, as a patch `git apply` takes, in place of a folder of the files it should leave.
 const PATCH: &str = "change.patch";
 
+/// The file in a task's folder that names the tools the model is given for it, separated by commas or lines, in place of the benchmark's own.
+const TOOLS: &str = "tools";
+
+/// The file in a task's folder that holds the command that says whether the model did what was asked: run by `bash` in the folder the model worked in, it ends successfully when it did.
+const CHECK: &str = "check";
+
 /// The folder git keeps its own files in, which is no part of a task's files.
 const GIT: &str = ".git";
 
@@ -34,8 +40,12 @@ pub(crate) struct Task {
     pub(crate) prompt: String,
     /// The folder of the files the model starts from.
     pub(crate) before: PathBuf,
-    /// The folder of the files the model should leave; for a task that gives them as a patch, the folder [`Task::settle`] makes.
-    pub(crate) after: PathBuf,
+    /// The folder of the files the model should leave, when the task is scored on them; for a task that gives them as a patch, the folder [`Task::settle`] makes.
+    pub(crate) after: Option<PathBuf>,
+    /// The command that ends successfully when the model did what was asked, when the task is scored by one.
+    pub(crate) check: Option<String>,
+    /// The tools the model is given for this task, when it names its own.
+    pub(crate) tools: Option<Vec<String>>,
     /// The patch that turns the files the model starts from into the ones it should leave, when the task gives them that way.
     pub(crate) patch: Option<PathBuf>,
 }
@@ -70,8 +80,13 @@ impl Task {
                 String::from_utf8_lossy(&applied.stderr).trim()
             ));
         }
-        self.after = after;
+        self.after = Some(after);
         Ok(())
+    }
+
+    /// The tools the model is given for this task: its own when it names them, else `usual`.
+    pub(crate) fn tools<'a>(&'a self, usual: &'a [String]) -> &'a [String] {
+        self.tools.as_deref().unwrap_or(usual)
     }
 }
 
@@ -81,17 +96,50 @@ impl Task {
 ///
 /// Fails when `git init` cannot be run there.
 pub(crate) fn init(folder: &Path) -> Result<(), String> {
-    let made = Process::new("git")
-        .args(["init", "--quiet"])
+    git(folder, &["init", "--quiet"])
+}
+
+/// Commits everything in the git repository `folder` as its first commit, so that a harness finds a clean working tree and a check can tell what the model changed.
+///
+/// # Errors
+///
+/// Fails when git cannot stage or commit the files.
+pub(crate) fn commit(folder: &Path) -> Result<(), String> {
+    git(folder, &["add", "--all"])?;
+    git(
+        folder,
+        &[
+            "-c",
+            "user.name=crab-bench",
+            "-c",
+            "user.email=crab-bench@localhost",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "--message",
+            "Start",
+        ],
+    )
+}
+
+/// Runs git in `folder` with `arguments`, showing nothing of what it prints.
+///
+/// # Errors
+///
+/// Fails when git cannot be started or ends unsuccessfully.
+fn git(folder: &Path, arguments: &[&str]) -> Result<(), String> {
+    let asked = arguments.join(" ");
+    let ran = Process::new("git")
+        .args(arguments)
         .current_dir(folder)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map_err(|error| format!("could not run git init: {error}"))?;
-    if made.success() {
+        .map_err(|error| format!("could not run git {asked}: {error}"))?;
+    if ran.success() {
         Ok(())
     } else {
-        Err(format!("git init failed in {}", folder.display()))
+        Err(format!("git {asked} failed in {}", folder.display()))
     }
 }
 
@@ -124,11 +172,11 @@ pub(crate) fn load(folder: &Path, only: &[String]) -> Result<Vec<Task>, String> 
 
 /// The task called `name` that the folder `path` holds, its shared fixture looked for under `fixtures` when it names one.
 ///
-/// The files the model starts from are the task's own `before` folder, or the fixture its `fixture` file names. The files it should leave are its `after` folder, or what its `change.patch` makes of the files it starts from.
+/// The files the model starts from are the task's own `before` folder, or the fixture its `fixture` file names. The task is scored on the files it should leave, which are its `after` folder or what its `change.patch` makes of the files it starts from, on the command in its `check` file, or on both. Its `tools` file names the tools the model gets, when it needs other than the usual ones.
 ///
 /// # Errors
 ///
-/// Fails when the prompt cannot be read or is empty, or the files to start from or the files to leave are given in neither way.
+/// Fails when the prompt cannot be read or is empty, the files to start from are missing, or the task has nothing to be scored on.
 fn read(name: String, path: &Path, fixtures: &Path) -> Result<Task, String> {
     let prompt = std::fs::read_to_string(path.join(PROMPT))
         .map_err(|error| format!("task {name} has no readable {PROMPT}: {error}"))?
@@ -146,16 +194,37 @@ fn read(name: String, path: &Path, fixtures: &Path) -> Result<Task, String> {
     }
     let (after, patch) = (path.join(AFTER), path.join(PATCH));
     let patch = patch.is_file().then_some(patch);
-    if patch.is_none() && !after.is_dir() {
-        return Err(format!("task {name} has neither {AFTER} nor {PATCH}"));
+    let after = after.is_dir().then_some(after);
+    let check = written(&path.join(CHECK));
+    if patch.is_none() && after.is_none() && check.is_none() {
+        return Err(format!(
+            "task {name} has none of {AFTER}, {PATCH} and {CHECK}"
+        ));
     }
+    let tools = written(&path.join(TOOLS)).map(|tools| {
+        tools
+            .split([',', '\n'])
+            .map(str::trim)
+            .filter(|tool| !tool.is_empty())
+            .map(str::to_owned)
+            .collect()
+    });
     Ok(Task {
         name,
         prompt,
         before,
         after,
+        check,
+        tools,
         patch,
     })
+}
+
+/// What the file `path` says, without the white space around it, or nothing when it is missing, unreadable or empty.
+fn written(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
 /// The files under `root` and what each holds, by path from `root` written with `/`, git's own folder left out.
@@ -331,14 +400,12 @@ mod tests {
         );
         let mut tasks = load(&folder.join("tasks"), &[]).unwrap();
         tasks[0].settle(&folder.join("expected")).unwrap();
+        let after = tasks[0].after.clone().unwrap();
         assert_eq!(
-            std::fs::read_to_string(tasks[0].after.join("a.txt")).unwrap(),
+            std::fs::read_to_string(after.join("a.txt")).unwrap(),
             "one\nthree\n"
         );
-        assert_eq!(
-            differing(&tasks[0].after, &tasks[0].before).unwrap(),
-            ["a.txt"]
-        );
+        assert_eq!(differing(&after, &tasks[0].before).unwrap(), ["a.txt"]);
         put(
             &folder,
             "tasks/swap/change.patch",
@@ -348,7 +415,23 @@ mod tests {
         assert!(broken[0].settle(&folder.join("expected")).is_err());
     }
 
-    /// Every bundled task asks for a change: its two folders hold the same files, and at least one of them differs.
+    /// A task may be scored by a command alone and name its own tools, and one with nothing to be scored on is refused.
+    #[test]
+    fn a_task_may_be_scored_by_a_command() {
+        let folder = scratch("checked");
+        put(&folder, "run/prompt.md", "Do it.\n");
+        put(&folder, "run/before/a.txt", "one\n");
+        assert!(load(&folder, &[]).is_err());
+        put(&folder, "run/check", "test -f done.txt\n");
+        put(&folder, "run/tools", "read, edit\nbash\n");
+        let tasks = load(&folder, &[]).unwrap();
+        assert_eq!(tasks[0].after, None);
+        assert_eq!(tasks[0].check.as_deref(), Some("test -f done.txt"));
+        let usual = ["read".to_owned()];
+        assert_eq!(tasks[0].tools(&usual), ["read", "edit", "bash"]);
+    }
+
+    /// Every bundled task asks for a change: one scored on files has the same files in both folders, at least one of them different, and one scored by a command alone has a command.
     #[test]
     fn bundled_tasks_ask_for_a_change() {
         let mut tasks = load(&crate::bundled_tasks(), &[]).unwrap();
@@ -356,15 +439,19 @@ mod tests {
         let expected = scratch("bundled");
         for task in &mut tasks {
             task.settle(&expected).unwrap();
-            let (before, after) = (files(&task.before).unwrap(), files(&task.after).unwrap());
+            let Some(after) = &task.after else {
+                assert!(task.check.is_some(), "task {} is not scored", task.name);
+                continue;
+            };
+            let (before, after_files) = (files(&task.before).unwrap(), files(after).unwrap());
             assert_eq!(
                 before.keys().collect::<Vec<_>>(),
-                after.keys().collect::<Vec<_>>(),
+                after_files.keys().collect::<Vec<_>>(),
                 "task {} adds or removes files",
                 task.name
             );
             assert!(
-                !differing(&task.after, &task.before).unwrap().is_empty(),
+                !differing(after, &task.before).unwrap().is_empty(),
                 "task {} changes nothing",
                 task.name
             );

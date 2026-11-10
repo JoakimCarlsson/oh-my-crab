@@ -1,0 +1,1 @@
+Run `python3 tools/check.py`. It lists the problems it finds in the Python files under `src/`. Fix every one of them in `src/`, running the check again until it prints `ok`. Do not change `tools/check.py`, and do not change what the code does.

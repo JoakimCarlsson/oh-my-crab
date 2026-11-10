@@ -25,6 +25,9 @@ const ERRORS: &str = "stderr.txt";
 /// How many characters of a baseline's error stream are kept to explain why it failed.
 const ERROR_TAIL: usize = 400;
 
+/// The placeholder in a baseline command that stands for the tools the model is given, as crab names them.
+const TOOLS: &str = "{tools}";
+
 /// The setting whose value Claude Code is given as its effort.
 const EFFORT: &str = "effort";
 
@@ -38,7 +41,7 @@ const CLAUDE_TOOLS: &[(&str, &str)] = &[
     ("bash", "Bash"),
 ];
 
-/// Runs `task` in `work` with Claude Code and the model `model`: no settings, hooks or tool servers of the user's, nothing asked before a tool runs, nothing saved, and only the tools of `setup` it has a counterpart of. Every line it prints is kept in the file `transcript`.
+/// Runs `task` in `work` with Claude Code and the model `model`: no settings, hooks or tool servers of the user's, nothing asked before a tool runs, nothing saved, and only those of the task's tools it has a counterpart of. Every line it prints is kept in the file `transcript`.
 ///
 /// Gives the count of what the model did and, when the run ended badly, why.
 pub(crate) fn claude_code(
@@ -53,7 +56,7 @@ pub(crate) fn claude_code(
         .args(["-p", &task.prompt])
         .args(["--output-format", "stream-json", "--verbose"])
         .args(["--model", model])
-        .args(["--tools", &claude_tools(&setup.tools)])
+        .args(["--tools", &claude_tools(task.tools(&setup.tools))])
         .args(["--permission-mode", "bypassPermissions"])
         .args(["--setting-sources", ""])
         .args(["--no-session-persistence", "--strict-mcp-config"]);
@@ -70,7 +73,7 @@ pub(crate) fn claude_code(
     (tally, ended.or(refused))
 }
 
-/// Runs `task` in `work` with the program `words` name, the word that is [`PROMPT`] replaced by what the model is asked. Every line it prints is kept in the file `transcript`, and lines that report tool calls as [`event_line`] reads them are counted.
+/// Runs `task` in `work` with the program `words` name, the word that is [`PROMPT`] replaced by what the model is asked and [`TOOLS`], wherever it stands, by the task's tools with commas between them. Every line it prints is kept in the file `transcript`, and lines that report tool calls as [`event_line`] reads them are counted.
 ///
 /// Gives the count of what the model did, which is empty for a program that reports no calls, and, when the run ended badly, why.
 pub(crate) fn command(
@@ -84,13 +87,14 @@ pub(crate) fn command(
     let Some((program, arguments)) = words.split_first() else {
         return (tally, Some("the command is empty".to_owned()));
     };
+    let tools = task.tools(&setup.tools).join(",");
     let mut process = Process::new(program);
     for argument in arguments {
-        process.arg(if argument == PROMPT {
-            &task.prompt
+        if argument == PROMPT {
+            process.arg(&task.prompt);
         } else {
-            argument
-        });
+            process.arg(argument.replace(TOOLS, &tools));
+        }
     }
     let mut refused = None;
     let ended = stream(process, work, transcript, setup.timeout, |line| {
@@ -188,7 +192,7 @@ fn tokens(usage: &Value, name: &str) -> u64 {
     usage.get(name).and_then(Value::as_u64).unwrap_or(0)
 }
 
-/// Counts in `tally` what one line of Claude Code's stream says: the tool calls of an assistant message and the request it answers, counted once however many lines carry the message, and the calls a user message reports as failed.
+/// Counts in `tally` what one line of Claude Code's stream says: the tool calls of an assistant message and the request it answers, counted once however many lines carry the message, the calls a user message reports as failed, and the tokens the closing result says the model wrote in all.
 ///
 /// Gives the reason when the line is a result that says the run failed.
 fn claude_line(line: &str, tally: &mut Tally) -> Option<String> {
@@ -219,18 +223,21 @@ fn claude_line(line: &str, tally: &mut Tally) -> Option<String> {
             }
             None
         }
-        "result" if event["is_error"] == true => Some(
-            event["result"]
-                .as_str()
-                .or(event["subtype"].as_str())
-                .unwrap_or("the run failed")
-                .to_owned(),
-        ),
+        "result" => {
+            tally.wrote(tokens(&event["usage"], "output_tokens"));
+            (event["is_error"] == true).then(|| {
+                event["result"]
+                    .as_str()
+                    .or(event["subtype"].as_str())
+                    .unwrap_or("the run failed")
+                    .to_owned()
+            })
+        }
         _ => None,
     }
 }
 
-/// Counts in `tally` what one line of a baseline's stream says, when it is a JSON object of one of these kinds, named by its `type`: `tool_execution_start` with a `toolCallId` and a `toolName`, `tool_execution_end` with a `toolCallId` and whether it `isError`, and `message_end` with the `usage` of its `message` as `input`, `cacheRead` and `cacheWrite` tokens. Any other line counts for nothing.
+/// Counts in `tally` what one line of a baseline's stream says, when it is a JSON object of one of these kinds, named by its `type`: `tool_execution_start` with a `toolCallId` and a `toolName`, `tool_execution_end` with a `toolCallId` and whether it `isError`, and `message_end` with the `usage` of its `message` as `input`, `cacheRead`, `cacheWrite` and `output` tokens. Any other line counts for nothing.
 ///
 /// Gives the reason when a `message_end` says its message stopped on an error.
 fn event_line(line: &str, tally: &mut Tally) -> Option<String> {
@@ -259,6 +266,7 @@ fn event_line(line: &str, tally: &mut Tally) -> Option<String> {
                         + tokens(usage, "cacheRead")
                         + tokens(usage, "cacheWrite"),
                 );
+                tally.wrote(tokens(usage, "output"));
             }
             (message["stopReason"] == "error").then(|| {
                 message["errorMessage"]
@@ -289,7 +297,7 @@ mod tests {
             r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"x"},{"type":"tool_use","id":"b","name":"Edit"}],"usage":{"input_tokens":8,"cache_creation_input_tokens":100,"cache_read_input_tokens":900}}}"#,
             r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b","is_error":true}]}}"#,
             r#"{"type":"assistant","message":{"id":"m3","content":[{"type":"tool_use","id":"c","name":"Edit"}],"usage":{"input_tokens":1100}}}"#,
-            r#"{"type":"result","subtype":"success","is_error":false,"result":"done"}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done","usage":{"output_tokens":250}}"#,
             "not json",
         ];
         for line in lines {
@@ -304,6 +312,7 @@ mod tests {
         );
         assert_eq!(tally.context(), 1100);
         assert_eq!((tally.requests(), tally.sent()), (3, 3018));
+        assert_eq!(tally.written(), 250);
         let tools = tally.into_tools();
         assert_eq!(
             tools["read"],
@@ -330,7 +339,7 @@ mod tests {
             r#"{"type":"tool_execution_end","toolCallId":"a","isError":true}"#,
             r#"{"type":"tool_execution_start","toolCallId":"b","toolName":"edit"}"#,
             r#"{"type":"tool_execution_end","toolCallId":"b","isError":false}"#,
-            r#"{"type":"message_end","message":{"usage":{"input":10,"cacheRead":500,"cacheWrite":90},"stopReason":"toolUse"}}"#,
+            r#"{"type":"message_end","message":{"usage":{"input":10,"cacheRead":500,"cacheWrite":90,"output":40},"stopReason":"toolUse"}}"#,
             r#"{"type":"message_update"}"#,
             "plain text",
         ];
@@ -346,6 +355,7 @@ mod tests {
         );
         assert_eq!(tally.context(), 600);
         assert_eq!((tally.requests(), tally.sent()), (1, 600));
+        assert_eq!(tally.written(), 40);
         assert_eq!(
             edits(&tally.into_tools()),
             Uses {

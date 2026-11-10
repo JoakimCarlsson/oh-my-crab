@@ -714,13 +714,14 @@ A `Slash`:
 How full the conversation's context is, as a `Usage`. Sent after each model
 reply and after compaction or pruning.
 
-| Field  | Type    | Meaning                                     |
-| ------ | ------- | ------------------------------------------- |
-| `used` | integer | Tokens the conversation holds.              |
-| `size` | integer | Tokens the model's context window takes.    |
+| Field     | Type    | Meaning                                                                                                   |
+| --------- | ------- | --------------------------------------------------------------------------------------------------------- |
+| `used`    | integer | Tokens the conversation holds: what the request sent, cached or not.                                      |
+| `size`    | integer | Tokens the model's context window takes.                                                                  |
+| `written` | integer | Tokens the model wrote in the reply this was measured on, reasoning included; 0 after compaction or pruning. A client written before the field may ignore it, and a `Usage` saved without it reads as 0. |
 
 ```json
-{"Used":{"used":22927,"size":1000000}}
+{"Used":{"used":22927,"size":1000000,"written":184}}
 ```
 
 ### `Started`

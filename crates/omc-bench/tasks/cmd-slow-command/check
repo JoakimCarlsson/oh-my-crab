@@ -1,0 +1,1 @@
+git diff --quiet HEAD && test "$(cat BUILD_ID | tr -d '[:space:]')" = "$(python3 -c 'import build; print(build.build_id())')"

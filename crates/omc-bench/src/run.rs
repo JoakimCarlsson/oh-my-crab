@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command as Process;
+use std::process::{Command as Process, Stdio};
 use std::time::{Duration, Instant};
 
 use omc_client::{Harness, Heard};
@@ -11,13 +11,16 @@ use omc_wire::{Command, Event, LanguageAnswer, LanguageAsk, Opening, Verdict};
 
 use crate::args::{Contender, Model};
 use crate::tally::{Tally, Uses, edits};
-use crate::task::{Task, copy, differing, init};
+use crate::task::{Task, commit, copy, differing, init};
 
 /// How long the harness is listened to before the time left is looked at again.
 const POLL: Duration = Duration::from_secs(1);
 
 /// The folder under a run's folder that the model works in.
 const WORK: &str = "work";
+
+/// What is listed among the files that differ when a task's check command did not end successfully.
+const CHECK_FAILED: &str = "(the check failed)";
 
 /// The file under a run's folder that the harness's events are kept in, one a line.
 const TRANSCRIPT: &str = "events.jsonl";
@@ -29,8 +32,8 @@ pub(crate) struct Setup {
     pub(crate) crab: PathBuf,
     /// The names of the tools the model is given, as crab calls them.
     pub(crate) tools: Vec<String>,
-    /// The names of crab's tools the model is not given.
-    pub(crate) denied: Vec<String>,
+    /// The names of every tool crab offers, from which the ones a task does not give the model are denied; empty when crab is not measured.
+    pub(crate) offered: Vec<String>,
     /// The conversation settings every run starts with, as ids and values.
     pub(crate) settings: Vec<(String, String)>,
     /// How long one run may take.
@@ -64,6 +67,9 @@ pub(crate) struct Outcome {
     pub(crate) requests: u32,
     /// The tokens the model was sent, added up over the requests; what it read from a cache counts too.
     pub(crate) tokens: u64,
+    /// The tokens the model wrote, added up over its replies.
+    #[serde(default)]
+    pub(crate) written: u64,
     /// How long the run took, in seconds.
     pub(crate) seconds: f64,
 }
@@ -91,11 +97,18 @@ pub(crate) fn run(
             crate::baseline::command(setup, words, task, &work, &transcript)
         }
     };
-    let (differing, error) = match differing(&task.after, &work) {
-        Ok(differing) => (differing, error),
-        Err(reason) => (Vec::new(), error.or(Some(reason))),
+    let (mut differing, error) = match task.after.as_ref().map(|after| differing(after, &work)) {
+        None => (Vec::new(), error),
+        Some(Ok(differing)) => (differing, error),
+        Some(Err(reason)) => (Vec::new(), error.or(Some(reason))),
     };
+    if let Some(check) = &task.check
+        && !checks(check, &work)
+    {
+        differing.push(CHECK_FAILED.to_owned());
+    }
     let (context, requests, tokens) = (tally.context(), tally.requests(), tally.sent());
+    let written = tally.written();
     let tools = tally.into_tools();
     let passed = error.is_none() && differing.is_empty();
     Outcome {
@@ -110,19 +123,33 @@ pub(crate) fn run(
         context,
         requests,
         tokens,
+        written,
         seconds: started.elapsed().as_secs_f64(),
     }
 }
 
-/// Makes `work` a fresh copy of the files `task` starts from, in a git repository of its own, so that the project the harness sees ends there.
+/// Makes `work` a fresh copy of the files `task` starts from, committed in a git repository of its own, so that the project the harness sees ends there and starts clean.
 ///
 /// # Errors
 ///
-/// Fails when the files cannot be copied or `git init` cannot be run there.
+/// Fails when the files cannot be copied, or git cannot make the repository or the commit.
 fn prepare(task: &Task, work: &Path) -> Result<(), String> {
     let _ = std::fs::remove_dir_all(work);
     copy(&task.before, work)?;
-    init(work)
+    init(work)?;
+    commit(work)
+}
+
+/// Whether the command `check`, run by `bash` in `work`, ends successfully; it does not when `bash` cannot be started.
+fn checks(check: &str, work: &Path) -> bool {
+    Process::new("bash")
+        .args(["-c", check])
+        .current_dir(work)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// The command that starts the measured crab in `work`, with the user's own folders and files replaced by empty ones, and memory, tool servers, extensions and the catalog download off.
@@ -150,8 +177,9 @@ fn harness(setup: &Setup, work: &Path) -> Process {
     process
 }
 
-/// How the conversation of a run is opened: `model` working in `work`, nothing asked before a tool runs, nothing saved, and the language services answered by the benchmark itself so that no language server is started.
-fn opening(setup: &Setup, model: &Model, work: &Path) -> Opening {
+/// How the conversation of a run of `task` is opened: `model` working in `work` with the task's tools and no others, nothing asked before a tool runs, nothing saved, and the language services answered by the benchmark itself so that no language server is started.
+fn opening(setup: &Setup, model: &Model, task: &Task, work: &Path) -> Opening {
+    let given = task.tools(&setup.tools);
     Opening {
         directory: work.to_path_buf(),
         home: None,
@@ -159,7 +187,12 @@ fn opening(setup: &Setup, model: &Model, work: &Path) -> Opening {
         model: model.model.clone(),
         yolo: true,
         tools: Vec::new(),
-        denied: setup.denied.clone(),
+        denied: setup
+            .offered
+            .iter()
+            .filter(|tool| !given.contains(tool))
+            .cloned()
+            .collect(),
         disabled: Vec::new(),
         conversation: None,
         history: None,
@@ -188,7 +221,7 @@ fn converse(
     };
     let mut kept = std::fs::File::create(transcript).ok();
     let asked = harness
-        .send(&Command::Open(opening(setup, model, work)))
+        .send(&Command::Open(opening(setup, model, task, work)))
         .and_then(|()| {
             harness.send(&Command::Prompt {
                 text: task.prompt.clone(),

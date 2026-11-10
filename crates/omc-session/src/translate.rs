@@ -244,6 +244,7 @@ pub(crate) fn replay(
                     turn.events.push(Event::Used(Usage {
                         used: tokens.context(),
                         size: window,
+                        written: tokens.output,
                     }));
                 }
             }
@@ -284,6 +285,7 @@ pub(crate) fn replay(
                     turn.events.push(Event::Used(Usage {
                         used: pruning.tokens_after,
                         size: window,
+                        written: 0,
                     }));
                 }
             }
@@ -326,6 +328,7 @@ pub(crate) fn translate(event: AgentEvent, window: u64) -> Option<Event> {
         AgentEvent::Used(tokens) => Event::Used(Usage {
             used: tokens.context(),
             size: window,
+            written: tokens.output,
         }),
         AgentEvent::ToolStart { id, name, summary } => Event::Tool(Tool {
             title: Some(name.clone()),
@@ -455,7 +458,7 @@ mod tests {
         assert_eq!(done.state, Some(ToolState::Failed));
     }
 
-    /// The context size follows the window it is given.
+    /// The context size follows the window it is given, and what the model wrote is passed on.
     #[test]
     fn usage_uses_the_window() {
         let tokens = omc_providers::Tokens {
@@ -468,7 +471,8 @@ mod tests {
             translate(AgentEvent::Used(tokens), 1_000_000),
             Some(Event::Used(Usage {
                 used: 15,
-                size: 1_000_000
+                size: 1_000_000,
+                written: 5,
             }))
         );
     }
@@ -903,7 +907,8 @@ mod tests {
             turns[2].events.last(),
             Some(Event::Used(Usage {
                 used: 120,
-                size: 1_000
+                size: 1_000,
+                ..
             }))
         ));
     }

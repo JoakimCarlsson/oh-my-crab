@@ -1,0 +1,1 @@
+git diff --quiet HEAD -- test_pricing.py && python3 -m unittest -q

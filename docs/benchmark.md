@@ -60,8 +60,9 @@ or the difference is the model's and not the harness's.
   `glob`, `edit`, `write` and `bash`. An `effort` given with `--set` is passed
   on to it.
 - `--command <name>=<command>` runs any other program. The command is split at
-  spaces, and the word `{prompt}` is replaced by what the model is asked. The
-  program is started in the run's folder with nothing on its input and must
+  spaces, and the word `{prompt}` is replaced by what the model is asked;
+  `{tools}`, wherever it stands, is replaced by the task's tools, by crab's
+  names with commas between them. The program is started in the run's folder with nothing on its input and must
   end when it is done; ending unsuccessfully fails the run. Which model and
   tools it uses is up to the command.
 
@@ -81,10 +82,12 @@ own system prompt and its own `read` and search tools.
 
 ## What a run is
 
-- The task's `before` files are copied to a fresh folder, which is made a git
-  repository of its own so that the project crab sees ends there.
+- The task's `before` files are copied to a fresh folder and committed in a
+  git repository of its own, so that the project crab sees ends there and
+  starts clean.
 - The conversation is opened in yolo mode, is not saved, and gets only the
-  tools `--tools` names. With the default tools the model cannot fall back on
+  tools `--tools` names, or the ones the task names in its `tools` file. With
+  the default tools the model cannot fall back on
   `write` or `bash`, so the result says how `edit` did.
 - The user's own instruction files, skills, agents, hooks and permission rules
   are left out, and memory, tool servers and extensions are off, so two
@@ -101,7 +104,9 @@ makes it.
 
 A run **passed** when every file is what the task's `after` folder holds and no
 file was added or removed. Files are compared line by line; white space at the
-end of a line and blank lines are ignored, everything else counts.
+end of a line and blank lines are ignored, everything else counts. A task with
+a `check` command passes when that command ends successfully, in place of the
+comparison or on top of it.
 
 A run is **clean** when it passed and no edit call failed on the way. A run
 that passes only after a rejected edit still costs a round trip and tokens,
@@ -117,12 +122,14 @@ The report has one row for each harness and model:
 | `tool calls / run`  | How many tool calls a run took, of any tool.                              |
 | `failed edit calls` | The share of the calls of `edit`, `write` and the like that did not work. |
 | `tokens sent / run` | The tokens sent to the model, added up over a run's requests.             |
+| `tokens written / run` | The tokens the model wrote, reasoning included.                        |
 | `seconds / run`     | How long a run took.                                                      |
 | `errors`            | Runs that ended badly: the turn failed, timed out or the harness stopped. |
 
 `tokens sent` counts what each request carried, cached or not, so it shows how
-much a harness makes the model read. It leaves out what the model wrote, which
-crab does not report over the wire.
+much a harness makes the model read. `tokens written` is what the model wrote
+in reply; a crab older than the `written` field of the wire's `Used` event
+reports 0.
 
 A second table shows, for each task, how many runs of each harness passed, and
 the requests, tokens sent and seconds a run of it took.
@@ -212,9 +219,16 @@ What the runs showed:
 - On the small tasks crab sends about 3,000 more tokens a run than Claude
   Code.
 
-Three runs a cell show the large differences and not the small ones, and
-`tokens sent` leaves out what the model wrote. Run the command above to
-measure again after a change.
+Three runs a cell show the large differences and not the small ones. Run the
+command above to measure again after a change.
+
+Since these runs, `edit` takes an insert at line 0 and needs no tag for one,
+so a line can be added to the top of files without reading them. Measured
+again on that one task, three runs each, `real-header-every-file` takes crab
+24.0k tokens and 8 seconds with Sonnet 5.5, and 24.0k tokens and 19 seconds
+with Fable 5.2, with no refused call. The tables above are from before that
+change, and from before the `cmd-` tasks and the `tokens written` column
+existed.
 
 ## Tasks
 
@@ -231,6 +245,14 @@ A task on a large body of code shares it with others instead of carrying a
 copy: a `fixture` file names a folder under `crates/omc-bench/fixtures` to
 start from in place of `before/`, and `change.patch` gives the change to make,
 as a patch `git apply` takes, in place of `after/`.
+
+A task that needs more than the usual tools names them in a `tools` file,
+separated by commas or lines. A task whose result cannot be given as files has
+a `check` file instead of `after/` or `change.patch`, or beside them: one
+command, run by `bash` in the folder the model worked in once the run is over,
+that ends successfully when the model did what was asked. The folder is a git
+repository with the starting files committed, so the command can use `git diff`
+to see that a file was left alone.
 
 Prompts say exactly what to change, so that a failed run is a failed edit and
 not a different opinion about the code.
@@ -270,5 +292,16 @@ tokens and seconds it takes.
 | `real-deep-edit`         | Change a line at the top and four lines deep in a 2,100-line file.        |
 | `real-catalog-values`    | Change eight values in a large JSON file where other lines look the same. |
 
+The `cmd-` tasks need commands to be run, so they give the model `bash` as
+well, and are scored by a check command. They need `python3`.
+
+| Task                   | What it asks                                                                    |
+| ---------------------- | ------------------------------------------------------------------------------- |
+| `cmd-fix-failing-test` | Run the tests, find the bug behind the one that fails, and fix it.               |
+| `cmd-lint-loop`        | Run a checker and fix the seven problems it lists in three files, until it passes. |
+| `cmd-slow-command`     | Run a command that takes 130 seconds and write down what it prints at the end.   |
+| `cmd-stale-file`       | Read a file, run a script that rewrites it, then edit the rewritten file.        |
+
 To add a task, add a folder in one of those shapes. A test fails when a task
-adds or removes files, changes nothing, or has a patch that does not apply.
+scored on files adds or removes files, changes nothing, or has a patch that
+does not apply.

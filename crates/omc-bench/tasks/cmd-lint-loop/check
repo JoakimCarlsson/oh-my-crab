@@ -1,0 +1,1 @@
+git diff --quiet HEAD -- tools && python3 tools/check.py
