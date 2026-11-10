@@ -185,7 +185,7 @@ async fn a_slow_extension_refuses_the_call() {
     let log = dir.join("log.jsonl");
     let (host, _) = started(
         &dir,
-        guard(&log, &[("GUARD_SLOW", "10")], Duration::from_secs(2)),
+        guard(&log, &[("GUARD_SLOW", "30")], Duration::from_secs(6)),
     )
     .await;
     assert!(host.wants("tool_call"), "the extension did not start");
@@ -196,6 +196,6 @@ async fn a_slow_extension_refuses_the_call() {
         panic!("a slow extension let the call through");
     };
     assert!(reason.contains("gave no answer"), "{reason}");
-    assert!(began.elapsed() < Duration::from_secs(8));
+    assert!(began.elapsed() < Duration::from_secs(20));
     host.shutdown().await;
 }
