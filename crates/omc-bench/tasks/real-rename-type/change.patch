@@ -1,0 +1,440 @@
+diff --git a/src/agent.rs b/src/agent.rs
+index fc61422..61f8bcf 100644
+--- a/src/agent.rs
++++ b/src/agent.rs
+@@ -9,7 +9,7 @@ use async_trait::async_trait;
+ use futures_util::future::join_all;
+ use omc_providers::{
+     ChatModel, Effort, Message, Part, ProviderError, Pruning, Reply, Request, Sink, Stop, Tokens,
+-    ToolCall, ToolResult, ToolSpec,
++    ToolCall, ToolOutcome, ToolSpec,
+ };
+ use omc_tools::{
+     Caller, Checkpoint, Concurrency, FileChange, NoCaller, Notebook, Registry, Tool, ToolOutput,
+@@ -186,7 +186,7 @@ fn rewind(history: &mut Vec<Message>, length: usize, report: &str, scribe: Optio
+     let [.., Message::Assistant(reply), Message::ToolResults(results)] = history.as_slice() else {
+         return;
+     };
+-    let siblings: Vec<ToolResult> = results
++    let siblings: Vec<ToolOutcome> = results
+         .iter()
+         .filter(|result| result.name != "rewind")
+         .cloned()
+@@ -435,7 +435,7 @@ fn refuse(
+     calls: &[ToolCall],
+     text: &str,
+     events: &(dyn Fn(AgentEvent) + Send + Sync),
+-) -> Vec<ToolResult> {
++) -> Vec<ToolOutcome> {
+     calls
+         .iter()
+         .map(|call| {
+@@ -450,7 +450,7 @@ fn refuse(
+ }
+ 
+ /// Adds `notice` to the end of the last of `results`, where the model reads it with them.
+-fn append_notice(results: &mut [ToolResult], notice: &str) {
++fn append_notice(results: &mut [ToolOutcome], notice: &str) {
+     if let Some(last) = results.last_mut() {
+         last.text.push_str("\n\n");
+         last.text.push_str(notice.trim());
+@@ -987,7 +987,7 @@ async fn run_calls(
+     history: &[Message],
+     calls: &[ToolCall],
+     events: &(dyn Fn(AgentEvent) + Send + Sync),
+-) -> (Vec<ToolResult>, Option<String>) {
++) -> (Vec<ToolOutcome>, Option<String>) {
+     let gate = tokio::sync::RwLock::new(());
+     let halt = std::sync::Mutex::new(None);
+     let batch = Batch {
+@@ -998,7 +998,7 @@ async fn run_calls(
+         gate: &gate,
+         halt: &halt,
+     };
+-    let mut slots: Vec<Option<ToolResult>> = vec![None; calls.len()];
++    let mut slots: Vec<Option<ToolOutcome>> = vec![None; calls.len()];
+     let mut admitted = Vec::new();
+     for (index, call) in calls.iter().enumerate() {
+         if call.name == RECALL && recall::offered(history) {
+@@ -1077,7 +1077,7 @@ struct Screening {
+ /// Where one call stands once it was read, shown to the hooks and announced.
+ enum Admitted<'r> {
+     /// It ended without running, with this result.
+-    Ended(ToolResult),
++    Ended(ToolOutcome),
+     /// It may run, once it is approved when it needs to be.
+     Ready(Ready<'r>),
+ }
+@@ -1225,7 +1225,7 @@ impl Batch<'_> {
+     /// Runs `call`, admitted as `ready`, and reports its outcome, with the note from the hooks that screened it and what the hooks say after it added to its text; the tools it runs, when it runs any, are run through a [`Nested`] caller under it.
+     ///
+     /// A failing tool yields a result with `is_error` set.
+-    async fn run_call(&self, call: &ToolCall, ready: Ready<'_>) -> ToolResult {
++    async fn run_call(&self, call: &ToolCall, ready: Ready<'_>) -> ToolOutcome {
+         let caller = Nested::new(*self, call);
+         let done = perform(call, ready, self.hooks, &caller).await;
+         if let Some(reason) = done.halt {
+@@ -1511,7 +1511,7 @@ fn finish(
+     is_error: bool,
+     changes: Vec<FileChange>,
+     events: &(dyn Fn(AgentEvent) + Send + Sync),
+-) -> ToolResult {
++) -> ToolOutcome {
+     events(AgentEvent::ToolDone {
+         id: call.id.clone(),
+         name: call.name.clone(),
+@@ -1519,7 +1519,7 @@ fn finish(
+         is_error,
+         changes,
+     });
+-    ToolResult {
++    ToolOutcome {
+         call_id: call.id.clone(),
+         name: call.name.clone(),
+         text,
+@@ -1736,7 +1736,7 @@ mod tests {
+             request: Request<'_>,
+             _: &mut dyn Sink,
+         ) -> Result<Reply, ProviderError> {
+-            let results: Vec<&ToolResult> = request
++            let results: Vec<&ToolOutcome> = request
+                 .messages
+                 .iter()
+                 .filter_map(|message| match message {
+@@ -1835,7 +1835,7 @@ mod tests {
+ 
+     /// Runs one turn in which the model calls `read` with `arguments` in `dir`,
+     /// denying every approval, and returns the result of that call.
+-    async fn read_once(dir: &std::path::Path, arguments: serde_json::Value) -> ToolResult {
++    async fn read_once(dir: &std::path::Path, arguments: serde_json::Value) -> ToolOutcome {
+         let registry = Registry::builtin(dir).unwrap();
+         let model = Scripted::new(vec![
+             call_reply("t1", "read", arguments),
+diff --git a/src/compaction.rs b/src/compaction.rs
+index f9314c0..3e73704 100644
+--- a/src/compaction.rs
++++ b/src/compaction.rs
+@@ -6,7 +6,7 @@ use std::borrow::Cow;
+ use std::collections::{BTreeSet, HashMap};
+ 
+ use omc_providers::{
+-    ChatModel, Compaction, Effort, Elision, Message, Part, Reply, Request, Sink, ToolResult,
++    ChatModel, Compaction, Effort, Elision, Message, Part, Reply, Request, Sink, ToolOutcome,
+ };
+ 
+ use crate::AgentEvent;
+@@ -209,7 +209,7 @@ pub(crate) fn shown<'h>(history: &'h [Message], at: usize, hidden: &Hidden) -> C
+                 .iter()
+                 .map(
+                     |result| match hidden.elided.get(&(at, result.call_id.as_str())) {
+-                        Some(&reason) => ToolResult {
++                        Some(&reason) => ToolOutcome {
+                             text: elision_note(result, reason),
+                             images: Vec::new(),
+                             ..result.clone()
+@@ -280,7 +280,7 @@ pub(crate) fn excision_note(block: &str, at: usize) -> String {
+ }
+ 
+ /// The note that stands in for `result` when it is left out for `reason`, which tells the model how to read it again.
+-pub(crate) fn elision_note(result: &ToolResult, reason: Elision) -> String {
++pub(crate) fn elision_note(result: &ToolOutcome, reason: Elision) -> String {
+     let id = &result.call_id;
+     match reason {
+         Elision::Old => format!(
+@@ -315,7 +315,7 @@ fn summary_message(compaction: &Compaction) -> String {
+ }
+ 
+ /// About how many tokens `result` takes, counted as [`estimate`] counts them.
+-pub(crate) fn result_tokens(result: &ToolResult) -> u64 {
++pub(crate) fn result_tokens(result: &ToolOutcome) -> u64 {
+     ((result.text.len() + result.images.len() * IMAGE_CHARS) as u64).div_ceil(4)
+ }
+ 
+@@ -684,7 +684,7 @@ fn call_id(at: usize) -> String {
+ #[cfg(test)]
+ /// Tests for planning and summarizing a compaction.
+ mod tests {
+-    use omc_providers::{Reply, ToolCall, ToolResult};
++    use omc_providers::{Reply, ToolCall, ToolOutcome};
+     use serde_json::json;
+ 
+     use super::*;
+@@ -709,7 +709,7 @@ mod tests {
+ 
+     /// The results of the call `id`, of about `tokens` tokens.
+     fn results(id: &str, tokens: usize) -> Message {
+-        Message::ToolResults(vec![ToolResult {
++        Message::ToolResults(vec![ToolOutcome {
+             call_id: id.to_owned(),
+             name: "read".to_owned(),
+             text: "t".repeat(tokens * 4),
+@@ -800,7 +800,7 @@ mod tests {
+                 }],
+                 ..Reply::default()
+             }),
+-            Message::ToolResults(vec![ToolResult {
++            Message::ToolResults(vec![ToolOutcome {
+                 call_id: "t".into(),
+                 name: "todo".into(),
+                 text: "ok".into(),
+@@ -834,7 +834,7 @@ mod tests {
+                 }],
+                 ..Reply::default()
+             }),
+-            Message::ToolResults(vec![ToolResult {
++            Message::ToolResults(vec![ToolOutcome {
+                 call_id: "u".into(),
+                 name: "todo".into(),
+                 text: "ok".into(),
+diff --git a/src/hooks.rs b/src/hooks.rs
+index a7ede31..caf7bf7 100644
+--- a/src/hooks.rs
++++ b/src/hooks.rs
+@@ -6,7 +6,7 @@ use std::sync::Arc;
+ use std::time::Duration;
+ 
+ use async_trait::async_trait;
+-use omc_providers::{Reply, ToolCall, ToolResult};
++use omc_providers::{Reply, ToolCall, ToolOutcome};
+ use serde_json::Value;
+ 
+ /// What the checks before a tool call decided about it.
+@@ -139,7 +139,7 @@ pub trait Hooks: Send + Sync {
+     }
+ 
+     /// What the checks make of a whole batch of `calls`, once each has its result in `results`, in the same order, and before the results go to the model; nothing, as by default.
+-    async fn after_batch(&self, _calls: &[ToolCall], _results: &[ToolResult]) -> Batched {
++    async fn after_batch(&self, _calls: &[ToolCall], _results: &[ToolOutcome]) -> Batched {
+         Batched::default()
+     }
+ 
+@@ -338,7 +338,7 @@ impl Hooks for Chained {
+     }
+ 
+     /// Runs each set on the batch, keeping every note.
+-    async fn after_batch(&self, calls: &[ToolCall], results: &[ToolResult]) -> Batched {
++    async fn after_batch(&self, calls: &[ToolCall], results: &[ToolOutcome]) -> Batched {
+         let mut notes = Vec::new();
+         let mut halt = None;
+         for link in &self.links {
+diff --git a/src/journal.rs b/src/journal.rs
+index aa45cd4..ddab743 100644
+--- a/src/journal.rs
++++ b/src/journal.rs
+@@ -1247,7 +1247,7 @@ fn end_of_turns(history: &[Message], turns: usize) -> usize {
+ /// Tests for appending, replaying and cutting back a history.
+ #[cfg(test)]
+ mod tests {
+-    use omc_providers::{Reply, ToolCall, ToolResult};
++    use omc_providers::{Reply, ToolCall, ToolOutcome};
+     use serde_json::json;
+ 
+     use super::*;
+@@ -1315,7 +1315,7 @@ mod tests {
+             &[
+                 Message::User("go".into()),
+                 call("c1"),
+-                Message::ToolResults(vec![ToolResult {
++                Message::ToolResults(vec![ToolOutcome {
+                     call_id: "c1".into(),
+                     name: "read".into(),
+                     text: "done".into(),
+@@ -1377,7 +1377,7 @@ mod tests {
+                 ],
+                 ..Reply::default()
+             }),
+-            Message::ToolResults(vec![ToolResult {
++            Message::ToolResults(vec![ToolOutcome {
+                 call_id: "c1".into(),
+                 name: "read".into(),
+                 text: "contents".into(),
+diff --git a/src/loop_guard.rs b/src/loop_guard.rs
+index c4ec876..dbfb304 100644
+--- a/src/loop_guard.rs
++++ b/src/loop_guard.rs
+@@ -2,7 +2,7 @@
+ 
+ use std::collections::HashMap;
+ 
+-use omc_providers::{ToolCall, ToolResult};
++use omc_providers::{ToolCall, ToolOutcome};
+ use omc_tools::FileChange;
+ use serde_json::Value;
+ 
+@@ -46,7 +46,7 @@ impl LoopGuard {
+     pub(crate) fn observe(
+         &mut self,
+         calls: &[ToolCall],
+-        results: &[ToolResult],
++        results: &[ToolOutcome],
+         changes: &[(String, Vec<FileChange>)],
+     ) -> Option<String> {
+         let mut notices = Vec::new();
+@@ -56,7 +56,7 @@ impl LoopGuard {
+     }
+ 
+     /// Counts how many batches in a row made `calls`, and returns the notice for repeating them when that is [`REPEATS`] or more; a batch only of exempt calls breaks the run.
+-    fn repeated(&mut self, calls: &[ToolCall], results: &[ToolResult]) -> Option<String> {
++    fn repeated(&mut self, calls: &[ToolCall], results: &[ToolOutcome]) -> Option<String> {
+         let counted: Vec<&ToolCall> = calls
+             .iter()
+             .filter(|call| !EXEMPT.contains(&call.name.as_str()))
+@@ -103,7 +103,7 @@ impl LoopGuard {
+     /// Counts, for each file a successful call in `results` reported in `changes`, how many edits in a row changed nothing, and returns the notices for the files where that reached [`NO_OPS`]: to look again, and from twice that on, to stop and explain.
+     fn no_op_edits(
+         &mut self,
+-        results: &[ToolResult],
++        results: &[ToolOutcome],
+         changes: &[(String, Vec<FileChange>)],
+     ) -> Vec<String> {
+         let mut notices = Vec::new();
+@@ -183,8 +183,8 @@ mod tests {
+     }
+ 
+     /// A result for the call `id` saying `text`.
+-    fn result(id: &str, text: &str, is_error: bool) -> ToolResult {
+-        ToolResult {
++    fn result(id: &str, text: &str, is_error: bool) -> ToolOutcome {
++        ToolOutcome {
+             call_id: id.into(),
+             name: "x".into(),
+             text: text.into(),
+diff --git a/src/pruning.rs b/src/pruning.rs
+index 5ea2fd5..cad3392 100644
+--- a/src/pruning.rs
++++ b/src/pruning.rs
+@@ -7,7 +7,7 @@
+ 
+ use std::collections::{HashMap, HashSet};
+ 
+-use omc_providers::{Elided, Elision, Message, Pruning, ToolResult};
++use omc_providers::{Elided, Elision, Message, Pruning, ToolOutcome};
+ 
+ use crate::compaction::{elision_note, elisions, estimate, hidden, live, result_tokens, shown};
+ 
+@@ -32,7 +32,7 @@ struct Candidate<'h> {
+     /// The position of the tool results it is one of.
+     at: usize,
+     /// The output.
+-    result: &'h ToolResult,
++    result: &'h ToolOutcome,
+ }
+ 
+ impl Candidate<'_> {
+@@ -202,7 +202,7 @@ mod tests {
+ 
+     /// The result of the call `id` to `name`, about `tokens` tokens long.
+     fn output(id: &str, name: &str, tokens: usize) -> Message {
+-        Message::ToolResults(vec![ToolResult {
++        Message::ToolResults(vec![ToolOutcome {
+             call_id: id.to_owned(),
+             name: name.to_owned(),
+             text: "x".repeat(tokens * 4),
+@@ -357,7 +357,7 @@ mod tests {
+         let Message::ToolResults(mut results) = output("b", "bash", 45_000) else {
+             unreachable!("output builds tool results");
+         };
+-        results.push(ToolResult {
++        results.push(ToolOutcome {
+             call_id: "c".into(),
+             ..results[0].clone()
+         });
+diff --git a/src/recall.rs b/src/recall.rs
+index 4d2f60b..3a75404 100644
+--- a/src/recall.rs
++++ b/src/recall.rs
+@@ -270,7 +270,7 @@ fn clip_to(text: &mut String, limit: usize) {
+ #[cfg(test)]
+ /// Tests for reading the history again.
+ mod tests {
+-    use omc_providers::{Compaction, Reply, ToolCall, ToolResult};
++    use omc_providers::{Compaction, Reply, ToolCall, ToolOutcome};
+ 
+     use super::*;
+ 
+@@ -286,7 +286,7 @@ mod tests {
+                 }],
+                 ..Reply::default()
+             }),
+-            Message::ToolResults(vec![ToolResult {
++            Message::ToolResults(vec![ToolOutcome {
+                 call_id: "c1".into(),
+                 name: "bash".into(),
+                 text: "ok 1\nFAILED parser::nested\nok 3".into(),
+diff --git a/src/recovery.rs b/src/recovery.rs
+index 510faec..8cfdf1e 100644
+--- a/src/recovery.rs
++++ b/src/recovery.rs
+@@ -215,7 +215,7 @@ fn kind(value: &Value) -> &'static str {
+ #[cfg(test)]
+ /// Tests for the retry waits and the recovery helpers.
+ mod tests {
+-    use omc_providers::{Stop, ToolResult};
++    use omc_providers::{Stop, ToolOutcome};
+     use serde_json::json;
+ 
+     use super::*;
+@@ -266,7 +266,7 @@ mod tests {
+         let mut prompt = vec![Message::User("go".into())];
+         add_notice(&mut prompt, "\nnote\n");
+         assert_eq!(prompt, [Message::User("go\n\nnote".into())]);
+-        let result = |text: &str| ToolResult {
++        let result = |text: &str| ToolOutcome {
+             call_id: "c".into(),
+             name: "read".into(),
+             text: text.into(),
+diff --git a/src/shake.rs b/src/shake.rs
+index 6bee216..abeca14 100644
+--- a/src/shake.rs
++++ b/src/shake.rs
+@@ -131,7 +131,7 @@ pub(crate) fn fenced(text: &str) -> Vec<(usize, usize)> {
+ #[cfg(test)]
+ /// Tests for choosing what a shake cuts out.
+ mod tests {
+-    use omc_providers::{Reply, ToolCall, ToolResult};
++    use omc_providers::{Reply, ToolCall, ToolOutcome};
+     use serde_json::json;
+ 
+     use super::*;
+@@ -151,7 +151,7 @@ mod tests {
+ 
+     /// The output of the call `id` to `name`: `lines` lines of about 40 bytes each.
+     fn output(id: &str, name: &str, lines: usize) -> Message {
+-        Message::ToolResults(vec![ToolResult {
++        Message::ToolResults(vec![ToolOutcome {
+             call_id: id.to_owned(),
+             name: name.to_owned(),
+             text: "0123456789012345678901234567890123456789\n".repeat(lines),
+diff --git a/src/todos.rs b/src/todos.rs
+index 9dd7973..d3fe6ff 100644
+--- a/src/todos.rs
++++ b/src/todos.rs
+@@ -4,7 +4,7 @@
+ 
+ use std::collections::HashMap;
+ 
+-use omc_providers::{Message, Reply, ToolCall, ToolResult};
++use omc_providers::{Message, Reply, ToolCall, ToolOutcome};
+ use omc_tools::FileChange;
+ use serde_json::Value;
+ 
+@@ -72,7 +72,7 @@ impl TodoTracker {
+     pub(crate) fn observe(
+         &mut self,
+         calls: &[ToolCall],
+-        results: &[ToolResult],
++        results: &[ToolOutcome],
+         changed: &[(String, Vec<FileChange>)],
+         text: &str,
+     ) -> Option<String> {
+@@ -244,8 +244,8 @@ mod tests {
+     }
+ 
+     /// A result of the call `id` to `name`.
+-    fn result(id: &str, name: &str, is_error: bool) -> ToolResult {
+-        ToolResult {
++    fn result(id: &str, name: &str, is_error: bool) -> ToolOutcome {
++        ToolOutcome {
+             call_id: id.into(),
+             name: name.into(),
+             text: "ok".into(),

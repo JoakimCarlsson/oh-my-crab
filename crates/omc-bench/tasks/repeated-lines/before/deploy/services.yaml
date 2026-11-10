@@ -1,0 +1,45 @@
+services:
+  api:
+    image: registry.example.com/shop/app:1.8.2
+    command: ["app", "serve"]
+    replicas: 2
+    resources:
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    env:
+      LOG_LEVEL: info
+      QUEUE: default
+  worker:
+    image: registry.example.com/shop/app:1.8.2
+    command: ["app", "work"]
+    replicas: 2
+    resources:
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    env:
+      LOG_LEVEL: info
+      QUEUE: default
+  scheduler:
+    image: registry.example.com/shop/app:1.8.2
+    command: ["app", "schedule"]
+    replicas: 2
+    resources:
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    env:
+      LOG_LEVEL: info
+      QUEUE: default
+  mailer:
+    image: registry.example.com/shop/app:1.8.2
+    command: ["app", "mail"]
+    replicas: 2
+    resources:
+      limits:
+        cpu: 500m
+        memory: 256Mi
+    env:
+      LOG_LEVEL: info
+      QUEUE: default

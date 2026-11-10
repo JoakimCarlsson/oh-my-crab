@@ -1,0 +1,1 @@
+Move the function `listing` from `src/files.rs` to `src/recall.rs`: remove it from `files.rs` together with its doc comment, and put it, unchanged and with its doc comment, directly above the `#[cfg(test)]` line near the end of `recall.rs`. Do not add imports or change callers; change nothing else.

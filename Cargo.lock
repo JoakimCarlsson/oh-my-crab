@@ -1511,6 +1511,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "omc-bench"
+version = "0.1.1"
+dependencies = [
+ "omc-client",
+ "omc-wire",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "omc-client"
 version = "0.1.1"
 dependencies = [

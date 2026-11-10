@@ -1,0 +1,135 @@
+diff --git a/src/agent.rs b/src/agent.rs
+index fc61422..16010b3 100644
+--- a/src/agent.rs
++++ b/src/agent.rs
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: MIT
+ //! The tool-calling loop.
+ 
+ use std::borrow::Cow;
+diff --git a/src/approval.rs b/src/approval.rs
+index d232d37..be28691 100644
+--- a/src/approval.rs
++++ b/src/approval.rs
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: MIT
+ //! Asking the user before tools that change things run, and the permission rules that decide for them.
+ 
+ use std::sync::atomic::{AtomicBool, Ordering};
+diff --git a/src/compaction.rs b/src/compaction.rs
+index f9314c0..c43157d 100644
+--- a/src/compaction.rs
++++ b/src/compaction.rs
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: MIT
+ //! Compaction: summarizing the older part of a long history so the conversation keeps fitting the model's context window.
+ //!
+ //! A compaction never deletes messages. It appends a [`Compaction`] to the history that holds a summary of the messages before a cut point; from then on the model is given that summary, the messages from the cut point on, and what follows. The whole history stays in the journal, so the conversation can still be shown and read in full.
+diff --git a/src/files.rs b/src/files.rs
+index 23a8abd..eed3e50 100644
+--- a/src/files.rs
++++ b/src/files.rs
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: MIT
+ //! Changes taken file by file, for subagents that work in a clone of a folder outside any git repository.
+ //!
+ //! The folder is cloned once, untouched, as the state every subagent of a call starts from, and each subagent works in a clone of that. When one ends, every file of its clone is compared with the untouched clone: one whose size and modification time match is taken to be unchanged, any other is read and compared byte for byte. Files a `.gitignore` names are left out on both sides, as git would leave them out.
+diff --git a/src/hooks.rs b/src/hooks.rs
+index a7ede31..7211bc1 100644
+--- a/src/hooks.rs
++++ b/src/hooks.rs
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: MIT
+ //! Checks the user defines around the loop: before and after each tool call, when a call needs the reader's permission, after each batch of calls, when a reply comes in, when a subagent starts, before and after the conversation is compacted, and when a turn is about to end.
+ //!
+ //! The loop only asks; what is checked and how is up to the [`Hooks`] it is given, such as commands the user configured.
+diff --git a/src/journal.rs b/src/journal.rs
+index aa45cd4..d140f17 100644
+--- a/src/journal.rs
++++ b/src/journal.rs
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: MIT
+ //! The history of one conversation, kept in an append-only file of JSON lines.
+ 
+ use std::fs::{File, OpenOptions};
+diff --git a/src/lib.rs b/src/lib.rs
+index 7a3108b..f378987 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: MIT
+ //! The agent loop: call the model, run its tool calls, repeat until it answers.
+ 
+ mod agent;
+diff --git a/src/loop_guard.rs b/src/loop_guard.rs
+index c4ec876..3111724 100644
+--- a/src/loop_guard.rs
++++ b/src/loop_guard.rs
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: MIT
+ //! Noticing when the model goes round in circles within a turn, and telling it to change course.
+ 
+ use std::collections::HashMap;
+diff --git a/src/pruning.rs b/src/pruning.rs
+index 5ea2fd5..acbce90 100644
+--- a/src/pruning.rs
++++ b/src/pruning.rs
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: MIT
+ //! Pruning: leaving tool outputs the model no longer needs out of its context, without asking a model for anything.
+ //!
+ //! A pruning never deletes messages. It appends a [`Pruning`] to the history that names the outputs to leave out; from then on the model is given a short note in place of each, which says how to read it again with `recall`. Two kinds of output are left out:
+diff --git a/src/recall.rs b/src/recall.rs
+index 4d2f60b..7a0afe9 100644
+--- a/src/recall.rs
++++ b/src/recall.rs
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: MIT
+ //! The `recall` tool: reading the whole history again, including what a compaction summarized and the tool outputs a pruning left out.
+ //!
+ //! The agent answers it from the history it holds, so it is offered only once the history holds something the model is no longer given in full.
+diff --git a/src/recovery.rs b/src/recovery.rs
+index 510faec..a240411 100644
+--- a/src/recovery.rs
++++ b/src/recovery.rs
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: MIT
+ //! Getting a turn past failures that need not end it: requests that fail for a while, and replies that stop short or cannot be read.
+ 
+ use std::hash::{BuildHasher, Hasher};
+diff --git a/src/shake.rs b/src/shake.rs
+index 6bee216..d764964 100644
+--- a/src/shake.rs
++++ b/src/shake.rs
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: MIT
+ //! Shaking: making room in a full context without asking a model, by cutting heavy content out of the older messages.
+ //!
+ //! A shake is the step between pruning and a summary. Like a pruning, it never deletes messages: it is recorded as a [`Pruning`] that names the tool outputs to leave out and the fenced blocks to cut out of earlier prompts and replies, and from then on the model is given a short note in place of each, which says how to read it again with `recall`. Everything in the most recent messages, about as much as a summary would keep, stays as it is.
+diff --git a/src/task.rs b/src/task.rs
+index d0a2295..41cd94f 100644
+--- a/src/task.rs
++++ b/src/task.rs
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: MIT
+ //! The `task` tool: runs subagents, alone or several at once, each in a loop of its own, and returns what they said last or the structured result they handed back.
+ //!
+ //! A subagent may work apart from the main agent, in a git worktree of its own; what it changed is applied to the main agent's working tree when it ends, as [`crate::worktree`] tells.
+diff --git a/src/todos.rs b/src/todos.rs
+index 9dd7973..d5d1d3f 100644
+--- a/src/todos.rs
++++ b/src/todos.rs
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: MIT
+ //! Keeping the model's todo list current: reminders when it works on for long without updating a list that still has open items, and the open items restated after a compaction hides the list.
+ //!
+ //! The list is read from the history, from the latest `todo` call that succeeded, so it survives a reopened conversation.
+diff --git a/src/worktree.rs b/src/worktree.rs
+index 7798023..db27e92 100644
+--- a/src/worktree.rs
++++ b/src/worktree.rs
+@@ -1,3 +1,4 @@
++// SPDX-License-Identifier: MIT
+ //! Copies of the working tree for subagents that work apart from the main agent: copy-on-write clones where the file system can make them, git worktrees checked out as git makes them where it cannot.
+ //!
+ //! An isolated subagent works in a copy of its own of the working tree the main agent works in, whichever that is: the repository's own checkout, a linked worktree, or a folder outside any repository. [`Backend`] picks how the copy is made, as [`ISOLATION_VARIABLE`] says.

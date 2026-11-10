@@ -1,0 +1,1 @@
+In `src/queue.rs`, the function `retry_delay` caps the delay at 30 seconds. Raise the cap to 60 seconds: change `Duration::from_secs(30)` inside `retry_delay` to `Duration::from_secs(60)`, and change "at most 30 seconds" in its doc comment to "at most 60 seconds". Leave `lease_time`, which also uses 30 seconds, as it is. Change nothing else.

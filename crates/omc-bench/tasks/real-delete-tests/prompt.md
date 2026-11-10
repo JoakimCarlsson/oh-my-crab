@@ -1,0 +1,1 @@
+Delete the test module at the end of each of these four files: `src/pruning.rs`, `src/recall.rs`, `src/shake.rs` and `src/loop_guard.rs`. In each, remove everything from the `#[cfg(test)]` line to the end of the file. Change nothing else.

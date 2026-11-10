@@ -1,0 +1,1 @@
+In `src/cart.ts`, the methods `addItem`, `removeItem` and `clear` each call `notify("cart")`. Change those three calls to `notify("cart", this.id)`. Leave the call in `restore` exactly as it is, and change nothing else.

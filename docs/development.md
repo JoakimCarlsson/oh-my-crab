@@ -35,6 +35,7 @@ Every text file is checked out with LF line endings on every system, as
 | `omc-lsp`       | Language servers crab starts itself.                                              |
 | `omc-dap`       | The `debug` tool and its debug adapters.                                          |
 | `omc-script`    | The `script` tool and its QuickJS sandbox.                                        |
+| `omc-bench`     | `crab-bench`, the [edit benchmark](benchmark.md); not part of a release.          |
 
 pandemonium depends on `omc-session`, `omc-wire` and `omc-context` by relative
 path, so a change to their public API must build there too.

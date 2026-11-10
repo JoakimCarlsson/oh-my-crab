@@ -1,0 +1,601 @@
+diff --git a/src/loop_guard.rs b/src/loop_guard.rs
+index c4ec876..f499b67 100644
+--- a/src/loop_guard.rs
++++ b/src/loop_guard.rs
+@@ -165,149 +165,3 @@ fn shortened(text: &str, limit: usize) -> String {
+     cut.push('…');
+     cut
+ }
+-
+-#[cfg(test)]
+-/// Tests for noticing circles.
+-mod tests {
+-    use serde_json::json;
+-
+-    use super::*;
+-
+-    /// A call of `name` with `arguments` under the id `id`.
+-    fn call(id: &str, name: &str, arguments: Value) -> ToolCall {
+-        ToolCall {
+-            id: id.into(),
+-            name: name.into(),
+-            arguments,
+-        }
+-    }
+-
+-    /// A result for the call `id` saying `text`.
+-    fn result(id: &str, text: &str, is_error: bool) -> ToolResult {
+-        ToolResult {
+-            call_id: id.into(),
+-            name: "x".into(),
+-            text: text.into(),
+-            is_error,
+-            images: Vec::new(),
+-        }
+-    }
+-
+-    /// The same call made [`REPEATS`] times in a row is noticed, with its arguments in any key order, and another call starts the count again.
+-    #[test]
+-    fn notices_a_call_repeated_in_a_row() {
+-        let mut guard = LoopGuard::default();
+-        let results = [result("c", "no matches found", false)];
+-        for round in 1..REPEATS {
+-            let arguments = if round % 2 == 0 {
+-                json!({ "pattern": "x", "path": "src" })
+-            } else {
+-                json!({ "path": "src", "pattern": "x" })
+-            };
+-            assert_eq!(
+-                guard.observe(&[call("c", "grep", arguments)], &results, &[]),
+-                None
+-            );
+-        }
+-        let notice = guard
+-            .observe(
+-                &[call("c", "grep", json!({ "path": "src", "pattern": "x" }))],
+-                &results,
+-                &[],
+-            )
+-            .unwrap();
+-        assert!(notice.contains("`grep`"), "{notice}");
+-        assert!(notice.contains(&format!("{REPEATS} times")), "{notice}");
+-        assert!(notice.contains("no matches found"), "{notice}");
+-        assert!(
+-            guard
+-                .observe(
+-                    &[call("c", "grep", json!({ "path": "lib" }))],
+-                    &results,
+-                    &[]
+-                )
+-                .is_none()
+-        );
+-    }
+-
+-    /// Waiting calls do not count and break a run of repeats.
+-    #[test]
+-    fn waiting_breaks_a_run() {
+-        let mut guard = LoopGuard::default();
+-        let read = || [call("c", "read", json!({ "path": "a" }))];
+-        for _ in 1..REPEATS {
+-            assert!(guard.observe(&read(), &[], &[]).is_none());
+-        }
+-        assert!(
+-            guard
+-                .observe(&[call("w", "wait", json!({}))], &[], &[])
+-                .is_none()
+-        );
+-        assert!(guard.observe(&read(), &[], &[]).is_none());
+-    }
+-
+-    /// Edits of a file that change nothing are noticed from [`NO_OPS`] on, more firmly from twice that, and a real change starts the count again.
+-    #[test]
+-    fn notices_edits_that_change_nothing() {
+-        let mut guard = LoopGuard::default();
+-        let same = |id: &str| {
+-            vec![(
+-                id.to_owned(),
+-                vec![FileChange {
+-                    path: "a.rs".into(),
+-                    old: "x\n".into(),
+-                    new: "x\n".into(),
+-                }],
+-            )]
+-        };
+-        let mut notices = Vec::new();
+-        for round in 0..NO_OPS * 2 {
+-            let id = format!("e{round}");
+-            let calls = [call(&id, "edit", json!({ "round": round }))];
+-            notices.push(guard.observe(&calls, &[result(&id, "ok", false)], &same(&id)));
+-        }
+-        assert!(notices[..NO_OPS as usize - 1].iter().all(Option::is_none));
+-        let first = notices[NO_OPS as usize - 1].as_deref().unwrap();
+-        assert!(
+-            first.contains("`a.rs`") && first.contains("Read the file again"),
+-            "{first}"
+-        );
+-        let last = notices.last().unwrap().as_deref().unwrap();
+-        assert!(last.contains("Stop editing this file"), "{last}");
+-        let changed = vec![(
+-            "real".to_owned(),
+-            vec![FileChange {
+-                path: "a.rs".into(),
+-                old: "x\n".into(),
+-                new: "y\n".into(),
+-            }],
+-        )];
+-        guard.observe(&[], &[result("real", "ok", false)], &changed);
+-        assert!(
+-            guard
+-                .observe(&[], &[result("e", "ok", false)], &same("e"))
+-                .is_none()
+-        );
+-    }
+-
+-    /// A failed edit is not counted as one that changed nothing.
+-    #[test]
+-    fn failed_edits_do_not_count() {
+-        let mut guard = LoopGuard::default();
+-        let same = vec![(
+-            "e".to_owned(),
+-            vec![FileChange {
+-                path: "a.rs".into(),
+-                old: "x".into(),
+-                new: "x".into(),
+-            }],
+-        )];
+-        for _ in 0..NO_OPS * 2 {
+-            assert!(
+-                guard
+-                    .observe(&[], &[result("e", "failed", true)], &same)
+-                    .is_none()
+-            );
+-        }
+-    }
+-}
+diff --git a/src/pruning.rs b/src/pruning.rs
+index 5ea2fd5..1edafc0 100644
+--- a/src/pruning.rs
++++ b/src/pruning.rs
+@@ -178,202 +178,3 @@ pub(crate) fn prune(history: &[Message]) -> Option<Pruning> {
+         ..Pruning::default()
+     })
+ }
+-
+-#[cfg(test)]
+-/// Tests for choosing the tool outputs to leave out.
+-mod tests {
+-    use omc_providers::{Reply, ToolCall};
+-    use serde_json::{Value, json};
+-
+-    use super::*;
+-    use crate::compaction::context;
+-
+-    /// A reply that calls `name` with `arguments` under the id `id`.
+-    fn call(id: &str, name: &str, arguments: Value) -> Message {
+-        Message::Assistant(Reply {
+-            tool_calls: vec![ToolCall {
+-                id: id.to_owned(),
+-                name: name.to_owned(),
+-                arguments,
+-            }],
+-            ..Reply::default()
+-        })
+-    }
+-
+-    /// The result of the call `id` to `name`, about `tokens` tokens long.
+-    fn output(id: &str, name: &str, tokens: usize) -> Message {
+-        Message::ToolResults(vec![ToolResult {
+-            call_id: id.to_owned(),
+-            name: name.to_owned(),
+-            text: "x".repeat(tokens * 4),
+-            is_error: false,
+-            images: Vec::new(),
+-        }])
+-    }
+-
+-    /// A reply with text only.
+-    fn answer() -> Message {
+-        Message::Assistant(Reply {
+-            text: "ok".into(),
+-            ..Reply::default()
+-        })
+-    }
+-
+-    /// A read of the same path made again leaves the first one out before the next request, while the suffix after it is small.
+-    #[test]
+-    fn a_read_made_again_is_left_out() {
+-        let mut history = vec![
+-            Message::User("go".into()),
+-            call("a", "read", json!({"path": "src/lib.rs"})),
+-            output("a", "read", 500),
+-            call("b", "read", json!({"path": "src/lib.rs"})),
+-            output("b", "read", 500),
+-        ];
+-        let pruning = stale(&history).expect("the first read is out of date");
+-        assert_eq!(
+-            pruning.elided,
+-            [Elided {
+-                at: 2,
+-                call_id: "a".into(),
+-                reason: Elision::Superseded
+-            }]
+-        );
+-        history.push(Message::Pruning(pruning));
+-        let Message::ToolResults(results) = &context(&history)[2] else {
+-            panic!("not tool results");
+-        };
+-        assert!(
+-            results[0].text.contains("call_id \"a\""),
+-            "{}",
+-            results[0].text
+-        );
+-        assert_eq!(stale(&history), None, "it is left out once");
+-    }
+-
+-    /// Reads of other ranges of a file, and reads that failed, do not make a read out of date.
+-    #[test]
+-    fn other_ranges_and_failures_do_not_supersede() {
+-        let mut failed = output("c", "read", 500);
+-        if let Message::ToolResults(results) = &mut failed {
+-            results[0].is_error = true;
+-        }
+-        let history = vec![
+-            Message::User("go".into()),
+-            call("a", "read", json!({"path": "src/lib.rs"})),
+-            output("a", "read", 500),
+-            call("b", "read", json!({"path": "src/lib.rs:1-20"})),
+-            output("b", "read", 500),
+-            call("c", "read", json!({"path": "src/lib.rs"})),
+-            failed,
+-            answer(),
+-        ];
+-        assert_eq!(stale(&history), None);
+-    }
+-
+-    /// A bare read of a code file, which may be an outline with bodies folded,
+-    /// and reads of ranges or of the whole text of the same file never make one
+-    /// another out of date, in either order; only the same read made again does.
+-    #[test]
+-    fn outlines_and_ranges_do_not_supersede_each_other() {
+-        let history = vec![
+-            Message::User("go".into()),
+-            call("a", "read", json!({"path": "src/lib.rs:120-180"})),
+-            output("a", "read", 500),
+-            call("b", "read", json!({"path": "src/lib.rs"})),
+-            output("b", "read", 500),
+-            call("c", "read", json!({"path": "src/lib.rs:1-"})),
+-            output("c", "read", 500),
+-            call("d", "read", json!({"path": "src/lib.rs:120-180"})),
+-            output("d", "read", 500),
+-            answer(),
+-        ];
+-        let ids: Vec<String> = stale(&history)
+-            .expect("the repeated range read is out of date")
+-            .elided
+-            .into_iter()
+-            .map(|elided| elided.call_id)
+-            .collect();
+-        assert_eq!(ids, ["a"]);
+-    }
+-
+-    /// A superseded read far back costs too much of the cache to leave out between prunings.
+-    #[test]
+-    fn a_read_far_back_waits_for_the_next_pruning() {
+-        let history = vec![
+-            Message::User("go".into()),
+-            call("a", "read", json!({"path": "a"})),
+-            output("a", "read", 500),
+-            call("b", "read", json!({"path": "a"})),
+-            output("b", "read", 500),
+-            call("c", "bash", json!({"command": "make"})),
+-            output("c", "bash", 9_000),
+-            answer(),
+-        ];
+-        assert_eq!(stale(&history), None);
+-        assert_eq!(prune(&history), None, "too little to save");
+-    }
+-
+-    /// Old outputs past the protected recent ones are left out, the recent ones, small ones and skills are kept, and nothing is left out when it saves too little.
+-    #[test]
+-    fn prunes_old_outputs_outside_the_recent_ones() {
+-        let mut history = vec![Message::User("go".into())];
+-        for (id, name, tokens) in [
+-            ("s", "skill", 5_000),
+-            ("tiny", "bash", 40),
+-            ("old1", "bash", 15_000),
+-            ("old2", "grep", 15_000),
+-            ("new1", "bash", 30_000),
+-            ("new2", "bash", 15_000),
+-        ] {
+-            history.push(call(id, name, json!({})));
+-            history.push(output(id, name, tokens));
+-        }
+-        history.push(answer());
+-        let pruning = prune(&history).expect("enough to save");
+-        let ids: Vec<&str> = pruning
+-            .elided
+-            .iter()
+-            .map(|elided| elided.call_id.as_str())
+-            .collect();
+-        assert_eq!(ids, ["old1", "old2"]);
+-        assert!(pruning.elided.iter().all(|e| e.reason == Elision::Old));
+-        history.push(Message::Pruning(pruning));
+-        assert_eq!(prune(&history), None, "nothing left worth pruning");
+-    }
+-
+-    /// The outputs of the latest batch are never left out before the model has seen them, however large.
+-    #[test]
+-    fn unseen_outputs_are_kept() {
+-        let batch = Message::Assistant(Reply {
+-            tool_calls: ["b", "c"]
+-                .map(|id| ToolCall {
+-                    id: id.to_owned(),
+-                    name: "bash".to_owned(),
+-                    arguments: json!({}),
+-                })
+-                .to_vec(),
+-            ..Reply::default()
+-        });
+-        let Message::ToolResults(mut results) = output("b", "bash", 45_000) else {
+-            unreachable!("output builds tool results");
+-        };
+-        results.push(ToolResult {
+-            call_id: "c".into(),
+-            ..results[0].clone()
+-        });
+-        let history = vec![
+-            Message::User("go".into()),
+-            call("a", "bash", json!({})),
+-            output("a", "bash", 30_000),
+-            batch,
+-            Message::ToolResults(results),
+-        ];
+-        let ids: Vec<String> = prune(&history)
+-            .expect("enough to save")
+-            .elided
+-            .into_iter()
+-            .map(|elided| elided.call_id)
+-            .collect();
+-        assert_eq!(ids, ["a"]);
+-    }
+-}
+diff --git a/src/recall.rs b/src/recall.rs
+index 4d2f60b..4abf4a2 100644
+--- a/src/recall.rs
++++ b/src/recall.rs
+@@ -266,84 +266,3 @@ fn clip_to(text: &mut String, limit: usize) {
+         text.truncate(end);
+     }
+ }
+-
+-#[cfg(test)]
+-/// Tests for reading the history again.
+-mod tests {
+-    use omc_providers::{Compaction, Reply, ToolCall, ToolResult};
+-
+-    use super::*;
+-
+-    /// A history with one call, its output, and a compaction after them.
+-    fn history() -> Vec<Message> {
+-        vec![
+-            Message::User("find the bug".into()),
+-            Message::Assistant(Reply {
+-                tool_calls: vec![ToolCall {
+-                    id: "c1".into(),
+-                    name: "bash".into(),
+-                    arguments: json!({"command": "make test"}),
+-                }],
+-                ..Reply::default()
+-            }),
+-            Message::ToolResults(vec![ToolResult {
+-                call_id: "c1".into(),
+-                name: "bash".into(),
+-                text: "ok 1\nFAILED parser::nested\nok 3".into(),
+-                is_error: false,
+-                images: Vec::new(),
+-            }]),
+-            Message::Compaction(Compaction {
+-                summary: "Ran the tests.".into(),
+-                ..Compaction::default()
+-            }),
+-        ]
+-    }
+-
+-    /// Only a compacted or pruned history offers the tool.
+-    #[test]
+-    fn offered_once_compacted() {
+-        let mut history = history();
+-        assert!(offered(&history));
+-        history.pop();
+-        assert!(!offered(&history));
+-    }
+-
+-    /// An output comes back whole, with the call's arguments.
+-    #[test]
+-    fn recalls_an_output() {
+-        let (text, _) = run(&history(), json!({"call_id": "c1"})).unwrap();
+-        assert_eq!(
+-            text,
+-            "#2 bash call c1, arguments {\"command\":\"make test\"}:\nok 1\nFAILED parser::nested\nok 3"
+-        );
+-        assert!(run(&history(), json!({"call_id": "nope"})).is_err());
+-    }
+-
+-    /// A search finds lines anywhere in the history, ignoring case.
+-    #[test]
+-    fn searches_the_whole_history() {
+-        let found = search(&history(), "failed").unwrap();
+-        assert_eq!(found, "#2: FAILED parser::nested");
+-        assert!(search(&history(), "zzz").unwrap().starts_with("nothing"));
+-    }
+-
+-    /// A range of messages comes back in full, and a range outside the history is refused.
+-    #[test]
+-    fn reads_a_range() {
+-        let text = messages(&history(), "0-1").unwrap();
+-        assert_eq!(
+-            text,
+-            "#0 user:\nfind the bug\n\n#1 assistant:\ncalls bash (call c1) with {\"command\":\"make test\"}"
+-        );
+-        assert!(messages(&history(), "9-12").is_err());
+-        assert!(messages(&history(), "x").is_err());
+-    }
+-
+-    /// Exactly one way to recall must be named.
+-    #[test]
+-    fn needs_exactly_one_argument() {
+-        assert!(run(&history(), json!({})).is_err());
+-        assert!(run(&history(), json!({"search": "a", "messages": "1"})).is_err());
+-    }
+-}
+diff --git a/src/shake.rs b/src/shake.rs
+index 6bee216..44aee76 100644
+--- a/src/shake.rs
++++ b/src/shake.rs
+@@ -127,146 +127,3 @@ pub(crate) fn fenced(text: &str) -> Vec<(usize, usize)> {
+     }
+     ranges
+ }
+-
+-#[cfg(test)]
+-/// Tests for choosing what a shake cuts out.
+-mod tests {
+-    use omc_providers::{Reply, ToolCall, ToolResult};
+-    use serde_json::json;
+-
+-    use super::*;
+-    use crate::compaction::context;
+-
+-    /// A reply that calls `name` under the id `id`.
+-    fn call(id: &str, name: &str) -> Message {
+-        Message::Assistant(Reply {
+-            tool_calls: vec![ToolCall {
+-                id: id.to_owned(),
+-                name: name.to_owned(),
+-                arguments: json!({}),
+-            }],
+-            ..Reply::default()
+-        })
+-    }
+-
+-    /// The output of the call `id` to `name`: `lines` lines of about 40 bytes each.
+-    fn output(id: &str, name: &str, lines: usize) -> Message {
+-        Message::ToolResults(vec![ToolResult {
+-            call_id: id.to_owned(),
+-            name: name.to_owned(),
+-            text: "0123456789012345678901234567890123456789\n".repeat(lines),
+-            is_error: false,
+-            images: Vec::new(),
+-        }])
+-    }
+-
+-    /// A text with a short lead-in and a fenced `rust` block of `lines` lines of about 40 bytes each.
+-    fn with_block(lines: usize) -> String {
+-        format!(
+-            "Here is the code:\n```rust\n{}```\nThat is all.",
+-            "let x = 0123456789012345678901234567890;\n".repeat(lines)
+-        )
+-    }
+-
+-    /// Fenced blocks are found whole, with longer and tilde fences, and an unclosed one is not.
+-    #[test]
+-    fn finds_fenced_blocks() {
+-        let text = "a\n```rust\nfn x() {}\n```\nb\n~~~~\n```\ninner\n~~~~\nc\n```\nopen";
+-        let ranges = fenced(text);
+-        assert_eq!(ranges.len(), 2);
+-        assert_eq!(&text[ranges[0].0..ranges[0].1], "```rust\nfn x() {}\n```");
+-        assert_eq!(&text[ranges[1].0..ranges[1].1], "~~~~\n```\ninner\n~~~~");
+-    }
+-
+-    /// Old heavy outputs and large blocks in old replies are cut out, while the recent messages, small outputs and skills stay as they are; the notes say how to read them again.
+-    #[test]
+-    fn shakes_old_heavy_content_and_keeps_the_recent() {
+-        let history = vec![
+-            Message::User("go".into()),
+-            call("a", "bash"),
+-            output("a", "bash", 400),
+-            call("s", "skill"),
+-            output("s", "skill", 400),
+-            call("tiny", "grep"),
+-            output("tiny", "grep", 2),
+-            Message::Assistant(Reply {
+-                text: with_block(200),
+-                ..Reply::default()
+-            }),
+-            Message::User("more".into()),
+-            call("b", "bash"),
+-            output("b", "bash", 600),
+-            Message::Assistant(Reply {
+-                text: "ok".into(),
+-                ..Reply::default()
+-            }),
+-        ];
+-        let pruning = shake(&history, 5_000).expect("enough to save");
+-        let ids: Vec<&str> = pruning
+-            .elided
+-            .iter()
+-            .map(|elided| elided.call_id.as_str())
+-            .collect();
+-        assert_eq!(ids, ["a"]);
+-        assert_eq!(pruning.excised.len(), 1);
+-        assert_eq!(pruning.excised[0].at, 7);
+-        let mut shaken = history.clone();
+-        shaken.push(Message::Pruning(pruning));
+-        let given = context(&shaken);
+-        let Message::ToolResults(results) = &given[2] else {
+-            panic!("not tool results");
+-        };
+-        assert_eq!(
+-            results[0].text,
+-            "[400 lines of bash output removed to save room. Call recall with call_id \"a\" to read it again.]"
+-        );
+-        let Message::Assistant(reply) = &given[7] else {
+-            panic!("not a reply");
+-        };
+-        assert_eq!(
+-            reply.text,
+-            "Here is the code:\n[200 lines of rust block removed to save room. Call recall with messages \"7\" to read them again.]\nThat is all."
+-        );
+-        assert_eq!(given[10], history[10]);
+-        assert_eq!(shake(&shaken, 5_000), None, "nothing left worth shaking");
+-    }
+-
+-    /// The plan is never shaken out: not the output of a submission, nor the blocks of the first message of a fresh context window opened for an approved plan, while other old content is.
+-    #[test]
+-    fn the_plan_is_never_shaken() {
+-        let plan = format!("# Plan\n{}", with_block(200));
+-        let history = vec![
+-            Message::User(omc_context::plan_fresh(&plan, false, None)),
+-            call("p", "exit_plan_mode"),
+-            output("p", "exit_plan_mode", 400),
+-            call("a", "bash"),
+-            output("a", "bash", 400),
+-            Message::User("more".into()),
+-            call("b", "bash"),
+-            output("b", "bash", 600),
+-        ];
+-        let pruning = shake(&history, 5_000).expect("enough to save");
+-        let ids: Vec<&str> = pruning
+-            .elided
+-            .iter()
+-            .map(|elided| elided.call_id.as_str())
+-            .collect();
+-        assert_eq!(ids, ["a"]);
+-        assert!(pruning.excised.is_empty());
+-    }
+-
+-    /// Too little to cut out is left alone.
+-    #[test]
+-    fn too_little_is_not_shaken() {
+-        let history = vec![
+-            Message::User(with_block(10)),
+-            call("a", "bash"),
+-            output("a", "bash", 50),
+-            Message::Assistant(Reply {
+-                text: "ok".into(),
+-                ..Reply::default()
+-            }),
+-        ];
+-        assert_eq!(shake(&history, 10), None);
+-    }
+-}

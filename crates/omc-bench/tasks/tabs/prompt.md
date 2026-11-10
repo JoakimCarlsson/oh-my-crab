@@ -1,0 +1,1 @@
+In `Makefile`, add `$(GO) vet ./...` as a new first command of the `test` recipe, before the existing `$(GO) test` line, and change `GOFLAGS ?= -mod=readonly` to `GOFLAGS ?= -mod=vendor`. Recipe lines in a Makefile start with a tab character; keep it that way. Change nothing else.

@@ -1,0 +1,32 @@
+{
+  "en": {
+    "greeting": "Hello, {name}! 👋",
+    "farewell": "Goodbye",
+    "cart_empty": "Your cart is empty.",
+    "price": "Price: {amount} €"
+  },
+  "sv": {
+    "greeting": "Hallå, {name}! 👋",
+    "farewell": "Vi ses",
+    "cart_empty": "Din varukorg är tom.",
+    "price": "Pris: {amount} kr"
+  },
+  "de": {
+    "greeting": "Hallo, {name}! 👋",
+    "farewell": "Tschüss",
+    "cart_empty": "Ihr Warenkorb ist leer.",
+    "price": "Preis: {amount} €"
+  },
+  "ja": {
+    "greeting": "こんにちは、{name}さん！ 👋",
+    "farewell": "さようなら",
+    "cart_empty": "カートは空です。",
+    "price": "価格：{amount} 円"
+  },
+  "da": {
+    "greeting": "Hej, {name}! 👋",
+    "farewell": "Farvel",
+    "cart_empty": "Din kurv er tom.",
+    "price": "Pris: {amount} kr"
+  }
+}

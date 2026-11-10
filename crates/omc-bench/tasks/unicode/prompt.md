@@ -1,0 +1,1 @@
+In `locales/messages.json`, in the `sv` block only, change the value of `greeting` from `Hej, {name}! 👋` to `Hallå, {name}! 👋` and the value of `farewell` from `Hej då` to `Vi ses`. The other languages have the same keys; leave them as they are. Change nothing else.

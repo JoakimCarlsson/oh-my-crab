@@ -1,0 +1,1 @@
+In `deploy/services.yaml`, change `replicas` of the `worker` service from `2` to `4`, and change its `memory` limit from `256Mi` to `512Mi`. The other services have the same lines; leave those as they are. Change nothing else.

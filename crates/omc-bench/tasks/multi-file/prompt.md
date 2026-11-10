@@ -1,0 +1,1 @@
+Rename the Go function `ParsePort` to `ParsePortNumber`: its definition and doc comment in `internal/netutil/port.go`, and every call of it in the other files. Do not rename `ParsePortRange`. Change nothing else.

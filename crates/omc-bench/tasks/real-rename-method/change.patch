@@ -1,0 +1,200 @@
+diff --git a/src/journal.rs b/src/journal.rs
+index aa45cd4..49bf2b4 100644
+--- a/src/journal.rs
++++ b/src/journal.rs
+@@ -300,7 +300,7 @@ impl State {
+     /// Returns the error of the write or the sync; the cut-back then stays waiting.
+     fn settle(&mut self) -> io::Result<()> {
+         if let Some(length) = self.pending {
+-            write_record(&mut self.file, &Written::Cut(length))?;
++            append_record(&mut self.file, &Written::Cut(length))?;
+             self.file.sync_data()?;
+             self.pending = None;
+         }
+@@ -508,21 +508,21 @@ impl Journal {
+             .collect();
+         let mut wrote = false;
+         if let Some(id) = switched {
+-            write_record(&mut file, &Written::Switch(id)).map_err(io_error)?;
++            append_record(&mut file, &Written::Switch(id)).map_err(io_error)?;
+             wrote = true;
+         }
+         if let Some(made) = &forked {
+-            write_record(&mut file, &Written::Branch(made)).map_err(io_error)?;
++            append_record(&mut file, &Written::Branch(made)).map_err(io_error)?;
+             wrote = true;
+         }
+         if let Some(id) = forgotten {
+-            write_record(&mut file, &Written::Forget(id)).map_err(io_error)?;
++            append_record(&mut file, &Written::Forget(id)).map_err(io_error)?;
+             wrote = true;
+         }
+         if history.len() < saved {
+-            write_record(&mut file, &Written::Cut(history.len())).map_err(io_error)?;
++            append_record(&mut file, &Written::Cut(history.len())).map_err(io_error)?;
+             for turn in &interrupted {
+-                write_record(&mut file, &Written::Lost(turn)).map_err(io_error)?;
++                append_record(&mut file, &Written::Lost(turn)).map_err(io_error)?;
+             }
+             wrote = true;
+         }
+@@ -607,27 +607,27 @@ impl Journal {
+         let file = &mut state.file;
+         for (at, message) in line.history.iter().enumerate() {
+             if let Some((_, mark)) = line.branch.marks.iter().find(|(start, _)| *start == at) {
+-                write_record(file, &Written::Turn(mark)).map_err(failed)?;
++                append_record(file, &Written::Turn(mark)).map_err(failed)?;
+             }
+-            write_record(file, &Written::Message(message)).map_err(failed)?;
++            append_record(file, &Written::Message(message)).map_err(failed)?;
+         }
+         for turn in &line.branch.lost {
+-            write_record(file, &Written::Lost(turn)).map_err(failed)?;
++            append_record(file, &Written::Lost(turn)).map_err(failed)?;
+         }
+         if !saved.notes.is_empty() {
+-            write_record(file, &Written::Notes(&saved.notes)).map_err(failed)?;
++            append_record(file, &Written::Notes(&saved.notes)).map_err(failed)?;
+         }
+         if let Some(title) = &saved.title {
+-            write_record(file, &Written::Title(title)).map_err(failed)?;
++            append_record(file, &Written::Title(title)).map_err(failed)?;
+         }
+         for (id, value) in &saved.settings {
+-            write_record(file, &Written::Setting(id, value)).map_err(failed)?;
++            append_record(file, &Written::Setting(id, value)).map_err(failed)?;
+         }
+         for (call, files) in &saved.changes {
+-            write_record(file, &Written::Changes(call, files)).map_err(failed)?;
++            append_record(file, &Written::Changes(call, files)).map_err(failed)?;
+         }
+         for (key, value) in &saved.facts {
+-            write_record(file, &Written::Fact(key, value)).map_err(failed)?;
++            append_record(file, &Written::Fact(key, value)).map_err(failed)?;
+         }
+         file.sync_data().map_err(failed)
+     }
+@@ -682,7 +682,7 @@ impl Journal {
+     pub fn save_title(&self, title: &str) -> io::Result<()> {
+         let mut state = self.lock();
+         state.settle()?;
+-        write_record(&mut state.file, &Written::Title(title))?;
++        append_record(&mut state.file, &Written::Title(title))?;
+         state.title = Some(title.to_owned());
+         state.file.sync_data()
+     }
+@@ -695,7 +695,7 @@ impl Journal {
+     pub fn save_setting(&self, id: &str, value: &str) -> io::Result<()> {
+         let mut state = self.lock();
+         state.settle()?;
+-        write_record(&mut state.file, &Written::Setting(id, value))?;
++        append_record(&mut state.file, &Written::Setting(id, value))?;
+         state.settings.retain(|(held, _)| held != id);
+         state.settings.push((id.to_owned(), value.to_owned()));
+         state.file.sync_data()
+@@ -730,7 +730,7 @@ impl Journal {
+             return Ok(());
+         }
+         state.settle()?;
+-        write_record(&mut state.file, &Written::Fact(key, value))?;
++        append_record(&mut state.file, &Written::Fact(key, value))?;
+         state.facts.retain(|(held, _)| held != key);
+         state.facts.push((key.to_owned(), value.clone()));
+         state.file.sync_data()
+@@ -744,7 +744,7 @@ impl Journal {
+     pub fn save_changes(&self, call: &str, files: &[FileChange]) -> io::Result<()> {
+         let mut state = self.lock();
+         state.settle()?;
+-        write_record(&mut state.file, &Written::Changes(call, files))?;
++        append_record(&mut state.file, &Written::Changes(call, files))?;
+         state.changes.insert(call.to_owned(), files.to_vec());
+         Ok(())
+     }
+@@ -782,7 +782,7 @@ impl Journal {
+     pub fn mark(&self, at: usize, mark: &Mark) -> io::Result<()> {
+         let mut state = self.lock();
+         state.settle()?;
+-        write_record(&mut state.file, &Written::Turn(mark))?;
++        append_record(&mut state.file, &Written::Turn(mark))?;
+         state.marks.push((at, mark.clone()));
+         Ok(())
+     }
+@@ -800,7 +800,7 @@ impl Journal {
+     pub fn save_notes(&self, text: &str) -> io::Result<()> {
+         let mut state = self.lock();
+         state.settle()?;
+-        write_record(&mut state.file, &Written::Notes(text))?;
++        append_record(&mut state.file, &Written::Notes(text))?;
+         state.file.sync_data()
+     }
+ 
+@@ -854,7 +854,7 @@ impl Journal {
+         self.cut(length)?;
+         let mut state = self.lock();
+         for turn in removed {
+-            write_record(&mut state.file, &Written::Lost(&turn))?;
++            append_record(&mut state.file, &Written::Lost(&turn))?;
+             state.lost.push(turn);
+         }
+         state.file.sync_data()
+@@ -891,7 +891,7 @@ impl Journal {
+             ..omc_providers::Reply::default()
+         });
+         let mut state = self.lock();
+-        write_record(&mut state.file, &Written::Message(&stopped))?;
++        append_record(&mut state.file, &Written::Message(&stopped))?;
+         state.file.sync_data()?;
+         history.push(stopped);
+         Ok(history)
+@@ -920,7 +920,7 @@ impl Scribe {
+             return Ok(());
+         }
+         state.settle()?;
+-        write_record(&mut state.file, &Written::Message(message))
++        append_record(&mut state.file, &Written::Message(message))
+     }
+ 
+     /// Records that the notebook now holds `text` and syncs; nothing is written when the history was cut back since this scribe was made.
+@@ -937,7 +937,7 @@ impl Scribe {
+             return Ok(());
+         }
+         state.settle()?;
+-        write_record(&mut state.file, &Written::Notes(text))?;
++        append_record(&mut state.file, &Written::Notes(text))?;
+         state.file.sync_data()
+     }
+ 
+@@ -955,9 +955,9 @@ impl Scribe {
+             return Ok(());
+         }
+         state.settle()?;
+-        write_record(&mut state.file, &Written::Cut(0))?;
++        append_record(&mut state.file, &Written::Cut(0))?;
+         state.marks.clear();
+-        write_record(&mut state.file, &Written::Message(first))
++        append_record(&mut state.file, &Written::Message(first))
+     }
+ 
+     /// Replaces the messages from index `keep` on with `messages`: the history is cut back to `keep` messages and `messages` are appended, in one step that keeps this scribe writing.
+@@ -974,10 +974,10 @@ impl Scribe {
+             return Ok(());
+         }
+         state.settle()?;
+-        write_record(&mut state.file, &Written::Cut(keep))?;
++        append_record(&mut state.file, &Written::Cut(keep))?;
+         state.marks.retain(|(at, _)| *at < keep);
+         for message in messages {
+-            write_record(&mut state.file, &Written::Message(message))?;
++            append_record(&mut state.file, &Written::Message(message))?;
+         }
+         Ok(())
+     }
+@@ -1071,7 +1071,7 @@ fn open_private(path: &Path) -> io::Result<File> {
+ }
+ 
+ /// Writes `record` as one line with a single write, which is flushed as the file is not buffered.
+-fn write_record(file: &mut File, record: &Written<'_>) -> io::Result<()> {
++fn append_record(file: &mut File, record: &Written<'_>) -> io::Result<()> {
+     let mut line = serde_json::to_vec(record).map_err(io::Error::other)?;
+     line.push(b'\n');
+     file.write_all(&line)

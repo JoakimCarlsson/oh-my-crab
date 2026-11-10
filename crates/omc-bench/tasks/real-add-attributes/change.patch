@@ -1,0 +1,118 @@
+diff --git a/src/agent.rs b/src/agent.rs
+index fc61422..1e0c39e 100644
+--- a/src/agent.rs
++++ b/src/agent.rs
+@@ -182,6 +182,7 @@ The current context window is nearing its rollover threshold. Before important d
+ /// Replaces the history since a checkpoint with `report`: the history is cut back to `length` messages, which end with the results of the `checkpoint` call, and a user message holding the report follows.
+ ///
+ /// The `rewind` call is dropped with the exploration, but the other calls of its batch have already run, so their calls and results are kept after the checkpoint, before the report. A journal that cannot be written to is reported on standard error and does not stop the turn.
++#[must_use]
+ fn rewind(history: &mut Vec<Message>, length: usize, report: &str, scribe: Option<&Scribe>) {
+     let [.., Message::Assistant(reply), Message::ToolResults(results)] = history.as_slice() else {
+         return;
+@@ -253,6 +254,7 @@ fn rewind(history: &mut Vec<Message>, length: usize, report: &str, scribe: Optio
+ /// A turn has no request limit: it ends when the model stops calling tools or
+ /// when the task running it is aborted, which also ends any wait before a
+ /// request is sent again.
++#[must_use]
+ pub async fn run_turn(
+     context: &Context<'_>,
+     history: &mut Vec<Message>,
+diff --git a/src/approval.rs b/src/approval.rs
+index d232d37..05b5421 100644
+--- a/src/approval.rs
++++ b/src/approval.rs
+@@ -106,11 +106,13 @@ impl Approvals {
+     }
+ 
+     /// Allows everything without asking when `yolo` is set, and asks again when it is not.
++    #[must_use]
+     pub fn set_yolo(&self, yolo: bool) {
+         self.yolo.store(yolo, Ordering::Relaxed);
+     }
+ 
+     /// Puts the rules of `book` in force in place of those before; the rules the user added for the conversation stay.
++    #[must_use]
+     pub fn set_rules(&self, book: RuleBook) {
+         *self.book.lock().unwrap_or_else(|held| held.into_inner()) = Arc::new(book);
+     }
+diff --git a/src/compaction.rs b/src/compaction.rs
+index f9314c0..026ffb8 100644
+--- a/src/compaction.rs
++++ b/src/compaction.rs
+@@ -62,6 +62,7 @@ pub(crate) struct Plan {
+ /// The messages the model is given for `history`: the history itself when it was never compacted or pruned; otherwise the latest summary as a user message, when there is one, followed by the messages kept with it and the messages after it, with every elided tool output replaced by its note.
+ ///
+ /// A reply that follows a finished answer directly, as the reply to a notice sent after that answer does, is given joined to it as one reply, since the notice is not kept and every provider wants a reader's message between two replies.
++#[must_use]
+ pub fn context(history: &[Message]) -> Cow<'_, [Message]> {
+     let hidden = hidden(history);
+     let compacted = latest(history);
+@@ -92,6 +93,7 @@ pub fn context(history: &[Message]) -> Cow<'_, [Message]> {
+ }
+ 
+ /// Whether `later` is a reply that directly follows `earlier`, a reply that made no tool calls.
++#[must_use]
+ fn follows_answer(earlier: &Message, later: &Message) -> bool {
+     matches!(
+         (earlier, later),
+diff --git a/src/journal.rs b/src/journal.rs
+index aa45cd4..8c3b19d 100644
+--- a/src/journal.rs
++++ b/src/journal.rs
+@@ -111,6 +111,7 @@ impl Line {
+     }
+ 
+     /// A new branch called `forked.id` that goes back from this one to before the turn `forked.before`, holding everything this one holds until it is cut back.
++    #[must_use]
+     fn branched(&self, forked: &Forked) -> Self {
+         Self {
+             branch: Branch {
+@@ -183,6 +184,7 @@ impl Saved {
+     }
+ 
+     /// The context window saved with the conversation, when one was.
++    #[must_use]
+     pub fn window(&self) -> Option<u64> {
+         self.facts
+             .iter()
+diff --git a/src/task.rs b/src/task.rs
+index d0a2295..5ae83f8 100644
+--- a/src/task.rs
++++ b/src/task.rs
+@@ -195,6 +195,7 @@ struct Lane {
+ 
+ impl Lane {
+     /// The event announcing the subagent: the call itself starting it, with the model it asks when that is known, when it is alone, or a step of the call when it is one of several.
++    #[must_use]
+     fn opened(&self) -> AgentEvent {
+         match self.place {
+             None => AgentEvent::Spawned {
+@@ -211,6 +212,7 @@ impl Lane {
+     }
+ 
+     /// The event ending the step of a subagent that is one of several with `outcome`; nothing for a lone one, whose call reports its own end.
++    #[must_use]
+     fn closed(&self, outcome: &Result<String, ToolError>) -> Option<AgentEvent> {
+         let place = self.place?;
+         let (text, is_error) = match outcome {
+diff --git a/src/worktree.rs b/src/worktree.rs
+index 7798023..e8cbbda 100644
+--- a/src/worktree.rs
++++ b/src/worktree.rs
+@@ -223,6 +223,7 @@ const BYTE_FOR_BYTE: [&str; 2] = ["-c", "core.autocrlf=false"];
+ /// # Errors
+ ///
+ /// Fails with what git said when it fails, or why it could not be run.
++#[must_use]
+ async fn git_with(
+     directory: &Path,
+     arguments: &[&str],
+@@ -281,6 +282,7 @@ async fn git(directory: &Path, arguments: &[&str]) -> Result<String, String> {
+ }
+ 
+ /// Runs git in `directory` with `arguments`, waiting for it to end, for the clean-ups that run outside of any task; whether it worked.
++#[must_use]
+ fn git_now(directory: &Path, arguments: &[&str]) -> bool {
+     let mut command = std::process::Command::new("git");
+     command

@@ -1,0 +1,19 @@
+[package]
+name = "omc-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "An edit benchmark for crab: fixed editing tasks run across models and scored on the files they leave"
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[[bin]]
+name = "crab-bench"
+path = "src/main.rs"
+
+[dependencies]
+omc-client.workspace = true
+omc-wire.workspace = true
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"

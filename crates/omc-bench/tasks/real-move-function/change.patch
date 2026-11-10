@@ -1,0 +1,67 @@
+diff --git a/src/files.rs b/src/files.rs
+index 23a8abd..616a5fd 100644
+--- a/src/files.rs
++++ b/src/files.rs
+@@ -73,28 +73,6 @@ fn executable(_meta: &std::fs::Metadata) -> bool {
+     false
+ }
+ 
+-/// The files and symbolic links under `root`, from it, with `/` between their parts; what a `.gitignore` names is left out.
+-fn listing(root: &Path) -> BTreeSet<String> {
+-    ignore::WalkBuilder::new(root)
+-        .standard_filters(false)
+-        .git_ignore(true)
+-        .require_git(false)
+-        .follow_links(false)
+-        .build()
+-        .flatten()
+-        .filter(|entry| entry.file_type().is_some_and(|kind| !kind.is_dir()))
+-        .filter_map(|entry| {
+-            let relative = entry.path().strip_prefix(root).ok()?;
+-            Some(
+-                relative
+-                    .components()
+-                    .map(|part| part.as_os_str().to_string_lossy())
+-                    .collect::<Vec<_>>()
+-                    .join("/"),
+-            )
+-        })
+-        .collect()
+-}
+ 
+ /// The size and modification time of the regular file at `path`, which a clone keeps from what it was made from, so that matching ones need not be read.
+ fn stamp(path: &Path) -> Option<(u64, SystemTime)> {
+diff --git a/src/recall.rs b/src/recall.rs
+index 4d2f60b..0d4bafe 100644
+--- a/src/recall.rs
++++ b/src/recall.rs
+@@ -267,6 +267,29 @@ fn clip_to(text: &mut String, limit: usize) {
+     }
+ }
+ 
++/// The files and symbolic links under `root`, from it, with `/` between their parts; what a `.gitignore` names is left out.
++fn listing(root: &Path) -> BTreeSet<String> {
++    ignore::WalkBuilder::new(root)
++        .standard_filters(false)
++        .git_ignore(true)
++        .require_git(false)
++        .follow_links(false)
++        .build()
++        .flatten()
++        .filter(|entry| entry.file_type().is_some_and(|kind| !kind.is_dir()))
++        .filter_map(|entry| {
++            let relative = entry.path().strip_prefix(root).ok()?;
++            Some(
++                relative
++                    .components()
++                    .map(|part| part.as_os_str().to_string_lossy())
++                    .collect::<Vec<_>>()
++                    .join("/"),
++            )
++        })
++        .collect()
++}
++
+ #[cfg(test)]
+ /// Tests for reading the history again.
+ mod tests {

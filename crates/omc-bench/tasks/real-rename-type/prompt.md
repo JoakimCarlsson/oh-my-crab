@@ -1,0 +1,1 @@
+Rename `ToolResult` to `ToolOutcome` everywhere under `src/`: every occurrence of the word `ToolResult`, in code, imports, comments and tests. `ToolResults`, with an `s`, is a different name; leave every `ToolResults` as it is. Change nothing else.
