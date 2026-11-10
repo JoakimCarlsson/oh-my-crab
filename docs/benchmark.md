@@ -141,13 +141,14 @@ crab sent or line a baseline printed (`events.jsonl`), under
 
 ## Results
 
-Measured on 10 November 2026 on Linux, with crab 0.1.1, Claude Code 2.1.319
-and oh-my-pi 18.16.0, all signed in to the same Claude account. Every task was
-run three times for each row, with the tools `read`, `grep`, `glob` and `edit`
-and medium effort:
+Measured on 10 November 2026 on Linux, with crab at commit `2401b05` (after
+0.1.1), Claude Code 2.1.319 and oh-my-pi 18.16.0, all signed in to the same
+Claude account. Every task was run three times for each row, with medium
+effort and the tools `read`, `grep`, `glob` and `edit`, plus `bash` for the
+`cmd-` tasks and `write` for `cmd-slow-command`:
 
 ```sh
-OMP="-p --mode json --no-session --thinking medium --tools read,grep,glob,edit \
+OMP="-p --mode json --no-session --thinking medium --tools {tools} \
   --no-lsp --no-extensions --no-skills --no-rules --no-context-files --no-title \
   --approval-mode yolo {prompt}"
 crab-bench --runs 3 --jobs 8 --timeout 900 --set effort=medium \
@@ -157,78 +158,81 @@ crab-bench --runs 3 --jobs 8 --timeout 900 --set effort=medium \
   --command "oh-my-pi fable-5-2=omp --model anthropic/claude-fable-5-2 $OMP"
 ```
 
-All 20 tasks, 60 runs a row:
+All 24 tasks, 72 runs a row:
 
-| Model      | Harness     | Passed | Clean | Requests / run | Tool calls / run | Tokens sent / run | Seconds / run |
-| ---------- | ----------- | ------ | ----- | -------------- | ---------------- | ----------------- | ------------- |
-| Sonnet 5.5 | crab        | 100%   | 100%  | 3.4            | 3.4              | 28.9k             | 8             |
-| Sonnet 5.5 | Claude Code | 100%   | 97%   | 3.6            | 8.1              | 31.3k             | 15            |
-| Sonnet 5.5 | oh-my-pi    | 100%   | 95%   | 3.4            | 3.4              | 29.6k             | 9             |
-| Fable 5.2  | crab        | 100%   | 95%   | 3.3            | 3.5              | 27.5k             | 16            |
-| Fable 5.2  | Claude Code | 97%    | 95%   | 3.6            | 8.6              | 33.3k             | 26            |
-| Fable 5.2  | oh-my-pi    | 100%   | 95%   | 3.6            | 3.9              | 41.5k             | 20            |
+| Model      | Harness     | Passed | Clean | Requests / run | Tool calls / run | Tokens sent / run | Tokens written / run | Seconds / run |
+| ---------- | ----------- | ------ | ----- | -------------- | ---------------- | ----------------- | -------------------- | ------------- |
+| Sonnet 5.5 | crab        | 100%   | 99%   | 3.4            | 2.8              | 28.4k             | 740                  | 13            |
+| Sonnet 5.5 | Claude Code | 100%   | 96%   | 3.8            | 7.3              | 30.6k             | 1924                 | 19            |
+| Sonnet 5.5 | oh-my-pi    | 96%    | 86%   | 3.5            | 3.7              | 33.3k             | 766                  | 11            |
+| Fable 5.2  | crab        | 100%   | 100%  | 3.3            | 3.1              | 27.7k             | 804                  | 21            |
+| Fable 5.2  | Claude Code | 100%   | 100%  | 3.6            | 7.6              | 32.5k             | 2003                 | 30            |
+| Fable 5.2  | oh-my-pi    | 96%    | 92%   | 3.6            | 3.9              | 36.3k             | 874                  | 22            |
 
-The `real-` tasks, as tokens sent and seconds a run, three runs a cell; every
-cell passed three of three unless it says otherwise.
+`cmd-slow-command` waits 130 seconds by design, and oh-my-pi's runs of it
+ended after about 67, so it bends the seconds. Without that task, a run takes
+7, 14 and 9 seconds with Sonnet 5.5 for crab, Claude Code and oh-my-pi, and
+15, 25 and 20 seconds with Fable 5.2.
+
+The `real-` and `cmd-` tasks, as tokens sent and seconds a run, three runs a
+cell; every cell passed three of three unless it says otherwise.
 
 With Sonnet 5.5:
 
-| Task                     | crab        | Claude Code | oh-my-pi    |
-| ------------------------ | ----------- | ----------- | ----------- |
-| `real-add-attributes`    | 31.2k · 9s  | 28.2k · 20s | 25.4k · 8s  |
-| `real-catalog-values`    | 43.8k · 16s | 94.0k · 29s | 43.4k · 11s |
-| `real-deep-edit`         | 23.4k · 5s  | 26.0k · 9s  | 22.2k · 7s  |
-| `real-delete-tests`      | 31.3k · 9s  | 73.7k · 53s | 67.3k · 17s |
-| `real-header-every-file` | 53.8k · 16s | 35.2k · 32s | 38.0k · 16s |
-| `real-move-function`     | 33.9k · 8s  | 29.0k · 13s | 30.2k · 11s |
-| `real-rename-method`     | 26.1k · 12s | 27.6k · 10s | 28.0k · 14s |
-| `real-rename-type`       | 43.4k · 17s | 70.2k · 45s | 81.3k · 22s |
+| Task                     | crab         | Claude Code  | oh-my-pi             |
+| ------------------------ | ------------ | ------------ | -------------------- |
+| `real-add-attributes`    | 27.0k · 9s   | 28.9k · 21s  | 25.4k · 8s           |
+| `real-catalog-values`    | 41.0k · 15s  | 76.2k · 34s  | 42.6k · 12s          |
+| `real-deep-edit`         | 23.3k · 6s   | 26.0k · 9s   | 22.2k · 6s           |
+| `real-delete-tests`      | 34.3k · 9s   | 55.6k · 49s  | 69.3k · 17s          |
+| `real-header-every-file` | 23.7k · 8s   | 35.8k · 31s  | 112.6k · 18s         |
+| `real-move-function`     | 40.7k · 10s  | 33.0k · 12s  | 30.8k · 9s           |
+| `real-rename-method`     | 25.9k · 13s  | 30.0k · 10s  | 28.1k · 12s          |
+| `real-rename-type`       | 36.8k · 16s  | 77.7k · 44s  | 71.0k · 20s          |
+| `cmd-fix-failing-test`   | 26.1k · 4s   | 24.3k · 5s   | 30.5k · 7s           |
+| `cmd-lint-loop`          | 44.2k · 10s  | 32.4k · 10s  | 52.6k · 14s          |
+| `cmd-slow-command`       | 25.7k · 135s | 23.5k · 135s | 23.9k · 67s (0 of 3) |
+| `cmd-stale-file`         | 42.3k · 6s   | 37.9k · 10s  | 36.8k · 9s           |
 
 With Fable 5.2:
 
-| Task                     | crab        | Claude Code          | oh-my-pi     |
-| ------------------------ | ----------- | -------------------- | ------------ |
-| `real-add-attributes`    | 27.1k · 16s | 38.4k · 39s (2 of 3) | 25.5k · 17s  |
-| `real-catalog-values`    | 39.2k · 27s | 48.5k · 46s          | 39.0k · 29s  |
-| `real-deep-edit`         | 23.4k · 14s | 28.5k · 22s          | 22.2k · 13s  |
-| `real-delete-tests`      | 35.2k · 19s | 52.8k · 75s          | 64.7k · 38s  |
-| `real-header-every-file` | 45.0k · 35s | 37.9k · 51s          | 258.7k · 40s |
-| `real-move-function`     | 43.0k · 21s | 32.3k · 24s          | 30.6k · 18s  |
-| `real-rename-method`     | 26.5k · 22s | 98.1k · 21s          | 28.9k · 26s  |
-| `real-rename-type`       | 37.4k · 34s | 73.4k · 76s (2 of 3) | 70.1k · 41s  |
+| Task                     | crab         | Claude Code  | oh-my-pi             |
+| ------------------------ | ------------ | ------------ | -------------------- |
+| `real-add-attributes`    | 27.0k · 16s  | 39.9k · 36s  | 25.6k · 15s          |
+| `real-catalog-values`    | 45.7k · 26s  | 48.4k · 43s  | 43.7k · 27s          |
+| `real-deep-edit`         | 23.3k · 11s  | 28.5k · 22s  | 22.2k · 15s          |
+| `real-delete-tests`      | 35.1k · 21s  | 53.9k · 81s  | 77.2k · 48s          |
+| `real-header-every-file` | 23.9k · 14s  | 37.8k · 54s  | 195.0k · 39s         |
+| `real-move-function`     | 42.5k · 22s  | 32.4k · 26s  | 30.8k · 22s          |
+| `real-rename-method`     | 26.0k · 23s  | 98.8k · 20s  | 44.1k · 27s          |
+| `real-rename-type`       | 37.4k · 34s  | 65.9k · 69s  | 35.8k · 39s          |
+| `cmd-fix-failing-test`   | 28.6k · 9s   | 24.9k · 11s  | 24.3k · 14s          |
+| `cmd-lint-loop`          | 28.2k · 19s  | 36.6k · 25s  | 36.5k · 31s          |
+| `cmd-slow-command`       | 25.7k · 142s | 24.1k · 141s | 15.6k · 70s (0 of 3) |
+| `cmd-stale-file`         | 39.3k · 19s  | 33.4k · 19s  | 39.4k · 20s          |
 
 What the runs showed:
 
-- Crab and oh-my-pi passed every run. Claude Code with Fable 5.2 failed two:
-  in both it dropped a space from lines it rewrote, such as `history:&mut` for
-  `history: &mut`.
-- Crab and oh-my-pi are close overall, within a second and a few percent of
-  tokens with Sonnet 5.5; both are faster than Claude Code with either model.
-- Crab is clearly ahead where a change is large or spread out. Deleting 569
-  lines of tests from four files takes it half the time and tokens of
-  oh-my-pi, whose first edit call was refused in every run of that task, and a
-  quarter of the time of Claude Code or less. Renaming a type in 46 places takes it
-  about half the tokens of either.
-- Crab does worst on `real-header-every-file`. With Fable 5.2 the first edit
-  call was refused in all three runs, because it asked to insert at line 0,
-  and with Sonnet 5.5 the task took more tokens than with either baseline.
-- oh-my-pi is ahead on `real-catalog-values` with Sonnet 5.5 and on
-  `real-add-attributes`, and takes one request fewer than crab on a few small
-  tasks. Its Fable 5.2 average is pulled up by one task, 258.7k tokens on
-  `real-header-every-file`.
+- Crab and Claude Code passed every run. oh-my-pi failed all six runs of
+  `cmd-slow-command`: it moved the command to the background after a minute
+  and, run without a reader as here, ended the run before the command
+  finished.
+- Crab sends the fewest tokens and makes the fewest tool calls with both
+  models, and without the slow command it is the fastest with both.
+- Crab is clearly ahead where a change is large or spread out: deleting 569
+  lines of tests from four files, renaming a type in 46 places with
+  Sonnet 5.5, and adding a first line to all fifteen files, which it does
+  without reading them.
+- The model writes about two and a half times as much with Claude Code as
+  with the other two.
+- Crab is behind on `real-move-function`, where it takes a request and about
+  10,000 tokens more than either baseline, on `insert-block` and, with
+  Sonnet 5.5, on `cmd-lint-loop` against Claude Code.
 - On the small tasks crab sends about 3,000 more tokens a run than Claude
   Code.
 
 Three runs a cell show the large differences and not the small ones. Run the
 command above to measure again after a change.
-
-Since these runs, `edit` takes an insert at line 0 and needs no tag for one,
-so a line can be added to the top of files without reading them. Measured
-again on that one task, three runs each, `real-header-every-file` takes crab
-24.0k tokens and 8 seconds with Sonnet 5.5, and 24.0k tokens and 19 seconds
-with Fable 5.2, with no refused call. The tables above are from before that
-change, and from before the `cmd-` tasks and the `tokens written` column
-existed.
 
 ## Tasks
 
