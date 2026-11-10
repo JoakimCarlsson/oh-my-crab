@@ -295,6 +295,11 @@ pub(crate) fn differing(expected: &Path, actual: &Path) -> Result<Vec<String>, S
     Ok(differing)
 }
 
+/// Whether the folders `expected` and `actual` hold the same files with the same bytes, git's own folder left out; they do not when either cannot be read.
+pub(crate) fn identical(expected: &Path, actual: &Path) -> bool {
+    matches!((files(expected), files(actual)), (Ok(expected), Ok(actual)) if expected == actual)
+}
+
 /// Whether the files holding `one` and `other` are the same: byte for byte when either is not text, else line for line as [`essence`] gives them.
 fn same(one: &[u8], other: &[u8]) -> bool {
     match (std::str::from_utf8(one), std::str::from_utf8(other)) {
@@ -363,6 +368,10 @@ mod tests {
         let copied = folder.join("copied");
         copy(&expected, &copied).unwrap();
         assert!(differing(&expected, &copied).unwrap().is_empty());
+        assert!(identical(&expected, &copied));
+        put(&copied, "same.txt", "one\n\n");
+        assert!(differing(&expected, &copied).unwrap().is_empty());
+        assert!(!identical(&expected, &copied));
     }
 
     /// Tasks are read by name, a filter keeps only those it names, and a name that is not there is refused.

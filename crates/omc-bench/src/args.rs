@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Usage text printed for `--help` and after a bad argument.
-pub(crate) const USAGE: &str = "usage: crab-bench <--model|--claude-code|--command> ... [options]\n\n  --model <provider[/model]>  measure crab with this model, as a provider id and optionally a model id\n  --claude-code <model>       measure Claude Code with this model, as a baseline\n  --command <name>=<command>  measure another program as a baseline: the command, split at spaces, with {prompt} standing for what the model is asked\n                              (repeat any of the three to compare several)\n  --runs <n>                  how many times each task is run for each contender (3)\n  --jobs <n>                  how many runs go on at once (4)\n  --task <name>               run only this task; repeat it for several\n  --tasks <folder>            the folder the tasks are read from (the bundled tasks)\n  --out <folder>              where the results, transcripts and edited files are written (build/bench/<time>)\n  --crab <program>            the crab to measure (the one beside crab-bench, else the one on PATH)\n  --timeout <seconds>         how long one run may take (300)\n  --tools <a,b,c>             the tools the model is given (read,grep,glob,edit)\n  --set <setting>=<value>     a conversation setting, such as effort=high; repeat it for several\n  --list                      print the tasks and stop";
+pub(crate) const USAGE: &str = "usage: crab-bench <--model|--claude-code|--codex|--command> ... [options]\n\n  --model <provider[/model]>  measure crab with this model, as a provider id and optionally a model id\n  --claude-code <model>       measure Claude Code with this model, as a baseline\n  --codex <model>             measure the Codex CLI with this model, as a baseline\n  --command <name>=<command>  measure another program as a baseline: the command, split at spaces, with {prompt} standing for what the model is asked\n                              (repeat any of the four to compare several)\n  --runs <n>                  how many times each task is run for each contender (3)\n  --jobs <n>                  how many runs go on at once (4)\n  --task <name>               run only this task; repeat it for several\n  --tasks <folder>            the folder the tasks are read from (the bundled tasks)\n  --out <folder>              where the results, transcripts and edited files are written (build/bench/<time>)\n  --crab <program>            the crab to measure (the one beside crab-bench, else the one on PATH)\n  --timeout <seconds>         how long one run may take (300)\n  --tools <a,b,c>             the tools the model is given (read,grep,glob,edit)\n  --set <setting>=<value>     a conversation setting, such as effort=high; repeat it for several\n  --list                      print the tasks and stop";
 
 /// The tools the model is given unless `--tools` names others.
 const TOOLS: &[&str] = &["read", "grep", "glob", "edit"];
@@ -59,6 +59,8 @@ pub(crate) enum Contender {
     Crab(Model),
     /// Claude Code, with the model of this id.
     ClaudeCode(String),
+    /// The Codex CLI, with the model of this id.
+    Codex(String),
     /// Another program, started once for each run.
     Command {
         /// The name it goes by in the results.
@@ -96,6 +98,7 @@ impl Contender {
         match self {
             Self::Crab(model) => format!("crab {}", model.label()),
             Self::ClaudeCode(model) => format!("claude-code {model}"),
+            Self::Codex(model) => format!("codex {model}"),
             Self::Command { name, .. } => name.clone(),
         }
     }
@@ -177,6 +180,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Asked
                 .contenders
                 .push(Contender::Crab(Model::parse(&value()?)?)),
             "--claude-code" => options.contenders.push(Contender::ClaudeCode(value()?)),
+            "--codex" => options.contenders.push(Contender::Codex(value()?)),
             "--command" => options.contenders.push(Contender::command(&value()?)?),
             "--runs" => options.runs = count(&argument, &value()?)?,
             "--jobs" => options.jobs = count(&argument, &value()?)?,
@@ -194,7 +198,8 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Asked
     }
     if options.contenders.is_empty() && !options.list {
         return Err(
-            "name something to measure with --model, --claude-code or --command".to_owned(),
+            "name something to measure with --model, --claude-code, --codex or --command"
+                .to_owned(),
         );
     }
     Ok(Asked::Run(Box::new(options)))
@@ -290,6 +295,8 @@ mod tests {
                 "some-model",
                 "--command",
                 "other=tool -p {prompt} --fast",
+                "--codex",
+                "gpt",
             ]
             .map(str::to_owned),
         )
@@ -306,6 +313,7 @@ mod tests {
                     .to_vec(),
             }
         );
+        assert_eq!(options.contenders[2].label(), "codex gpt");
         assert!(Contender::command("other=tool -p").is_err());
         assert!(Contender::command("=tool {prompt}").is_err());
         assert!(Contender::command("other").is_err());

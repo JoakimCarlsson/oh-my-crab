@@ -15,6 +15,8 @@ struct Sum {
     passed: u32,
     /// How many of them passed without an edit call that did not work.
     clean: u32,
+    /// How many of them left every file byte for byte as asked.
+    exact: u32,
     /// How many tool calls the model made.
     calls: u32,
     /// How many edit calls the model made.
@@ -42,6 +44,7 @@ impl Sum {
             sum.runs += 1;
             sum.passed += u32::from(outcome.passed);
             sum.clean += u32::from(outcome.clean);
+            sum.exact += u32::from(outcome.exact);
             sum.calls += outcome.tools.values().map(|uses| uses.calls).sum::<u32>();
             sum.edits += edits.calls;
             sum.failed += edits.failed;
@@ -69,6 +72,15 @@ fn share(part: u32, whole: u32) -> String {
     }
 }
 
+/// `requests` a run, with one decimal, or a dash when none were counted, as for a harness that does not say how many it made.
+fn requests(requests: f64) -> String {
+    if requests == 0.0 {
+        "-".to_owned()
+    } else {
+        format!("{requests:.1}")
+    }
+}
+
 /// `tokens` in thousands, with one decimal.
 fn thousands(tokens: f64) -> String {
     format!("{:.1}k", tokens / 1000.0)
@@ -85,20 +97,21 @@ fn contenders(outcomes: &[Outcome]) -> Vec<&str> {
     contenders
 }
 
-/// The table of `outcomes` by contender: how many runs passed and passed cleanly, what a run took in requests, tool calls, tokens sent, tokens written and time, how many edit calls failed, and how many runs ended badly.
+/// The table of `outcomes` by contender: how many runs passed, were exact and passed cleanly, what a run took in requests, tool calls, tokens sent, tokens written and time, how many edit calls failed, and how many runs ended badly.
 fn by_contender(outcomes: &[Outcome]) -> String {
     let mut table = String::from(
-        "| contender | runs | passed | clean | requests / run | tool calls / run | failed edit calls | tokens sent / run | tokens written / run | seconds / run | errors |\n|---|---|---|---|---|---|---|---|---|---|---|\n",
+        "| contender | runs | passed | exact | clean | requests / run | tool calls / run | failed edit calls | tokens sent / run | tokens written / run | seconds / run | errors |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for contender in contenders(outcomes) {
         let sum = Sum::of(outcomes.iter().filter(|outcome| outcome.model == contender));
         let _ = writeln!(
             table,
-            "| {contender} | {} | {} | {} | {:.1} | {:.1} | {} | {} | {:.0} | {:.0} | {} |",
+            "| {contender} | {} | {} | {} | {} | {} | {:.1} | {} | {} | {:.0} | {:.0} | {} |",
             sum.runs,
             share(sum.passed, sum.runs),
+            share(sum.exact, sum.runs),
             share(sum.clean, sum.runs),
-            sum.each(f64::from(sum.requests)),
+            requests(sum.each(f64::from(sum.requests))),
             sum.each(f64::from(sum.calls)),
             share(sum.failed, sum.edits),
             thousands(sum.each(sum.tokens as f64)),
@@ -134,10 +147,10 @@ fn by_task(outcomes: &[Outcome]) -> String {
                 Some(runs) => {
                     let sum = Sum::of(runs.iter().copied());
                     format!(
-                        "{}/{} · {:.1} req · {} · {:.0}s",
+                        "{}/{} · {} req · {} · {:.0}s",
                         sum.passed,
                         sum.runs,
-                        sum.each(f64::from(sum.requests)),
+                        requests(sum.each(f64::from(sum.requests))),
                         thousands(sum.each(sum.tokens as f64)),
                         sum.each(sum.seconds),
                     )
@@ -182,6 +195,7 @@ mod tests {
             run: 1,
             passed,
             clean: passed && failed == 0,
+            exact: passed,
             differing: if passed {
                 Vec::new()
             } else {
@@ -218,11 +232,11 @@ mod tests {
         let rows: Vec<&str> = report.lines().collect();
         assert_eq!(
             rows[2],
-            "| b | 2 | 100% | 50% | 4.0 | 3.0 | 25% | 2.5k | 300 | 10 | 0 |"
+            "| b | 2 | 100% | 100% | 50% | 4.0 | 3.0 | 25% | 2.5k | 300 | 10 | 0 |"
         );
         assert_eq!(
             rows[3],
-            "| a | 1 | 0% | 0% | 4.0 | 3.0 | 100% | 2.5k | 300 | 10 | 0 |"
+            "| a | 1 | 0% | 0% | 0% | 4.0 | 3.0 | 100% | 2.5k | 300 | 10 | 0 |"
         );
         assert!(report.contains("| task | b | a |"));
         assert!(

@@ -19,6 +19,15 @@ use crate::task::Task;
 /// The program that is Claude Code.
 const CLAUDE_CODE: &str = "claude";
 
+/// The program that is the Codex CLI.
+const CODEX: &str = "codex";
+
+/// What a patch the Codex CLI applies is counted as, among the tools that change files.
+const CODEX_PATCH: &str = "apply_patch";
+
+/// What a command the Codex CLI runs is counted as.
+const CODEX_SHELL: &str = "shell";
+
 /// The file beside a run's transcript that keeps what the baseline wrote to its error stream.
 const ERRORS: &str = "stderr.txt";
 
@@ -67,6 +76,35 @@ pub(crate) fn claude_code(
     let mut refused = None;
     let ended = stream(process, work, transcript, setup.timeout, |line| {
         if let Some(reason) = claude_line(line, &mut tally) {
+            refused = Some(reason);
+        }
+    });
+    (tally, ended.or(refused))
+}
+
+/// Runs `task` in `work` with the Codex CLI and the model `model`: nothing asked before a command runs or a file changes, nothing saved, and its own tools, a shell and patches, since it takes no list of them. It reads the user's own Codex settings and instructions, which is where its sign-in is. Every line it prints is kept in the file `transcript`.
+///
+/// Gives the count of what the model did and, when the run ended badly, why.
+pub(crate) fn codex(
+    setup: &Setup,
+    model: &str,
+    task: &Task,
+    work: &Path,
+    transcript: &Path,
+) -> (Tally, Option<String>) {
+    let mut process = Process::new(CODEX);
+    process
+        .args(["exec", "--json", "--ephemeral", "--skip-git-repo-check"])
+        .arg("--dangerously-bypass-approvals-and-sandbox")
+        .args(["--model", model]);
+    if let Some((_, effort)) = setup.settings.iter().find(|(id, _)| id == EFFORT) {
+        process.args(["--config", &format!("model_reasoning_effort={effort}")]);
+    }
+    process.arg(&task.prompt);
+    let mut tally = Tally::default();
+    let mut refused = None;
+    let ended = stream(process, work, transcript, setup.timeout, |line| {
+        if let Some(reason) = codex_line(line, &mut tally) {
             refused = Some(reason);
         }
     });
@@ -237,6 +275,46 @@ fn claude_line(line: &str, tally: &mut Tally) -> Option<String> {
     }
 }
 
+/// Counts in `tally` what one line of the Codex CLI's stream says: a command it starts as a call of its shell, a change to files as a call of its patch tool, which failed when it did not complete, and the tokens a finished turn says were sent and written in all, since it does not say in how many requests.
+///
+/// Gives the reason when the line says the turn failed or reports an error.
+fn codex_line(line: &str, tally: &mut Tally) -> Option<String> {
+    let event: Value = serde_json::from_str(line).ok()?;
+    let item = &event["item"];
+    let tool = match item["type"].as_str() {
+        Some("command_execution") => Some(CODEX_SHELL),
+        Some("file_change") => Some(CODEX_PATCH),
+        _ => None,
+    };
+    match (event["type"].as_str()?, tool, item["id"].as_str()) {
+        ("item.started", Some(tool), Some(id)) => tally.called(id, tool),
+        ("item.completed", Some(tool), Some(id)) => {
+            tally.called(id, tool);
+            if tool == CODEX_PATCH && item["status"] != "completed" {
+                tally.failed(id);
+            }
+        }
+        ("turn.completed", _, _) => {
+            let usage = &event["usage"];
+            tally.sent_more(tokens(usage, "input_tokens"));
+            tally.wrote(tokens(usage, "output_tokens"));
+        }
+        ("turn.failed", _, _) => {
+            return Some(
+                event["error"]["message"]
+                    .as_str()
+                    .unwrap_or("the turn failed")
+                    .to_owned(),
+            );
+        }
+        ("error", _, _) => {
+            return Some(event["message"].as_str().unwrap_or("an error").to_owned());
+        }
+        _ => {}
+    }
+    None
+}
+
 /// Counts in `tally` what one line of a baseline's stream says, when it is a JSON object of one of these kinds, named by its `type`: `tool_execution_start` with a `toolCallId` and a `toolName`, `tool_execution_end` with a `toolCallId` and whether it `isError`, and `message_end` with the `usage` of its `message` as `input`, `cacheRead`, `cacheWrite` and `output` tokens. Any other line counts for nothing.
 ///
 /// Gives the reason when a `message_end` says its message stopped on an error.
@@ -316,6 +394,51 @@ mod tests {
         let tools = tally.into_tools();
         assert_eq!(
             tools["read"],
+            Uses {
+                calls: 1,
+                failed: 0
+            }
+        );
+        assert_eq!(
+            edits(&tools),
+            Uses {
+                calls: 2,
+                failed: 1
+            }
+        );
+    }
+
+    /// The Codex CLI's commands and patches are counted as calls, a patch that did not complete as a failed one, a turn's tokens are added up, and a failed turn gives its reason.
+    #[test]
+    fn codex_lines_are_counted() {
+        let mut tally = Tally::default();
+        let lines = [
+            r#"{"type":"thread.started","thread_id":"t"}"#,
+            r#"{"type":"item.started","item":{"id":"i0","type":"command_execution","status":"in_progress"}}"#,
+            r#"{"type":"item.completed","item":{"id":"i0","type":"command_execution","exit_code":1,"status":"completed"}}"#,
+            r#"{"type":"item.started","item":{"id":"i1","type":"file_change","status":"in_progress"}}"#,
+            r#"{"type":"item.completed","item":{"id":"i1","type":"file_change","status":"failed"}}"#,
+            r#"{"type":"item.completed","item":{"id":"i2","type":"file_change","status":"completed"}}"#,
+            r#"{"type":"item.completed","item":{"id":"i3","type":"agent_message","text":"done"}}"#,
+            r#"{"type":"turn.completed","usage":{"input_tokens":5000,"cached_input_tokens":4000,"output_tokens":120}}"#,
+        ];
+        for line in lines {
+            assert_eq!(codex_line(line, &mut tally), None);
+        }
+        assert_eq!(
+            codex_line(
+                r#"{"type":"turn.failed","error":{"message":"out of quota"}}"#,
+                &mut tally
+            ),
+            Some("out of quota".to_owned())
+        );
+        assert_eq!(
+            (tally.requests(), tally.sent(), tally.written()),
+            (0, 5000, 120)
+        );
+        let tools = tally.into_tools();
+        assert_eq!(
+            tools["shell"],
             Uses {
                 calls: 1,
                 failed: 0

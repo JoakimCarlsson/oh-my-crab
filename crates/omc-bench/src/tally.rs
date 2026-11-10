@@ -5,7 +5,14 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use omc_wire::{Event, ToolState};
 
 /// The tools whose calls change files.
-const EDITING: &[&str] = &["edit", "write", "ast_edit", "multiedit", "notebookedit"];
+const EDITING: &[&str] = &[
+    "edit",
+    "write",
+    "ast_edit",
+    "multiedit",
+    "notebookedit",
+    "apply_patch",
+];
 
 /// How often one tool was called in a run.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -92,6 +99,11 @@ impl Tally {
         if self.counted.insert(id.to_owned()) {
             self.request(tokens);
         }
+    }
+
+    /// Counts `tokens` more tokens the model was sent, by a harness that says how many in all but not in how many requests.
+    pub(crate) fn sent_more(&mut self, tokens: u64) {
+        self.sent += tokens;
     }
 
     /// Counts `tokens` more tokens the model wrote.

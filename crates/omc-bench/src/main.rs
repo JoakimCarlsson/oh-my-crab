@@ -67,6 +67,7 @@ fn benchmark(options: &Options) -> Result<(), String> {
         return Ok(());
     }
     let crab = options.crab.clone().unwrap_or_else(nearest_crab);
+    let crab = crab.canonicalize().unwrap_or(crab);
     let out = match &options.out {
         Some(out) => out.clone(),
         None => Path::new("build").join("bench").join(stamp()),
@@ -175,6 +176,7 @@ fn unmade(
         run: number,
         passed: false,
         clean: false,
+        exact: false,
         differing: Vec::new(),
         error: Some(format!("could not make {}: {error}", folder.display())),
         tools: std::collections::BTreeMap::new(),

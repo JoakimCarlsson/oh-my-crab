@@ -33,6 +33,7 @@ crab-bench --list
 | ---------------------------- | ---------------------------------------------------------------------------- | ------------------------------------ |
 | `--model <provider[/model]>` | Measure crab with this model.                                                | none                                 |
 | `--claude-code <model>`      | Measure Claude Code with this model, as a baseline.                          | none                                 |
+| `--codex <model>`            | Measure the Codex CLI with this model, as a baseline.                        | none                                 |
 | `--command <name>=<command>` | Measure another program, as a baseline.                                      | none                                 |
 | `--runs <n>`                 | How many times each task is run for each of those.                           | `3`                                  |
 | `--jobs <n>`                 | How many runs go on at once.                                                 | `4`                                  |
@@ -45,7 +46,7 @@ crab-bench --list
 | `--set <setting>=<value>`    | A conversation setting for every crab run, such as `effort=high`.            | none                                 |
 | `--list`                     | Print the tasks and stop.                                                    |                                      |
 
-At least one of `--model`, `--claude-code` and `--command` is needed, and each
+At least one of `--model`, `--claude-code`, `--codex` and `--command` is needed, and each
 can be repeated. The report lists them in the order they were named.
 
 ## Baselines
@@ -59,6 +60,13 @@ or the difference is the model's and not the harness's.
   and with the tools of `--tools` it has a counterpart of: `read`, `grep`,
   `glob`, `edit`, `write` and `bash`. An `effort` given with `--set` is passed
   on to it.
+- `--codex <model>` runs the Codex CLI (`codex` on `PATH`) without asking
+  before a command runs or a file changes. It takes no list of tools, so it
+  works with its own, a shell and patches, whatever `--tools` says, and it
+  reads the user's own Codex settings and instructions, which is where its
+  sign-in is. It reports the tokens of a run in all and not its requests, so
+  its requests show as a dash. An `effort` given with `--set` is passed on to
+  it.
 - `--command <name>=<command>` runs any other program. The command is split at
   spaces, and the word `{prompt}` is replaced by what the model is asked;
   `{tools}`, wherever it stands, is replaced by the task's tools, by crab's
@@ -108,6 +116,11 @@ end of a line and blank lines are ignored, everything else counts. A task with
 a `check` command passes when that command ends successfully, in place of the
 comparison or on top of it.
 
+A run is **exact** when it passed and every file is the expected one byte for
+byte, so a run that passed but is not exact got a blank line or the white
+space at the end of a line wrong. A task scored by a command alone is exact
+when it passed.
+
 A run is **clean** when it passed and no edit call failed on the way. A run
 that passes only after a rejected edit still costs a round trip and tokens,
 which is what the difference between the two columns shows.
@@ -117,6 +130,7 @@ The report has one row for each harness and model:
 | Column              | What it says                                                              |
 | ------------------- | ------------------------------------------------------------------------- |
 | `passed`            | The share of runs that left the right files.                              |
+| `exact`             | The share that left them byte for byte, blank lines included.             |
 | `clean`             | The share that did so without a failed edit call.                         |
 | `requests / run`    | How many times the model was asked: one round trip each.                  |
 | `tool calls / run`  | How many tool calls a run took, of any tool.                              |
@@ -141,11 +155,13 @@ crab sent or line a baseline printed (`events.jsonl`), under
 
 ## Results
 
-Measured on 10 November 2026 on Linux, with crab at commit `2401b05` (after
-0.1.1), Claude Code 2.1.319 and oh-my-pi 18.16.0, all signed in to the same
-Claude account. Every task was run three times for each row, with medium
-effort and the tools `read`, `grep`, `glob` and `edit`, plus `bash` for the
-`cmd-` tasks and `write` for `cmd-slow-command`:
+Measured on 10 November 2026 on Linux, with crab as it stands at the commit
+that added these results (after 0.1.1), Claude Code 2.1.319, oh-my-pi 18.16.0
+and the Codex CLI 0.166.0, signed in to one Claude account and one ChatGPT
+account. Every task was run three times for each row, with medium effort and
+the tools `read`, `grep`, `glob` and `edit`, plus `bash` for the `cmd-` tasks
+and `write` for `cmd-slow-command`; the Codex CLI works with its own tools.
+oh-my-pi was not signed in to OpenAI, so it has no GPT row.
 
 ```sh
 OMP="-p --mode json --no-session --thinking medium --tools {tools} \
@@ -155,81 +171,142 @@ crab-bench --runs 3 --jobs 8 --timeout 900 --set effort=medium \
   --model claude/claude-sonnet-5-5 --claude-code claude-sonnet-5-5 \
   --command "oh-my-pi sonnet-5-5=omp --model anthropic/claude-sonnet-5-5 $OMP" \
   --model claude/claude-fable-5-2 --claude-code claude-fable-5-2 \
-  --command "oh-my-pi fable-5-2=omp --model anthropic/claude-fable-5-2 $OMP"
+  --command "oh-my-pi fable-5-2=omp --model anthropic/claude-fable-5-2 $OMP" \
+  --model codex/gpt-6.1-sol --codex gpt-6.1-sol
 ```
 
 All 24 tasks, 72 runs a row:
 
-| Model      | Harness     | Passed | Clean | Requests / run | Tool calls / run | Tokens sent / run | Tokens written / run | Seconds / run |
-| ---------- | ----------- | ------ | ----- | -------------- | ---------------- | ----------------- | -------------------- | ------------- |
-| Sonnet 5.5 | crab        | 100%   | 99%   | 3.4            | 2.8              | 28.4k             | 740                  | 13            |
-| Sonnet 5.5 | Claude Code | 100%   | 96%   | 3.8            | 7.3              | 30.6k             | 1924                 | 19            |
-| Sonnet 5.5 | oh-my-pi    | 96%    | 86%   | 3.5            | 3.7              | 33.3k             | 766                  | 11            |
-| Fable 5.2  | crab        | 100%   | 100%  | 3.3            | 3.1              | 27.7k             | 804                  | 21            |
-| Fable 5.2  | Claude Code | 100%   | 100%  | 3.6            | 7.6              | 32.5k             | 2003                 | 30            |
-| Fable 5.2  | oh-my-pi    | 96%    | 92%   | 3.6            | 3.9              | 36.3k             | 874                  | 22            |
+| Model       | Harness     | Passed | Exact | Clean | Requests / run | Tool calls / run | Tokens sent / run | Tokens written / run | Seconds / run | Seconds / run, no slow command |
+| ----------- | ----------- | ------ | ----- | ----- | -------------- | ---------------- | ----------------- | -------------------- | ------------- | ------------------------------ |
+| Sonnet 5.5  | crab        | 100%   | 92%   | 99%   | 3.3            | 2.7              | 25.8k             | 739                  | 12            | 7                              |
+| Sonnet 5.5  | Claude Code | 100%   | 92%   | 97%   | 3.7            | 7.5              | 29.6k             | 1955                 | 19            | 14                             |
+| Sonnet 5.5  | oh-my-pi    | 96%    | 88%   | 89%   | 3.5            | 3.6              | 34.3k             | 767                  | 11            | 9                              |
+| Fable 5.2   | crab        | 100%   | 92%   | 100%  | 3.2            | 2.9              | 25.4k             | 763                  | 20            | 14                             |
+| Fable 5.2   | Claude Code | 100%   | 93%   | 99%   | 3.6            | 7.5              | 32.3k             | 1964                 | 29            | 25                             |
+| Fable 5.2   | oh-my-pi    | 96%    | 88%   | 92%   | 3.5            | 3.9              | 34.8k             | 858                  | 21            | 19                             |
+| GPT-6.1 Sol | crab        | 100%   | 92%   | 100%  | 3.8            | 3.5              | 20.1k             | 401                  | 23            | 18                             |
+| GPT-6.1 Sol | Codex CLI   | 100%   | 92%   | 100%  | -              | 3.3              | 64.0k             | 361                  | 21            | 16                             |
 
 `cmd-slow-command` waits 130 seconds by design, and oh-my-pi's runs of it
-ended after about 67, so it bends the seconds. Without that task, a run takes
-7, 14 and 9 seconds with Sonnet 5.5 for crab, Claude Code and oh-my-pi, and
-15, 25 and 20 seconds with Fable 5.2.
+ended after about 67, so the last column leaves that task out. The runs that
+passed and were not exact are those of `real-delete-tests` and
+`real-move-function`, in every row: where a block is cut out or put in, how
+many blank lines stay is a matter of taste the expected files settle one way.
 
-The `real-` and `cmd-` tasks, as tokens sent and seconds a run, three runs a
-cell; every cell passed three of three unless it says otherwise.
+Every task, as tokens sent and seconds a run, three runs a cell; every cell
+passed three of three unless it says otherwise.
 
 With Sonnet 5.5:
 
 | Task                     | crab         | Claude Code  | oh-my-pi             |
 | ------------------------ | ------------ | ------------ | -------------------- |
-| `real-add-attributes`    | 27.0k · 9s   | 28.9k · 21s  | 25.4k · 8s           |
-| `real-catalog-values`    | 41.0k · 15s  | 76.2k · 34s  | 42.6k · 12s          |
-| `real-deep-edit`         | 23.3k · 6s   | 26.0k · 9s   | 22.2k · 6s           |
-| `real-delete-tests`      | 34.3k · 9s   | 55.6k · 49s  | 69.3k · 17s          |
-| `real-header-every-file` | 23.7k · 8s   | 35.8k · 31s  | 112.6k · 18s         |
-| `real-move-function`     | 40.7k · 10s  | 33.0k · 12s  | 30.8k · 9s           |
-| `real-rename-method`     | 25.9k · 13s  | 30.0k · 10s  | 28.1k · 12s          |
-| `real-rename-type`       | 36.8k · 16s  | 77.7k · 44s  | 71.0k · 20s          |
-| `cmd-fix-failing-test`   | 26.1k · 4s   | 24.3k · 5s   | 30.5k · 7s           |
-| `cmd-lint-loop`          | 44.2k · 10s  | 32.4k · 10s  | 52.6k · 14s          |
-| `cmd-slow-command`       | 25.7k · 135s | 23.5k · 135s | 23.9k · 67s (0 of 3) |
-| `cmd-stale-file`         | 42.3k · 6s   | 37.9k · 10s  | 36.8k · 9s           |
+| `real-add-attributes`    | 25.7k · 8s   | 31.3k · 18s  | 25.4k · 8s           |
+| `real-catalog-values`    | 29.5k · 13s  | 55.1k · 30s  | 42.6k · 12s          |
+| `real-deep-edit`         | 22.1k · 5s   | 26.1k · 10s  | 22.2k · 7s           |
+| `real-delete-tests`      | 35.5k · 10s  | 62.6k · 52s  | 70.3k · 16s          |
+| `real-header-every-file` | 22.4k · 7s   | 41.6k · 35s  | 145.2k · 19s         |
+| `real-move-function`     | 32.2k · 8s   | 26.4k · 12s  | 30.6k · 8s           |
+| `real-rename-method`     | 24.7k · 12s  | 29.7k · 10s  | 28.1k · 12s          |
+| `real-rename-type`       | 41.9k · 17s  | 65.7k · 46s  | 63.9k · 19s          |
+| `cmd-fix-failing-test`   | 24.9k · 4s   | 24.3k · 6s   | 30.5k · 8s           |
+| `cmd-lint-loop`          | 39.2k · 10s  | 33.4k · 10s  | 49.2k · 16s          |
+| `cmd-slow-command`       | 24.5k · 135s | 23.5k · 135s | 21.1k · 65s (0 of 3) |
+| `cmd-stale-file`         | 40.0k · 7s   | 38.3k · 11s  | 39.3k · 9s           |
+| `delete-block`           | 21.2k · 4s   | 19.6k · 7s   | 21.2k · 5s           |
+| `insert-block`           | 20.6k · 5s   | 25.3k · 7s   | 21.1k · 5s           |
+| `long-file`              | 20.8k · 5s   | 19.0k · 6s   | 21.4k · 6s           |
+| `multi-file`             | 27.0k · 6s   | 19.6k · 9s   | 21.8k · 6s           |
+| `nested-indent`          | 21.1k · 5s   | 25.8k · 8s   | 20.8k · 6s           |
+| `repeated-lines`         | 21.1k · 4s   | 19.2k · 6s   | 21.3k · 4s           |
+| `rewrite-body`           | 21.3k · 4s   | 19.4k · 6s   | 21.4k · 5s           |
+| `scattered`              | 20.7k · 5s   | 26.5k · 9s   | 20.8k · 6s           |
+| `shifting-lines`         | 22.2k · 6s   | 20.5k · 9s   | 21.9k · 6s           |
+| `single-line`            | 20.3k · 4s   | 18.1k · 5s   | 20.3k · 5s           |
+| `tabs`                   | 20.6k · 5s   | 18.9k · 7s   | 20.8k · 6s           |
+| `unicode`                | 20.8k · 4s   | 21.1k · 7s   | 21.4k · 5s           |
 
 With Fable 5.2:
 
 | Task                     | crab         | Claude Code  | oh-my-pi             |
 | ------------------------ | ------------ | ------------ | -------------------- |
-| `real-add-attributes`    | 27.0k · 16s  | 39.9k · 36s  | 25.6k · 15s          |
-| `real-catalog-values`    | 45.7k · 26s  | 48.4k · 43s  | 43.7k · 27s          |
-| `real-deep-edit`         | 23.3k · 11s  | 28.5k · 22s  | 22.2k · 15s          |
-| `real-delete-tests`      | 35.1k · 21s  | 53.9k · 81s  | 77.2k · 48s          |
-| `real-header-every-file` | 23.9k · 14s  | 37.8k · 54s  | 195.0k · 39s         |
-| `real-move-function`     | 42.5k · 22s  | 32.4k · 26s  | 30.8k · 22s          |
-| `real-rename-method`     | 26.0k · 23s  | 98.8k · 20s  | 44.1k · 27s          |
-| `real-rename-type`       | 37.4k · 34s  | 65.9k · 69s  | 35.8k · 39s          |
-| `cmd-fix-failing-test`   | 28.6k · 9s   | 24.9k · 11s  | 24.3k · 14s          |
-| `cmd-lint-loop`          | 28.2k · 19s  | 36.6k · 25s  | 36.5k · 31s          |
-| `cmd-slow-command`       | 25.7k · 142s | 24.1k · 141s | 15.6k · 70s (0 of 3) |
-| `cmd-stale-file`         | 39.3k · 19s  | 33.4k · 19s  | 39.4k · 20s          |
+| `real-add-attributes`    | 25.7k · 13s  | 36.9k · 36s  | 25.6k · 17s          |
+| `real-catalog-values`    | 45.3k · 28s  | 50.2k · 46s  | 43.8k · 24s          |
+| `real-deep-edit`         | 22.1k · 13s  | 28.6k · 23s  | 22.2k · 17s          |
+| `real-delete-tests`      | 30.7k · 16s  | 52.8k · 73s  | 67.6k · 34s          |
+| `real-header-every-file` | 22.7k · 17s  | 38.0k · 52s  | 162.6k · 39s         |
+| `real-move-function`     | 31.5k · 17s  | 32.3k · 24s  | 30.6k · 17s          |
+| `real-rename-method`     | 25.1k · 20s  | 104.3k · 19s | 30.5k · 23s          |
+| `real-rename-type`       | 36.5k · 33s  | 52.8k · 69s  | 55.0k · 39s          |
+| `cmd-fix-failing-test`   | 27.3k · 11s  | 24.9k · 12s  | 24.5k · 12s          |
+| `cmd-lint-loop`          | 27.2k · 18s  | 36.5k · 25s  | 36.1k · 23s          |
+| `cmd-slow-command`       | 24.4k · 140s | 24.0k · 140s | 15.6k · 69s (0 of 3) |
+| `cmd-stale-file`         | 34.7k · 14s  | 33.1k · 17s  | 40.2k · 17s          |
+| `delete-block`           | 21.5k · 12s  | 20.2k · 15s  | 26.7k · 12s          |
+| `insert-block`           | 20.8k · 12s  | 19.3k · 12s  | 26.0k · 17s          |
+| `long-file`              | 20.9k · 9s   | 27.1k · 16s  | 21.5k · 13s          |
+| `multi-file`             | 21.6k · 12s  | 29.7k · 22s  | 22.2k · 14s          |
+| `nested-indent`          | 21.1k · 10s  | 19.6k · 11s  | 20.8k · 10s          |
+| `repeated-lines`         | 21.1k · 8s   | 19.7k · 12s  | 21.3k · 11s          |
+| `rewrite-body`           | 21.3k · 8s   | 24.0k · 16s  | 24.1k · 16s          |
+| `scattered`              | 20.9k · 12s  | 20.9k · 14s  | 21.5k · 14s          |
+| `shifting-lines`         | 22.2k · 12s  | 20.9k · 15s  | 30.8k · 19s          |
+| `single-line`            | 20.4k · 9s   | 19.2k · 11s  | 20.3k · 11s          |
+| `tabs`                   | 20.6k · 12s  | 19.4k · 14s  | 20.7k · 13s          |
+| `unicode`                | 23.6k · 13s  | 19.7k · 13s  | 23.9k · 15s          |
+
+With GPT-6.1 Sol:
+
+| Task                     | crab         | Codex CLI     |
+| ------------------------ | ------------ | ------------- |
+| `real-add-attributes`    | 24.7k · 23s  | 63.9k · 21s   |
+| `real-catalog-values`    | 26.1k · 27s  | 72.7k · 22s   |
+| `real-deep-edit`         | 19.9k · 15s  | 51.6k · 16s   |
+| `real-delete-tests`      | 26.9k · 18s  | 56.6k · 17s   |
+| `real-header-every-file` | 12.9k · 17s  | 56.5k · 15s   |
+| `real-move-function`     | 25.1k · 27s  | 69.5k · 15s   |
+| `real-rename-method`     | 56.0k · 28s  | 52.4k · 14s   |
+| `real-rename-type`       | 19.9k · 36s  | 58.9k · 16s   |
+| `cmd-fix-failing-test`   | 27.3k · 20s  | 70.4k · 18s   |
+| `cmd-lint-loop`          | 35.4k · 34s  | 77.7k · 32s   |
+| `cmd-slow-command`       | 14.4k · 138s | 159.2k · 140s |
+| `cmd-stale-file`         | 25.6k · 18s  | 85.4k · 17s   |
+| `delete-block`           | 12.4k · 10s  | 50.8k · 12s   |
+| `insert-block`           | 16.5k · 16s  | 51.1k · 14s   |
+| `long-file`              | 16.9k · 14s  | 54.3k · 15s   |
+| `multi-file`             | 23.7k · 23s  | 68.5k · 15s   |
+| `nested-indent`          | 12.3k · 10s  | 56.3k · 12s   |
+| `repeated-lines`         | 12.3k · 11s  | 51.1k · 12s   |
+| `rewrite-body`           | 12.4k · 10s  | 68.5k · 18s   |
+| `scattered`              | 13.2k · 10s  | 51.7k · 12s   |
+| `shifting-lines`         | 13.3k · 11s  | 51.9k · 15s   |
+| `single-line`            | 12.1k · 8s   | 50.7k · 13s   |
+| `tabs`                   | 11.9k · 10s  | 50.8k · 12s   |
+| `unicode`                | 12.3k · 9s   | 56.3k · 16s   |
 
 What the runs showed:
 
-- Crab and Claude Code passed every run. oh-my-pi failed all six runs of
-  `cmd-slow-command`: it moved the command to the background after a minute
-  and, run without a reader as here, ended the run before the command
-  finished.
-- Crab sends the fewest tokens and makes the fewest tool calls with both
-  models, and without the slow command it is the fastest with both.
+- Crab passed every run with all three models, as did Claude Code and the
+  Codex CLI. oh-my-pi failed all six runs of `cmd-slow-command`: it moved the
+  command to the background after a minute and, run without a reader as here,
+  ended the run before the command finished.
+- Crab sends the fewest tokens with every model: an eighth to a fifth fewer than
+  Claude Code and a quarter fewer than oh-my-pi with the Claude models, and a
+  third of what the Codex CLI sends with GPT-6.1 Sol.
+- With the Claude models crab is the fastest once the slow command is left
+  out, and makes the fewest tool calls.
+- With GPT-6.1 Sol crab is a little slower than the Codex CLI, 18 seconds a
+  run against 16. The renames and the move are where it loses the time: the
+  Codex CLI does them with a shell command, and crab's model writes each
+  changed line. On `real-rename-method` crab also sends more tokens.
 - Crab is clearly ahead where a change is large or spread out: deleting 569
-  lines of tests from four files, renaming a type in 46 places with
-  Sonnet 5.5, and adding a first line to all fifteen files, which it does
-  without reading them.
+  lines of tests from four files, adding a first line to all fifteen files,
+  which it does without reading them, and renaming a type in 46 places.
 - The model writes about two and a half times as much with Claude Code as
-  with the other two.
-- Crab is behind on `real-move-function`, where it takes a request and about
-  10,000 tokens more than either baseline, on `insert-block` and, with
-  Sonnet 5.5, on `cmd-lint-loop` against Claude Code.
-- On the small tasks crab sends about 3,000 more tokens a run than Claude
-  Code.
+  with crab or oh-my-pi.
+- With Sonnet 5.5 crab is behind Claude Code on `multi-file`,
+  `real-move-function` and `cmd-lint-loop`, and on the smallest tasks it sends
+  about 2,000 more tokens a run than Claude Code, while level with oh-my-pi.
 
 Three runs a cell show the large differences and not the small ones. Run the
 command above to measure again after a change.

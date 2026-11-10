@@ -11,7 +11,7 @@ use omc_wire::{Command, Event, LanguageAnswer, LanguageAsk, Opening, Verdict};
 
 use crate::args::{Contender, Model};
 use crate::tally::{Tally, Uses, edits};
-use crate::task::{Task, commit, copy, differing, init};
+use crate::task::{Task, commit, copy, differing, identical, init};
 
 /// How long the harness is listened to before the time left is looked at again.
 const POLL: Duration = Duration::from_secs(1);
@@ -55,6 +55,9 @@ pub(crate) struct Outcome {
     pub(crate) passed: bool,
     /// Whether it passed without a single edit call that did not work.
     pub(crate) clean: bool,
+    /// Whether it passed and every file is, byte for byte, what the task asks for, blank lines and the white space at the end of lines included; a task scored by a command alone is exact when it passed.
+    #[serde(default)]
+    pub(crate) exact: bool,
     /// The files that are not what the task asks for.
     pub(crate) differing: Vec<String>,
     /// Why the run ended badly, when it did: the turn failed, the time ran out or the harness stopped.
@@ -93,6 +96,9 @@ pub(crate) fn run(
         (Ok(()), Contender::ClaudeCode(model)) => {
             crate::baseline::claude_code(setup, model, task, &work, &transcript)
         }
+        (Ok(()), Contender::Codex(model)) => {
+            crate::baseline::codex(setup, model, task, &work, &transcript)
+        }
         (Ok(()), Contender::Command { words, .. }) => {
             crate::baseline::command(setup, words, task, &work, &transcript)
         }
@@ -111,12 +117,18 @@ pub(crate) fn run(
     let written = tally.written();
     let tools = tally.into_tools();
     let passed = error.is_none() && differing.is_empty();
+    let exact = passed
+        && task
+            .after
+            .as_ref()
+            .is_none_or(|after| identical(after, &work));
     Outcome {
         model: contender.label(),
         task: task.name.clone(),
         run: number,
         passed,
         clean: passed && edits(&tools).failed == 0,
+        exact,
         differing,
         error,
         tools,
