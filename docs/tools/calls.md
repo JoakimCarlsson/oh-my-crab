@@ -3,9 +3,15 @@
 Arguments the model gets slightly wrong are put right against the tool's
 schema before the tool runs, for built-in tools and tool-server tools alike: a
 number or boolean sent as a string, a single value where a list is wanted, an
-object or list sent as JSON text, and `null` for an optional argument. When the
-arguments still do not fit, the call is turned away with every place that is
-wrong and what was expected there.
+object or list sent as JSON text, and `null` for an optional argument.
+Arguments that are one item of the list a tool requires become that list: an
+`edit` call that sends one file's `path`, `tag` and `ops` without the `files`
+list around them means that one file. When the arguments still do not fit, the
+call is turned away with every place that is wrong and what was expected
+there.
+
+A call whose name is a tool's name with stray characters around it, such as a
+space or an underscore in front, is taken as a call of that tool.
 
 ## Which calls run at once
 

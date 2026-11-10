@@ -397,6 +397,19 @@ fn strip_images(history: &mut [Message]) -> bool {
     any
 }
 
+/// `reply` with each tool call that names no tool of `registry`, but does once the characters around the name that are neither letters nor digits are taken off, given that tool's name: a model now and then writes ` edit` or `_edit` for `edit`.
+///
+/// The name is put right in the reply itself, so that the permission rules, the hooks and the saved history all see the tool that runs.
+fn named(mut reply: Reply, registry: &Registry) -> Reply {
+    for call in &mut reply.tool_calls {
+        let tidy = call.name.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        if registry.get(&call.name).is_none() && registry.get(tidy).is_some() {
+            call.name = tidy.to_owned();
+        }
+    }
+    reply
+}
+
 /// Whether `reply` holds nothing for the reader or the turn: no text beyond
 /// whitespace and no tool calls.
 fn is_empty(reply: &Reply) -> bool {
@@ -578,6 +591,7 @@ async fn drive(
             Some(earlier) => recovery::joined(earlier, reply),
             None => reply,
         };
+        let reply = named(reply, registry);
         notice = None;
         if std::mem::take(&mut following_up) && is_empty(&reply) && reply.stop != Stop::Length {
             return Ok(());
@@ -1636,6 +1650,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A call whose name has stray characters around a tool's name is given that tool's name, and a name that is no tool's either way is left alone.
+    #[test]
+    fn a_stray_name_is_put_right() {
+        let registry = Registry::builtin(scratch("loop-named")).unwrap();
+        let mut reply = call_reply("t1", " edit", json!({}));
+        reply.tool_calls.push(ToolCall {
+            id: "t2".into(),
+            name: "_read".into(),
+            arguments: json!({}),
+        });
+        reply.tool_calls.push(ToolCall {
+            id: "t3".into(),
+            name: " nothing".into(),
+            arguments: json!({}),
+        });
+        let names: Vec<String> = named(reply, &registry)
+            .tool_calls
+            .into_iter()
+            .map(|call| call.name)
+            .collect();
+        assert_eq!(names, ["edit", "read", " nothing"]);
     }
 
     /// The model asks for `read`, gets the file, then answers.

@@ -1,6 +1,6 @@
 //! Lenient reading of tool arguments: the common ways a model gets an argument's type wrong are put right against the tool's schema before the arguments are checked.
 //!
-//! A string holding a number or a boolean becomes that number or boolean where the schema wants one, a number or boolean becomes a string where the schema wants text, a string holding JSON becomes the object or array it encodes where the schema wants one, a single value becomes a one-element list where the schema wants a list, a whole number written with a fraction becomes an integer where the schema wants an integer, and `null` given for an optional property that does not take it is left out. The rules apply all the way down, to the properties of objects and the items of arrays.
+//! A string holding a number or a boolean becomes that number or boolean where the schema wants one, a number or boolean becomes a string where the schema wants text, a string holding JSON becomes the object or array it encodes where the schema wants one, a single value becomes a one-element list where the schema wants a list, arguments that are themselves one item of the tool's required list of objects become that list, a whole number written with a fraction becomes an integer where the schema wants an integer, and `null` given for an optional property that does not take it is left out. The rules apply all the way down, to the properties of objects and the items of arrays.
 
 use serde_json::{Map, Number, Value};
 
@@ -72,9 +72,42 @@ pub(crate) fn coerce(schema: &Value, value: Value) -> Value {
         converted(&wanted, value)
     };
     match value {
-        Value::Object(fields) => Value::Object(coerce_fields(rules, fields)),
+        Value::Object(fields) => Value::Object(coerce_fields(rules, wrapped(rules, fields))),
         Value::Array(items) => Value::Array(coerce_items(rules, items)),
         other => other,
+    }
+}
+
+/// The properties `fields` of an object, or, when they hold one item of a list the object must have and does not, the object with that list and the item in it: a model asked for `{"files": [{...}]}` that sends only the `{...}` of its one file means the list, and one that sends `{"path": ..., "op": ..., "line": ...}` for `{"path": ..., "ops": [{...}]}` means the one operation.
+///
+/// The properties the object's own schema names stay on the object; the others make the item. The object is changed only when exactly one of its required properties is missing, that property is a list of objects, and the item fits what the list holds once it is put right; otherwise it is left as it is, for the check to report.
+fn wrapped(rules: &Map<String, Value>, fields: Map<String, Value>) -> Map<String, Value> {
+    let missing: Vec<&str> = list(rules, "required")
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|name| !fields.contains_key(*name))
+        .collect();
+    let [name] = missing.as_slice() else {
+        return fields;
+    };
+    let properties = rules.get("properties").and_then(Value::as_object);
+    let item = properties
+        .and_then(|properties| properties.get(*name))
+        .filter(|property| property["type"] == "array")
+        .map(|property| &property["items"])
+        .filter(|item| item["type"] == "object");
+    let Some(item) = item else {
+        return fields;
+    };
+    let own = |key: &String| properties.is_some_and(|properties| properties.contains_key(key));
+    let (mut kept, inner): (Map<String, Value>, Map<String, Value>) =
+        fields.clone().into_iter().partition(|(key, _)| own(key));
+    let one = coerce(item, Value::Object(inner));
+    if one.as_object().is_some_and(|one| !one.is_empty()) && fits(item, &one) {
+        kept.insert((*name).to_owned(), Value::Array(vec![one]));
+        kept
+    } else {
+        fields
     }
 }
 
@@ -270,6 +303,61 @@ mod tests {
             },
             "required": ["path"]
         })
+    }
+
+    /// Arguments that hold one item of the required list of objects get that list with the item in it, keeping the properties that are the object's own, and are left alone when what is left does not fit an item or the list is there.
+    #[test]
+    fn a_bare_item_becomes_the_required_list() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" },
+                            "line": { "type": "integer" }
+                        },
+                        "required": ["path", "line"]
+                    }
+                }
+            },
+            "required": ["files"]
+        });
+        assert_eq!(
+            prepare(&schema, json!({ "path": "a.rs", "line": "3" })).unwrap(),
+            json!({ "files": [{ "path": "a.rs", "line": 3 }] })
+        );
+        assert!(prepare(&schema, json!({ "path": "a.rs" })).is_err());
+        let nested = json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "ops": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": { "op": { "type": "string" }, "line": { "type": "integer" } },
+                        "required": ["op"]
+                    }
+                }
+            },
+            "required": ["path", "ops"]
+        });
+        assert_eq!(
+            prepare(
+                &nested,
+                json!({ "path": "a.rs", "op": "delete", "line": 3 })
+            )
+            .unwrap(),
+            json!({ "path": "a.rs", "ops": [{ "op": "delete", "line": 3 }] })
+        );
+        assert!(prepare(&nested, json!({ "path": "a.rs" })).is_err());
+        assert_eq!(
+            prepare(&schema, json!({ "files": [{ "path": "a.rs", "line": 3 }] })).unwrap(),
+            json!({ "files": [{ "path": "a.rs", "line": 3 }] })
+        );
     }
 
     /// Numbers and booleans written as strings become numbers and booleans.

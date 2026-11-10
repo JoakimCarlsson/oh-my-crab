@@ -54,7 +54,8 @@ struct Args {
 struct Section {
     /// File to edit, relative to the working directory.
     path: String,
-    /// Snapshot tag from the latest `read`, `grep` or `edit` result for the file.
+    /// Snapshot tag from the latest `read`, `grep` or `edit` result for the file; empty when the model gave none, which only a section of inserts at the top may do.
+    #[serde(default)]
     tag: String,
     /// Operations, all anchored to line numbers of that snapshot.
     ops: Vec<Op>,
@@ -157,7 +158,9 @@ impl Tool for Edit {
          range shows them. If the file changed since the tag was issued the call is rejected and \
          nothing is written; read the file again. A call either applies to every file or to \
          none. A successful edit returns the new tag and a preview of the changed lines, so you \
-         can edit again without reading. The user is asked to approve each edit.\n\
+         can edit again without reading. An insert at line 0 puts text at the top of a file and \
+         needs no tag, so a line can be added to the top of files that were never read. The \
+         user is asked to approve each edit.\n\
          Merge conflicts: {\"op\": \"resolve\", \"conflict\": N, \"take\": \"ours\"} replaces \
          the whole block of conflict N, markers included, with one side (ours, theirs, base or \
          both, ours first); give text instead of take to put your own lines there (an empty \
@@ -183,7 +186,7 @@ impl Tool for Edit {
                         "type": "object",
                         "properties": {
                             "path": { "type": "string", "description": "File to edit, relative to the working directory." },
-                            "tag": { "type": "string", "description": "Snapshot tag from the latest read, grep or edit result for this file: four hex digits, or O and four hex digits for an outline."},
+                            "tag": { "type": "string", "description": "Snapshot tag from the latest read, grep or edit result for this file: four hex digits, or O and four hex digits for an outline. Leave it out only when every operation of the section is an insert at line 0."},
                             "ops": {
                                 "type": "array",
                                 "minItems": 1,
@@ -192,7 +195,7 @@ impl Tool for Edit {
                                     "type": "object",
                                     "properties": {
                                         "op": { "type": "string", "enum": ["replace", "insert_before", "insert_after", "delete", "resolve"] },
-                                        "line": { "type": "integer", "minimum": 1, "description": "The line to act on; the first line of a range. Required except for resolve. insert_after accepts 0 to insert at the top." },
+                                        "line": { "type": "integer", "minimum": 0, "description": "The line to act on; the first line of a range. Required except for resolve. An insert at line 0, before or after, puts the text at the top of the file." },
                                         "end": { "type": "integer", "minimum": 1, "description": "Last line of the range, for replace and delete. Defaults to line." },
                                         "text": { "type": "string", "description": "The new lines, separated by newlines, without line numbers. Required for replace and the inserts; an empty string is one blank line, so use delete to remove lines. For resolve, the lines that replace the conflict block, instead of take." },
                                         "conflict": { "type": "integer", "minimum": 1, "description": "For resolve: the number of the merge conflict, as read lists them." },
@@ -203,7 +206,7 @@ impl Tool for Edit {
                             },
                             "generated": { "type": "boolean", "description": "Allow changing a generated file or lockfile. Only when the user explicitly asked to change this file itself." }
                         },
-                        "required": ["path", "tag", "ops"]
+                        "required": ["path", "ops"]
                     }
                 }
             },
@@ -443,7 +446,14 @@ fn prepare(sandbox: &Sandbox, path: PathBuf, section: &Section) -> Result<Pendin
     } else {
         tag(&bytes)
     };
-    if !cited.eq_ignore_ascii_case(&current) {
+    if cited.is_empty() && !only_tops(&section.ops) {
+        return Err(ToolError::InvalidArguments(format!(
+            "{} needs the tag from the latest read, grep or edit result for it; only a section \
+             whose every operation is an insert at line 0 may leave the tag out",
+            section.path
+        )));
+    }
+    if !cited.is_empty() && !cited.eq_ignore_ascii_case(&current) {
         return Err(ToolError::Failed(format!(
             "{} has changed since it was read (you cited tag {:?}, it is now {current}); \
              read the file again and redo the edit against the new tag and line numbers",
@@ -465,6 +475,12 @@ fn prepare(sandbox: &Sandbox, path: PathBuf, section: &Section) -> Result<Pendin
         region,
         outlined,
     })
+}
+
+/// Whether every operation in `ops` is an insert at line 0, which puts text at the top of the file whatever the file holds, so that it needs no snapshot to be anchored to.
+fn only_tops(ops: &[Op]) -> bool {
+    ops.iter()
+        .all(|op| matches!(op.op, Kind::InsertBefore | Kind::InsertAfter) && op.line == Some(0))
 }
 
 /// Refuses the operations `ops` of `section`, placed on the lines of the
@@ -722,12 +738,12 @@ fn rewrite(old: &str, ops: &[Placed]) -> Result<(String, (usize, usize)), String
             }
             Action::InsertBefore | Action::InsertAfter => {
                 let gap = if op.action == Action::InsertBefore {
-                    op.line.wrapping_sub(1)
+                    op.line.saturating_sub(1)
                 } else {
                     op.line
                 };
                 let valid = if op.action == Action::InsertBefore {
-                    (1..=total + 1).contains(&op.line)
+                    op.line <= total + 1
                 } else {
                     op.line <= total
                 };
@@ -905,6 +921,43 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(get(&dir, "f.txt"), "top\na\nafter a\nbefore b\nb\nbottom\n");
+    }
+
+    /// An insert at line 0 puts the text at the top of the file, before or after, and the schema lets line 0 through.
+    #[tokio::test]
+    async fn inserts_at_line_zero_go_to_the_top() {
+        let (tool, dir) = tool("edit-insert-zero");
+        for op in ["insert_before", "insert_after"] {
+            let t = put(&dir, "f.txt", "a\nb\n");
+            let args = call("f.txt", &t, json!([{ "op": op, "line": 0, "text": "top" }]));
+            assert!(crate::schema::violations(&tool.schema(), &args, "args").is_empty());
+            tool.call(args).await.unwrap();
+            assert_eq!(get(&dir, "f.txt"), "top\na\nb\n");
+        }
+    }
+
+    /// A section of inserts at line 0 needs no tag, also for a file that was never read, while any other operation without a tag is refused and writes nothing.
+    #[tokio::test]
+    async fn inserts_at_the_top_need_no_tag() {
+        let (tool, dir) = tool("edit-top-untagged");
+        put(&dir, "a.txt", "a\n");
+        put(&dir, "b.txt", "b\n");
+        let args = json!({ "files": [
+            { "path": "a.txt", "ops": [{ "op": "insert_before", "line": 0, "text": "top" }] },
+            { "path": "b.txt", "ops": [{ "op": "insert_after", "line": 0, "text": "top" }] }
+        ]});
+        assert!(crate::schema::violations(&tool.schema(), &args, "args").is_empty());
+        tool.call(args).await.unwrap();
+        assert_eq!(get(&dir, "a.txt"), "top\na\n");
+        assert_eq!(get(&dir, "b.txt"), "top\nb\n");
+        let refused = tool
+            .call(json!({ "files": [
+                { "path": "a.txt", "ops": [{ "op": "insert_after", "line": 1, "text": "x" }] }
+            ]}))
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("needs the tag"));
+        assert_eq!(get(&dir, "a.txt"), "top\na\n");
     }
 
     /// Deleting a line and a range removes exactly those lines, with line numbers from the original file.

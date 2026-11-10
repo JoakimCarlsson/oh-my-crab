@@ -30,6 +30,10 @@ each request, but `load_tools` names them, each with a one-line summary. See
 | `write`    | Creates a file or overwrites it whole                                                            | yes, per folder | no   | [files](files.md)         |
 | `ast_edit` | Rewrites code by syntax tree across files                                                        | yes, per folder | no   | [files](files.md#generated-files) |
 
+An `edit` insert at line 0 puts text at the top of a file. A file whose every
+operation is such an insert needs no tag, so a line can be added to the top of
+files that were never read.
+
 After `edit` and `write`, the file is formatted and its diagnostics are added
 to the result; see [language services](../language-services.md).
 

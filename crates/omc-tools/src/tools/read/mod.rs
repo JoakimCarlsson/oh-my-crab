@@ -179,19 +179,16 @@ impl Tool for Read {
          ignoring case) reads that file, and the result says so; several candidates are \
          listed in the error.\n\
          - Directories: entries, directories first and ending in /, honoring .gitignore.\n\
-         - Images (PNG, JPEG, GIF, WebP): returned for you to look at. One over 3.75 MB or \
-         2000 px on a side is shrunk first; the header then gives the original size and \
-         the factor to multiply coordinates by to map them back to it. Images over 12000 px \
-         on a side or 256 MiB of pixels cannot be shrunk and are refused.\n\
+         - Images (PNG, JPEG, GIF, WebP): returned for you to look at. A large one is shrunk \
+         first; the header then gives the original size and the factor to multiply \
+         coordinates by to map them back to it.\n\
          - PDFs: extracted text, a [page N] line before each page; line suffixes work.\n\
          - SQLite databases: db.sqlite lists tables with row counts and schemas; \
-         db.sqlite:users shows rows (50 at a time; db.sqlite:users:51-100 or :-20 for \
-         others); db.sqlite:SELECT ... runs a read-only query (SELECT, WITH or PRAGMA \
-         table_info only), paged the same way.\n\
+         db.sqlite:users shows rows, a page at a time; db.sqlite:SELECT ... runs a read-only \
+         query. Each result says how to read on.\n\
          - Archives (.zip, .tar, .tar.gz, .tgz): a.zip lists members with sizes; \
-         a.zip:dir/file.txt reads a member as numbered text, with line suffixes such as \
-         a.zip:dir/file.txt:10-40; a.zip:dir lists a directory. Members have no tag and \
-         cannot be edited.\n\
+         a.zip:dir/file.txt reads a member as numbered text, with line suffixes; a.zip:dir \
+         lists a directory. Members have no tag and cannot be edited.\n\
          - JSON: data.json:<query> gives the values a query picks, pretty-printed and \
          numbered. A query is a small path language, not jq: a path such as .items[0].name, \
          .items[].id, .[\"a key\"], .[-1] or .[2:5], piped with | through more paths or the \
