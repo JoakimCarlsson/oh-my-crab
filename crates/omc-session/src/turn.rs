@@ -1,6 +1,6 @@
 //! One turn of the conversation, owned so it can run on a task of its own.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use omc_agent::{Chained, Context, EventSink, Hooks, Models, Scribe, compact, run_turn_steered};
@@ -20,6 +20,18 @@ use crate::shared::{SessionHost, Shared};
 use crate::toolset::{Inputs, Toolset};
 use crate::translate::translate_all;
 use crate::warmer::Recorder;
+
+/// Keeps `streamed` holding the text of the reply being written: `event` adds a chunk to it, and the end of a model request, after which the reply is saved whole, empties it.
+fn follow_reply(streamed: &Mutex<String>, event: &omc_agent::AgentEvent) {
+    let mut text = streamed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match event {
+        omc_agent::AgentEvent::Delta(chunk) => text.push_str(chunk),
+        omc_agent::AgentEvent::Used(_) => text.clear(),
+        _ => {}
+    }
+}
 
 /// How a turn ended.
 pub(crate) enum Ended {
@@ -97,8 +109,8 @@ impl ChatModel for Switch {
 
 /// What a turn is asked to do.
 pub(crate) enum Job {
-    /// Answer this prompt.
-    Prompt(String),
+    /// Answer this prompt, looking at the images the reader attached to it.
+    Prompt(String, Vec<omc_providers::Image>),
     /// Summarize the older part of the conversation, giving particular attention to this when it is given.
     Compact(Option<String>),
 }
@@ -244,7 +256,9 @@ impl Turn {
         let out = self.shared.out.clone();
         let lifecycle = self.shared.lifecycle.clone();
         let named = self.model.clone();
+        let streamed = self.shared.streamed.clone();
         let events: Arc<EventSink> = Arc::new(move |event| {
+            follow_reply(&streamed, &event);
             if compacted(&event) {
                 lifecycle.begin(START_COMPACT, Some(named.clone()));
             }
@@ -355,7 +369,7 @@ impl Turn {
             hooks: checks.as_deref(),
         };
         let result = match job {
-            Job::Prompt(prompt) => {
+            Job::Prompt(prompt, images) => {
                 let added = match self.submitted(&prompt).await {
                     Ok(added) => added,
                     Err(blocked) => return blocked,
@@ -400,6 +414,7 @@ impl Turn {
                     &context,
                     &mut self.history,
                     told.join("\n\n"),
+                    images,
                     events.as_ref(),
                     self.scribe.as_ref(),
                     steering,
@@ -666,7 +681,8 @@ mod tests {
         let model = Arc::new(Planner {
             seen: Mutex::new(Vec::new()),
         });
-        let running = tokio::spawn(turn.run_with(model.clone(), Job::Prompt("plan it".into())));
+        let running =
+            tokio::spawn(turn.run_with(model.clone(), Job::Prompt("plan it".into(), Vec::new())));
         let ticket = loop {
             match events.recv().await {
                 Some(Event::Ask(asked)) => {
@@ -773,7 +789,7 @@ mod tests {
             results: Mutex::new(Vec::new()),
         });
         let Ended::Done(_) = turn
-            .run_with(model.clone(), Job::Prompt("look".into()))
+            .run_with(model.clone(), Job::Prompt("look".into(), Vec::new()))
             .await
         else {
             panic!("turn failed");
@@ -858,7 +874,7 @@ mod tests {
             shared.set_mode(mode);
             let turn = turn_in(&dir, &shared, history);
             let Ended::Done(after) = turn
-                .run_with(model.clone(), Job::Prompt(prompt.into()))
+                .run_with(model.clone(), Job::Prompt(prompt.into(), Vec::new()))
                 .await
             else {
                 panic!("turn failed");
@@ -926,7 +942,7 @@ mod tests {
         let mut history = vec![Message::User(told), reply.clone()];
         let turn = turn_in(&dir, &shared, history.clone());
         let Ended::Done(_) = turn
-            .run_with(model.clone(), Job::Prompt("second".into()))
+            .run_with(model.clone(), Job::Prompt("second".into(), Vec::new()))
             .await
         else {
             panic!("turn failed");
@@ -942,7 +958,7 @@ mod tests {
         ]);
         let turn = turn_in(&dir, &shared, history);
         let Ended::Done(_) = turn
-            .run_with(model.clone(), Job::Prompt("third".into()))
+            .run_with(model.clone(), Job::Prompt("third".into(), Vec::new()))
             .await
         else {
             panic!("turn failed");
@@ -1015,7 +1031,9 @@ mod tests {
         });
         let mut turn = turn_in(&dir, &shared, Vec::new());
         turn.base = base.clone();
-        let Ended::Done(mut history) = turn.run_with(model.clone(), Job::Prompt("go".into())).await
+        let Ended::Done(mut history) = turn
+            .run_with(model.clone(), Job::Prompt("go".into(), Vec::new()))
+            .await
         else {
             panic!("turn failed");
         };
@@ -1030,7 +1048,7 @@ mod tests {
         let mut turn = turn_in(&dir, &shared, history);
         turn.base = base;
         let Ended::Done(_) = turn
-            .run_with(model_after.clone(), Job::Prompt("again".into()))
+            .run_with(model_after.clone(), Job::Prompt("again".into(), Vec::new()))
             .await
         else {
             panic!("turn failed");
@@ -1153,7 +1171,10 @@ mod tests {
                 results: Mutex::new(Vec::new()),
             });
             let Ended::Done(_) = turn
-                .run_with(model.clone(), Job::Prompt("delete f.txt".into()))
+                .run_with(
+                    model.clone(),
+                    Job::Prompt("delete f.txt".into(), Vec::new()),
+                )
                 .await
             else {
                 panic!("turn failed");
@@ -1221,7 +1242,7 @@ mod tests {
             },
         )));
         let Ended::Failed(reason) = turn
-            .run_with(Arc::new(Limited), Job::Prompt("hello".into()))
+            .run_with(Arc::new(Limited), Job::Prompt("hello".into(), Vec::new()))
             .await
         else {
             panic!("the turn did not fail");
@@ -1279,7 +1300,10 @@ mod tests {
             "grep -q secret && { echo 'no secrets in prompts' >&2; exit 2; }; exit 0",
         ));
         let Ended::Failed(reason) = turn
-            .run_with(model.clone(), Job::Prompt("my secret is 42".into()))
+            .run_with(
+                model.clone(),
+                Job::Prompt("my secret is 42".into(), Vec::new()),
+            )
             .await
         else {
             panic!("the prompt was not blocked");
@@ -1289,7 +1313,7 @@ mod tests {
         let mut turn = turn_in(&dir, &shared, Vec::new());
         turn.hooks = Some(engine("echo 'the build is red'"));
         let Ended::Done(_) = turn
-            .run_with(model.clone(), Job::Prompt("hello".into()))
+            .run_with(model.clone(), Job::Prompt("hello".into(), Vec::new()))
             .await
         else {
             panic!("turn failed");
@@ -1347,10 +1371,10 @@ mod tests {
             reply,
         ];
         let jobs = [
-            Job::Prompt("one".into()),
-            Job::Prompt("two".into()),
+            Job::Prompt("one".into(), Vec::new()),
+            Job::Prompt("two".into(), Vec::new()),
             Job::Compact(None),
-            Job::Prompt("three".into()),
+            Job::Prompt("three".into(), Vec::new()),
         ];
         for job in jobs {
             let turn = turn_in(&dir, &shared, history);
@@ -1470,7 +1494,8 @@ mod tests {
         let model = Arc::new(FreshPlanner {
             seen: Mutex::new(Vec::new()),
         });
-        let running = tokio::spawn(turn.run_with(model.clone(), Job::Prompt("plan it".into())));
+        let running =
+            tokio::spawn(turn.run_with(model.clone(), Job::Prompt("plan it".into(), Vec::new())));
         let ticket = loop {
             match events.recv().await {
                 Some(Event::Ask(asked)) => break asked.ticket,
@@ -1566,7 +1591,7 @@ mod tests {
                 id: "p".into(),
                 effort: Some(Effort::High),
             }),
-            Job::Prompt("plan it".into()),
+            Job::Prompt("plan it".into(), Vec::new()),
         ));
         let ticket = loop {
             match events.recv().await {
@@ -1664,7 +1689,7 @@ mod tests {
                 main: Mutex::new(0),
             });
             let Ended::Done(_) = turn
-                .run_with(model.clone(), Job::Prompt("carry on".into()))
+                .run_with(model.clone(), Job::Prompt("carry on".into(), Vec::new()))
                 .await
             else {
                 panic!("turn failed");
@@ -1847,6 +1872,7 @@ mod tests {
             }
             self.shared.queue.push(
                 "and the second".into(),
+                Vec::new(),
                 Some("t2".into()),
                 "and the second".into(),
                 vec!["b.txt".into()],
@@ -1905,7 +1931,7 @@ mod tests {
             last: Mutex::new(Vec::new()),
         });
         let Ended::Done(history) = turn
-            .run_with(model.clone(), Job::Prompt("read f".into()))
+            .run_with(model.clone(), Job::Prompt("read f".into(), Vec::new()))
             .await
         else {
             panic!("turn failed");
@@ -1985,7 +2011,10 @@ mod tests {
         let model = Arc::new(Editor {
             step: Mutex::new(0),
         });
-        let Ended::Done(history) = turn.run_with(model, Job::Prompt("edit".into())).await else {
+        let Ended::Done(history) = turn
+            .run_with(model, Job::Prompt("edit".into(), Vec::new()))
+            .await
+        else {
             panic!("turn failed");
         };
         assert_eq!(
@@ -2085,7 +2114,7 @@ mod tests {
         for prompt in ["how do I run the integration tests", "next"] {
             let turn = turn_in(&dir, &shared, history);
             let Ended::Done(after) = turn
-                .run_with(model.clone(), Job::Prompt(prompt.into()))
+                .run_with(model.clone(), Job::Prompt(prompt.into(), Vec::new()))
                 .await
             else {
                 panic!("turn failed");
@@ -2139,7 +2168,10 @@ mod tests {
             let turn = turn_in(&dir, &shared, history);
             let model = model.clone();
             async move {
-                match turn.run_with(model, Job::Prompt(prompt.into())).await {
+                match turn
+                    .run_with(model, Job::Prompt(prompt.into(), Vec::new()))
+                    .await
+                {
                     Ended::Done(after) => after,
                     _ => panic!("turn failed"),
                 }

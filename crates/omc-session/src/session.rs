@@ -235,8 +235,9 @@ impl Session {
                     .filter_map(|file| file.file_name())
                     .map(|name| name.to_string_lossy().into_owned())
                     .collect();
-                let told = format!("{}{}", context.unwrap_or_default(), compose(&text, &files));
-                self.prompt(told, turn, text, names);
+                let (composed, images) = compose(&text, &files);
+                let told = format!("{}{composed}", context.unwrap_or_default());
+                self.prompt(told, images, turn, text, names);
             }
             Command::Choose {
                 ticket,
@@ -689,10 +690,17 @@ impl Session {
         }));
     }
 
-    /// Answers the prompt that tells the model `told`, which the client sent as `text` with the files named `files` under the turn id `turn`: starts a turn with it, or queues it for the turn that is running and tells the client so.
+    /// Answers the prompt that tells the model `told` and shows it `images`, which the client sent as `text` with the files named `files` under the turn id `turn`: starts a turn with it, or queues it for the turn that is running and tells the client so.
     ///
     /// The skills must have been read again first, as [`Self::rescan`] does, so that a skill added since the last turn can be invoked.
-    fn prompt(&mut self, told: String, turn: Option<String>, text: String, files: Vec<String>) {
+    fn prompt(
+        &mut self,
+        told: String,
+        images: Vec<omc_providers::Image>,
+        turn: Option<String>,
+        text: String,
+        files: Vec<String>,
+    ) {
         if self.open.is_none() {
             return self.say(Event::Failed("the conversation is not open".to_owned()));
         }
@@ -701,11 +709,11 @@ impl Session {
         };
         let told = expand_skill(&told, &open.discovered.skills);
         if self.running.is_some() {
-            let waiting = self.shared.queue.push(told, turn, text, files);
+            let waiting = self.shared.queue.push(told, images, turn, text, files);
             return self.say(waiting);
         }
         let mark = turn.map(|id| omc_agent::Mark { id, text, files });
-        self.start(Job::Prompt(told), mark);
+        self.start(Job::Prompt(told, images), mark);
     }
 
     /// Starts a turn doing `job`, whose prompt the client described as `mark` when it did, unless one is running or nothing is open; the skill a prompt invokes must already be expanded in it. A compaction stops warming the last request first, since the request after it no longer starts the same way.
@@ -729,6 +737,11 @@ impl Session {
         if matches!(job, Job::Compact(_)) {
             self.shared.warmer.stop();
         }
+        self.shared
+            .streamed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.turns += 1;
         let number = self.turns;
         self.resets_at_start = self.shared.notebook.resets();
@@ -877,7 +890,7 @@ impl Session {
         self.rescan();
         let mark = waiting.mark();
         let dropped = waiting.event(QueueState::Dropped);
-        self.start(Job::Prompt(waiting.told), mark);
+        self.start(Job::Prompt(waiting.told, waiting.images), mark);
         if self.running.is_none() {
             self.say(dropped);
             self.drop_queue();
@@ -893,7 +906,7 @@ impl Session {
 
     /// Stops the turn that is running, subagents included, declines what it waited on and drops the prompts queued for it, telling the client of each.
     ///
-    /// The turn's task owns everything it started, so aborting it ends them all; its history is never taken in. Queued prompts it had already taken in are cut back with it and saved as stopped.
+    /// The turn's task owns everything it started, so aborting it ends them all; what it finished and the reply it was writing stay in the saved history, marked as stopped.
     fn cancel(&mut self) {
         self.shared.questions.decline_all();
         if let Some((_, task)) = self.running.take() {
@@ -916,17 +929,26 @@ impl Session {
         }
     }
 
-    /// Records in the saved history that the turn that was stopped never happened, and stops warming its last request, which the next one will not start with.
+    /// Settles the saved history after the turn was stopped, keeping every step the turn finished, the prompt and the reply as far as it was written, marked as stopped, and stops warming its last request, which the next one will not start with.
     fn forget_turn(&mut self) {
         self.shared.warmer.stop();
         self.shared.checkpoint.clear();
         self.keep_fresh_window();
-        if let Some(Err(error)) = self
+        let partial = std::mem::take(
+            &mut *self
+                .shared
+                .streamed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        match self
             .journal
             .as_ref()
-            .map(|j| j.cut_losing(self.history.len(), omc_agent::STOPPED))
+            .map(|j| j.settle_stopped(omc_agent::STOPPED, &partial))
         {
-            eprintln!("history not saved: {error}");
+            Some(Ok(kept)) => self.history = kept,
+            Some(Err(error)) => eprintln!("history not saved: {error}"),
+            None => {}
         }
         if let Some(Err(error)) = self
             .journal

@@ -507,9 +507,13 @@ pub(crate) fn messages_json(messages: &[Message], prefixed: bool, replay: bool) 
             name.to_string()
         }
     };
-    messages
-        .iter()
-        .filter_map(|message| match message {
+    let mut out: Vec<Value> = Vec::new();
+    for message in messages {
+        if let Message::Images(images) = message {
+            attach_images(&mut out, images);
+            continue;
+        }
+        out.extend(match message {
             Message::User(text) => Some(json!({ "role": "user", "content": text })),
             Message::Assistant(reply) => {
                 let mut blocks = Vec::new();
@@ -554,9 +558,41 @@ pub(crate) fn messages_json(messages: &[Message], prefixed: bool, replay: bool) 
                     .collect();
                 Some(json!({ "role": "user", "content": blocks }))
             }
-            Message::Compaction(_) | Message::Pruning(_) => None,
-        })
-        .collect()
+            Message::Compaction(_) | Message::Pruning(_) | Message::Images(_) => None,
+        });
+    }
+    out
+}
+
+/// Adds `images`, which the user attached to a prompt, to the end of `messages` as `image` blocks: into the last message when it is the user's, so the prompt and its images are one message, and as a user message of their own otherwise.
+fn attach_images(messages: &mut Vec<Value>, images: &[crate::Image]) {
+    let blocks: Vec<Value> = images.iter().map(image_block).collect();
+    if blocks.is_empty() {
+        return;
+    }
+    match messages.last_mut() {
+        Some(last) if last["role"] == "user" => {
+            if let Some(text) = last["content"].as_str().map(str::to_string) {
+                last["content"] = json!([{ "type": "text", "text": text }]);
+            }
+            if let Some(content) = last["content"].as_array_mut() {
+                content.extend(blocks);
+            }
+        }
+        _ => messages.push(json!({ "role": "user", "content": blocks })),
+    }
+}
+
+/// The `image` block that carries `image`.
+fn image_block(image: &crate::Image) -> Value {
+    json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": image.media_type,
+            "data": image.data,
+        },
+    })
 }
 
 /// The `content` of the `tool_result` block for `result`: its text alone, or a
@@ -566,16 +602,7 @@ fn result_content(result: &crate::ToolResult) -> Value {
         return Value::String(result.text.clone());
     }
     let text = (!result.text.is_empty()).then(|| json!({ "type": "text", "text": result.text }));
-    let images = result.images.iter().map(|image| {
-        json!({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": image.media_type,
-                "data": image.data,
-            },
-        })
-    });
+    let images = result.images.iter().map(image_block);
     Value::Array(text.into_iter().chain(images).collect())
 }
 
@@ -1171,6 +1198,27 @@ mod tests {
                 data: "AAAA".into(),
             }],
         }
+    }
+
+    /// Images attached to a prompt join the prompt's user message, after its text, so the model sees them with it.
+    #[test]
+    fn attached_images_join_their_prompt() {
+        let out = messages_json(
+            &[
+                Message::User("look".into()),
+                Message::Images(pictured().images),
+            ],
+            false,
+            true,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(
+            out[0]["content"][0],
+            json!({ "type": "text", "text": "look" })
+        );
+        assert_eq!(out[0]["content"][1]["type"], "image");
+        assert_eq!(out[0]["content"][1]["source"]["data"], "AAAA");
     }
 
     /// A result with images becomes a text block followed by base64 image blocks.

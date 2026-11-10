@@ -149,6 +149,13 @@ pub(crate) fn messages_json(
     for message in messages {
         match message {
             Message::User(text) => out.push(json!({"role": "user", "content": text})),
+            Message::Images(images) if !images.is_empty() => {
+                let parts: Vec<Value> = images
+                    .iter()
+                    .map(|image| json!({ "type": "image_url", "image_url": { "url": image.data_url() } }))
+                    .collect();
+                out.push(json!({ "role": "user", "content": parts }));
+            }
             Message::Assistant(reply) => {
                 let calls: Vec<Value> = reply
                     .tool_calls
@@ -193,7 +200,7 @@ pub(crate) fn messages_json(
                 }
                 out.extend(result_images(results));
             }
-            Message::Compaction(_) | Message::Pruning(_) => {}
+            Message::Compaction(_) | Message::Pruning(_) | Message::Images(_) => {}
         }
     }
     out

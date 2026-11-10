@@ -213,6 +213,7 @@ fn messages(history: &[Message], range: &str) -> Result<String, String> {
 fn render(at: usize, message: &Message) -> String {
     match message {
         Message::User(text) => format!("#{at} user:\n{text}"),
+        Message::Images(images) => format!("#{at} user attached {} image(s)", images.len()),
         Message::Assistant(reply) => {
             let mut out = format!("#{at} assistant:");
             if !reply.text.is_empty() {

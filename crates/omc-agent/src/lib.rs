@@ -35,8 +35,8 @@ pub use hooks::{
     MAX_STOP_PER_TURN, Permit, Screened,
 };
 pub use journal::{
-    Branch, FIRST_BRANCH, INTERRUPTED, Journal, JournalError, Lost, Mark, Marked, STOPPED, Saved,
-    Scribe,
+    Branch, FIRST_BRANCH, INTERRUPTED, Journal, JournalError, Lost, Mark, Marked, STOPPED,
+    STOPPED_NOTE, Saved, Scribe,
 };
 pub use nesting::{DEFAULT_DEPTH, DEPTH_VARIABLE, MOST_DEPTH, Nesting, Throttle, max_depth};
 pub use picker::{ModelPicker, Models, Picked};

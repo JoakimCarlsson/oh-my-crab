@@ -166,6 +166,9 @@ pub struct Lost {
 /// The reason given for a turn the reader stopped.
 pub const STOPPED: &str = "stopped";
 
+/// What a reply the reader stopped ends with in the saved history, so that the model knows on the next turn that it was cut off there.
+pub const STOPPED_NOTE: &str = "[The user stopped this reply here.]";
+
 /// The reason given for a turn that was still running when the conversation stopped.
 pub const INTERRUPTED: &str = "interrupted";
 
@@ -489,7 +492,7 @@ impl Journal {
             }
         }
         let intended = history.len();
-        while matches!(history.last(), Some(Message::User(_)))
+        while matches!(history.last(), Some(Message::User(_) | Message::Images(_)))
             || matches!(history.last(), Some(Message::Assistant(reply)) if !reply.tool_calls.is_empty())
         {
             history.pop();
@@ -855,6 +858,43 @@ impl Journal {
             state.lost.push(turn);
         }
         state.file.sync_data()
+    }
+
+    /// Ends a turn that was stopped without losing what it did, so the model still knows it on the next turn: every step the turn finished stays, a reply whose tool calls have no results gives up its calls but keeps its text, and the reply that was being written when it stopped, `partial`, is kept as far as it got. The kept reply, or a reply of its own when the turn's prompt has none, ends with [`STOPPED_NOTE`]. Turns cut off whole are recorded as lost for `reason`. Returns the messages the history holds afterwards.
+    ///
+    /// The history is read back from the file, which holds everything the turn wrote, since the turn's own copy is gone with its task.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the write or the sync, or of reading the file back.
+    pub fn settle_stopped(&self, reason: &str, partial: &str) -> io::Result<Vec<Message>> {
+        self.lock().settle()?;
+        let mut history = Self::read(&self.path).map_err(io::Error::other)?.history;
+        let mut said = Vec::new();
+        while let Some(Message::Assistant(reply)) = history.last()
+            && !reply.tool_calls.is_empty()
+        {
+            said.push(reply.text.trim().to_owned());
+            history.pop();
+        }
+        said.reverse();
+        said.push(partial.trim().to_owned());
+        said.retain(|text| !text.is_empty());
+        self.cut_losing(history.len(), reason)?;
+        if said.is_empty() && !matches!(history.last(), Some(Message::User(_) | Message::Images(_)))
+        {
+            return Ok(history);
+        }
+        said.push(STOPPED_NOTE.to_owned());
+        let stopped = Message::Assistant(omc_providers::Reply {
+            text: said.join("\n\n"),
+            ..omc_providers::Reply::default()
+        });
+        let mut state = self.lock();
+        write_record(&mut state.file, &Written::Message(&stopped))?;
+        state.file.sync_data()?;
+        history.push(stopped);
+        Ok(history)
     }
 
     /// Takes the state, whatever a panicking writer left.
@@ -1243,6 +1283,76 @@ mod tests {
         for message in messages {
             scribe.append(message).unwrap();
         }
+    }
+
+    /// A turn stopped after finishing a step keeps that step and loses only the call nothing answered, so the next open still has the work.
+    #[test]
+    fn a_stopped_turn_keeps_the_steps_it_finished() {
+        let path = scratch("stopped.jsonl");
+        let (journal, _) = Journal::open(&path, None).unwrap();
+        let call = |id: &str| {
+            Message::Assistant(Reply {
+                tool_calls: vec![ToolCall {
+                    id: id.into(),
+                    name: "read".into(),
+                    arguments: json!({}),
+                }],
+                ..Reply::default()
+            })
+        };
+        journal
+            .mark(
+                0,
+                &Mark {
+                    id: "1".into(),
+                    text: "go".into(),
+                    files: Vec::new(),
+                },
+            )
+            .unwrap();
+        append_all(
+            &journal,
+            &[
+                Message::User("go".into()),
+                call("c1"),
+                Message::ToolResults(vec![ToolResult {
+                    call_id: "c1".into(),
+                    name: "read".into(),
+                    text: "done".into(),
+                    is_error: false,
+                    images: Vec::new(),
+                }]),
+                call("c2"),
+            ],
+        );
+        let kept = journal.settle_stopped(STOPPED, "").unwrap();
+        assert_eq!(kept.len(), 3);
+        drop(journal);
+        let (_, reopened) = Journal::open(&path, None).unwrap();
+        assert_eq!(reopened.len(), 3);
+        assert!(Journal::read(&path).unwrap().lost.is_empty());
+    }
+
+    /// A reply stopped while it was being written keeps its prompt and the text written so far, marked as stopped, so the model knows on the next turn what it was saying.
+    #[test]
+    fn a_reply_stopped_midway_is_kept_as_far_as_it_got() {
+        let path = scratch("stopped-midway.jsonl");
+        let (journal, _) = Journal::open(&path, None).unwrap();
+        append_all(&journal, &[Message::User("write a poem".into())]);
+        let kept = journal
+            .settle_stopped(STOPPED, "The cursor blinks, a patient light")
+            .unwrap();
+        drop(journal);
+        let (_, reopened) = Journal::open(&path, None).unwrap();
+        assert_eq!(kept, reopened);
+        assert_eq!(reopened.len(), 2);
+        let Message::Assistant(reply) = &reopened[1] else {
+            panic!("the stopped reply is not kept");
+        };
+        assert_eq!(
+            reply.text,
+            format!("The cursor blinks, a patient light\n\n{STOPPED_NOTE}")
+        );
     }
 
     /// What was appended is what a later open replays, including signed thinking and encrypted reasoning.

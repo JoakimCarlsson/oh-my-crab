@@ -79,6 +79,8 @@ pub(crate) struct Shared {
     pub(crate) given_languages: Option<Arc<dyn LanguageService>>,
     /// The prompts the client sent while a turn was running.
     pub(crate) queue: Queue,
+    /// The text of the reply being written, which the saved history does not hold until the reply is whole; kept so that a turn stopped midway keeps what it had said.
+    pub(crate) streamed: Arc<Mutex<String>>,
     /// The conversation's name and the history it is saved in.
     naming: Mutex<Naming>,
     /// Where the conversation keeps its logins.
@@ -131,6 +133,7 @@ impl Shared {
             client_languages: Arc::new(ClientLanguages::new(out.clone())),
             given_languages: given,
             queue: Queue::default(),
+            streamed: Arc::default(),
             out,
             approvals: Arc::new(Approvals::new(questions.clone(), false)),
             questions,

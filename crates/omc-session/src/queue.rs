@@ -11,6 +11,8 @@ use crate::shared::Shared;
 pub(crate) struct Waiting {
     /// What the model is told: the context, the reader's words, the files and any skill they invoke.
     pub(crate) told: String,
+    /// The images the reader attached, which the model is shown with `told`.
+    pub(crate) images: Vec<omc_providers::Image>,
     /// The prompt as the client is shown it.
     pub(crate) queued: Queued,
 }
@@ -56,10 +58,11 @@ impl Queue {
         with(&mut self.line.lock().unwrap_or_else(|held| held.into_inner()))
     }
 
-    /// Queues the prompt that tells the model `told`, which the client sent as `text` with the files named `files` under the turn id `turn`, and returns the event that says it waits.
+    /// Queues the prompt that tells the model `told` and shows it `images`, which the client sent as `text` with the files named `files` under the turn id `turn`, and returns the event that says it waits.
     pub(crate) fn push(
         &self,
         told: String,
+        images: Vec<omc_providers::Image>,
         turn: Option<String>,
         text: String,
         files: Vec<String>,
@@ -68,6 +71,7 @@ impl Queue {
             line.tickets += 1;
             let waiting = Waiting {
                 told,
+                images,
                 queued: Queued {
                     ticket: line.tickets,
                     turn,
@@ -94,8 +98,8 @@ impl Queue {
 }
 
 impl omc_agent::Steering for Shared {
-    /// Takes the prompt that has waited longest for the running turn, saves what the client said about it as the turn that starts at message `at`, and tells the client it was put in.
-    fn next(&self, at: usize) -> Option<String> {
+    /// Takes the prompt that has waited longest for the running turn, with its images, saves what the client said about it as the turn that starts at message `at`, and tells the client it was put in.
+    fn next(&self, at: usize) -> Option<(String, Vec<omc_providers::Image>)> {
         let waiting = self.queue.pop()?;
         if let (Some(journal), Some(mark)) = (self.journal(), waiting.mark())
             && let Err(error) = journal.mark(at, &mark)
@@ -103,6 +107,6 @@ impl omc_agent::Steering for Shared {
             eprintln!("history not saved: {error}");
         }
         self.say(waiting.event(QueueState::Steered));
-        Some(waiting.told)
+        Some((waiting.told, waiting.images))
     }
 }

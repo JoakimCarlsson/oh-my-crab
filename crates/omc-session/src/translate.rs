@@ -264,6 +264,7 @@ pub(crate) fn replay(
                     ));
                 }
             }
+            Message::Images(_) => {}
             Message::Compaction(compaction) => {
                 let Some(turn) = turns.last_mut() else {
                     continue;

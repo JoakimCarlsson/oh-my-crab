@@ -183,6 +183,8 @@ pub struct Request<'a> {
 pub enum Message {
     /// Text typed by the user.
     User(String),
+    /// Images the user attached to the prompt before it, which the model is shown with that prompt.
+    Images(Vec<Image>),
     /// A model reply, possibly with tool calls.
     Assistant(Reply),
     /// The results for the tool calls of the previous assistant message.

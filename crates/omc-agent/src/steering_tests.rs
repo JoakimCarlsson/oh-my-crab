@@ -28,10 +28,10 @@ impl Waiting {
 
 impl Steering for Waiting {
     /// Hands out the oldest message and keeps the position it was given.
-    fn next(&self, at: usize) -> Option<String> {
+    fn next(&self, at: usize) -> Option<(String, Vec<omc_providers::Image>)> {
         let text = self.messages.lock().unwrap().pop_front()?;
         self.taken_at.lock().unwrap().push(at);
-        Some(text)
+        Some((text, Vec::new()))
     }
 }
 
@@ -61,6 +61,7 @@ async fn steered_turn(
         },
         history,
         "go".into(),
+        Vec::new(),
         &|_: AgentEvent| {},
         Some(&journal.scribe()),
         Some(steering),

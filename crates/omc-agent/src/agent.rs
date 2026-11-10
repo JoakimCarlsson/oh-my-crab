@@ -276,10 +276,10 @@ pub async fn run_turn_recorded(
     events: &(dyn Fn(AgentEvent) + Send + Sync),
     scribe: Option<&Scribe>,
 ) -> Result<(), AgentError> {
-    run_turn_steered(context, history, prompt, events, scribe, None).await
+    run_turn_steered(context, history, prompt, Vec::new(), events, scribe, None).await
 }
 
-/// Runs a turn like [`run_turn_recorded`], and puts the messages waiting in `steering`, when there is one, into the conversation at each safe point: after a batch of tool calls and any compaction, before the next model request. Each is added to `history` and recorded as the reader's.
+/// Runs a turn like [`run_turn_recorded`], showing the model `images`, which the reader attached to `prompt`, with it, and puts the messages waiting in `steering`, when there is one, into the conversation at each safe point: after a batch of tool calls and any compaction, before the next model request. Each is added to `history` and recorded as the reader's.
 ///
 /// A message that is still waiting when the model answers without calling a tool is left in `steering` for the caller. When the turn fails, the messages put into it are cut back with it.
 ///
@@ -290,6 +290,7 @@ pub async fn run_turn_steered(
     context: &Context<'_>,
     history: &mut Vec<Message>,
     prompt: String,
+    images: Vec<omc_providers::Image>,
     events: &(dyn Fn(AgentEvent) + Send + Sync),
     scribe: Option<&Scribe>,
     steering: Option<&dyn Steering>,
@@ -297,7 +298,12 @@ pub async fn run_turn_steered(
     let start = history.len();
     let resets = context.notebook.map_or(0, Notebook::resets);
     history.push(Message::User(prompt));
-    record(scribe, &history[start]);
+    if !images.is_empty() {
+        history.push(Message::Images(images));
+    }
+    for message in &history[start..] {
+        record(scribe, message);
+    }
     let mut settled = None;
     let result = drive(context, history, events, scribe, steering, &mut settled).await;
     if let Some(checkpoint) = context.checkpoint {

@@ -335,6 +335,7 @@ pub(crate) fn estimate(message: &Message) -> u64 {
         Message::ToolResults(results) => {
             return results.iter().map(result_tokens).sum();
         }
+        Message::Images(images) => images.len() * IMAGE_CHARS,
         Message::Compaction(compaction) => summary_message(compaction).len(),
         Message::Pruning(_) => 0,
     };
@@ -552,6 +553,9 @@ fn transcript(history: &[Message], positions: &[usize]) -> String {
     for message in positions.iter().map(|&at| &history[at]) {
         match message {
             Message::User(text) => parts.push(format!("[User]: {text}")),
+            Message::Images(images) => {
+                parts.push(format!("[User attached {} image(s)]", images.len()));
+            }
             Message::Assistant(reply) => {
                 if !reply.text.trim().is_empty() {
                     parts.push(format!("[Assistant]: {}", reply.text));

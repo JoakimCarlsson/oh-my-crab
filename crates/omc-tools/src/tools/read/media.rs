@@ -77,6 +77,39 @@ pub(super) fn image(bytes: &[u8], media_type: &str, label: &str) -> Result<ToolO
     }]))
 }
 
+/// The image in the file at `path`, shrunk as `read` shrinks images for the model, with the line that says what it is; nothing when the file is not an image `read` hands to the model.
+///
+/// # Errors
+///
+/// Returns the reason when the file is an image that cannot be read, is too large or cannot be shrunk enough.
+pub fn attached_image(path: &std::path::Path) -> Option<Result<(Image, String), String>> {
+    let mut head = [0u8; 16];
+    let read = std::io::Read::read(&mut std::fs::File::open(path).ok()?, &mut head).ok()?;
+    let Some(Media::Image(media_type)) = sniff(&head[..read]) else {
+        return None;
+    };
+    let label = path.display().to_string();
+    let loaded = std::fs::metadata(path)
+        .map_err(|error| error.to_string())
+        .and_then(|metadata| {
+            check_image_size(
+                usize::try_from(metadata.len()).unwrap_or(usize::MAX),
+                &label,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .and_then(|()| std::fs::read(path).map_err(|error| error.to_string()))
+        .and_then(|bytes| image(&bytes, media_type, &label).map_err(|error| error.to_string()))
+        .and_then(|mut output| {
+            output
+                .images
+                .pop()
+                .map(|image| (image, output.text))
+                .ok_or_else(|| format!("{label} gave no image"))
+        });
+    Some(loaded)
+}
+
 /// Checks that an image of `len` bytes, called `label`, is small enough to
 /// decode and, if need be, shrink for the model.
 ///

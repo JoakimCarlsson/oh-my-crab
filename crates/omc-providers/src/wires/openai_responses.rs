@@ -197,7 +197,15 @@ pub(crate) fn input_json(messages: &[Message]) -> Vec<Value> {
                     }));
                 }
             }
-            Message::Compaction(_) | Message::Pruning(_) => {}
+            Message::Images(images) if !images.is_empty() => items.push(json!({
+                "type": "message",
+                "role": "user",
+                "content": images
+                    .iter()
+                    .map(|image| json!({ "type": "input_image", "image_url": image.data_url() }))
+                    .collect::<Vec<_>>(),
+            })),
+            Message::Compaction(_) | Message::Pruning(_) | Message::Images(_) => {}
         }
     }
     items
