@@ -161,16 +161,11 @@ impl Tool for Edit {
          can edit again without reading. An insert at line 0 puts text at the top of a file and \
          needs no tag, so a line can be added to the top of files that were never read. The \
          user is asked to approve each edit.\n\
-         Merge conflicts: {\"op\": \"resolve\", \"conflict\": N, \"take\": \"ours\"} replaces \
-         the whole block of conflict N, markers included, with one side (ours, theirs, base or \
-         both, ours first); give text instead of take to put your own lines there (an empty \
-         text removes the block). N is the number read lists the conflicts by; no line is \
-         needed.\n\
-         Generated files (a generator's banner such as Code generated … DO NOT EDIT near the \
-         top, generated names like *.pb.go, and lockfiles) are refused: change their source or \
-         generator instead. Set generated: true in a file's section only when the user \
-         explicitly asked to change that file itself.\n\
-         A path that does not exist is an error naming the files whose path ends with it."
+         Merge conflicts: the resolve operation replaces the whole block of conflict N, \
+         markers included, with one side or with your text; N is the number read lists the \
+         conflicts by.\n\
+         Generated files and lockfiles are refused: change their source or generator instead, \
+         unless the user asked to change that file itself."
     }
 
     /// Returns the argument schema.
@@ -197,7 +192,7 @@ impl Tool for Edit {
                                         "op": { "type": "string", "enum": ["replace", "insert_before", "insert_after", "delete", "resolve"] },
                                         "line": { "type": "integer", "minimum": 0, "description": "The line to act on; the first line of a range. Required except for resolve. An insert at line 0, before or after, puts the text at the top of the file." },
                                         "end": { "type": "integer", "minimum": 1, "description": "Last line of the range, for replace and delete. Defaults to line." },
-                                        "text": { "type": "string", "description": "The new lines, separated by newlines, without line numbers. Required for replace and the inserts; an empty string is one blank line, so use delete to remove lines. For resolve, the lines that replace the conflict block, instead of take." },
+                                        "text": { "type": "string", "description": "The new lines, separated by newlines, without line numbers; each newline at the end adds a blank line. Required for replace and the inserts; an empty string is one blank line, so use delete to remove lines. For resolve, the lines that replace the conflict block, instead of take." },
                                         "conflict": { "type": "integer", "minimum": 1, "description": "For resolve: the number of the merge conflict, as read lists them." },
                                         "take": { "type": "string", "enum": ["ours", "theirs", "base", "both"], "description": "For resolve: the side of the conflict to keep; both is ours then theirs." }
                                     },
@@ -651,9 +646,8 @@ impl Lines {
         }
     }
 
-    /// Turns the lines of replacement `text` into bodies that follow the file's line endings.
+    /// Turns the lines of replacement `text`, separated by newlines, into bodies that follow the file's line endings; a newline at the end of `text` separates its last line from one more, empty line.
     fn fresh(&self, text: &str) -> Vec<String> {
-        let text = text.strip_suffix('\n').unwrap_or(text);
         text.split('\n')
             .map(|line| {
                 let line = line.strip_suffix('\r').unwrap_or(line);
@@ -921,6 +915,21 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(get(&dir, "f.txt"), "top\na\nafter a\nbefore b\nb\nbottom\n");
+    }
+
+    /// Each newline at the end of the text adds a blank line, so that a block can be inserted with the blank lines that set it apart.
+    #[tokio::test]
+    async fn newlines_at_the_end_add_blank_lines() {
+        let (tool, dir) = tool("edit-trailing-newlines");
+        let t = put(&dir, "f.txt", "a\nb\n");
+        tool.call(call(
+            "f.txt",
+            &t,
+            json!([{ "op": "insert_after", "line": 1, "text": "x\n\n" }]),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(get(&dir, "f.txt"), "a\nx\n\n\nb\n");
     }
 
     /// An insert at line 0 puts the text at the top of the file, before or after, and the schema lets line 0 through.

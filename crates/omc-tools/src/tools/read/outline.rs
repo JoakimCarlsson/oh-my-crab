@@ -105,6 +105,57 @@ pub(crate) fn folds(path: &Path, text: &str) -> Option<Vec<Fold>> {
     (hidden * MIN_HIDDEN_SHARE >= total).then_some(found)
 }
 
+/// A named function or method of a code file, with the lines it spans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Named {
+    /// The first line of the function, 1-indexed.
+    pub(crate) first: usize,
+    /// The last line of the function, 1-indexed.
+    pub(crate) last: usize,
+    /// The function's name.
+    pub(crate) name: String,
+}
+
+/// The named functions and methods of `text`, the contents of the code file at `path`, in the order they start; none when the file's language is not one that is outlined or the file is larger than an outline takes.
+pub(crate) fn named_functions(path: &Path, text: &str) -> Vec<Named> {
+    let Some(lang) = detect(path).filter(|lang| outlined(*lang)) else {
+        return Vec::new();
+    };
+    if text.len() as u64 > MAX_SOURCE_BYTES {
+        return Vec::new();
+    }
+    let parsed = lang.ast_grep(text);
+    let mut found: Vec<Named> = parsed
+        .root()
+        .dfs()
+        .filter(|node| function_kinds(lang).contains(&node.kind().as_ref()))
+        .filter_map(|node| {
+            Some(Named {
+                first: node.start_pos().line() + 1,
+                last: last_line(&node) + 1,
+                name: name_of(&node)?,
+            })
+        })
+        .collect();
+    found.sort_by_key(|named| named.first);
+    found
+}
+
+/// The name the function `node` is declared with: its `name`, or the identifier its declarators lead to, as in C; nothing for a function without one.
+fn name_of(node: &Node<'_, StrDoc<SupportLang>>) -> Option<String> {
+    if let Some(name) = node.field("name") {
+        return Some(name.text().into_owned());
+    }
+    let mut declarator = node.field("declarator");
+    while let Some(inner) = declarator {
+        if inner.kind().ends_with("identifier") {
+            return Some(inner.text().into_owned());
+        }
+        declarator = inner.field("declarator");
+    }
+    None
+}
+
 /// Whether files in `lang` are outlined.
 fn outlined(lang: SupportLang) -> bool {
     matches!(

@@ -44,7 +44,7 @@ Every `read`, `grep`{{#if has_ast_grep}}, `ast_grep`{{/if}} and successful `edit
 {{/if}}
 
 # Exploration
-NEVER open guessed files.{{#if has_glob}} Read `glob` hits only.{{/if}}{{#if has_read}} Use `read` line ranges (`path:50-200`, `path:-60`), not whole files.{{/if}}
+NEVER open guessed files.{{#if has_glob}} Read `glob` hits only.{{/if}}{{#if has_read}} A file the user names: `read` it directly, no search first. Long files: `read` line ranges (`path:50-200`, `path:-60`), not the whole file.{{/if}}
 
 {{#if has_task}}
 # Delegation

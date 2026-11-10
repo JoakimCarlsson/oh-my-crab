@@ -11,6 +11,7 @@ use ignore::overrides::OverrideBuilder;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::read::{Named, named_functions};
 use super::snapshot::tag_file;
 use crate::tool::parse_args;
 use crate::{Sandbox, Tool, ToolError, ToolOutput};
@@ -20,6 +21,9 @@ const DEFAULT_LIMIT: usize = 100;
 
 /// Largest limit a caller may ask for.
 const MAX_LIMIT: usize = 500;
+
+/// The most matches a result may hold for each match in a function to be given the function's name; a longer result is a survey, where the names would cost more than they tell.
+const NAMED_LIMIT: usize = 20;
 
 /// Longest matched line kept, in characters.
 const MAX_LINE_CHARS: usize = 500;
@@ -68,7 +72,8 @@ impl Tool for Grep {
     fn description(&self) -> &'static str {
         "Search file contents with a regular expression. Honors .gitignore and skips binary \
          files. Returns matches as path:line:text, capped at the limit, followed by the snapshot \
-         tag of each file with matches; pass a tag to edit."
+         tag of each file with matches; pass a tag to edit. In a short result, a match inside a \
+         function of a code file names it before the text, as path:line in name:text."
     }
 
     /// Returns the argument schema.
@@ -97,7 +102,9 @@ impl Tool for Grep {
 
     /// The matches as a list, and whether the limit cut it.
     fn data_shape(&self) -> Option<&'static str> {
-        Some("{ matches: { path: string; line: number; text: string }[]; truncated: boolean }")
+        Some(
+            "{ matches: { path: string; line: number; text: string; within?: string }[]; truncated: boolean }",
+        )
     }
 
     /// Runs the search on a blocking thread.
@@ -128,17 +135,27 @@ struct Match {
     line: u64,
     /// The line, cut to [`MAX_LINE_CHARS`] characters.
     text: String,
+    /// The name of the function the line is in, when the result is short enough to say and the line is in one.
+    within: Option<String>,
 }
 
 impl Match {
-    /// The match as `path:line:text`.
+    /// The match as `path:line:text`, with the function it is in after the line number when that is known, so that the text stays the line as it is to its end.
     fn shown(&self) -> String {
-        format!("{}:{}:{}", self.path, self.line, self.text)
+        match &self.within {
+            Some(name) => format!("{}:{} in {name}:{}", self.path, self.line, self.text),
+            None => format!("{}:{}:{}", self.path, self.line, self.text),
+        }
     }
 
-    /// The match as a JSON object with `path`, `line` and `text`.
+    /// The match as a JSON object with `path`, `line` and `text`, and `within` when the function it is in is known.
     fn value(&self) -> Value {
-        json!({ "path": self.path, "line": self.line, "text": self.text })
+        match &self.within {
+            Some(name) => {
+                json!({ "path": self.path, "line": self.line, "text": self.text, "within": name })
+            }
+            None => json!({ "path": self.path, "line": self.line, "text": self.text }),
+        }
     }
 }
 
@@ -162,9 +179,33 @@ impl Sink for Collector<'_> {
             path: self.path.clone(),
             line: mat.line_number().unwrap_or(0),
             text: clip(text.trim_end_matches(['\n', '\r'])),
+            within: None,
         });
         Ok(self.found.len() < self.limit)
     }
+}
+
+/// Gives each match in `found` the name of the function its line is in, when its file is code and the line is inside a named function but is not the line the function starts on. `files` lists the files with matches, each with the place in `found` its matches start at.
+fn name_functions(found: &mut [Match], files: &[(std::path::PathBuf, usize)]) {
+    for (index, (path, start)) in files.iter().enumerate() {
+        let end = files.get(index + 1).map_or(found.len(), |(_, next)| *next);
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let functions = named_functions(path, &text);
+        for found in &mut found[*start..end] {
+            found.within =
+                innermost(&functions, found.line as usize).map(|named| named.name.clone());
+        }
+    }
+}
+
+/// The function in `functions` that holds `line` most closely, the one that starts last, unless `line` is the line it starts on, which names it already.
+fn innermost(functions: &[Named], line: usize) -> Option<&Named> {
+    functions
+        .iter()
+        .rfind(|named| named.first <= line && line <= named.last)
+        .filter(|named| named.first != line)
 }
 
 /// Cuts `line` to [`MAX_LINE_CHARS`] characters, marking the cut.
@@ -204,6 +245,7 @@ fn search(
         .build();
     let mut found = Vec::new();
     let mut tags: Vec<(String, String)> = Vec::new();
+    let mut files: Vec<(std::path::PathBuf, usize)> = Vec::new();
     for entry in walker.build().flatten() {
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
@@ -216,16 +258,20 @@ fn search(
             limit,
         };
         let _ = searcher.search_path(&matcher, entry.path(), sink);
-        if found.len() > before
-            && let Ok(file_tag) = tag_file(entry.path())
-        {
-            tags.push((path, file_tag));
+        if found.len() > before {
+            files.push((entry.path().to_path_buf(), before));
+            if let Ok(file_tag) = tag_file(entry.path()) {
+                tags.push((path, file_tag));
+            }
         }
         if found.len() >= limit {
             break;
         }
     }
     let truncated = found.len() >= limit;
+    if found.len() <= NAMED_LIMIT {
+        name_functions(&mut found, &files);
+    }
     let data = json!({
         "matches": found.iter().map(Match::value).collect::<Vec<_>>(),
         "truncated": truncated,
@@ -291,6 +337,35 @@ mod tests {
                 .starts_with("a.rs:2:let needle = 1;\n[tags]\na.rs: ")
         );
         assert!(!only_rs.text.contains("b.txt"));
+    }
+
+    /// A match inside a named function of a code file says which, in the text and in the data, while the line a function starts on, a match outside any function and a match in a file that is not code say nothing; a long result names no functions.
+    #[tokio::test]
+    async fn matches_name_the_function_they_are_in() {
+        let (tool, dir) = tool("grep-within");
+        std::fs::write(
+            dir.join("a.rs"),
+            "const KEY: u32 = 1;\nfn outer() {\n    let key = KEY;\n    fn inner() {\n        let key = 2;\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("b.txt"), "key\n").unwrap();
+        let out = tool
+            .call(json!({ "pattern": "(?i)key|fn outer" }))
+            .await
+            .unwrap();
+        assert!(out.text.starts_with(
+            "a.rs:1:const KEY: u32 = 1;\na.rs:2:fn outer() {\na.rs:3 in outer:    let key = KEY;\na.rs:5 in inner:        let key = 2;\nb.txt:1:key\n[tags]"
+        ));
+        let matches = out.data.unwrap()["matches"].clone();
+        assert_eq!(matches[2]["within"], "outer");
+        assert!(matches[0].get("within").is_none());
+        let many = "fn f() {\n".to_owned() + &"    let key = 1;\n".repeat(NAMED_LIMIT + 1) + "}\n";
+        std::fs::write(dir.join("c.rs"), many).unwrap();
+        let long = tool
+            .call(json!({ "pattern": "key", "glob": "c.rs" }))
+            .await
+            .unwrap();
+        assert!(!long.text.contains(" in f:"));
     }
 
     /// The result is capped at the limit and says so.

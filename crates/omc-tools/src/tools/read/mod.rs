@@ -32,7 +32,7 @@ use super::{conflict, lookalike};
 use crate::tool::parse_args;
 use crate::{Sandbox, Subject, Tool, ToolError, ToolOutput};
 use media::Media;
-pub(crate) use outline::{Fold, folds};
+pub(crate) use outline::{Fold, Named, folds, named_functions};
 use selector::Selector;
 
 /// Bytes at the start of a file inspected to tell text, images, PDFs and other
@@ -168,49 +168,33 @@ impl Tool for Read {
          - Code files of 200 lines or more (Rust, Go, TypeScript, JavaScript, Python, C, C++, \
          Java, Lua) read without a selector come back as an outline: signatures, types, \
          imports and comments keep their real line numbers, and each long function body is \
-         folded to one unnumbered line such as `… 30 lines folded (120-149)`. A footer lists \
-         the folded ranges. Never guess what a fold holds: read it, e.g. file:120-149, before \
-         editing inside it; an edit with the outline's tag that touches a folded line is \
-         refused. file:1- reads the file as it is.\n\
-         - Merge conflicts: when lines with conflict markers are shown, a note lists every \
-         conflict of the file by number with its lines and side labels; file:conflicts shows \
-         only the conflicts. Resolve one with edit's resolve operation and the read's tag.\n\
-         - A path that does not exist but is the end of exactly one file's path (or matches it \
-         ignoring case) reads that file, and the result says so; several candidates are \
-         listed in the error.\n\
+         folded to one unnumbered line such as `… 30 lines folded (120-149)`. Never guess what \
+         a fold holds: read it, e.g. file:120-149, before editing inside it; an edit with the \
+         outline's tag that touches a folded line is refused. file:1- reads the file as it is.\n\
+         - Merge conflicts: a note lists every conflict of the file by number; file:conflicts \
+         shows only the conflicts. Resolve one with edit's resolve operation.\n\
+         - A path that does not exist but is the end of exactly one file's path reads that file.\n\
          - Directories: entries, directories first and ending in /, honoring .gitignore.\n\
-         - Images (PNG, JPEG, GIF, WebP): returned for you to look at. A large one is shrunk \
-         first; the header then gives the original size and the factor to multiply \
-         coordinates by to map them back to it.\n\
+         - Images (PNG, JPEG, GIF, WebP): returned for you to look at; a large one is shrunk, \
+         and the header gives the factor that maps coordinates back to the original.\n\
          - PDFs: extracted text, a [page N] line before each page; line suffixes work.\n\
-         - SQLite databases: db.sqlite lists tables with row counts and schemas; \
-         db.sqlite:users shows rows, a page at a time; db.sqlite:SELECT ... runs a read-only \
-         query. Each result says how to read on.\n\
-         - Archives (.zip, .tar, .tar.gz, .tgz): a.zip lists members with sizes; \
-         a.zip:dir/file.txt reads a member as numbered text, with line suffixes; a.zip:dir \
-         lists a directory. Members have no tag and cannot be edited.\n\
-         - JSON: data.json:<query> gives the values a query picks, pretty-printed and \
-         numbered. A query is a small path language, not jq: a path such as .items[0].name, \
-         .items[].id, .[\"a key\"], .[-1] or .[2:5], piped with | through more paths or the \
-         builtins keys, length, type, first, last and select(.field == literal) (or !=), as \
-         in data.json:.items[] | select(.kind == \"x\") | .id. Nothing else is supported. Add \
-         a line suffix to page the output (data.json:.items:100-200). data.json:50-80 reads \
-         lines as text.\n\
-         - http:// and https:// URLs: the page's main content as Markdown with numbered \
-         lines and absolute links; url:full for the whole page, url:raw for the original \
-         HTML. PDFs give their text, JSON comes pretty-printed. Line suffixes work as for \
-         files (url:100-200); a page longer than one read is saved to a file the result \
-         names: page that file rather than fetching again. Page scripts never run. The user \
-         approves fetches per site. Redirects to another site are not followed: read the \
-         URL the error names. A host name that resolves to a local or private address is \
-         refused; only read localhost or a local address when the user asks for one.\n\
+         - SQLite databases: db.sqlite lists tables; db.sqlite:users shows rows; \
+         db.sqlite:SELECT ... runs a read-only query.\n\
+         - Archives (.zip, .tar, .tar.gz, .tgz): a.zip lists members; a.zip:dir/file.txt reads \
+         one, with line suffixes. Members cannot be edited.\n\
+         - JSON: data.json:<query> gives the values a query picks, numbered. A query is a small \
+         path language, not jq: .items[0].name, .items[].id, .[\"a key\"], .[-1] or .[2:5], \
+         piped with | through more paths or keys, length, type, first, last and \
+         select(.field == literal) (or !=). data.json:50-80 reads lines as text.\n\
+         - http:// and https:// URLs: the page's main content as Markdown with numbered lines; \
+         url:full for the whole page, url:raw for the HTML; line suffixes work. The user \
+         approves fetches per site. Redirects to another site are not followed, and a local \
+         or private address is read only when the user asks for one.\n\
          - GitHub: pr://123 and issue://45 in the repository origin points at, \
-         pr://owner/repo/123, gh://owner/repo (facts, files and README), \
-         gh://owner/repo/pull/123, gh://owner/repo/issues/45, \
-         gh://owner/repo/blob/<ref>/<path>, gh://owner/repo/tree/<ref>/<path>, or the same \
-         github.com URLs. A pull request gives its state, description, changed files, \
-         reviews and comments; add :diff (pr://123:diff, pr://123:diff:1-400) for its \
-         unified diff. Prefer these over gh or curl in bash."
+         pr://owner/repo/123, gh://owner/repo, gh://owner/repo/pull/123, \
+         gh://owner/repo/issues/45, gh://owner/repo/blob/<ref>/<path>, \
+         gh://owner/repo/tree/<ref>/<path>, or the same github.com URLs; pr://123:diff gives \
+         a pull request's diff. Prefer these over gh or curl in bash."
     }
 
     /// Returns the argument schema.

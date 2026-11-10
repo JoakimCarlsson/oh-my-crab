@@ -34,6 +34,10 @@ An `edit` insert at line 0 puts text at the top of a file. A file whose every
 operation is such an insert needs no tag, so a line can be added to the top of
 files that were never read.
 
+The text of an `edit` operation is its lines with newlines between them, so
+each newline at its end adds a blank line: `"x\n\n"` is the line `x` and two
+blank lines.
+
 After `edit` and `write`, the file is formatted and its diagnostics are added
 to the result; see [language services](../language-services.md).
 
@@ -44,6 +48,12 @@ to the result; see [language services](../language-services.md).
 | `grep`     | Searches file contents with a regular expression                     | no   | yes  |
 | `glob`     | Finds files by glob pattern                                          | no   | yes  |
 | `ast_grep` | Searches code by syntax tree, ignoring formatting and comments       | no   | yes  |
+
+A `grep` result of 20 matches or fewer says which function each match in a
+code file is in, as `path:line in name:text`, so that matches that look alike
+can be told apart without reading the file. A match on the line a function
+starts on, outside any function or in a file that is not code is shown as
+`path:line:text`.
 
 ## Code intelligence
 
