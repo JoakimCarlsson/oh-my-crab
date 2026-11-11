@@ -153,12 +153,13 @@ impl Turn {
             Err(AuthError::NotLoggedIn) => return Ended::SignedOut("not logged in".to_owned()),
             Err(error) => return Ended::Failed(error.to_string()),
         };
-        let model = RemoteModel {
-            provider: self.provider,
+        let model = RemoteModel::new(
+            self.provider,
             credentials,
-            model: self.model.clone(),
-            retention: self.shared.retention(),
-        };
+            self.model.clone(),
+            self.shared.retention(),
+            self.shared.home(),
+        );
         let planner = self.planner().await;
         self.run_planned(Arc::new(model), planner, job).await
     }

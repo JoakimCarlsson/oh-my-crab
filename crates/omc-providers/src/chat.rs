@@ -1,5 +1,8 @@
 //! Provider-neutral conversation types and the [`ChatModel`] trait.
 
+use std::path::PathBuf;
+use std::sync::Mutex;
+
 use async_trait::async_trait;
 use omc_auth::Credentials;
 use serde_json::Value;
@@ -365,15 +368,19 @@ pub trait ChatModel: Send + Sync {
 }
 
 /// A hosted model reached with a login's credentials.
+///
+/// The credentials are looked at again for every request, so a login whose token runs out, or is renewed by another process, in the middle of long work is renewed rather than ending the work.
 pub struct RemoteModel {
     /// The provider that serves the model.
-    pub provider: Provider,
-    /// The login's credentials.
-    pub credentials: Credentials,
+    provider: Provider,
+    /// The credentials the last request was sent with, or is to be.
+    credentials: Mutex<Credentials>,
     /// The model id to request.
-    pub model: String,
+    model: String,
     /// How long the provider is asked to keep the prompt cache entries requests write.
-    pub retention: Retention,
+    retention: Retention,
+    /// The folder the logins are kept in, or nothing for the default one.
+    home: Option<PathBuf>,
 }
 
 #[async_trait]
@@ -398,26 +405,84 @@ impl ChatModel for RemoteModel {
 
     /// Replays the request with no output on Anthropic's own host, when its thinking settings allow it; the other wires and hosts are not warmed.
     async fn warm(&self, request: Request<'_>) -> Result<Option<Tokens>, ProviderError> {
-        match self.provider.wire() {
-            Wire::AnthropicMessages => {
-                anthropic_messages::warm(
-                    self.provider,
-                    &self.credentials,
-                    &self.model,
-                    request,
-                    self.retention,
-                )
-                .await
-            }
-            Wire::OpenAiResponses | Wire::ChatCompletions | Wire::Bedrock | Wire::Vertex => {
-                Ok(None)
-            }
+        let credentials = self.current().await;
+        match self.warm_with(&credentials, request).await {
+            Err(error) if error.is_unauthorized() => match self.replacement(&credentials).await {
+                Some(renewed) => self.warm_with(&renewed, request).await,
+                None => Err(error),
+            },
+            answered => answered,
         }
     }
 }
 
 impl RemoteModel {
-    /// Dispatches `request` to the provider's streaming implementation, giving `sink` each chunk; on the Anthropic wire `cache` says how long the cache entries it writes live, and nothing asks it to write none.
+    /// The model `model` of `provider`, reached with `credentials`, which are kept in `home`, or in the default folder when there is none, and renewed there when they run out; `retention` is how long the provider is asked to keep the prompt cache entries requests write.
+    pub fn new(
+        provider: Provider,
+        credentials: Credentials,
+        model: String,
+        retention: Retention,
+        home: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            provider,
+            credentials: Mutex::new(credentials),
+            model,
+            retention,
+            home,
+        }
+    }
+
+    /// The credentials held now.
+    fn held(&self) -> Credentials {
+        self.credentials
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Holds `credentials` for the requests to come.
+    fn hold(&self, credentials: &Credentials) {
+        *self
+            .credentials
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = credentials.clone();
+    }
+
+    /// The credentials to send the next request with: those held, or, when their token has run out, the login as it is stored now, renewed when need be. When that fails the held ones are sent, and the provider's refusal says what is wrong.
+    async fn current(&self) -> Credentials {
+        let held = self.held();
+        if !held.is_expired() {
+            return held;
+        }
+        let stored = omc_auth::with_home(self.home.clone(), crate::credentials_for(self.provider));
+        match stored.await {
+            Ok(fresh) => {
+                self.hold(&fresh);
+                fresh
+            }
+            Err(_) => held,
+        }
+    }
+
+    /// The credentials to send a request again with after the provider refused the token of `refused`: those another request of this model got meanwhile, or the login renewed; nothing when there is no login to renew or the provider will not renew it.
+    async fn replacement(&self, refused: &Credentials) -> Option<Credentials> {
+        let held = self.held();
+        if held.access != refused.access {
+            return Some(held);
+        }
+        let def = self.provider.def();
+        let renewal = omc_auth::credentials_after_refusal(def.id, &def.auth, refused);
+        let renewed = omc_auth::with_home(self.home.clone(), renewal)
+            .await
+            .ok()
+            .flatten()?;
+        self.hold(&renewed);
+        Some(renewed)
+    }
+
+    /// Sends `request` with the credentials of now, and once more with a renewed login when the provider refuses the token, giving `sink` each chunk; on the Anthropic wire `cache` says how long the cache entries it writes live, and nothing asks it to write none.
     ///
     /// # Errors
     ///
@@ -428,11 +493,33 @@ impl RemoteModel {
         sink: &mut dyn Sink,
         cache: Option<Retention>,
     ) -> Result<Reply, ProviderError> {
+        let credentials = self.current().await;
+        match self.send_with(&credentials, request, sink, cache).await {
+            Err(error) if error.is_unauthorized() => match self.replacement(&credentials).await {
+                Some(renewed) => self.send_with(&renewed, request, sink, cache).await,
+                None => Err(error),
+            },
+            answered => answered,
+        }
+    }
+
+    /// Dispatches `request`, authorized with `credentials`, to the provider's streaming implementation, giving `sink` each chunk; `cache` is as for [`RemoteModel::send`].
+    ///
+    /// # Errors
+    ///
+    /// Same as [`ChatModel::complete`].
+    async fn send_with(
+        &self,
+        credentials: &Credentials,
+        request: Request<'_>,
+        sink: &mut dyn Sink,
+        cache: Option<Retention>,
+    ) -> Result<Reply, ProviderError> {
         match self.provider.wire() {
             Wire::AnthropicMessages | Wire::Bedrock | Wire::Vertex => {
                 anthropic_messages::complete(
                     self.provider,
-                    &self.credentials,
+                    credentials,
                     &self.model,
                     request,
                     sink,
@@ -441,17 +528,44 @@ impl RemoteModel {
                 .await
             }
             Wire::OpenAiResponses => {
-                openai_responses::complete(&self.credentials, &self.model, request, sink).await
+                openai_responses::complete(credentials, &self.model, request, sink).await
             }
             Wire::ChatCompletions => {
-                let base_url = chat_completions::base_url(self.provider, &self.credentials);
+                let base_url = chat_completions::base_url(self.provider, credentials);
                 let target = chat_completions::Target {
-                    credentials: &self.credentials,
+                    credentials,
                     base_url: &base_url,
                     headers: self.provider.def().headers,
                     replay_reasoning: self.provider.def().replay_reasoning,
                 };
                 chat_completions::complete(target, &self.model, request, sink).await
+            }
+        }
+    }
+
+    /// Replays `request`, authorized with `credentials`, asking for no output, where the wire and host can be warmed so.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`ChatModel::warm`].
+    async fn warm_with(
+        &self,
+        credentials: &Credentials,
+        request: Request<'_>,
+    ) -> Result<Option<Tokens>, ProviderError> {
+        match self.provider.wire() {
+            Wire::AnthropicMessages => {
+                anthropic_messages::warm(
+                    self.provider,
+                    credentials,
+                    &self.model,
+                    request,
+                    self.retention,
+                )
+                .await
+            }
+            Wire::OpenAiResponses | Wire::ChatCompletions | Wire::Bedrock | Wire::Vertex => {
+                Ok(None)
             }
         }
     }

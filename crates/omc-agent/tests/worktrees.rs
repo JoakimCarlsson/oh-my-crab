@@ -815,8 +815,9 @@ async fn a_cloned_subagent_sees_ignored_files_and_hands_its_edits_back() {
     assert!(told(&seen[0]).contains("copy-on-write clone"));
     drop(seen);
     let outputs = tool_outputs(&log);
-    assert!(outputs[0].contains("untracked words"));
-    assert!(outputs[1].contains("noise"), "{}", outputs[1]);
+    let read = |words: &str| outputs.iter().any(|output| output.contains(words));
+    assert!(read("untracked words"), "{outputs:?}");
+    assert!(read("noise"), "{outputs:?}");
     assert!(!path.exists());
     assert!(!listed(&bench.main).contains(LOCK_REASON));
 }

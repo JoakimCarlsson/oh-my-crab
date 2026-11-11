@@ -88,7 +88,7 @@ Do step 1 as well, then:
    `Message`, `Reply`, `ToolSpec`) to and from the wire's format, and push each
    streamed chunk to the `Sink`. `chat_completions.rs` is the shortest example.
 2. Add a `Wire` variant in `crates/omc-providers/src/provider.rs`.
-3. Add its arm to the matches the compiler points at: `RemoteModel::complete`
+3. Add its arm to the matches the compiler points at: `RemoteModel::send_with`
    in `chat.rs`, `list_models` in `lib.rs`, and `context_window` and `efforts`
    in `models.rs`. A host that serves the Anthropic Messages body behind its
    own address and authorization, as Bedrock and Vertex do, is a `Host` of
