@@ -8,4 +8,4 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-omc-wire = { version = "0.1.1", path = "../omc-wire" }
+omc-wire = { version = "0.1.2", path = "../omc-wire" }

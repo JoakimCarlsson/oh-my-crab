@@ -8,7 +8,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-omc-context = { version = "0.1.1", path = "../omc-context" }
+omc-context = { version = "0.1.2", path = "../omc-context" }
 omc-tools.workspace = true
 async-trait = "0.1.92"
 futures-util = "0.3.34"

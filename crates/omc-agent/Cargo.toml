@@ -10,7 +10,7 @@ homepage.workspace = true
 [dependencies]
 omc-providers.workspace = true
 omc-tools.workspace = true
-omc-context = { version = "0.1.1", path = "../omc-context" }
+omc-context = { version = "0.1.2", path = "../omc-context" }
 async-trait = "0.1.92"
 futures-util = "0.3.34"
 ignore = "0.4.34"
@@ -23,6 +23,6 @@ tokio = { version = "1.54.1", features = ["rt", "macros", "sync", "time", "proce
 libc = "0.2.191"
 
 [dev-dependencies]
-omc-wire = { version = "0.1.1", path = "../omc-wire" }
-omc-script = { version = "0.1.1", path = "../omc-script" }
+omc-wire = { version = "0.1.2", path = "../omc-wire" }
+omc-script = { version = "0.1.2", path = "../omc-script" }
 tokio = { version = "1.54.1", features = ["test-util"] }
