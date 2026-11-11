@@ -72,6 +72,11 @@ const NOT_OVERFLOW_PHRASES: [&str; 4] = [
 ];
 
 impl ProviderError {
+    /// Whether the provider refused the request for the token it was sent with, as it does once a login's token has run out or the login was renewed elsewhere; renewing the login can cure it.
+    pub fn is_unauthorized(&self) -> bool {
+        matches!(self, ProviderError::Status { status, .. } if status.starts_with("401"))
+    }
+
     /// Whether the provider refused the request because it holds more than the model's context window takes, which compacting the history can cure.
     ///
     /// A `413` status always counts; otherwise the error's text is matched against the phrases providers use for it, leaving out rate limits and limits on the reply's length.
@@ -267,6 +272,8 @@ mod tests {
     #[test]
     fn permanent_failures_are_not_retried() {
         assert!(!status("401 Unauthorized", "invalid key").is_transient());
+        assert!(status("401 Unauthorized", "token revoked").is_unauthorized());
+        assert!(!status("403 Forbidden", "no").is_unauthorized());
         assert!(!status("403 Forbidden", "").is_transient());
         assert!(!status("400 Bad Request", "invalid tool schema").is_transient());
         assert!(

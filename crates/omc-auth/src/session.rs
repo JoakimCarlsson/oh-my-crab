@@ -1,7 +1,7 @@
 //! High-level login and credential retrieval used by the UI.
 
 use crate::store::{self, AuthFile};
-use crate::{Auth, AuthError, Credentials, LoginPrompt, device, flow};
+use crate::{Auth, AuthError, Credentials, Device, LoginPrompt, Spec, device, flow};
 
 /// Returns the first of the environment variables `names` that holds a key.
 pub fn env_key(names: &[&str]) -> Option<String> {
@@ -105,19 +105,14 @@ pub async fn credentials_for(id: &str, auth: &'static Auth) -> Result<Credential
             );
         }
     };
-    let mut file = store::load()?;
-    let stored = file
+    let stored = store::load()?
         .credentials
-        .get(id)
-        .cloned()
+        .remove(id)
         .ok_or(AuthError::NotLoggedIn)?;
     if !stored.is_expired() {
         return Ok(stored);
     }
-    let renewed = flow::refresh(spec, &stored).await?;
-    file.credentials.insert(id.to_string(), renewed.clone());
-    store::save(&file)?;
-    Ok(renewed)
+    renew(id, &Renewal::OAuth(spec), &stored).await
 }
 
 /// The credentials stored for the provider `id`, which signs in with `device` or a saved key, renewed and saved again when they are a login whose token expired; `missing` when nothing is stored.
@@ -127,18 +122,106 @@ pub async fn credentials_for(id: &str, auth: &'static Auth) -> Result<Credential
 /// Returns `missing` when nothing is stored, or another [`AuthError`] when renewing or saving fails.
 async fn device_credentials(
     id: &str,
-    device: &'static crate::Device,
+    device: &'static Device,
     missing: AuthError,
 ) -> Result<Credentials, AuthError> {
-    let mut file = store::load()?;
-    let stored = file.credentials.get(id).cloned().ok_or(missing)?;
+    let stored = store::load()?.credentials.remove(id).ok_or(missing)?;
     if !stored.is_expired() {
         return Ok(stored);
     }
-    let renewed = device::refresh(device, &stored).await?;
+    renew(id, &Renewal::Device(device), &stored).await
+}
+
+/// How a login's access token is traded for a new one.
+enum Renewal {
+    /// With the refresh grant of the browser flow.
+    OAuth(&'static Spec),
+    /// With the refresh grant of the device-code flow.
+    Device(&'static Device),
+}
+
+impl Renewal {
+    /// The way logins of a provider signed in to as `auth` says are renewed; nothing for a provider that has no logins.
+    fn of(auth: &'static Auth) -> Option<Self> {
+        match auth {
+            Auth::OAuth(spec) => Some(Self::OAuth(spec)),
+            Auth::DeviceCode(device) | Auth::DeviceCodeOrKey { device, .. } => {
+                Some(Self::Device(device))
+            }
+            Auth::ApiKey { .. } | Auth::Cloud { .. } | Auth::None => None,
+        }
+    }
+
+    /// Trades the refresh token of `stored` for new credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::Token`] when the provider refuses the refresh token.
+    async fn run(&self, stored: &Credentials) -> Result<Credentials, AuthError> {
+        match self {
+            Self::OAuth(spec) => flow::refresh(spec, stored).await,
+            Self::Device(device) => device::refresh(device, stored).await,
+        }
+    }
+}
+
+/// The login another process saved for the provider `id` in place of `stale`, when one did and its token is still good.
+///
+/// Renewing a login makes the token it had worthless, so of two processes that hold the same login only the first to renew it succeeds; the other finds what the first one saved here.
+fn renewed_elsewhere(id: &str, stale: &Credentials) -> Option<Credentials> {
+    store::load()
+        .ok()?
+        .credentials
+        .remove(id)
+        .filter(|found| found.is_login() && found.access != stale.access && !found.is_expired())
+}
+
+/// Renews `stored`, the login of the provider `id`, the way `renewal` says and saves the result; when the provider refuses because another process renewed the login first, what that process saved is used.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Token`] when the provider refuses the refresh token and nothing newer was saved, or [`AuthError::Storage`] when the result cannot be saved.
+async fn renew(
+    id: &str,
+    renewal: &Renewal,
+    stored: &Credentials,
+) -> Result<Credentials, AuthError> {
+    let renewed = match renewal.run(stored).await {
+        Ok(renewed) => renewed,
+        Err(error) => return renewed_elsewhere(id, stored).ok_or(error),
+    };
+    let mut file = store::load()?;
     file.credentials.insert(id.to_string(), renewed.clone());
     store::save(&file)?;
     Ok(renewed)
+}
+
+/// Credentials for the provider `id` to use after it refused the access token of `refused`: the login as another process renewed it meanwhile, or else the login renewed now and saved.
+///
+/// A provider refuses a token that has not run out when the login was renewed elsewhere, which makes the token it had worthless. Returns nothing when `refused` is a key, or nothing is stored to renew, since asking again would then be refused the same way.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Token`] when the provider refuses to renew the login, as after it was revoked, or [`AuthError::Storage`] when the logins cannot be read or saved.
+pub async fn credentials_after_refusal(
+    id: &str,
+    auth: &'static Auth,
+    refused: &Credentials,
+) -> Result<Option<Credentials>, AuthError> {
+    let Some(renewal) = Renewal::of(auth).filter(|_| refused.is_login()) else {
+        return Ok(None);
+    };
+    if let Some(found) = renewed_elsewhere(id, refused) {
+        return Ok(Some(found));
+    }
+    let Some(stored) = store::load()?
+        .credentials
+        .remove(id)
+        .filter(Credentials::is_login)
+    else {
+        return Ok(None);
+    };
+    renew(id, &renewal, &stored).await.map(Some)
 }
 
 /// The key saved in `file` for the provider `id`, when one is saved and is not empty.
@@ -255,6 +338,62 @@ mod tests {
         crate::with_home(Some(home.clone()), login("aws", &ABSENT, |_| {}))
             .await
             .unwrap();
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    /// A sign-in whose token endpoint is never reached by these tests.
+    static BROWSER: Spec = Spec {
+        client_id: "client",
+        authorize_url: "https://example.invalid/authorize",
+        token_url: "https://example.invalid/token",
+        scopes: &[],
+        authorize_params: &[],
+        port: 1,
+        path: "/callback",
+        redirect_uri: "http://localhost:1/callback",
+        json_body: true,
+        state_in_exchange: true,
+        refresh_headers: &[],
+        account_from_jwt: false,
+    };
+
+    /// A provider signed in to through the browser.
+    static SIGNED_IN: Auth = Auth::OAuth(&BROWSER);
+
+    /// A login with the access token `access` that does not run out for an hour.
+    fn login_with(access: &str) -> Credentials {
+        let mut login = Credentials::static_key(access.to_owned());
+        login.refresh = format!("refresh-{access}");
+        login.expires_at_ms = crate::credentials::now_ms() + 3_600_000;
+        login
+    }
+
+    /// A refused token is answered with the login another process saved meanwhile, without asking the provider; a refused key is answered with nothing.
+    #[tokio::test]
+    async fn a_refused_token_is_replaced_by_the_login_saved_meanwhile() {
+        let home = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-auth/refused");
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let mut file = AuthFile::default();
+        file.credentials
+            .insert("claude".to_owned(), login_with("new"));
+        store::save_in(Some(home.clone()), &file).unwrap();
+        let found = crate::with_home(
+            Some(home.clone()),
+            credentials_after_refusal("claude", &SIGNED_IN, &login_with("old")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.unwrap().access, "new");
+        let key = Credentials::static_key("key".to_owned());
+        let none = crate::with_home(
+            Some(home.clone()),
+            credentials_after_refusal("claude", &SIGNED_IN, &key),
+        )
+        .await
+        .unwrap();
+        assert!(none.is_none());
         std::fs::remove_dir_all(home).unwrap();
     }
 }

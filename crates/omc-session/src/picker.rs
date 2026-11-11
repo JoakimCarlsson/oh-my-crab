@@ -71,16 +71,17 @@ impl SessionPicker {
             format!("{}/{id}", provider.def().id)
         };
         let picked = Picked {
-            model: Arc::new(RemoteModel {
+            model: Arc::new(RemoteModel::new(
                 provider,
                 credentials,
-                model: id.clone(),
-                retention: if same {
+                id.clone(),
+                if same {
                     self.shared.retention()
                 } else {
                     Retention::default()
                 },
-            }),
+                self.shared.home(),
+            )),
             name,
             effort,
         };

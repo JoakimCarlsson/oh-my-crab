@@ -14,5 +14,7 @@ mod store;
 pub use credentials::Credentials;
 pub use error::AuthError;
 pub use method::{Auth, Device, LoginPrompt, Spec};
-pub use session::{active_id, credentials_for, env_key_named, login, save_key, stored};
+pub use session::{
+    active_id, credentials_after_refusal, credentials_for, env_key_named, login, save_key, stored,
+};
 pub use store::with_home;

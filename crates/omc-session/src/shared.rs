@@ -225,15 +225,18 @@ impl Shared {
             .home = home;
     }
 
-    /// Runs `work` against the folder the conversation keeps its logins in.
-    pub(crate) async fn with_home<F: std::future::Future>(&self, work: F) -> F::Output {
-        let home = self
-            .login
+    /// The folder the conversation keeps its logins in, or nothing for the default one.
+    pub(crate) fn home(&self) -> Option<std::path::PathBuf> {
+        self.login
             .lock()
             .unwrap_or_else(|held| held.into_inner())
             .home
-            .clone();
-        omc_auth::with_home(home, work).await
+            .clone()
+    }
+
+    /// Runs `work` against the folder the conversation keeps its logins in.
+    pub(crate) async fn with_home<F: std::future::Future>(&self, work: F) -> F::Output {
+        omc_auth::with_home(self.home(), work).await
     }
 
     /// Takes the history the conversation is saved in, and the name it was saved with.
