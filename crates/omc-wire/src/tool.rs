@@ -126,3 +126,36 @@ pub struct Background {
     #[serde(default)]
     pub call: Option<String>,
 }
+
+/// A subagent the agent started, sent when it starts and again when it ends.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Subagent {
+    /// The id it is known by for as long as the conversation lasts, which [`crate::Command::StopSubagent`] names; the id of a subagent started by another subagent begins with that one's id and a `:`.
+    pub id: String,
+    /// The id of the `task` call that started it, as the [`Tool`] events of that call carry it.
+    pub call: String,
+    /// The kind of subagent.
+    pub agent: String,
+    /// What it is doing, in a few words.
+    pub label: String,
+    /// What the model it asks is called, when that is known.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Whether it runs in the background.
+    pub background: bool,
+    /// How it stands.
+    pub state: SubagentState,
+}
+
+/// How a subagent stands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum SubagentState {
+    /// It runs, or waits for a seat to run.
+    Running,
+    /// It ended with a result.
+    Finished,
+    /// It ended with an error.
+    Failed,
+    /// The reader stopped it, or the turn it ran in was stopped.
+    Stopped,
+}

@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 
 use crate::nesting::{Nesting, Seat};
 use crate::picker::Models;
+use crate::roster::{Enrolment, SubagentNotice, SubagentState};
 use crate::submit::{SUBMIT_RESULT, Slot, SubmitResult};
 use crate::worktree::{self, Handback, Isolation, Lease, Merge};
 use crate::{AgentError, AgentEvent, Approvals, Context, Hooks, run_turn};
@@ -263,6 +264,19 @@ impl Lane {
         }
     }
 
+    /// How the subagent with the id `id` is announced, running in the background when `background` says so.
+    fn notice(&self, id: &str, background: bool) -> SubagentNotice {
+        SubagentNotice {
+            id: id.to_owned(),
+            call: self.call.clone(),
+            agent: self.kind.clone(),
+            label: self.label.clone(),
+            model: Some(self.model.clone()).filter(|model| !model.is_empty()),
+            background,
+            state: SubagentState::Running,
+        }
+    }
+
     /// The heading of the subagent's part of a combined result, which ended `ok` or not.
     fn heading(&self, ok: bool) -> String {
         let status = if ok { "completed" } else { "failed" };
@@ -325,6 +339,13 @@ fn failed(kind: &str, error: &AgentError) -> ToolError {
     ToolError::Failed(format!("the {kind} agent failed: {error}"))
 }
 
+/// The failure of a `kind` subagent the reader stopped, worded so that the agent does not start it again on its own.
+fn stopped(kind: &str) -> ToolError {
+    ToolError::Failed(format!(
+        "the {kind} agent was stopped by the reader before it finished. Do not start it again unless the reader asks you to."
+    ))
+}
+
 /// A subagent, owning everything it needs so that it can run on a task of its own.
 struct Run {
     /// The model it asks.
@@ -359,6 +380,8 @@ struct Run {
     nests: bool,
     /// The seat it holds while it runs.
     seat: Arc<Seat>,
+    /// Its place on the roster of running subagents, once it was announced.
+    enrolment: Option<Enrolment>,
 }
 
 impl Run {
@@ -488,13 +511,30 @@ struct Ended {
     handback: Option<Handback>,
 }
 
-/// Runs `run` once it took a seat of `nesting`'s throttle, which it holds until it ends, takes what it changed from its worktree when it has one, reports the end of its step through `events` when it is one of several, and says how it ended.
+/// Runs `run` once it took a seat of `nesting`'s throttle, which it holds until it ends, takes what it changed from its worktree when it has one, reports the end of its step through `events` when it is one of several, announces its end, and says how it ended.
+///
+/// A subagent the reader stops through the roster ends at once, with the subagents it started, as failed with a note saying the reader stopped it.
 async fn finish(mut run: Run, events: Arc<EventSink>, nesting: Nesting) -> Ended {
     let lane = run.lane.clone();
     let lease = run.lease.take();
+    let mut enrolment = run.enrolment.take();
     let seat = run.seat.clone();
-    seat.fill(nesting.throttle.take().await);
-    let outcome = run.go().await;
+    let held = seat.clone();
+    let work = async move {
+        held.fill(nesting.throttle.take().await);
+        run.go().await
+    };
+    let (outcome, halted) = match enrolment.as_mut() {
+        Some(enrolment) => tokio::select! {
+            biased;
+            () = enrolment.stopped() => (Err(stopped(&lane.kind)), true),
+            outcome = work => (outcome, false),
+        },
+        None => (work.await, false),
+    };
+    if let Some(enrolment) = enrolment.as_mut() {
+        enrolment.leave();
+    }
     seat.vacate();
     let handback = match lease {
         Some(lease) => Some(lease.hand_back().await),
@@ -502,6 +542,13 @@ async fn finish(mut run: Run, events: Arc<EventSink>, nesting: Nesting) -> Ended
     };
     if let Some(event) = lane.closed(&outcome) {
         events(event);
+    }
+    if let Some(enrolment) = enrolment {
+        enrolment.end(match (&outcome, halted) {
+            (_, true) => SubagentState::Stopped,
+            (Ok(_), false) => SubagentState::Finished,
+            (Err(_), false) => SubagentState::Failed,
+        });
     }
     Ended {
         lane,
@@ -745,6 +792,7 @@ impl Task {
             id,
             nests: self.nests(agent),
             seat: Arc::new(Seat::default()),
+            enrolment: None,
         })
     }
 
@@ -1075,8 +1123,12 @@ impl Tool for Task {
         for run in &mut runs {
             self.arm(run);
         }
-        for run in &runs {
+        for run in &mut runs {
             (self.settings.events)(run.lane.opened());
+            run.enrolment = Some(self.settings.nesting.roster.enrol(
+                run.lane.notice(&run.id, background),
+                self.settings.events.clone(),
+            ));
             if let Some(lease) = &run.lease {
                 (self.settings.events)(run.lane.worktree(lease.directory(), None));
             }

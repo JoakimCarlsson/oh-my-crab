@@ -208,6 +208,10 @@ impl Prompter for Questions {
         if self.out.send(asked).is_err() {
             return Decision::Deny;
         }
+        let _forget = Forget {
+            pending: &self.pending,
+            ticket,
+        };
         self.notify(
             PERMISSION,
             "Permission needed",
@@ -216,6 +220,23 @@ impl Prompter for Questions {
         answer
             .await
             .map_or(Decision::Deny, |picked| picked.decision())
+    }
+}
+
+/// Takes a permission question off the pending ones when the agent that asked it stops waiting, as when the reader stops the subagent that asked it; an answer sent later is then ignored.
+struct Forget<'a> {
+    /// The questions waiting for an answer.
+    pending: &'a Mutex<HashMap<u64, oneshot::Sender<Picked>>>,
+    /// The ticket of the question.
+    ticket: u64,
+}
+
+impl Drop for Forget<'_> {
+    /// Removes the question's ticket, when it is still pending.
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&self.ticket);
+        }
     }
 }
 

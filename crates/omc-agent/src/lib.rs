@@ -16,6 +16,7 @@ mod plans;
 mod pruning;
 mod recall;
 mod recovery;
+mod roster;
 mod shake;
 mod steering;
 mod submit;
@@ -42,6 +43,7 @@ pub use nesting::{DEFAULT_DEPTH, DEPTH_VARIABLE, MOST_DEPTH, Nesting, Throttle, 
 pub use picker::{ModelPicker, Models, Picked};
 pub use plans::approved_plan;
 pub use recall::{RECALL, spec as recall_spec};
+pub use roster::{Roster, SubagentNotice, SubagentState};
 pub use steering::Steering;
 pub use task::{EventSink, MAX_CONCURRENT, MAX_TASKS, PromptBuilder, Task, TaskSettings};
 pub use worktree::{Isolation, LOCK_REASON, Merge, ToolsFor, prune as prune_worktrees};
@@ -60,6 +62,8 @@ mod scheduling_tests;
 mod script_tests;
 #[cfg(test)]
 mod steering_tests;
+#[cfg(test)]
+mod stop_tests;
 #[cfg(test)]
 mod task_tests;
 #[cfg(test)]

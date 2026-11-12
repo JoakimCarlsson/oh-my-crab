@@ -101,6 +101,7 @@ fn every_variant_of_the_carried_enums_is_named() {
     let names = [
         variants::<omc_wire::Part>(),
         variants::<omc_wire::ToolState>(),
+        variants::<omc_wire::SubagentState>(),
         variants::<omc_wire::Kind>(),
         variants::<omc_wire::Merge>(),
         variants::<omc_wire::Verdict>(),

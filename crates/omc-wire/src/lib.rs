@@ -38,7 +38,9 @@ pub use plan::{PlanStep, Progress};
 pub use provider::{KeySource, ProviderInfo, SignIn};
 pub use queue::{QueueState, Queued};
 pub use setting::{Pick, Setting, Slash};
-pub use tool::{Background, Diff, Kind, Merge, Tool, ToolInfo, ToolState, Worktree};
+pub use tool::{
+    Background, Diff, Kind, Merge, Subagent, SubagentState, Tool, ToolInfo, ToolState, Worktree,
+};
 pub use toolserver::{Reach, ToolServer};
 pub use trust::{Input, Skipped, Standing, TrustRequest};
 pub use usage::Usage;

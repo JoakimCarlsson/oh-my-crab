@@ -69,6 +69,8 @@ pub(crate) struct Shared {
     pub(crate) jobs: Arc<Jobs>,
     /// The seats subagents take to run, shared by every level of subagents and every turn, so that only so many run at once.
     pub(crate) throttle: Arc<omc_agent::Throttle>,
+    /// The subagents running in the conversation, at every level and in every turn, by which the reader stops one.
+    pub(crate) roster: Arc<omc_agent::Roster>,
     /// The debugging sessions the `debug` tool keeps across calls.
     pub(crate) debuggers: Arc<omc_dap::Sessions>,
     /// The language services `edit` and `write` ask, chosen when the conversation is opened.
@@ -145,6 +147,7 @@ impl Shared {
                 let _ = announce.send(Event::Background(run));
             })),
             throttle: Arc::new(omc_agent::Throttle::default()),
+            roster: Arc::new(omc_agent::Roster::default()),
             debuggers: Arc::new(omc_dap::Sessions::new()),
             naming: Mutex::new(Naming::default()),
             login: Mutex::new(Login::default()),

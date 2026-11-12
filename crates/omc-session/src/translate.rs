@@ -364,6 +364,7 @@ pub(crate) fn translate(event: AgentEvent, window: u64) -> Option<Event> {
             })),
             ..bare(id)
         }),
+        AgentEvent::Subagent(notice) => Event::Subagent(subagent_of(notice)),
         AgentEvent::Nested {
             parent,
             agent,
@@ -378,9 +379,31 @@ pub(crate) fn translate(event: AgentEvent, window: u64) -> Option<Event> {
                 agent: tool.agent.or(Some(agent)),
                 ..tool
             }),
+            Event::Subagent(subagent) => Event::Subagent(omc_wire::Subagent {
+                call: format!("{parent}:{}", subagent.call),
+                ..subagent
+            }),
             _ => return None,
         },
     })
+}
+
+/// The wire form of `notice`, a subagent starting or ending.
+fn subagent_of(notice: omc_agent::SubagentNotice) -> omc_wire::Subagent {
+    omc_wire::Subagent {
+        id: notice.id,
+        call: notice.call,
+        agent: notice.agent,
+        label: notice.label,
+        model: notice.model,
+        background: notice.background,
+        state: match notice.state {
+            omc_agent::SubagentState::Running => omc_wire::SubagentState::Running,
+            omc_agent::SubagentState::Finished => omc_wire::SubagentState::Finished,
+            omc_agent::SubagentState::Failed => omc_wire::SubagentState::Failed,
+            omc_agent::SubagentState::Stopped => omc_wire::SubagentState::Stopped,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -567,6 +590,37 @@ mod tests {
         assert_eq!(deep.id, "c1:s1:g");
         assert_eq!(deep.parent.as_deref(), Some("c1:s1"));
         assert_eq!(deep.agent.as_deref(), Some("scout"));
+    }
+
+    /// A subagent's announcement passes through the calls it is nested under, its call id chained as their tool ids are, its own id left as it is.
+    #[test]
+    fn nested_subagent_announcements_chain_their_call() {
+        let notice = omc_agent::SubagentNotice {
+            id: "c1/2:s1".into(),
+            call: "s1".into(),
+            agent: "scout".into(),
+            label: "look".into(),
+            model: None,
+            background: false,
+            state: omc_agent::SubagentState::Stopped,
+        };
+        let Some(Event::Subagent(subagent)) = translate(
+            AgentEvent::Nested {
+                parent: "c1".into(),
+                agent: "task".into(),
+                event: Box::new(AgentEvent::Nested {
+                    parent: "2".into(),
+                    agent: "task".into(),
+                    event: Box::new(AgentEvent::Subagent(notice)),
+                }),
+            },
+            1,
+        ) else {
+            panic!()
+        };
+        assert_eq!(subagent.id, "c1/2:s1");
+        assert_eq!(subagent.call, "c1:2:s1");
+        assert_eq!(subagent.state, omc_wire::SubagentState::Stopped);
     }
 
     /// The worktree of an isolated subagent is reported on its call, or on its step of a call, with what became of its changes once it ended.

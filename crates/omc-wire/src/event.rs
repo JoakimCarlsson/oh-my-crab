@@ -7,7 +7,7 @@ use crate::permission::Permission;
 use crate::plan::PlanStep;
 use crate::queue::Queued;
 use crate::setting::{Setting, Slash};
-use crate::tool::{Background, Tool};
+use crate::tool::{Background, Subagent, Tool};
 use crate::trust::TrustRequest;
 use crate::usage::Usage;
 
@@ -73,6 +73,8 @@ pub enum Event {
     Tool(Tool),
     /// A command or task left running beyond its call started, or ended.
     Background(Background),
+    /// A subagent started, or ended.
+    Subagent(Subagent),
     /// The turn was stopped, so that nothing the agent had running goes on.
     Halted,
     /// The agent's plan, whole, as it stands now.
