@@ -606,6 +606,75 @@ async fn a_failed_subagent_has_its_changes_held() {
     assert!(std::fs::read_to_string(patch).unwrap().contains("+half"));
 }
 
+/// A model whose subagents write `new.txt` and then never answer again, so that only stopping them ends them.
+struct WritesThenHangs;
+
+#[async_trait]
+impl ChatModel for WritesThenHangs {
+    /// Writes `new.txt` on the first request and never answers the ones after it.
+    async fn complete(
+        &self,
+        request: Request<'_>,
+        _: &mut dyn Sink,
+    ) -> Result<Reply, ProviderError> {
+        if request.messages.len() == 1 {
+            return Ok(calls(&[(
+                "write",
+                json!({"path": "new.txt", "content": "half\n"}),
+            )]));
+        }
+        std::future::pending().await
+    }
+}
+
+/// An isolated subagent the reader stops has its changes held, not applied, and its result says the reader stopped it.
+#[tokio::test]
+async fn a_subagent_the_reader_stops_has_its_changes_held() {
+    let bench = bench("isolated-reader-stopped");
+    let roster = Arc::new(omc_agent::Roster::default());
+    let log: Log = Arc::new(Mutex::new(Vec::new()));
+    let sink = log.clone();
+    let task = Task::new(TaskSettings {
+        models: omc_agent::Models::default(),
+        nesting: omc_agent::Nesting::default().with_roster(roster.clone()),
+        model: Arc::new(WritesThenHangs),
+        registry: Arc::new(Registry::builtin(&bench.linked).unwrap()),
+        approvals: Arc::new(Approvals::new(Arc::new(DenyAll), true)),
+        events: Arc::new(move |event| sink.lock().unwrap().push(event)),
+        agents: builtin_agents(),
+        effort: None,
+        prompt: Arc::new(|agent, _, _, _| format!("SUB:{}", agent.name)),
+        jobs: Arc::new(Jobs::new(|_| {})),
+        isolation: Some(isolation(&bench.linked, &bench, Backend::Worktree)),
+        hooks: None,
+    });
+    let call = task.call_as("t1", json!({"task": "x", "isolated": true}));
+    let stop = async {
+        loop {
+            if let Some((_, path, _)) = worktree_events(&log).pop()
+                && path.join("new.txt").exists()
+            {
+                assert!(roster.stop("t1"));
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let (outcome, ()) =
+        tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(call, stop) })
+            .await
+            .unwrap();
+    let stopped = outcome.unwrap_err().to_string();
+    assert!(stopped.contains("stopped by the reader"));
+    assert!(stopped.contains("Its changes were not applied"));
+    assert!(!bench.linked.join("new.txt").exists());
+    let merge = worktree_events(&log).pop().and_then(|(_, _, merge)| merge);
+    assert!(
+        matches!(merge, Some(Merge::Held { .. })),
+        "not held: {merge:?}"
+    );
+}
+
 /// An isolated subagent started in the background, asked for a structured result, hands back its checked JSON through `wait`, followed by the files it changed, which are applied by then.
 #[tokio::test]
 async fn a_background_subagent_hands_back_typed_results_and_edits() {

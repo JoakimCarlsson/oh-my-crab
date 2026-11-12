@@ -32,6 +32,8 @@ pub(crate) struct Inputs<'a> {
     pub(crate) models: Models,
     /// The seats subagents take to run, shared by all of them.
     pub(crate) throttle: Arc<Throttle>,
+    /// The subagents running in the conversation, by which the reader stops one.
+    pub(crate) roster: Arc<omc_agent::Roster>,
     /// What is allowed without asking.
     pub(crate) approvals: Arc<Approvals>,
     /// Where the work of subagents is reported.
@@ -163,7 +165,8 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
         jobs: inputs.jobs.clone(),
         isolation: inputs.isolation.clone(),
         hooks: inputs.hooks.clone(),
-        nesting: Nesting::new(omc_agent::max_depth(), inputs.throttle.clone()),
+        nesting: Nesting::new(omc_agent::max_depth(), inputs.throttle.clone())
+            .with_roster(inputs.roster.clone()),
     }));
     for name in inputs.denied {
         registry.remove(name);
@@ -291,6 +294,7 @@ mod tests {
             model: Arc::new(Silent),
             models: Models::default(),
             throttle: shared.throttle.clone(),
+            roster: shared.roster.clone(),
             approvals: shared.approvals.clone(),
             events: Arc::new(|_| {}),
             effort: None,

@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::Roster;
+
 /// The environment variable that sets how many levels of subagents may run below the main agent.
 pub const DEPTH_VARIABLE: &str = "OMC_SUBAGENT_DEPTH";
 
@@ -92,10 +94,12 @@ pub struct Nesting {
     pub(crate) seat: Option<Arc<Seat>>,
     /// The id of the subagent this tool belongs to, which the ids of the subagents it starts are put under; empty for the main agent's tool.
     pub(crate) scope: String,
+    /// The subagents running in the conversation, at every level, by which the reader stops one.
+    pub roster: Arc<Roster>,
 }
 
 impl Nesting {
-    /// Where the main agent's `task` tool stands: its subagents at level 1, `most` levels allowed, and seats taken from `throttle`.
+    /// Where the main agent's `task` tool stands: its subagents at level 1, `most` levels allowed, seats taken from `throttle`, and a roster of its own.
     pub fn new(most: usize, throttle: Arc<Throttle>) -> Self {
         Self {
             depth: 1,
@@ -103,7 +107,14 @@ impl Nesting {
             throttle,
             seat: None,
             scope: String::new(),
+            roster: Arc::new(Roster::default()),
         }
+    }
+
+    /// The same, with its subagents put on `roster`, which the conversation shares.
+    #[must_use]
+    pub fn with_roster(self, roster: Arc<Roster>) -> Self {
+        Self { roster, ..self }
     }
 
     /// Whether the subagents this tool starts may start subagents of their own.
@@ -119,6 +130,7 @@ impl Nesting {
             throttle: self.throttle.clone(),
             seat: Some(seat),
             scope: id.to_owned(),
+            roster: self.roster.clone(),
         }
     }
 

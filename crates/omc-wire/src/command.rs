@@ -99,6 +99,11 @@ pub enum Command {
     },
     /// Stops the turn that is running.
     Cancel,
+    /// Stops the subagent `id`, as a [`crate::Event::Subagent`] named it, and the subagents it started; the others and the turn go on, and the agent is told the reader stopped it. Fails with a [`crate::Event::Failed`] when no subagent with that id is running.
+    StopSubagent {
+        /// The id of the subagent.
+        id: String,
+    },
     /// Gives the setting `setting` the value `value`.
     Set {
         /// The setting.

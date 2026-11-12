@@ -80,6 +80,8 @@ pub enum AgentEvent {
         /// What became of its changes, once it ended.
         merge: Option<crate::Merge>,
     },
+    /// A subagent started, or ended; its `call` is the id of the `task` call that started it, as the agent that made the call sees it.
+    Subagent(crate::SubagentNotice),
     /// A tool call finished, successfully or not.
     ToolDone {
         /// Id of the call.

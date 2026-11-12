@@ -74,6 +74,21 @@ takes one again once they ended, so a tree of subagents waiting on each other
 can never hold every seat and stall. Approvals are shared with the main agent
 at every level, as are the hooks, which see each subagent under its own id.
 
+## Stopping one subagent
+
+Every subagent, in the foreground, in the background or started by another
+subagent, is announced to the client with a `Subagent` event when it starts
+and again when it ends, under a stable id: the `task` call id, then `/` and
+its place when the call started several, put after its parent's id and a `:`
+when a subagent started it. The client stops one with the `StopSubagent`
+command (see [the wire protocol](../wire-protocol.md#stopsubagent)); the
+subagents it started stop with it, and its siblings and the turn go on. The
+`task` result, or the `wait` result for one in the background, gives the
+others' results as usual and, for the stopped one, a failure saying the reader
+stopped it, so that the agent does not start it again on its own. A stopped
+subagent counts as failed for its worktree: its changes are saved, not
+applied. `Cancel` still stops the whole turn and every subagent in it.
+
 ## Worktrees
 
 A subagent can work in a copy of its own of the working tree, so that

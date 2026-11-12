@@ -475,6 +475,25 @@ declines open questions, and sends nothing else.
 "Cancel"
 ```
 
+### `StopSubagent`
+
+Stops one subagent, named by the `id` a `Subagent` event gave it, and every
+subagent it started. Its siblings and the turn carry on: the `task` call (or
+`wait`, for one in the background) returns the others' results as usual, and
+the stopped one's part says the reader stopped it. Crab sends a `Subagent`
+event in the `Stopped` state for it and for each subagent it started. A
+stopped subagent working in a worktree of its own has its changes held, not
+applied. An id that names no running subagent is answered with `Failed` and
+leaves the turn as it is.
+
+| Field | Type   | Presence | Meaning                 |
+| ----- | ------ | -------- | ----------------------- |
+| `id`  | string | required | The id of the subagent. |
+
+```json
+{"StopSubagent":{"id":"toolu_07/2"}}
+```
+
 ### `Set`
 
 Gives a setting a value. See [Settings round-trips](#settings-round-trips).
@@ -842,6 +861,35 @@ between turns, and they are stopped by `Open` and `Close`.
 
 ```json
 {"Background":{"id":"job-1","label":"npm run dev","running":true,"call":"toolu_05"}}
+```
+
+### `Subagent`
+
+A subagent started, or ended. Sent once in the `Running` state when it starts,
+for subagents in the foreground, in the background and started by other
+subagents, and once more in another state when it ends. Carries a `Subagent`:
+
+| Field        | Type   | Presence | Meaning                                                                   |
+| ------------ | ------ | -------- | ------------------------------------------------------------------------- |
+| `id`         | string | required | Its id for the conversation, which `StopSubagent` names.                  |
+| `call`       | string | required | The id of the `task` call that started it, as its `Tool` events carry it. |
+| `agent`      | string | required | The kind of subagent.                                                     |
+| `label`      | string | required | What it is doing, in a few words.                                         |
+| `model`      | string | optional | The model it asks, when that is known.                                    |
+| `background` | bool   | required | Whether it runs in the background.                                        |
+| `state`      | string | required | How it stands, a `SubagentState`.                                         |
+
+The id is the `task` call id, followed by `/` and the place in the list,
+counted from one, when the call started several. The id of a subagent started
+by another subagent is that one's id, a `:`, and its own: `toolu_07/2:toolu_11`.
+`SubagentState` is one of `Running`, `Finished` (it ended with a result),
+`Failed` (it ended with an error) and `Stopped` (`StopSubagent` stopped it or
+a subagent above it, or the turn or background run it belonged to was
+stopped).
+
+```json
+{"Subagent":{"id":"toolu_07/2","call":"toolu_07","agent":"scout","label":"Find the parser","model":"claude-sonnet-4-5","background":false,"state":"Running"}}
+{"Subagent":{"id":"toolu_07/2","call":"toolu_07","agent":"scout","label":"Find the parser","model":"claude-sonnet-4-5","background":false,"state":"Stopped"}}
 ```
 
 ### `Halted`

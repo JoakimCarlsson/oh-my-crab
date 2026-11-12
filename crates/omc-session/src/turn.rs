@@ -302,6 +302,7 @@ impl Turn {
                 })),
             },
             throttle: self.shared.throttle.clone(),
+            roster: self.shared.roster.clone(),
             approvals: self.shared.approvals.clone(),
             events: events.clone(),
             effort,

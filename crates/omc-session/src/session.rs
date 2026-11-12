@@ -256,6 +256,11 @@ impl Session {
                 }
             }
             Command::Cancel => self.cancel(),
+            Command::StopSubagent { id } => {
+                if !self.shared.roster.stop(&id) {
+                    self.say(Event::Failed(format!("no subagent {id} is running")));
+                }
+            }
             Command::Set { setting, value } => self.set(&setting, &value).await,
             Command::Login { provider } => self.login(&provider),
             Command::Language { ticket, answer } => {
@@ -2619,6 +2624,22 @@ mod tests {
             ]
         );
         assert!(session.shared.queue.pop().is_none());
+    }
+
+    /// Stopping a subagent that is not running is refused with a `Failed` event, and the running turn goes on.
+    #[tokio::test]
+    async fn stopping_an_unknown_subagent_is_refused_and_the_turn_goes_on() {
+        let (mut session, mut events) = busy_session("stop-unknown");
+        while events.try_recv().is_ok() {}
+        session
+            .handle(Command::StopSubagent { id: "t9/1".into() })
+            .await;
+        let told: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert_eq!(
+            told,
+            vec![Event::Failed("no subagent t9/1 is running".into())]
+        );
+        assert!(session.running.is_some());
     }
 
     /// A turn that answers is followed by a turn for the prompt that waited longest, and the rest keep waiting; a turn that fails drops what waits.
