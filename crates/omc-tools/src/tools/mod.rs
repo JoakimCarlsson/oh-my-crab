@@ -42,7 +42,7 @@ pub use load_tools::{LOAD_TOOLS, LoadTools, one_line_summary};
 pub use lsp::Lsp;
 pub use memory::{MemoryEdit, MemorySearch, Remember};
 pub use notes::{ContextNotes, NewContext};
-pub use read::{Read, attached_image};
+pub use read::{Read, attached_image, encoded_image};
 pub use skill::Skill;
 pub use snapshot::tag as snapshot_tag;
 pub use title::SetTitle;

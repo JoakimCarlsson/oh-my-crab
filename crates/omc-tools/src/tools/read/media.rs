@@ -110,6 +110,23 @@ pub fn attached_image(path: &std::path::Path) -> Option<Result<(Image, String), 
     Some(loaded)
 }
 
+/// The image a tool of another program returned as base64 `data` of type `media_type`, called `label`, shrunk as `read` shrinks images for the model, with the line that says what it is.
+///
+/// # Errors
+///
+/// Returns the reason when `data` is not base64, or the image is too large or cannot be shrunk enough.
+pub fn encoded_image(data: &str, media_type: &str, label: &str) -> Result<(Image, String), String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.trim())
+        .map_err(|error| format!("the image {label} is not base64: {error}"))?;
+    let mut output = image(&bytes, media_type, label).map_err(|error| error.to_string())?;
+    output
+        .images
+        .pop()
+        .map(|image| (image, output.text))
+        .ok_or_else(|| format!("{label} gave no image"))
+}
+
 /// Checks that an image of `len` bytes, called `label`, is small enough to
 /// decode and, if need be, shrink for the model.
 ///

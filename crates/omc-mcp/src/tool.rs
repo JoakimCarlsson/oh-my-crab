@@ -107,13 +107,32 @@ impl Tool for McpTool {
         format!("{}: {} {args}", self.server, self.remote)
     }
 
-    /// Calls the tool on its server, cutting text longer than [`OUTPUT_LIMIT`] in the middle and saving the whole of it.
+    /// Calls the tool on its server, cutting text longer than [`OUTPUT_LIMIT`] in the middle and saving the whole of it, and handing the images it returns to the model, shrunk as `read` shrinks them.
     async fn call(&self, args: Value) -> Result<ToolOutput, ToolError> {
         let capped = |text| self.spill.cap("mcp", text, OUTPUT_LIMIT);
-        match self.client.call(&self.remote, args).await {
-            Ok(text) => Ok(ToolOutput::new(capped(text))),
-            Err(text) => Err(ToolError::Failed(capped(text))),
+        let (text, encoded) = self
+            .client
+            .call(&self.remote, args)
+            .await
+            .map_err(|text| ToolError::Failed(capped(text)))?;
+        let mut lines = vec![capped(text)];
+        let mut images = Vec::new();
+        for (index, (data, media_type)) in encoded.iter().enumerate() {
+            let label = format!("{} {}", self.remote, index + 1);
+            match omc_tools::encoded_image(data, media_type, &label) {
+                Ok((image, line)) => {
+                    images.push(image);
+                    lines.push(line);
+                }
+                Err(reason) => lines.push(format!("[image dropped: {reason}]")),
+            }
         }
+        let text = lines
+            .into_iter()
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(ToolOutput::new(text).with_images(images))
     }
 }
 

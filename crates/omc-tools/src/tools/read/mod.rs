@@ -13,7 +13,7 @@ mod lines;
 mod listing;
 mod media;
 
-pub use media::attached_image;
+pub use media::{attached_image, encoded_image};
 mod outline;
 mod selector;
 mod shrink;

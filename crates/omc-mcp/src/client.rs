@@ -236,30 +236,42 @@ impl Client {
             .collect())
     }
 
-    /// Calls the tool `name` with `arguments` and returns what it printed.
+    /// Calls the tool `name` with `arguments` and returns what it printed, with the image parts of the answer as `(base64 data, media type)`.
     ///
     /// # Errors
     ///
     /// Fails with the reason when the call fails or the tool reports an error.
-    pub(crate) async fn call(&self, name: &str, arguments: Value) -> Result<String, String> {
+    pub(crate) async fn call(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<(String, Vec<(String, String)>), String> {
         let result = self
             .request(
                 "tools/call",
                 json!({ "name": name, "arguments": arguments }),
             )
             .await?;
-        let text = result["content"]
-            .as_array()
-            .into_iter()
-            .flatten()
+        let parts = result["content"].as_array().cloned().unwrap_or_default();
+        let text = parts
+            .iter()
             .filter_map(|part| part["text"].as_str())
             .collect::<Vec<_>>()
             .join("\n");
         if result["isError"] == json!(true) {
-            Err(text)
-        } else {
-            Ok(text)
+            return Err(text);
         }
+        let images = parts
+            .iter()
+            .filter(|part| part["type"] == "image")
+            .filter_map(|part| {
+                Some((
+                    part["data"].as_str()?.to_owned(),
+                    part["mimeType"].as_str().unwrap_or("image/png").to_owned(),
+                ))
+            })
+            .collect();
+        Ok((text, images))
     }
 
     /// The resources the server lists.
