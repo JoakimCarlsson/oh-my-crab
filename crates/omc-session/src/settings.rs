@@ -45,6 +45,9 @@ pub(crate) const WARMING: &str = "cache_warming";
 /// The id of the setting that turns the memory that outlives conversations on or off; it takes [`ON`] and [`OFF`].
 pub(crate) const MEMORY: &str = "memory";
 
+/// The id of the setting that turns keeping the files before and after each turn on or off; it takes [`ON`] and [`OFF`].
+pub(crate) const SNAPSHOTS: &str = "snapshots";
+
 /// The value of the cache setting that stands for `retention`.
 pub(crate) fn retention_value(retention: Retention) -> &'static str {
     match retention {
@@ -110,6 +113,8 @@ pub(crate) struct Offer<'a> {
     pub(crate) effort: Option<Effort>,
     /// Whether the agent has the checkpoint and rewind tools.
     pub(crate) checkpoints: bool,
+    /// Whether the files are kept before and after each turn.
+    pub(crate) snapshots: bool,
     /// The prompt cache lifetime in use, when the provider offers a choice.
     pub(crate) retention: Option<Retention>,
     /// Whether the prompt cache is kept warm, when the provider can be warmed.
@@ -269,6 +274,24 @@ pub(crate) fn offered(offer: &Offer<'_>) -> Vec<Setting> {
         ],
     });
     settings.push(Setting {
+        id: SNAPSHOTS.to_owned(),
+        category: SNAPSHOTS.to_owned(),
+        name: "File snapshots".to_owned(),
+        current: if offer.snapshots { ON } else { OFF }.to_owned(),
+        picks: vec![
+            pick(
+                ON,
+                "On",
+                "In a git repository the files are kept before and after each turn, so what a turn changed can be shown, undone, and the files put back as they were before it",
+            ),
+            pick(
+                OFF,
+                "Off",
+                "No files are kept, so turns cannot be shown, undone or restored",
+            ),
+        ],
+    });
+    settings.push(Setting {
         id: CHECKPOINTS.to_owned(),
         category: CHECKPOINTS.to_owned(),
         name: "Checkpoints".to_owned(),
@@ -319,6 +342,7 @@ mod tests {
             efforts,
             effort,
             checkpoints: false,
+            snapshots: true,
             retention: None,
             warming: None,
             memory: None,
@@ -345,6 +369,7 @@ mod tests {
                 "memory",
                 "plan_model",
                 "plan_autosave",
+                "snapshots",
                 "checkpoints"
             ]
         );
@@ -372,7 +397,7 @@ mod tests {
     /// Effort is hidden when the model takes none, and otherwise falls back to medium.
     #[test]
     fn effort_follows_the_model() {
-        assert_eq!(offered(&offer(&[], &[], None)).len(), 5);
+        assert_eq!(offered(&offer(&[], &[], None)).len(), 6);
         let settings = offered(&offer(&[], &Effort::ALL, None));
         let effort = &settings[2];
         assert_eq!(

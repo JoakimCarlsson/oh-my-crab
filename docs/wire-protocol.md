@@ -203,6 +203,7 @@ The settings crab offers today:
 | `memory`        | `memory`        | `on`, `off`                               | memory is not turned off for the process   |
 | `plan_model`    | `plan_model`    | `same`, the provider's models, or any model as `model` or `provider/model` | always            |
 | `plan_autosave` | `plan_autosave` | `on`, `off`                               | always                                     |
+| `snapshots`     | `snapshots`     | `on`, `off`                               | always                                     |
 | `checkpoints`   | `checkpoints`   | `on`, `off`                               | always                                     |
 
 A client should not hard-code this list: show what `Settings` offers. `yolo`
@@ -291,6 +292,50 @@ branch, opened again, and switched back to branch `1` (lines shortened):
 In the file, going back is a `branch` record followed by the cut-back, and
 switching is a `switch` record; the turns of every branch stay where they
 were written.
+
+### Files of a turn
+
+In a git repository, with the `snapshots` setting on, crab keeps the files of
+the folder it works in before every turn that has an id and again when the
+turn ends, however it ends. Every file the repository does not ignore is kept,
+tracked or not, so what a shell command, a formatter or a generator wrote is
+kept along with the agent's own edits. Neither the branch, the head nor the
+index changes: the files are written as commits no branch holds, under
+`refs/worktree/oh-my-crab/<conversation>/before/<turn>` and
+`.../after/<turn>`, with every byte of an id that is not a letter, a digit or
+`-` written as `_` and two hexadecimal digits. `<conversation>` is the
+conversation's id followed by `-` and a hash of the path of its history file,
+so conversations saved under one id in different folders stay apart. A
+conversation without an id keeps them under `unsaved-<process id>`.
+
+- `Changes` asks what a turn changed, and crab answers with a `Changes` event
+  holding each file and its diff. A turn that ended is told from the files
+  kept before and after it, so nothing done later is in it; the running turn
+  is told against the files as they are now.
+- `Undo` takes what a turn changed back out of some files or all of them,
+  leaving what was done to them since. It changes nothing when lines the turn
+  changed were changed again.
+- `Restore` puts every file back as it was before a turn, deleting files made
+  since.
+- `Undo` and `Restore` keep the files as they were first, under
+  `.../<conversation>/backup`, are refused while a turn runs, and leave the
+  conversation as it is. The model is told what happened with the next
+  prompt.
+- A turn crab starts itself toward a goal is kept under the id its
+  `Continued` event carries.
+- A turn without an id, a `/compact`, and a folder that is in no git
+  repository keep nothing, and the three commands then answer `Failed`.
+- Every `Failed` these three commands answer with starts with `files:`, so a
+  client can tell it from a failure of the conversation, which goes on.
+
+```json
+{"Prompt":{"text":"Rename add to sum.","files":[],"turn":"t-4"}}
+{"Finished":null}
+{"Changes":{"turn":"t-4"}}
+{"Changes":{"turn":"t-4","open":false,"files":[{"path":"calc.py","from":null,"status":"M","diff":"@@ -1 +1 @@\n-def add(a, b):\n+def sum(a, b):","added":1,"removed":1,"truncated":false}]}}
+{"Undo":{"turn":"t-4","paths":["calc.py"]}}
+{"Undone":{"turn":"t-4","files":["calc.py"]}}
+```
 
 ### Tool events are updates
 
@@ -684,6 +729,51 @@ where it was. See [Branches](#branches).
 
 ```json
 {"Switch":{"branch":"1"}}
+```
+
+### `Changes`
+
+Asks what a turn changed in the files. Crab answers with a `Changes` event,
+or with `Failed` when no files were kept for the turn. See
+[Files of a turn](#files-of-a-turn).
+
+| Field  | Type   | Presence | Meaning                                      |
+| ------ | ------ | -------- | -------------------------------------------- |
+| `turn` | string | required | The id the client gave the turn in `Prompt`. |
+
+```json
+{"Changes":{"turn":"t-4"}}
+```
+
+### `Restore`
+
+Puts the files back as they were before a turn, and crab answers with a
+`Restored` event. Fails with `Failed` while a turn is running or when no files
+were kept before the turn. See [Files of a turn](#files-of-a-turn).
+
+| Field  | Type   | Presence | Meaning                                      |
+| ------ | ------ | -------- | -------------------------------------------- |
+| `turn` | string | required | The id the client gave the turn in `Prompt`. |
+
+```json
+{"Restore":{"turn":"t-4"}}
+```
+
+### `Undo`
+
+Takes what a turn changed back out of the files, and crab answers with an
+`Undone` event. Fails with `Failed`, changing nothing, while a turn is
+running, when no files were kept before and after the turn, or when lines the
+turn changed were changed again since. See
+[Files of a turn](#files-of-a-turn).
+
+| Field   | Type           | Presence | Meaning                                                                                                   |
+| ------- | -------------- | -------- | --------------------------------------------------------------------------------------------------------- |
+| `turn`  | string         | required | The id the client gave the turn in `Prompt`.                                                              |
+| `paths` | list of string | default  | The files, as `Changes` gave their `path`, or every file the turn changed when empty. A renamed file is put back only when both its names are listed. |
+
+```json
+{"Undo":{"turn":"t-4","paths":["calc.py"]}}
 ```
 
 ### `Close`
@@ -1344,13 +1434,63 @@ budget, and when a saved conversation that has one opens. See
 
 ### `Continued`
 
-Crab started a turn of its own toward the active goal, with this prompt, since
-the last turn ended with the goal still open. The turn's events follow as for a
-prompt the reader sent, and it ends with `Finished`. The prompt is saved as the
-turn's prompt, so a replayed history shows it as a turn the reader sent.
+Crab started a turn of its own toward the active goal, since the last turn
+ended with the goal still open. The turn's events follow as for a prompt the
+reader sent, and it ends with `Finished`. The prompt is saved as the turn's
+prompt, so a replayed history shows it as a turn the reader sent.
+
+| Field    | Type   | Presence | Meaning                                                                                                     |
+| -------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------- |
+| `prompt` | string | required | The prompt the turn started with.                                                                           |
+| `turn`   | string | required | The id crab saved the turn under: `goal-` and a number. Use it as the id of a turn the client prompted: with `before` in `Open`, and with `Changes`, `Restore` and `Undo`. |
 
 ```json
-{"Continued":"Keep working toward the goal. ..."}
+{"Continued":{"prompt":"Keep working toward the goal.","turn":"goal-1794563890123456789"}}
+```
+
+### `Changes`
+
+What a turn changed in the files, in answer to the `Changes` command.
+
+| Field   | Type                 | Presence | Meaning                                                                                  |
+| ------- | -------------------- | -------- | ---------------------------------------------------------------------------------------- |
+| `turn`  | string               | required | The turn's id.                                                                           |
+| `open`  | boolean              | required | Whether the turn is still running, so the files are set against what they hold now.      |
+| `files` | list of `TurnChange` | required | The files the turn changed.                                                              |
+
+A `TurnChange`:
+
+| Field       | Type    | Presence | Meaning                                                                                              |
+| ----------- | ------- | -------- | ---------------------------------------------------------------------------------------------------- |
+| `path`      | string  | required | Where the file is, from the root of the repository.                                                  |
+| `from`      | string  | optional | Where it was before the turn renamed or copied it.                                                   |
+| `status`    | string  | required | The letter git writes the change with: `A` added, `M` modified, `D` deleted, `R` renamed, `C` copied, `T` changed in kind. |
+| `diff`      | string  | required | The lines of its diff from the first hunk on, each starting with `@`, `+`, `-` or a space; empty for a file that is not text. |
+| `added`     | integer | required | How many lines the turn put in.                                                                      |
+| `removed`   | integer | required | How many lines the turn took out.                                                                    |
+| `truncated` | boolean | default  | Whether `diff` was cut at 2000 lines; `added` and `removed` then count only the lines sent.          |
+
+```json
+{"Changes":{"turn":"t-4","open":true,"files":[{"path":"notes.txt","from":null,"status":"A","diff":"@@ -0,0 +1 @@\n+hello","added":1,"removed":0,"truncated":false}]}}
+```
+
+### `Restored`
+
+The files were put back as they were before a turn, in answer to `Restore`.
+`files` are the paths that changed, from the root of the repository.
+
+```json
+{"Restored":{"turn":"t-4","files":["calc.py","notes.txt"]}}
+```
+
+### `Undone`
+
+What a turn changed was taken back out of the files, in answer to `Undo`.
+`files` are the paths that changed, from the root of the repository; the list
+is empty when the turn changed none of the files asked for.
+
+```json
+{"Undone":{"turn":"t-4","files":["calc.py"]}}
 ```
 
 ## Types the subcommands print and read

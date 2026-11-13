@@ -39,6 +39,8 @@ struct State {
     effort: Option<Effort>,
     /// Whether the agent has the checkpoint and rewind tools.
     checkpoints: bool,
+    /// Whether the files are kept before and after each turn.
+    snapshots: bool,
     /// How long the provider is asked to keep the prompt cache entries requests write.
     retention: Retention,
     /// Whether the prompt cache is kept warm while the agent waits.
@@ -163,6 +165,7 @@ impl Shared {
                 resume: Mode::Asking,
                 effort: None,
                 checkpoints: false,
+                snapshots: true,
                 retention: Retention::Short,
                 warming: true,
                 memory: true,
@@ -365,6 +368,7 @@ impl Shared {
                 efforts: &efforts,
                 effort: state.effort,
                 checkpoints: state.checkpoints,
+                snapshots: state.snapshots,
                 retention: omc_providers::cache_ttl(provider, &state.model, Retention::Long)
                     .map(|_| state.retention),
                 warming: omc_providers::warmable(provider, &state.model, None)
@@ -501,6 +505,16 @@ impl Shared {
             self.warmer.stop();
         }
         self.checkpoint.clear();
+    }
+
+    /// Whether the files are kept before and after each turn.
+    pub(crate) fn snapshots(&self) -> bool {
+        self.state(|state| state.snapshots)
+    }
+
+    /// Turns keeping the files before and after each turn on or off for the turns that start from now on.
+    pub(crate) fn set_snapshots(&self, enabled: bool) {
+        self.state(|state| state.snapshots = enabled);
     }
 
     /// Gives the conversation `memories`, the memories of its project and of the user, or none when memory is turned off for the process or has no folder.

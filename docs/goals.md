@@ -67,7 +67,7 @@ held to it by its prompts, and crab does not run it.
   objective and how much of the budget is used, before the prompt.
 - **After a turn ends** with no prompt of the reader's waiting, crab starts
   the next turn itself and tells the client with a
-  [`Continued`](wire-protocol.md#continued) event carrying the prompt. That
+  [`Continued`](wire-protocol.md#continued) event carrying the prompt and the id of the turn. That
   prompt asks the agent to audit where the objective stands with real
   evidence, list what is missing, take the next step, and end the turn without
   calling tools when only the reader can unblock it. The prompt is saved as the

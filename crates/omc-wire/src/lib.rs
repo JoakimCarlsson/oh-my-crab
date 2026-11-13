@@ -5,6 +5,7 @@
 //! are framed, so both ends can depend on it without depending on each other.
 
 mod branch;
+mod change;
 mod command;
 mod event;
 mod frame;
@@ -25,6 +26,7 @@ mod trust;
 mod usage;
 
 pub use branch::{Branch, BranchTurn};
+pub use change::TurnChange;
 pub use command::{Command, Opening};
 pub use event::{Conversation, Event, Part, PastTurn};
 pub use frame::{decode, encode};

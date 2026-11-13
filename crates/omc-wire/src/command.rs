@@ -135,6 +135,24 @@ pub enum Command {
         /// The id of the branch, as [`crate::Branch::id`] gives it.
         branch: String,
     },
+    /// Asks what the turn `turn` changed in the files of the folder the agent works in, answered with a [`crate::Event::Changes`]: the files as they were when the turn ended set against the files as they were before it, or against the files as they are now for the turn that is running. Fails with a [`crate::Event::Failed`] when no files were kept for the turn.
+    Changes {
+        /// The id the client gave the turn when it prompted.
+        turn: String,
+    },
+    /// Puts the files of the folder the agent works in back as they were before the turn `turn`, and says so with a [`crate::Event::Restored`]; the conversation stays as it is, and the agent is told with the next prompt. Fails with a [`crate::Event::Failed`] while a turn is running or when no files were kept before the turn.
+    Restore {
+        /// The id the client gave the turn when it prompted.
+        turn: String,
+    },
+    /// Takes what the turn `turn` changed back out of the files `paths`, or out of every file it changed when there are none, leaving what was done to them since, and says so with a [`crate::Event::Undone`]; the agent is told with the next prompt. Fails with a [`crate::Event::Failed`], changing nothing, while a turn is running, when no files were kept for the turn, or when lines the turn changed were changed again since.
+    Undo {
+        /// The id the client gave the turn when it prompted.
+        turn: String,
+        /// The files, from the root of the repository, as [`crate::TurnChange::path`] gives them; a file the turn renamed is put back only when both its names are here.
+        #[serde(default)]
+        paths: Vec<String>,
+    },
     /// Ends the conversation and the harness.
     Close,
 }

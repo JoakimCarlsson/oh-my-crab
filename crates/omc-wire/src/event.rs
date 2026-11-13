@@ -1,6 +1,7 @@
 //! What the harness tells its client, in the order it happened.
 
 use crate::branch::Branch;
+use crate::change::TurnChange;
 use crate::goal::Goal;
 use crate::inquiry::Inquiry;
 use crate::language::LanguageRequest;
@@ -118,8 +119,36 @@ pub enum Event {
     Trust(TrustRequest),
     /// The conversation's goal was set, or how it stands changed; sent when the conversation opens too, when it has one.
     Goal(Goal),
-    /// The harness started a turn of its own toward the goal, with this prompt, since the last turn ended with the goal open; the turn's events follow as for a prompt the reader sent.
-    Continued(String),
+    /// The harness started a turn of its own toward the goal, since the last turn ended with the goal open; the turn's events follow as for a prompt the reader sent.
+    Continued {
+        /// The prompt the turn started with.
+        prompt: String,
+        /// The id the harness saved the turn under, by which the client goes back to before it and asks about its files, as with the id of a turn it prompted itself.
+        turn: String,
+    },
+    /// What a turn changed in the files, in answer to a [`crate::Command::Changes`].
+    Changes {
+        /// The id of the turn.
+        turn: String,
+        /// Whether the turn is still running, so that the files are set against what they hold now and more may follow.
+        open: bool,
+        /// The files the turn changed, each with its diff.
+        files: Vec<TurnChange>,
+    },
+    /// The files were put back as they were before a turn, in answer to a [`crate::Command::Restore`].
+    Restored {
+        /// The id of the turn.
+        turn: String,
+        /// The files that changed, from the root of the repository.
+        files: Vec<String>,
+    },
+    /// What a turn changed was taken back out of the files, in answer to a [`crate::Command::Undo`].
+    Undone {
+        /// The id of the turn.
+        turn: String,
+        /// The files that changed, from the root of the repository.
+        files: Vec<String>,
+    },
 }
 
 /// The kind of a block of the agent's reply.

@@ -113,7 +113,7 @@ line on standard output. Open the conversation:
 
 ```json
 > {"Open":{"directory":"/path/to/hello","provider":"claude","model":null,"yolo":false,"conversation":"first-chat"}}
-< {"Settings":[{"id":"model","category":"model","name":"Model","current":"claude-haiku-5-5","picks":[…]},{"id":"mode","category":"mode","name":"Mode","current":"default","picks":[{"value":"default","name":"Ask",…},{"value":"yolo","name":"Run freely",…},{"value":"plan","name":"Plan",…}]},{"id":"effort",…},{"id":"cache",…},{"id":"cache_warming",…},{"id":"memory",…},{"id":"plan_model",…},{"id":"plan_autosave",…},{"id":"checkpoints",…}]}
+< {"Settings":[{"id":"model","category":"model","name":"Model","current":"claude-haiku-5-5","picks":[…]},{"id":"mode","category":"mode","name":"Mode","current":"default","picks":[{"value":"default","name":"Ask",…},{"value":"yolo","name":"Run freely",…},{"value":"plan","name":"Plan",…}]},{"id":"effort",…},{"id":"cache",…},{"id":"cache_warming",…},{"id":"memory",…},{"id":"plan_model",…},{"id":"plan_autosave",…},{"id":"snapshots",…},{"id":"checkpoints",…}]}
 < {"Commands":[{"name":"compact","description":"Summarize the older part of the conversation to free up context; …"},…]}
 < {"Resumed":{"title":null,"settings":[],"turns":[],"offered":[…],"commands":[…],"window":1000000}}
 < {"Trust":{"ticket":1,"root":"/path/to/hello","standing":"Unknown","skipped":[{"kind":"Instruction","name":"/path/to/hello/AGENTS.md","path":"/path/to/hello/AGENTS.md"}]}}

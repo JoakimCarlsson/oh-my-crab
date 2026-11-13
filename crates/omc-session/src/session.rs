@@ -25,9 +25,10 @@ use crate::permissions::{self, FileKeeper, PermissionsFile};
 use crate::prompt::compose;
 use crate::settings::{
     CACHE, CHECKPOINTS, EFFORT, MEMORY, MODE, MODEL, Mode, OFF, ON, PLAN_AUTOSAVE, PLAN_MODEL,
-    WARMING, parse_retention,
+    SNAPSHOTS, WARMING, parse_retention,
 };
 use crate::shared::Shared;
+use crate::snapshots::{End, Snapshots};
 use crate::turn::{Ended, Job, Turn};
 
 /// A conversation that has been opened.
@@ -133,6 +134,12 @@ struct Session {
     trust_tickets: u64,
     /// The wait after the last turn ended before the hooks are told crab is idle, while it runs.
     idle: Option<AbortHandle>,
+    /// Where the files of the conversation's turns are kept, once it is opened.
+    snapshots: Option<Snapshots>,
+    /// The id of the turn that is running, when the files were kept before it.
+    turn_id: Option<String>,
+    /// What the model is told with the next prompt about files put back, or a turn's changes taken out of them, since its last turn.
+    put_back: Option<String>,
 }
 
 /// What a conversation is run with besides its commands.
@@ -167,6 +174,9 @@ pub async fn run_with(
         ended,
         trust_tickets: 0,
         idle: None,
+        snapshots: None,
+        turn_id: None,
+        put_back: None,
     };
     let reason = loop {
         tokio::select! {
@@ -186,6 +196,9 @@ pub async fn run_with(
         session.shared.lifecycle.end(reason).await;
     }
 }
+
+/// What every failure of the [`Command::Changes`], [`Command::Restore`] and [`Command::Undo`] commands starts with, so that a client can tell it from a failure of the conversation.
+const FILES: &str = "files:";
 
 /// Why a conversation ended, as `SessionEnd` hooks are told it, when the client closed it while no turn ran.
 const END_EXIT: &str = "prompt_input_exit";
@@ -275,6 +288,9 @@ impl Session {
                 self.reach_servers().await;
             }
             Command::Switch { branch } => self.switch(&branch),
+            Command::Changes { turn } => self.changes(turn),
+            Command::Restore { turn } => self.restore(turn),
+            Command::Undo { turn, paths } => self.undo(turn, &paths),
             Command::Close => {}
         }
     }
@@ -424,6 +440,13 @@ impl Session {
         self.shared.checkpoint.clear();
         self.history = messages.unwrap_or_default();
         self.journal = journal;
+        self.snapshots = Some(Snapshots::new(
+            &directory,
+            conversation.as_deref(),
+            self.journal.as_ref().map(|journal| journal.path()),
+        ));
+        self.turn_id = None;
+        self.put_back = None;
         self.shared.attach(self.journal.clone());
         self.shared.lifecycle.set_engine(hooks.clone());
         self.shared
@@ -749,6 +772,7 @@ impl Session {
                 "cannot save the conversation: {error}"
             )));
         }
+        let job = self.keep_before(job, mark.as_ref());
         let Some(open) = &self.open else {
             return;
         };
@@ -782,6 +806,102 @@ impl Session {
             let _ = ended.send((number, how));
         });
         self.running = Some((number, task.abort_handle()));
+    }
+
+    /// Keeps the files as they are before a turn doing `job` starts, when it is a prompt the client described as `mark`, the conversation works in a git repository and the setting is on; the job is returned with word of files put back since the last turn put before its prompt.
+    fn keep_before(&mut self, job: Job, mark: Option<&omc_agent::Mark>) -> Job {
+        let Job::Prompt(told, images) = job else {
+            self.turn_id = None;
+            return job;
+        };
+        self.turn_id = match (mark, &self.snapshots, self.shared.snapshots()) {
+            (Some(mark), Some(snapshots), true) => snapshots
+                .keep_before(&mark.id)
+                .ok()
+                .map(|()| mark.id.clone()),
+            _ => None,
+        };
+        let note = self.put_back.take().unwrap_or_default();
+        Job::Prompt(format!("{note}{told}"), images)
+    }
+
+    /// Keeps the files as they are now that the running turn ended, when they were kept before it.
+    fn keep_after(&mut self) {
+        if let (Some(turn), Some(snapshots)) = (self.turn_id.take(), &self.snapshots) {
+            let _ = snapshots.keep_after(&turn);
+        }
+    }
+
+    /// Tells the client what the turn `turn` changed in the files: against the files as they are now while it runs, and as they were when it ended otherwise; a turn no files were kept for fails.
+    fn changes(&self, turn: String) {
+        let Some(snapshots) = &self.snapshots else {
+            return self.say(Event::Failed(format!(
+                "{FILES} the conversation is not open"
+            )));
+        };
+        let open = self.running.is_some() && self.turn_id.as_deref() == Some(turn.as_str());
+        let end = if open { End::Now } else { End::Kept };
+        match snapshots.changes(&turn, &end) {
+            Ok(files) => self.say(Event::Changes { turn, open, files }),
+            Err(reason) => self.say(Event::Failed(format!(
+                "{FILES} cannot tell what the turn {turn} changed: {reason}"
+            ))),
+        }
+    }
+
+    /// Puts the files back as they were before the turn `turn` and tells the client which changed; the model is told with the next prompt. Refused while a turn runs.
+    fn restore(&mut self, turn: String) {
+        let Some(snapshots) = self.idle_snapshots() else {
+            return;
+        };
+        match snapshots.restore(&turn) {
+            Ok(files) => {
+                self.put_back = Some(
+                    "The reader put the files back as they were before an earlier turn of this conversation. Your conversation has not gone back with them, so read a file again before relying on what it held.\n\n".to_owned(),
+                );
+                self.say(Event::Restored { turn, files });
+            }
+            Err(reason) => self.say(Event::Failed(format!(
+                "{FILES} cannot put the files back to before the turn {turn}: {reason}"
+            ))),
+        }
+    }
+
+    /// Takes what the turn `turn` changed back out of the files `paths`, or of every file it changed when there are none, and tells the client which changed; the model is told with the next prompt. Refused while a turn runs.
+    fn undo(&mut self, turn: String, paths: &[String]) {
+        let Some(snapshots) = self.idle_snapshots() else {
+            return;
+        };
+        match snapshots.undo(&turn, paths) {
+            Ok(files) => {
+                if !files.is_empty() {
+                    self.put_back = Some(format!(
+                        "The reader took what an earlier turn of this conversation changed back out of these files: {}. Your conversation has not gone back with them, so read a file again before relying on what it held.\n\n",
+                        files.join(", ")
+                    ));
+                }
+                self.say(Event::Undone { turn, files });
+            }
+            Err(reason) => self.say(Event::Failed(format!(
+                "{FILES} cannot undo the turn {turn}: {reason}"
+            ))),
+        }
+    }
+
+    /// Where the files of the conversation's turns are kept, when the conversation is open and no turn runs; the client is told why with [`Event::Failed`] otherwise.
+    fn idle_snapshots(&self) -> Option<Snapshots> {
+        if self.running.is_some() {
+            self.say(Event::Failed(format!(
+                "{FILES} they cannot be changed while a turn is running; stop it first"
+            )));
+            return None;
+        }
+        if self.snapshots.is_none() {
+            self.say(Event::Failed(format!(
+                "{FILES} the conversation is not open"
+            )));
+        }
+        self.snapshots.clone()
     }
 
     /// Reads what is on disk again, so that a skill added or removed since the last turn is known to this one; the client is told the commands again when the skills changed.
@@ -854,6 +974,7 @@ impl Session {
             return;
         }
         self.running = None;
+        self.keep_after();
         match how {
             Ended::Done(history) => {
                 let progress = goal::digest(goal::added(self.history.len(), &history));
@@ -905,9 +1026,13 @@ impl Session {
 
     /// Starts a turn of crab's own with `prompt`, saved as the turn's prompt under an id of its own, and tells the client; the goal pauses when the turn cannot start.
     fn start_goal_turn(&mut self, prompt: String) {
-        self.say(Event::Continued(prompt.clone()));
+        let id = goal::turn_id();
+        self.say(Event::Continued {
+            prompt: prompt.clone(),
+            turn: id.clone(),
+        });
         let mark = omc_agent::Mark {
-            id: goal::turn_id(),
+            id,
             text: prompt.clone(),
             files: Vec::new(),
         };
@@ -1058,6 +1183,7 @@ impl Session {
         self.shared.questions.decline_all();
         if let Some((_, task)) = self.running.take() {
             task.abort();
+            self.keep_after();
             self.forget_turn();
             self.pause_goal(goal::STOPPED);
             self.say(Event::Halted);
@@ -1073,6 +1199,7 @@ impl Session {
         self.shared.debuggers.stop_all();
         if let Some((_, task)) = self.running.take() {
             task.abort();
+            self.keep_after();
             self.forget_turn();
         }
     }
@@ -1176,6 +1303,13 @@ impl Session {
             MEMORY => match value {
                 ON | OFF => {
                     self.shared.set_memory(value == ON);
+                    true
+                }
+                _ => false,
+            },
+            SNAPSHOTS => match value {
+                ON | OFF => {
+                    self.shared.set_snapshots(value == ON);
                     true
                 }
                 _ => false,
@@ -1798,6 +1932,9 @@ mod tests {
             ended,
             trust_tickets: 0,
             idle: None,
+            snapshots: None,
+            turn_id: None,
+            put_back: None,
         };
         session.rescan();
         assert!(events.try_recv().is_err());
@@ -1844,6 +1981,9 @@ mod tests {
             ended,
             trust_tickets: 0,
             idle: None,
+            snapshots: None,
+            turn_id: None,
+            put_back: None,
         };
         session
             .shared
@@ -1949,6 +2089,9 @@ mod tests {
             ended,
             trust_tickets: 0,
             idle: None,
+            snapshots: None,
+            turn_id: None,
+            put_back: None,
         };
         session
             .handle(omc_wire::decode(&line(&directory)).unwrap())
@@ -2416,6 +2559,9 @@ mod tests {
             ended,
             trust_tickets: 0,
             idle: None,
+            snapshots: None,
+            turn_id: None,
+            put_back: None,
         };
         let chosen = session.languages_for(Path::new("/w"), true, false).unwrap();
         assert!(Arc::ptr_eq(&chosen, &given));
@@ -2432,6 +2578,9 @@ mod tests {
             ended,
             trust_tickets: 0,
             idle: None,
+            snapshots: None,
+            turn_id: None,
+            put_back: None,
         };
         let client: Arc<dyn LanguageService> = session.shared.client_languages.clone();
         let chosen = session.languages_for(Path::new("/w"), true, false).unwrap();
@@ -2627,6 +2776,9 @@ mod tests {
             ended,
             trust_tickets: 0,
             idle: None,
+            snapshots: None,
+            turn_id: None,
+            put_back: None,
         };
         let task = tokio::spawn(std::future::pending::<()>());
         session.running = Some((1, task.abort_handle()));
@@ -2652,6 +2804,9 @@ mod tests {
             ended,
             trust_tickets: 0,
             idle: None,
+            snapshots: None,
+            turn_id: None,
+            put_back: None,
         }
     }
 
@@ -2720,6 +2875,9 @@ mod tests {
             ended,
             trust_tickets: 0,
             idle: None,
+            snapshots: None,
+            turn_id: None,
+            put_back: None,
         };
         let task = tokio::spawn(std::future::pending::<()>());
         session.running = Some((1, task.abort_handle()));
@@ -2829,7 +2987,7 @@ mod tests {
         std::iter::from_fn(|| events.try_recv().ok())
             .filter_map(|event| match event {
                 Event::Goal(goal) => Some((format!("{:?}", goal.state), goal.note)),
-                Event::Continued(_) => Some(("continued".to_owned(), None)),
+                Event::Continued { .. } => Some(("continued".to_owned(), None)),
                 Event::Failed(reason) if reason.starts_with("/goal") => {
                     Some(("failed".to_owned(), Some(reason)))
                 }
@@ -3200,5 +3358,119 @@ mod tests {
         unsaved.shared = Shared::new(out);
         unsaved.handle(Command::Switch { branch: "1".into() }).await;
         assert!(matches!(told.try_recv(), Ok(Event::Failed(_))));
+    }
+
+    /// The events sent so far that tell of files: what a turn changed, as its openness and paths, files put back or undone, as their paths, and failures.
+    fn file_events(events: &mut UnboundedReceiver<Event>) -> Vec<String> {
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            match event {
+                Event::Changes { open, files, .. } => {
+                    let paths: Vec<String> = files.into_iter().map(|file| file.path).collect();
+                    seen.push(format!("changes open={open} {}", paths.join(",")));
+                }
+                Event::Restored { files, .. } => seen.push(format!("restored {}", files.join(","))),
+                Event::Undone { files, .. } => seen.push(format!("undone {}", files.join(","))),
+                Event::Failed(_) => seen.push("failed".to_owned()),
+                _ => {}
+            }
+        }
+        seen
+    }
+
+    /// A turn's files are kept when it starts and when it is stopped: what it changed is told while it runs and after, undoing and restoring are refused while it runs and done once it ended, the model is told with the next prompt, and turning the setting off keeps nothing.
+    #[tokio::test]
+    async fn a_turn_keeps_its_files_and_the_client_shows_undoes_and_restores_them() {
+        let name = "turn-files";
+        let (mut session, mut events) = busy_session(name);
+        let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session")
+            .join(name);
+        repository(&directory);
+        std::fs::write(directory.join("a.txt"), "one\n").unwrap();
+        session.snapshots = Some(Snapshots::new(&directory, None, None));
+        let mark = omc_agent::Mark {
+            id: "t-1".to_owned(),
+            text: "change it".to_owned(),
+            files: Vec::new(),
+        };
+        let job = session.keep_before(Job::Prompt("change it".to_owned(), Vec::new()), Some(&mark));
+        assert!(matches!(&job, Job::Prompt(told, _) if told == "change it"));
+        assert_eq!(session.turn_id.as_deref(), Some("t-1"));
+        std::fs::write(directory.join("a.txt"), "two\n").unwrap();
+        std::fs::write(directory.join("b.txt"), "new\n").unwrap();
+
+        session
+            .handle(Command::Changes { turn: "t-1".into() })
+            .await;
+        session
+            .handle(Command::Undo {
+                turn: "t-1".into(),
+                paths: Vec::new(),
+            })
+            .await;
+        session
+            .handle(Command::Restore { turn: "t-1".into() })
+            .await;
+        assert_eq!(
+            file_events(&mut events),
+            ["changes open=true a.txt,b.txt", "failed", "failed"]
+        );
+
+        session.cancel();
+        assert_eq!(session.turn_id, None);
+        session
+            .handle(Command::Changes { turn: "t-1".into() })
+            .await;
+        session
+            .handle(Command::Changes { turn: "t-9".into() })
+            .await;
+        session
+            .handle(Command::Undo {
+                turn: "t-1".into(),
+                paths: vec!["b.txt".into()],
+            })
+            .await;
+        assert_eq!(
+            file_events(&mut events),
+            ["changes open=false a.txt,b.txt", "failed", "undone b.txt"]
+        );
+        assert!(!directory.join("b.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(directory.join("a.txt")).unwrap(),
+            "two\n"
+        );
+        let told = session.keep_before(Job::Prompt("next".to_owned(), Vec::new()), None);
+        assert!(
+            matches!(&told, Job::Prompt(told, _) if told.contains("b.txt") && told.ends_with("next"))
+        );
+        assert_eq!(session.turn_id, None);
+
+        session
+            .handle(Command::Restore { turn: "t-1".into() })
+            .await;
+        assert_eq!(file_events(&mut events), ["restored a.txt"]);
+        assert_eq!(
+            std::fs::read_to_string(directory.join("a.txt")).unwrap(),
+            "one\n"
+        );
+
+        session
+            .handle(Command::Set {
+                setting: "snapshots".into(),
+                value: "off".into(),
+            })
+            .await;
+        let mark = omc_agent::Mark {
+            id: "t-2".to_owned(),
+            text: String::new(),
+            files: Vec::new(),
+        };
+        session.keep_before(Job::Prompt(String::new(), Vec::new()), Some(&mark));
+        assert_eq!(session.turn_id, None);
+        session
+            .handle(Command::Changes { turn: "t-2".into() })
+            .await;
+        assert_eq!(file_events(&mut events), ["failed"]);
     }
 }

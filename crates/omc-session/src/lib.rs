@@ -25,6 +25,7 @@ mod serve;
 mod session;
 mod settings;
 mod shared;
+mod snapshots;
 mod toolset;
 mod translate;
 mod turn;
