@@ -299,7 +299,9 @@ In a git repository, with the `snapshots` setting on, crab keeps the files of
 the folder it works in before every turn that has an id and again when the
 turn ends, however it ends. Every file the repository does not ignore is kept,
 tracked or not, so what a shell command, a formatter or a generator wrote is
-kept along with the agent's own edits. Neither the branch, the head nor the
+kept along with the agent's own edits, byte for byte: the reader's
+`core.autocrlf` is not applied, so putting files back never changes their line
+endings. Neither the branch, the head nor the
 index changes: the files are written as commits no branch holds, under
 `refs/worktree/oh-my-crab/<conversation>/before/<turn>` and
 `.../after/<turn>`, with every byte of an id that is not a letter, a digit or

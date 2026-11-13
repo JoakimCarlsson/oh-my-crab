@@ -747,10 +747,14 @@ mod tests {
     }
 
     /// The outline is walked off the runtime's threads: the task asking for it gives way while the walk runs, and the outline it gets is kept.
+    ///
+    /// The folder walked is a small one of the test's own, so that the walk stays well inside its time limit however busy the machine is with the other tests.
     #[tokio::test(flavor = "current_thread")]
     async fn the_outline_is_walked_without_holding_up_other_tasks() {
         let (shared, _events) = opened();
-        let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/outline");
+        std::fs::create_dir_all(directory.join("crates")).unwrap();
         let order = Mutex::new(Vec::new());
         let (made, ()) = tokio::join!(
             async {

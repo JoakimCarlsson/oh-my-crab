@@ -24,6 +24,9 @@ const IDENTITY: [&str; 4] = [
     "user.email=oh-my-crab@localhost",
 ];
 
+/// The settings every git command here runs with, so that files are kept and put back byte for byte, whatever the reader's settings say about line endings.
+const AS_ON_DISK: [&str; 4] = ["-c", "core.autocrlf=false", "-c", "core.safecrlf=false"];
+
 /// The most lines of one file's diff that are sent.
 const DIFF_LINES: usize = 2000;
 
@@ -312,6 +315,7 @@ fn git_indexed(
 ) -> Result<String, String> {
     let mut command = Command::new("git");
     command
+        .args(AS_ON_DISK)
         .args(arguments)
         .current_dir(directory)
         .stdin(Stdio::null());
