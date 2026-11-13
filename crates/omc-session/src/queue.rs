@@ -98,8 +98,11 @@ impl Queue {
 }
 
 impl omc_agent::Steering for Shared {
-    /// Takes the prompt that has waited longest for the running turn, with its images, saves what the client said about it as the turn that starts at message `at`, and tells the client it was put in.
+    /// Takes the message that tells the agent the goal's budget is used up, the first time it is due; otherwise the prompt that has waited longest for the running turn, with its images, saves what the client said about it as the turn that starts at message `at`, and tells the client it was put in.
     fn next(&self, at: usize) -> Option<(String, Vec<omc_providers::Image>)> {
+        if let Some(wrap_up) = self.goals.take_wrap_up() {
+            return Some((wrap_up, Vec::new()));
+        }
         let waiting = self.queue.pop()?;
         if let (Some(journal), Some(mark)) = (self.journal(), waiting.mark())
             && let Err(error) = journal.mark(at, &mark)

@@ -35,6 +35,7 @@ pub const WITHHELD: &[&str] = &[
     "rewind",
     "wait",
     "set_title",
+    "goal",
     "submit_result",
     "recall",
     "skill",

@@ -292,6 +292,14 @@ plan mode refuses calls instead, and `skill` and `recall` are listed from the
 first turn even before they have anything to do. See
 [prompt cache](long-conversations.md#prompt-cache).
 
+## Goals
+
+A reader who sends `/goal <objective>` sets a goal: crab starts each next turn
+itself, opening every turn with a reminder of the objective, until the agent
+ends it with the `goal` tool, two turns in a row make no progress, its token
+budget runs out, or the reader pauses it or stops a turn. See
+[goals](goals.md).
+
 ## Context management
 
 When a conversation nears the model's context window, `crab` first leaves old

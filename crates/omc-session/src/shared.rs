@@ -95,6 +95,8 @@ pub(crate) struct Shared {
     tree: Mutex<Option<Arc<str>>>,
     /// What keeps the prompt cache warm.
     pub(crate) warmer: Arc<Warmer>,
+    /// The goal the agent works toward across turns, when the reader set one.
+    pub(crate) goals: crate::goal::Goals,
     /// The date turns tell the agent instead of today's, in tests.
     #[cfg(test)]
     pub(crate) today: Mutex<Option<String>>,
@@ -169,6 +171,7 @@ impl Shared {
             prefix: Mutex::new(None),
             tree: Mutex::new(None),
             warmer: Arc::new(Warmer::default()),
+            goals: crate::goal::Goals::default(),
             #[cfg(test)]
             today: Mutex::new(None),
         })
@@ -284,6 +287,16 @@ impl Shared {
         drop(naming);
         self.say(Event::Titled(title.to_owned()));
         true
+    }
+
+    /// Tells the client how the goal `goal` stands and saves it with the conversation; a cleared goal is saved as none.
+    pub(crate) fn announce_goal(&self, goal: &omc_wire::Goal) {
+        let saved = match goal.state {
+            omc_wire::GoalState::Cleared => serde_json::Value::Null,
+            _ => serde_json::to_value(goal).unwrap_or_default(),
+        };
+        self.save_fact(crate::goal::GOAL_FACT, &saved);
+        self.say(Event::Goal(goal.clone()));
     }
 
     /// Saves `value` under `key` with the conversation, when it is saved; the harness's own record of what it last found out, such as what can be set.

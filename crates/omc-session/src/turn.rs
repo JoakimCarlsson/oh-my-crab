@@ -12,6 +12,7 @@ use omc_providers::{ChatModel, Effort, Message, RemoteModel};
 use omc_providers::{Provider, ProviderError, Reply, Request, Sink};
 use omc_tools::{Deferral, Host, Registry};
 
+use crate::goal::{GoalTool, Metered};
 use crate::lifecycle::{context_of, start_notice};
 use crate::picker::SessionPicker;
 use crate::prefix::{Key, Planning, Prefix};
@@ -229,6 +230,17 @@ impl Turn {
         planner: Option<Planner>,
         job: Job,
     ) -> Ended {
+        let model: Arc<dyn ChatModel> = Arc::new(Metered {
+            inner: model,
+            shared: self.shared.clone(),
+        });
+        let planner = planner.map(|planner| Planner {
+            model: Arc::new(Metered {
+                inner: planner.model,
+                shared: self.shared.clone(),
+            }),
+            ..planner
+        });
         let window = omc_providers::context_window(self.provider, &self.model);
         let window = planner.as_ref().map_or(window, |planner| {
             window.min(omc_providers::context_window(planner.provider, &planner.id))
@@ -317,6 +329,9 @@ impl Turn {
             memories: memories.clone(),
             hooks: checks.clone(),
             approved_plan,
+            goal: Arc::new(GoalTool {
+                shared: self.shared.clone(),
+            }),
         });
         let key = Key {
             provider: self.provider,
@@ -399,6 +414,7 @@ impl Turn {
                 }
                 told.extend(added);
                 told.extend(extended);
+                told.extend(self.shared.goals.reminder());
                 told.push(prompt);
                 let steering: Option<&dyn omc_agent::Steering> = if self
                     .hooks

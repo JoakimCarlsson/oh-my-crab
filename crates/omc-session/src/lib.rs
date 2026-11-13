@@ -7,6 +7,7 @@
 
 mod bridge;
 mod edits;
+mod goal;
 mod hooks;
 mod languages;
 mod lifecycle;

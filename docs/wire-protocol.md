@@ -392,7 +392,7 @@ running.
 
 | Field     | Type           | Presence | Meaning                                                                                                     |
 | --------- | -------------- | -------- | ----------------------------------------------------------------------------------------------------------- |
-| `text`    | string         | required | What the reader wrote. `/compact` and `/<skill>` are understood here.                                       |
+| `text`    | string         | required | What the reader wrote. `/compact`, `/goal`, `/guided-goal` and `/<skill>` are understood here.              |
 | `files`   | list of path   | required | Files attached, by path.                                                                                    |
 | `turn`    | string         | optional | The id the client knows the turn by; saved with the turn so the client can go back to before it.            |
 | `context` | string         | optional | Words the model is told before the reader's, which are not saved as what the reader wrote.                  |
@@ -404,6 +404,24 @@ running.
 `/compact`, optionally followed by what the summary should keep, compacts the
 conversation instead of starting a normal turn; it takes no files and is
 refused while a turn runs.
+
+`/goal` sets, shows and changes the conversation's goal; see
+[goals](goals.md). `/goal <objective>` sets one, with an optional budget
+first (`/goal 500k <objective>`); `/goal` alone shows it; `/goal pause`,
+`/goal resume` and `/goal clear` change how it stands; `/goal budget <N|off>`
+changes its budget. Each sends a `Goal` event when the goal changed or is
+shown. Setting and resuming start a turn toward the goal, under the `turn` id
+sent, which ends with `Finished` as any turn does. The others start no turn:
+sent between turns, they are answered as a short turn of their own, a `Said`
+with a few words on the goal, or on why the command cannot be done, then
+`Finished` (`null`, or the reason when it cannot be done), so that every
+prompt sent between turns ends with `Finished`; sent while a turn runs, they
+are carried out at once, with no `Finished`, and one that cannot be done is
+answered with `Failed`. Setting and resuming are refused while a turn runs.
+
+`/guided-goal`, optionally followed by an idea, starts a turn under the `turn`
+id sent in which the agent asks the reader what the goal should be and then
+sets it, which sends a `Goal` event; it is refused while a turn runs.
 
 ### `Choose`
 
@@ -1302,6 +1320,37 @@ From a real run:
 
 ```json
 {"Trust":{"ticket":1,"root":"/home/me/project","standing":"Unknown","skipped":[{"kind":"Hook","name":"PreToolUse bash: ./guard.sh","path":"/home/me/project/.claude/settings.json"},{"kind":"Instruction","name":"/home/me/project/AGENTS.md","path":"/home/me/project/AGENTS.md"}]}}
+```
+
+### `Goal`
+
+The conversation's goal was set, or how it stands changed. Sent when it is
+set, paused, resumed, cleared, given a new budget, completed or runs out of
+budget, and when a saved conversation that has one opens. See
+[goals](goals.md). Carries a `Goal`:
+
+| Field       | Type        | Presence | Meaning                                                                                       |
+| ----------- | ----------- | -------- | --------------------------------------------------------------------------------------------- |
+| `objective` | string      | required | What the agent works toward.                                                                  |
+| `state`     | `GoalState` | required | `Active`, `Paused`, `BudgetLimited`, `Complete` or `Cleared`.                                 |
+| `budget`    | integer     | optional | The most tokens the goal may use.                                                             |
+| `used`      | integer     | default  | Tokens used toward it: input, output and cache writes of every request while it was active, subagents included. |
+| `note`      | string      | optional | Why it stands as it does: why it paused, or the agent's summary when it completed.             |
+
+```json
+{"Goal":{"objective":"Make every test in the workspace pass","state":"Active","budget":2000000,"used":0,"note":null}}
+{"Goal":{"objective":"Make every test in the workspace pass","state":"Paused","budget":2000000,"used":412000,"note":"two turns in a row made the same tool calls with the same results"}}
+```
+
+### `Continued`
+
+Crab started a turn of its own toward the active goal, with this prompt, since
+the last turn ended with the goal still open. The turn's events follow as for a
+prompt the reader sent, and it ends with `Finished`. The prompt is saved as the
+turn's prompt, so a replayed history shows it as a turn the reader sent.
+
+```json
+{"Continued":"Keep working toward the goal. ..."}
 ```
 
 ## Types the subcommands print and read

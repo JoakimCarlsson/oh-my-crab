@@ -62,6 +62,8 @@ pub(crate) struct Inputs<'a> {
     pub(crate) hooks: Option<Arc<dyn Hooks>>,
     /// The plan being carried out, which subagents are told of.
     pub(crate) approved_plan: Arc<PlanSource>,
+    /// The tool the agent reads and ends the conversation's goal with; the main agent's alone.
+    pub(crate) goal: Arc<dyn omc_tools::Tool>,
 }
 
 /// The tools of a turn in each mode.
@@ -122,6 +124,7 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
     registry.register(ContextNotes::new(inputs.notebook.clone()));
     registry.register(NewContext::new(inputs.notebook.clone()));
     registry.register(Wait::new(inputs.jobs.clone()));
+    registry.register_shared(inputs.goal.clone());
     if inputs.unnamed {
         registry.register(SetTitle::new(inputs.host.clone()));
     }
@@ -309,6 +312,9 @@ mod tests {
             memories,
             hooks: None,
             approved_plan: Arc::new(|| None),
+            goal: Arc::new(crate::goal::GoalTool {
+                shared: shared.clone(),
+            }),
         })
     }
 
@@ -388,6 +394,7 @@ mod tests {
                 "context_notes",
                 "exit_plan_mode",
                 "glob",
+                "goal",
                 "grep",
                 "lsp",
                 "new_context",
@@ -410,6 +417,7 @@ mod tests {
                 "context_notes",
                 "edit",
                 "glob",
+                "goal",
                 "grep",
                 "lsp",
                 "new_context",

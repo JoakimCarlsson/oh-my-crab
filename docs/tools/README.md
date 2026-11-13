@@ -113,6 +113,7 @@ None of the three exists with the `memory` setting off or `OMC_MEMORY=0`.
 | `ask`            | Asks the reader a form of questions and waits for the answers                                 | no   | yes  | [`Inquire`](../wire-protocol.md#inquire) |
 | `todo`           | Keeps the todo list the reader sees, sent to the client as `Plan`                              | no   | yes  | [troubleshooting](../troubleshooting.md) |
 | `set_title`      | *Sometimes.* Names the conversation; given only while it has no name                          | no   | yes  | [history](../concepts.md#history-saved-and-reopened-by-id) |
+| `goal`           | Reads the goal, sets the one worked out after `/guided-goal`, or ends it as achieved; nothing else ends goal mode | no   | yes  | [goals](../goals.md) |
 | `exit_plan_mode` | Hands the plan to the reader for approval and ends plan mode when approved, in the same context or a fresh one; saves every plan; refused outside it | no   | only | [plans](../concepts.md#plans) |
 | `skill`          | Loads a skill's instructions; listed even when there are no skills                             | no   | yes  | [skills](../extending/skills-and-agents.md#skills) |
 | `load_tools`     | *Sometimes.* Hands over the description and parameters of hidden tools so they can be called   | no   | yes  | [hidden tools](#hidden-tools) |
@@ -184,7 +185,7 @@ A client can deny any tool by name in `Open`; a denied tool is given to no
 one, subagents and scripts included.
 
 **Subagents** never get `exit_plan_mode`, `ask`, `todo`, `context_notes`,
-`new_context`, `checkpoint`, `rewind`, `wait`, `debug`, `set_title`,
+`new_context`, `checkpoint`, `rewind`, `wait`, `debug`, `set_title`, `goal`,
 `remember` or `memory_edit`: the tools that talk to the reader, steer the
 conversation, change memory, or hold state that belongs to the conversation.
 They get a `task` tool of their own, which cannot start background runs, only
@@ -196,6 +197,6 @@ mode it is the copy that refuses changes other than dry runs.
 
 **Scripts** never get `script` itself, `task`, `ask`, `exit_plan_mode`,
 `todo`, `context_notes`, `new_context`, `checkpoint`, `rewind`, `wait`,
-`set_title`, `submit_result`, `recall`, `skill`, `remember`,
+`set_title`, `goal`, `submit_result`, `recall`, `skill`, `remember`,
 `memory_edit` or `load_tools`. A subagent's script calls only that subagent's tools. See
 [scripts](script.md).

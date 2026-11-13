@@ -84,6 +84,9 @@ pub fn tools() -> Result<Vec<ToolInfo>, String> {
             .map(Arc::new),
         hooks: None,
         approved_plan: Arc::new(|| None),
+        goal: Arc::new(crate::goal::GoalTool {
+            shared: shared.clone(),
+        }),
     });
     let mut listed: Vec<ToolInfo> = Vec::new();
     for plan in [false, true] {
@@ -129,6 +132,7 @@ mod tests {
                 "edit",
                 "exit_plan_mode",
                 "glob",
+                "goal",
                 "grep",
                 "lsp",
                 "new_context",

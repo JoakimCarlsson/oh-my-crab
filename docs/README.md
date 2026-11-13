@@ -33,6 +33,8 @@
 - [Long conversations](long-conversations.md): pruning, compaction, recall and
   the prompt cache.
 - [Memory](memory.md).
+- [Goals](goals.md): `/goal`, which keeps the agent working across turns until
+  an objective is done.
 
 ## Extending
 

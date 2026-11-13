@@ -1,6 +1,7 @@
 //! What the harness tells its client, in the order it happened.
 
 use crate::branch::Branch;
+use crate::goal::Goal;
 use crate::inquiry::Inquiry;
 use crate::language::LanguageRequest;
 use crate::permission::Permission;
@@ -115,6 +116,10 @@ pub enum Event {
     Queued(Queued),
     /// The harness left out what the project folder brings, its hooks, instruction files, skills and agent definitions, or some of them, until the reader trusts it, and waits for a [`crate::Command::Trust`] answer; sent when the conversation opens and again when what was left out changes.
     Trust(TrustRequest),
+    /// The conversation's goal was set, or how it stands changed; sent when the conversation opens too, when it has one.
+    Goal(Goal),
+    /// The harness started a turn of its own toward the goal, with this prompt, since the last turn ended with the goal open; the turn's events follow as for a prompt the reader sent.
+    Continued(String),
 }
 
 /// The kind of a block of the agent's reply.

@@ -19,6 +19,7 @@ use omc_wire::{Command, Event, Opening, QueueState, Slash};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::AbortHandle;
 
+use crate::goal;
 use crate::lifecycle::IDLE_AFTER;
 use crate::permissions::{self, FileKeeper, PermissionsFile};
 use crate::prompt::compose;
@@ -229,6 +230,9 @@ impl Session {
                         files: Vec::new(),
                     });
                     return self.start(Job::Compact(focus), mark);
+                }
+                if let Some(asked) = goal::request(&text) {
+                    return self.goal(asked, &files, turn, text);
                 }
                 let names: Vec<String> = files
                     .iter()
@@ -468,6 +472,14 @@ impl Session {
         self.shared.announce();
         self.shared.save_fact("commands", &commands_value);
         self.say(Event::Commands(commands));
+        let saved = self
+            .journal
+            .as_ref()
+            .and_then(|journal| journal.fact(goal::GOAL_FACT))
+            .and_then(|value| serde_json::from_value(value).ok());
+        if let Some(goal) = self.shared.goals.restore(saved) {
+            self.shared.announce_goal(&goal);
+        }
         if self.journal.is_some() {
             if let Some(title) = self.shared.title() {
                 self.say(Event::Titled(title));
@@ -713,6 +725,7 @@ impl Session {
             return;
         };
         let told = expand_skill(&told, &open.discovered.skills);
+        self.shared.goals.reader_spoke();
         if self.running.is_some() {
             let waiting = self.shared.queue.push(told, images, turn, text, files);
             return self.say(waiting);
@@ -843,11 +856,16 @@ impl Session {
         self.running = None;
         match how {
             Ended::Done(history) => {
+                let progress = goal::digest(goal::added(self.history.len(), &history));
                 self.history = history;
                 self.say(Event::Finished(None));
                 self.follow_up();
+                if self.running.is_none() {
+                    self.pursue(progress);
+                }
             }
             Ended::SignedOut(reason) => {
+                self.pause_goal(&reason);
                 self.shared.warmer.stop();
                 self.say(Event::SignedOut {
                     reason,
@@ -856,6 +874,7 @@ impl Session {
                 self.drop_queue();
             }
             Ended::Failed(reason) => {
+                self.pause_goal(&format!("the turn failed: {reason}"));
                 self.shared.warmer.stop();
                 self.shared.checkpoint.clear();
                 self.keep_fresh_window();
@@ -866,6 +885,129 @@ impl Session {
         if self.running.is_none() {
             self.wait_idle();
         }
+    }
+
+    /// Pauses the goal for `note` when crab works toward it, and tells the client.
+    fn pause_goal(&self, note: &str) {
+        if let Some(goal) = self.shared.goals.pause(note) {
+            self.shared.announce_goal(&goal);
+        }
+    }
+
+    /// Goes on toward the goal after a turn that ended with nothing waiting, whose tool calls and results came to `progress`: starts the next turn when the goal says so, telling the client its prompt, or tells the client the goal stopped.
+    fn pursue(&mut self, progress: Option<u64>) {
+        match self.shared.goals.after_turn(progress) {
+            goal::Next::Rest => {}
+            goal::Next::Halt(goal) => self.shared.announce_goal(&goal),
+            goal::Next::Continue(prompt) => self.start_goal_turn(prompt),
+        }
+    }
+
+    /// Starts a turn of crab's own with `prompt`, saved as the turn's prompt under an id of its own, and tells the client; the goal pauses when the turn cannot start.
+    fn start_goal_turn(&mut self, prompt: String) {
+        self.say(Event::Continued(prompt.clone()));
+        let mark = omc_agent::Mark {
+            id: goal::turn_id(),
+            text: prompt.clone(),
+            files: Vec::new(),
+        };
+        self.start(Job::Prompt(prompt, Vec::new()), Some(mark));
+        if self.running.is_none() {
+            self.pause_goal("the turn toward it could not start");
+        }
+    }
+
+    /// Carries out the `/goal` command the client sent as `text` under the turn id `turn` with `files`, which `asked` reads as: shows, sets, pauses, resumes, clears or gives a budget to the goal, telling the client how it stands with a `Goal` event, and starts a turn toward it, under the reader's turn id, when it was set or resumed.
+    ///
+    /// A command that starts no turn is answered as a turn of its own when none runs: a few words on the goal, or why the command cannot be done, then `Finished`, so that every prompt sent between turns ends with `Finished`. While a turn runs it is answered with the `Goal` event alone, or a `Failed` event when it cannot be done; setting and resuming are refused then.
+    fn goal(
+        &mut self,
+        asked: Result<goal::Asked, String>,
+        files: &[PathBuf],
+        turn: Option<String>,
+        text: String,
+    ) {
+        let asked = match asked {
+            Ok(asked) => asked,
+            Err(reason) => return self.answer_goal(Err(reason)),
+        };
+        if !files.is_empty() {
+            return self.answer_goal(Err(
+                "/goal takes no files; send them with a prompt instead".to_owned()
+            ));
+        }
+        let setting = matches!(asked, goal::Asked::Set(..));
+        let starts = setting || matches!(asked, goal::Asked::Resume | goal::Asked::Guide(_));
+        if self.running.is_some() && starts {
+            return self.answer_goal(Err(
+                "/goal cannot set or resume the goal, and /guided-goal cannot start, while a turn is running; send it again when the turn has finished".to_owned(),
+            ));
+        }
+        if self.open.is_none() {
+            return self.say(Event::Failed("the conversation is not open".to_owned()));
+        }
+        if let goal::Asked::Guide(idea) = &asked {
+            if let Some(paused) = self.shared.goals.begin_interview() {
+                self.shared.announce_goal(&paused);
+            }
+            let mark = turn.map(|id| omc_agent::Mark {
+                id,
+                text,
+                files: Vec::new(),
+            });
+            return self.start(Job::Prompt(goal::interview(idea), Vec::new()), mark);
+        }
+        let goals = &self.shared.goals;
+        let outcome = match asked {
+            goal::Asked::Guide(_) => return,
+            goal::Asked::Show => goals.current().ok_or_else(|| "no goal is set".to_owned()),
+            goal::Asked::Set(objective, budget) => Ok(goals.set(&objective, budget)),
+            goal::Asked::Pause => goals
+                .pause("paused by the reader")
+                .ok_or_else(|| "the goal is not active".to_owned()),
+            goal::Asked::Resume => goals.resume(),
+            goal::Asked::Clear => goals.clear().ok_or_else(|| "no goal is set".to_owned()),
+            goal::Asked::Budget(budget) => goals.rebudget(budget),
+        };
+        let goal = match outcome {
+            Ok(goal) => goal,
+            Err(reason) => return self.answer_goal(Err(reason)),
+        };
+        self.shared.announce_goal(&goal);
+        if !starts {
+            return self.answer_goal(Ok(goal::described(&goal)));
+        }
+        let prompt = if setting {
+            goal::opening(&goal.objective)
+        } else {
+            goal::continuation(&goal)
+        };
+        let mark = turn.map(|id| omc_agent::Mark {
+            id,
+            text,
+            files: Vec::new(),
+        });
+        self.start(Job::Prompt(prompt, Vec::new()), mark);
+        if self.running.is_none() {
+            self.pause_goal("the turn toward it could not start");
+        }
+    }
+
+    /// Answers a `/goal` command that starts no turn with `outcome`, a few words on the goal or why the command cannot be done: as a short turn of its own ending with `Finished` when no turn runs, and otherwise with a `Failed` event for a failure and nothing more for a success, whose `Goal` event was already sent.
+    fn answer_goal(&self, outcome: Result<String, String>) {
+        if self.running.is_some() {
+            if let Err(reason) = outcome {
+                self.say(Event::Failed(format!("/goal: {reason}")));
+            }
+            return;
+        }
+        let (said, failure) = match outcome {
+            Ok(said) => (said, None),
+            Err(reason) => (format!("/goal: {reason}"), Some(format!("/goal: {reason}"))),
+        };
+        self.say(Event::Started(omc_wire::Part::Text));
+        self.say(Event::Said(said));
+        self.say(Event::Finished(failure));
     }
 
     /// Starts the wait after which the `Notification` hooks are told crab is idle, in place of any wait already running; they are told only when no command comes within [`IDLE_AFTER`].
@@ -917,6 +1059,7 @@ impl Session {
         if let Some((_, task)) = self.running.take() {
             task.abort();
             self.forget_turn();
+            self.pause_goal(goal::STOPPED);
             self.say(Event::Halted);
             self.say(Event::Finished(None));
         }
@@ -1532,7 +1675,16 @@ fn commands_of(discovered: &Discovered) -> Vec<Slash> {
         name: COMPACT_COMMAND.to_owned(),
         description: "Summarize the older part of the conversation to free up context; text after the command says what the summary should keep in particular".to_owned(),
     };
-    std::iter::once(compact)
+    let goal = Slash {
+        name: goal::GOAL_COMMAND.to_owned(),
+        description: "Work toward an objective across turns until it is done: /goal [budget such as 500k] <objective>; /goal alone shows it; /goal pause, resume or clear; /goal budget <tokens|off>".to_owned(),
+    };
+    let guided = Slash {
+        name: goal::GUIDED_COMMAND.to_owned(),
+        description: "Work out a goal with the agent first: it asks what done means, how to check it and where to stop, then sets the goal and starts on it".to_owned(),
+    };
+    [compact, goal, guided]
+        .into_iter()
         .chain(discovered.skills.iter().map(|skill| Slash {
             name: skill.name.clone(),
             description: skill.description.clone(),
@@ -1655,7 +1807,15 @@ mod tests {
             panic!("the new skill was not announced");
         };
         let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, vec![COMPACT_COMMAND, "fresh"]);
+        assert_eq!(
+            names,
+            vec![
+                COMPACT_COMMAND,
+                goal::GOAL_COMMAND,
+                goal::GUIDED_COMMAND,
+                "fresh"
+            ]
+        );
         let open = session.open.as_ref().unwrap();
         assert!(open.base.get("skill").is_some());
         session.rescan();
@@ -2661,6 +2821,99 @@ mod tests {
             vec![(2, "b".into(), QueueState::Dropped)]
         );
         assert!(session.running.is_none());
+        session.stop();
+    }
+
+    /// The goal and continuation events sent so far: each goal's state and note, and each prompt crab started a turn with, as `continued`.
+    fn goal_events(events: &mut UnboundedReceiver<Event>) -> Vec<(String, Option<String>)> {
+        std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                Event::Goal(goal) => Some((format!("{:?}", goal.state), goal.note)),
+                Event::Continued(_) => Some(("continued".to_owned(), None)),
+                Event::Failed(reason) if reason.starts_with("/goal") => {
+                    Some(("failed".to_owned(), Some(reason)))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `history` with a turn that ran `cargo test` and was told `output` after it.
+    fn tested(history: &[Message], output: &str) -> Vec<Message> {
+        let mut history = history.to_vec();
+        history.push(Message::Assistant(omc_providers::Reply {
+            tool_calls: vec![omc_providers::ToolCall {
+                id: "c".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({ "command": "cargo test" }),
+            }],
+            ..omc_providers::Reply::default()
+        }));
+        history.push(Message::ToolResults(vec![omc_providers::ToolResult {
+            call_id: "c".into(),
+            name: "bash".into(),
+            text: output.into(),
+            is_error: false,
+            images: Vec::new(),
+        }]));
+        history
+    }
+
+    /// Setting a goal is refused while a turn runs and starts a turn once none does; crab then starts a turn of its own after each one, until two of its turns in a row run the same calls with the same results, which pauses the goal; stopping a turn pauses it too.
+    #[tokio::test]
+    async fn a_goal_goes_on_until_its_turns_make_no_progress() {
+        let (mut session, mut events) = busy_session("goal-loop");
+        session.handle(prompt("/goal make it pass", "g")).await;
+        assert_eq!(goal_events(&mut events)[0].0, "failed");
+        session.finish(1, Ended::Done(Vec::new()));
+        let _ = goal_events(&mut events);
+
+        session.handle(prompt("/goal 500k make it pass", "g")).await;
+        assert_eq!(goal_events(&mut events), vec![("Active".into(), None)]);
+        assert_eq!(session.running.as_ref().map(|(number, _)| *number), Some(2));
+
+        let first = tested(&[], "1 failed");
+        session.finish(2, Ended::Done(first.clone()));
+        assert_eq!(goal_events(&mut events), vec![("continued".into(), None)]);
+        let second = tested(&first, "1 failed");
+        session.finish(3, Ended::Done(second.clone()));
+        assert_eq!(goal_events(&mut events), vec![("continued".into(), None)]);
+        let third = tested(&second, "1 failed");
+        session.finish(4, Ended::Done(third));
+        assert_eq!(
+            goal_events(&mut events),
+            vec![("Paused".into(), Some(goal::NO_PROGRESS.to_owned()))]
+        );
+        assert!(session.running.is_none());
+
+        session.handle(prompt("/goal resume", "r")).await;
+        assert_eq!(goal_events(&mut events), vec![("Active".into(), None)]);
+        assert!(session.running.is_some());
+        session.cancel();
+        assert_eq!(
+            goal_events(&mut events),
+            vec![("Paused".into(), Some(goal::STOPPED.to_owned()))]
+        );
+        session.handle(prompt("/goal clear", "x")).await;
+        assert_eq!(goal_events(&mut events), vec![("Cleared".into(), None)]);
+        session
+            .handle(prompt("/guided-goal get CI green", "i"))
+            .await;
+        assert!(goal_events(&mut events).is_empty());
+        assert!(session.running.is_some());
+        session.cancel();
+        let _ = goal_events(&mut events);
+        session.handle(prompt("/goal", "s")).await;
+        let answered: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|event| matches!(event, Event::Said(_) | Event::Finished(_)))
+            .collect();
+        assert_eq!(
+            answered,
+            vec![
+                Event::Said("/goal: no goal is set".into()),
+                Event::Finished(Some("/goal: no goal is set".into()))
+            ]
+        );
         session.stop();
     }
 
