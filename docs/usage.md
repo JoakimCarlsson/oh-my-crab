@@ -2,6 +2,7 @@
 
 ```text
 crab serve                      hold a conversation over standard input and output
+crab exec [options] [prompt]    run one prompt with nobody asked and print the answer
 crab tools                      print the tools the agent can have, as a JSON list
 crab providers                  print the providers, as a JSON list of id, name and sign-in
 crab account <p> [folder]       print who provider <p> is signed in as, or nothing
@@ -28,6 +29,17 @@ one prints it as an error.
   or the end of standard input. It holds one conversation at a time; an `Open`
   for another one replaces it. [Getting started](getting-started.md) walks
   through a session.
+- **`exec`** runs one prompt, given as words or on standard input, in the
+  current folder or `--folder`, with every tool allowed and nobody asked:
+  approvals and questions are turned down, the project's hooks, instruction
+  files, skills and agents are used only with `--trust`, and the turn is
+  stopped after `--timeout` seconds. `--provider` and `--model` pick the
+  model, signed in as for `serve`, such as `OPENROUTER_API_KEY` for
+  `openrouter`. It prints what the agent said after its last tool call, or
+  with `--json` one object: `result`, `is_error`, `error`, `requests`,
+  `input_tokens` (every token sent, summed over the requests), `output_tokens`
+  and `tool_calls`. It exits 1 when the turn fails. For scripts, CI and
+  sandboxes: `crab exec --provider openrouter --model anthropic/claude-sonnet-4.5 --json "fix the failing test"`.
 - **`limits [provider] [--json] [--folder <folder>]`** asks each signed-in
   provider that meters a subscription allowance how much of it the account has
   used, or only `provider`, and prints a bar, a share and the time to the reset

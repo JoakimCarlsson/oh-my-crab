@@ -1471,6 +1471,7 @@ dependencies = [
  "omc-providers",
  "omc-session",
  "omc-wire",
+ "serde",
  "serde_json",
  "tokio",
 ]
