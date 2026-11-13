@@ -26,7 +26,8 @@ pub use discovery::{Discovered, discover};
 pub use environment::{Environment, timestamp};
 pub use frontmatter::{Parsed, parse as parse_frontmatter};
 pub use instructions::{
-    APPEND_SYSTEM_FILE, Instruction, SYSTEM_FILE, SystemFiles, native_system_files, system_files,
+    APPEND_SYSTEM_FILE, Instruction, SYSTEM_FILE, Scoped, SystemFiles, instructions_for,
+    native_system_files, path_rules, path_rules_in, system_files,
 };
 pub use invoke::{
     expand_skill, plan_abandoned, plan_approved, plan_approved_fresh, plan_fresh, plan_rejected,

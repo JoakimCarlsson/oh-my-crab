@@ -1,12 +1,14 @@
 //! Everything found on disk for a conversation.
 
-use crate::{AgentDefinition, Instruction, Locations, Skill, agents, instructions, skills};
+use crate::{AgentDefinition, Instruction, Locations, Scoped, Skill, agents, instructions, skills};
 
 /// The instruction files, skills and agent definitions found for a conversation.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Discovered {
-    /// The instruction files, the project's nearest first, then the reader's.
+    /// The instruction files that always apply, the project's nearest first, then the reader's.
     pub instructions: Vec<Instruction>,
+    /// The rules that apply only to the files their front matter names, which the agent is handed with the first matching file it touches; see [`crate::instructions_for`].
+    pub scoped: Vec<Scoped>,
     /// The skills.
     pub skills: Vec<Skill>,
     /// The agent kinds, built-in ones last.
@@ -20,8 +22,10 @@ pub struct Discovered {
 /// Finds what there is for work in `locations`, leaving out instruction and system prompt files by path, and skills and agents by name, as `disabled` lists them.
 pub fn discover(locations: &Locations, disabled: &[String]) -> Discovered {
     let (system, append_system) = instructions::system_texts(locations, disabled);
+    let found = instructions::find(locations, disabled);
     Discovered {
-        instructions: instructions::find(locations, disabled),
+        instructions: found.always,
+        scoped: found.scoped,
         skills: skills::find(locations, disabled),
         agents: agents::find(locations, disabled),
         system,

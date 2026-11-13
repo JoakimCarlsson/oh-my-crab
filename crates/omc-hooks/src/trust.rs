@@ -354,6 +354,7 @@ fn left_out(all: &Discovered, kept: &Discovered) -> Vec<Skipped> {
         found
             .instructions
             .iter()
+            .chain(found.scoped.iter().map(|rule| &rule.file))
             .chain(&found.system)
             .chain(&found.append_system)
             .map(|file| file.path.clone())

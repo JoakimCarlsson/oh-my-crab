@@ -96,7 +96,7 @@ fn fields(head: &[&str]) -> Vec<(String, String)> {
 }
 
 /// `text` without one pair of surrounding quotes.
-fn unquote(text: &str) -> String {
+pub(crate) fn unquote(text: &str) -> String {
     let text = text.trim();
     for quote in ['"', '\''] {
         if let Some(inner) = text

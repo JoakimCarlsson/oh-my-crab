@@ -18,6 +18,6 @@ MUST follow these context files for all tasks; nearer files override farther one
 {{rules}}
 </repo-rules>
 
-Context files above auto-loaded. NEVER `grep`/`glob` for `AGENTS.md`, `CLAUDE.md`, or similar agent/context files: relevant files already in context; others noise.
+Context files above auto-loaded; those of one folder or kind of file arrive in a `<path-rules>` block at the end of the first read or edit of a matching file. NEVER `grep`/`glob` for `AGENTS.md`, `CLAUDE.md`, or similar agent/context files: relevant files already in context; others noise.
 {{/if}}
 </project-context>

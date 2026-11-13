@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use ignore::{DirEntry, WalkBuilder};
 
 /// Folders never walked into or shown, whatever the ignore files say.
-const SKIPPED: &[&str] = &[
+pub(crate) const SKIPPED: &[&str] = &[
     ".git",
     ".hg",
     ".svn",

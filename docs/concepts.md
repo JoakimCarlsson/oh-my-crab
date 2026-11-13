@@ -272,7 +272,9 @@ when the model changes or the `checkpoints` or `memory` setting is turned on
 or off. The system prompt holds crab's instructions (or the user's or the
 project's `SYSTEM.md` in their place, and any `APPEND_SYSTEM.md` after them;
 see [the system prompt](extending/skills-and-agents.md#the-system-prompt)),
-the instruction files (`AGENTS.md`, `CLAUDE.md` and the like), the skills and
+the instruction files that always apply (`AGENTS.md`, `CLAUDE.md` and the
+like; those for some files only arrive with
+[the first matching file](extending/skills-and-agents.md#rules-for-some-files-only)), the skills and
 subagent kinds, the working folder, the operating system and the model, and an
 outline of the working directory.
 A few rarely used tools are left off the tool list, named by `load_tools`

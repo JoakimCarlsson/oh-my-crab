@@ -40,6 +40,8 @@ struct Scripted {
     agent: Option<(String, String)>,
     /// What the checks were shown, as who saw it, the event and the tool or answer.
     seen: Seen,
+    /// How many messages each request the checks were told of was made with.
+    sent: Arc<Mutex<Vec<usize>>>,
 }
 
 impl Scripted {
@@ -63,6 +65,11 @@ impl Hooks for Scripted {
             .find(|(name, _)| *name == call.name)
             .map(|(_, screened)| screened.clone())
             .unwrap_or_default()
+    }
+
+    /// Records how many messages the request is made with.
+    fn sending(&self, messages: &[Message]) {
+        self.sent.lock().unwrap().push(messages.len());
     }
 
     /// Adds the scripted note.
@@ -135,6 +142,7 @@ impl Hooks for Scripted {
             stop: self.stop,
             agent: Some((id.to_owned(), kind.to_owned())),
             seen: self.seen.clone(),
+            sent: self.sent.clone(),
         })
     }
 }
@@ -298,6 +306,26 @@ async fn a_note_after_the_call_reaches_the_model() {
     let (text, failed) = result(&history, 2);
     assert!(!failed && text.contains("alpha"));
     assert!(text.ends_with("<hook-note>\nremember to run the tests\n</hook-note>"));
+}
+
+/// The checks are told what each request sends, before it is sent, alone and chained.
+#[tokio::test]
+async fn the_checks_are_told_what_each_request_sends() {
+    let dir = scratch("hooks-sending");
+    std::fs::write(dir.join("a.txt"), "alpha\n").unwrap();
+    let hooks = Scripted::default();
+    let model = Router::new(|seen| match seen.messages {
+        1 => call("r", "read", read_args("a.txt")),
+        _ => say("done"),
+    });
+    drive(&model, &dir, &hooks).await;
+    assert_eq!(*hooks.sent.lock().unwrap(), vec![1, 3]);
+    let link = Arc::new(Scripted::default());
+    let sent = link.sent.clone();
+    let chained =
+        crate::Chained::of(vec![link as Arc<dyn Hooks>, Arc::new(Scripted::default())]).unwrap();
+    chained.sending(&[]);
+    assert_eq!(*sent.lock().unwrap(), vec![0]);
 }
 
 /// A stop hook that never lets go makes the turn go on only so many times in a row, and says so to the model each time.

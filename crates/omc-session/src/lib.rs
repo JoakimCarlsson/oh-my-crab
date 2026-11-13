@@ -21,6 +21,7 @@ mod prefix;
 mod prompt;
 mod providers;
 mod queue;
+mod rules;
 mod serve;
 mod session;
 mod settings;

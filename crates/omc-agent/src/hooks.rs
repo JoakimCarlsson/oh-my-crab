@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use omc_providers::{Reply, ToolCall, ToolResult};
+use omc_providers::{Message, Reply, ToolCall, ToolResult};
 use serde_json::Value;
 
 /// What the checks before a tool call decided about it.
@@ -145,6 +145,9 @@ pub trait Hooks: Send + Sync {
 
     /// Tells the checks the model replied with `reply`, before its calls are run; by default nothing is told.
     async fn replied(&self, _reply: &Reply) {}
+
+    /// Tells the checks what the model is about to be given: `messages`, the history as the next request sends it, without what was pruned, compacted, rewound or dropped for a fresh context window; by default nothing is told.
+    fn sending(&self, _messages: &[Message]) {}
 
     /// Tells the checks the conversation was compacted, as `trigger` started it, into `summary`; by default nothing is told.
     async fn after_compact(&self, _trigger: CompactTrigger, _summary: &str) {}
@@ -356,6 +359,13 @@ impl Hooks for Chained {
     async fn replied(&self, reply: &Reply) {
         for link in &self.links {
             link.replied(reply).await;
+        }
+    }
+
+    /// Tells every set what the model is about to be given.
+    fn sending(&self, messages: &[Message]) {
+        for link in &self.links {
+            link.sending(messages);
         }
     }
 

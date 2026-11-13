@@ -129,6 +129,8 @@ pub(crate) struct Turn {
     pub(crate) denied: Arc<Vec<String>>,
     /// What was found on disk.
     pub(crate) discovered: Arc<Discovered>,
+    /// The instruction files the agent is not given, by path.
+    pub(crate) disabled: Arc<Vec<String>>,
     /// Where the work is.
     pub(crate) locations: Arc<Locations>,
     /// What the conversation shares.
@@ -309,6 +311,12 @@ impl Turn {
         if let Some(extensions) = &extensions {
             links.push(Arc::new(extensions.clone()));
         }
+        links.push(Arc::new(crate::rules::PathRules::new(
+            self.locations.clone(),
+            self.discovered.clone(),
+            self.disabled.clone(),
+            self.base.clone(),
+        )));
         let checks = Chained::of(links);
         let toolset = Toolset::build(&Inputs {
             base: &self.base,
@@ -677,6 +685,7 @@ mod tests {
             base: Arc::new(Registry::builtin(dir).unwrap()),
             denied: Arc::new(Vec::new()),
             discovered: Arc::new(Discovered::default()),
+            disabled: Arc::new(Vec::new()),
             locations: Arc::new(Locations {
                 directory: dir.to_path_buf(),
                 root: None,
@@ -1911,6 +1920,7 @@ mod tests {
             base: Arc::new(Registry::new()),
             denied: Arc::new(Vec::new()),
             discovered: Arc::new(Discovered::default()),
+            disabled: Arc::new(Vec::new()),
             locations: Arc::new(Locations {
                 directory: std::path::PathBuf::from("."),
                 root: None,
@@ -2019,6 +2029,7 @@ mod tests {
             base: registry.clone(),
             denied: Arc::new(Vec::new()),
             discovered: Arc::new(Discovered::default()),
+            disabled: Arc::new(Vec::new()),
             locations: Arc::new(Locations {
                 directory: dir.clone(),
                 root: None,
@@ -2101,6 +2112,7 @@ mod tests {
             base: Arc::new(Registry::builtin(&dir).unwrap()),
             denied: Arc::new(Vec::new()),
             discovered: Arc::new(Discovered::default()),
+            disabled: Arc::new(Vec::new()),
             locations: Arc::new(Locations {
                 directory: dir.clone(),
                 root: None,

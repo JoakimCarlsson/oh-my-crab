@@ -802,6 +802,7 @@ impl Session {
             base: open.base.clone(),
             denied: open.denied.clone(),
             discovered: open.discovered.clone(),
+            disabled: Arc::new(open.disabled.clone()),
             locations: open.locations.clone(),
             shared: self.shared.clone(),
             history: self.history.clone(),

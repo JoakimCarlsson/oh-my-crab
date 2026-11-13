@@ -1,5 +1,6 @@
 //! The system prompt, built from the templates in `prompts/`.
 
+use crate::instructions::blocks;
 use crate::template::render;
 use crate::{Discovered, Environment, environment_reminder};
 
@@ -175,19 +176,7 @@ fn skills(discovered: &Discovered) -> String {
 fn project(input: &PromptInput<'_>) -> String {
     let environment = input.environment;
     let directory = environment.directory.display().to_string();
-    let rules = input
-        .discovered
-        .instructions
-        .iter()
-        .map(|file| {
-            format!(
-                "<file path=\"{}\">\n{}\n</file>",
-                file.path.display(),
-                file.content.trim_end()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let rules = blocks(&input.discovered.instructions);
     render(
         PROJECT,
         &[

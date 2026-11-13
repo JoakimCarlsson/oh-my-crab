@@ -54,6 +54,51 @@ files override farther ones. Subagents get the same block in their own
 prompts. The model is told the files are already loaded, so it does not search
 for them.
 
+### Rules for some files only
+
+Two kinds of instruction file stay out of the system prompt and reach the
+agent only when it works on the files they are about:
+
+- A rule file (a `.md` file under one of the `rules` folders above) whose
+  front matter names paths under `paths` or `globs`:
+
+  ```markdown
+  ---
+  paths:
+    - "src/**/*.{ts,tsx}"
+    - "!src/generated/**"
+  ---
+  Use strict mode.
+  ```
+
+  The patterns are written like `.gitignore` lines, one to a line or separated
+  by commas: a pattern without a slash matches at any depth, and a pattern
+  starting with `!` takes files out again. A project's rule is matched from
+  the folder that holds its `.oh-my-crab` or `.claude` folder; the user's own
+  rules are
+  matched from the repository root, or from the working folder outside a
+  repository. `alwaysApply: true` in the front matter keeps a rule in the
+  system prompt whatever paths it names. Only what follows the front matter is
+  handed over.
+- The instruction files listed above, in a folder below the project's folders:
+  `crates/ui/AGENTS.md` when crab runs in the repository root, say. They apply
+  to every file in their folder and below; a rule file there with `paths` or
+  `globs` is matched from that folder. Folders are looked in only below the
+  repository root, or below the working folder outside a repository, and never
+  inside the folders of version control, builds and vendored packages (`.git`,
+  `node_modules`, `vendor`, `target`, `build` and the like).
+
+The first time the agent reads, edits or writes a matching file, the files
+that apply are added to the end of that call's result, in a `<path-rules>`
+block, nearest folder first, then the rules. Each is handed over once for as
+long as the model still sees it: when the result that carried it is pruned,
+compacted, rewound or dropped for a fresh context window, the next matching
+call carries it again. A subagent is handed them with its own first matching
+call. Other tools, `bash` and `grep` among them, bring nothing. Files turned
+off in `disabled` and the files of an untrusted project are never handed
+over, and a change to a rule's text during a conversation reaches the agent
+only with a later hand-over, not as a `<context-changes>` notice.
+
 ## Skills
 
 A skill is a folder holding a `SKILL.md`. Crab looks for skill folders in:

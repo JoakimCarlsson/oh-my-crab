@@ -549,6 +549,9 @@ async fn drive(
         let mut chunks = Chunks { events };
         let answered = {
             let messages = request_messages(history, cut.as_ref(), notice.as_deref());
+            if let Some(hooks) = context.hooks {
+                hooks.sending(&messages);
+            }
             let request = Request {
                 system,
                 messages: &messages,
