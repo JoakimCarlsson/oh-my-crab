@@ -380,7 +380,7 @@ fn listed(listing: &str) -> Vec<String> {
 fn keep(top: &Path, name: &str) -> Result<(), String> {
     let index = git_path(top, INDEX)?;
     let own = git_path(top, "index")?;
-    if fs::copy(&own, &index).is_err() {
+    if copy_index(&own, &index).is_err() {
         let _ = fs::remove_file(&index);
     }
     let staged = git_indexed(top, &["add", "--all", "--", "."], Some(&index));
@@ -391,6 +391,20 @@ fn keep(top: &Path, name: &str) -> Result<(), String> {
     arguments.extend(["commit-tree", tree.trim(), "-m", "Files kept by oh-my-crab"]);
     let commit = git(top, &arguments)?;
     git(top, &["update-ref", name, commit.trim()]).map(|_| ())
+}
+
+/// Copies the index `own` to `index` with its modification time, which git compares with each file's to tell a file changed in the second the index was written, of the same size, from an unchanged one; a copy stamped now would hide such changes.
+///
+/// # Errors
+///
+/// Fails when the index cannot be read, copied or stamped.
+fn copy_index(own: &Path, index: &Path) -> std::io::Result<()> {
+    fs::copy(own, index)?;
+    let written = fs::metadata(own)?.modified()?;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(index)?
+        .set_modified(written)
 }
 
 /// The lines of the diff `shown` from its first hunk on, at most [`DIFF_LINES`] of them, and whether some were left out.
