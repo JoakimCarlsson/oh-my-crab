@@ -168,3 +168,11 @@ impl Host for Reader {
 pub fn read_args(path: &str) -> Value {
     json!({ "path": path })
 }
+
+/// What a subagent said in `result`, the text of its `task` result: the text without the line naming the handle it is kept under.
+pub fn said(result: &str) -> &str {
+    result
+        .split("\n\n(Subagent kept as ")
+        .next()
+        .unwrap_or(result)
+}

@@ -3,6 +3,8 @@
 //! A subagent may work apart from the main agent, in a git worktree of its own; what it changed is applied to the main agent's working tree when it ends, as [`crate::worktree`] tells.
 //!
 //! A subagent asks the model of the agent that starts it unless its definition or the call names another, which [`crate::picker`] finds. A subagent above the deepest level allowed gets a `task` tool of its own, and every subagent at every level takes a seat of one shared throttle to run, as [`crate::nesting`] tells.
+//!
+//! A subagent that finished is kept with its conversation on the [`crate::Roster`] for a while, under a handle its result names, so that a call giving that handle as `continue` sends it a follow-up instead of starting a subagent that has to learn everything again.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -112,6 +114,9 @@ struct Args {
     isolated: Option<bool>,
     /// The model the subagents ask, for the single assignment or the items of `tasks` that name none; their kind's definition decides when nothing does.
     model: Option<String>,
+    /// The handle of a finished subagent that `task` is a follow-up for.
+    #[serde(rename = "continue")]
+    resume: Option<String>,
 }
 
 /// One assignment of a `task` call.
@@ -175,6 +180,39 @@ impl Args {
                     ..item
                 })
                 .collect()),
+        }
+    }
+
+    /// The follow-up the call sends to a finished subagent: the handle of the subagent, what it is told, and the few words naming that.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::InvalidArguments`] when the call gives no `continue`, no follow-up in `task`, or anything that only fits a subagent being started.
+    fn follow_up(self) -> Result<(String, String, Option<String>), ToolError> {
+        let stray: Vec<&str> = [
+            ("`agent`", self.agent.is_some()),
+            ("`output_schema`", self.output_schema.is_some()),
+            ("`tasks`", self.tasks.is_some()),
+            ("`isolated`", self.isolated.is_some()),
+            ("`model`", self.model.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(name, given)| given.then_some(name))
+        .collect();
+        if !stray.is_empty() {
+            return Err(ToolError::InvalidArguments(format!(
+                "`continue` sends a follow-up to a finished subagent as it is; leave out {}",
+                stray.join(", ")
+            )));
+        }
+        match (self.resume, self.task) {
+            (Some(handle), Some(task)) if !task.trim().is_empty() => {
+                Ok((handle.trim().to_owned(), task, self.description))
+            }
+            (Some(_), _) => Err(ToolError::InvalidArguments(
+                "`continue` needs the follow-up in `task`".to_owned(),
+            )),
+            (None, _) => Err(ToolError::InvalidArguments("missing `continue`".to_owned())),
         }
     }
 }
@@ -346,8 +384,13 @@ fn stopped(kind: &str) -> ToolError {
     ))
 }
 
-/// A subagent, owning everything it needs so that it can run on a task of its own.
-struct Run {
+/// What the result of a finished subagent kept as `handle` says after its text, so that the agent starting it can send it a follow-up.
+fn kept_note(handle: &str) -> String {
+    format!("(Subagent kept as {handle}; `continue: \"{handle}\"` sends it a follow-up.)")
+}
+
+/// A subagent, owning everything it needs so that it can run on a task of its own, and be kept once it finished for a follow-up to run it again.
+pub(crate) struct Run {
     /// The model it asks.
     model: Arc<dyn ChatModel>,
     /// The tools it has.
@@ -362,8 +405,14 @@ struct Run {
     system: String,
     /// How hard it thinks.
     effort: Option<Effort>,
-    /// What it is to do.
+    /// What it is to do: its assignment, or the follow-up it was sent.
     assignment: String,
+    /// Its conversation so far.
+    history: Vec<Message>,
+    /// The handle it is kept under once it finished.
+    pub(crate) handle: String,
+    /// Whether it finished before and now runs a follow-up.
+    resumed: bool,
     /// The schema its result must match, when it is to hand back data.
     structured: Option<Structured>,
     /// The kind of subagent it is.
@@ -421,26 +470,45 @@ impl Run {
         Ok(())
     }
 
-    /// Runs the subagent to the end and returns what it said last, or the result it handed back when it was asked for one; one that ends without handing back a result is reminded once.
+    /// Whether the subagent only looks: every tool it has only looks, but for the `task` tool of its own, whose subagents draw on those tools.
+    pub(crate) fn looks(&self) -> bool {
+        self.registry
+            .iter()
+            .all(|tool| tool.read_only() || tool.name() == "task")
+    }
+
+    /// Whether the subagent is kept for follow-ups once it finished: one that worked in a worktree of its own is not, since that is removed when it ends, and neither is one asked for a structured result, which stays the data it handed back.
+    fn keeps(&self) -> bool {
+        !self.isolated && self.structured.is_none()
+    }
+
+    /// The message the subagent's turn starts with: the follow-up as it is for one that finished before, and otherwise its assignment, with how to hand back a structured result when it is asked for one, after what the hooks add when a subagent starts.
+    async fn opening(&self) -> String {
+        if self.resumed {
+            return self.assignment.clone();
+        }
+        let opening = match &self.structured {
+            Some(wanted) => format!(
+                "{}\n\n{}",
+                subagent_assignment(&self.assignment),
+                render(STRUCTURED, &[("schema", pretty(&wanted.schema).as_str())])
+            ),
+            None => subagent_assignment(&self.assignment),
+        };
+        match &self.hooks {
+            Some(hooks) => with_start_context(hooks.subagent_start().await, opening),
+            None => opening,
+        }
+    }
+
+    /// Runs the subagent to the end of a turn, going on from its conversation so far, and returns what it said last, or the result it handed back when it was asked for one; one that ends without handing back a result is reminded once.
     ///
     /// # Errors
     ///
     /// Returns [`ToolError::Failed`] when a model request fails, or when a subagent asked for a result ends twice without one that matches the schema.
-    async fn go(self) -> Result<String, ToolError> {
-        let Run {
-            model,
-            registry,
-            approvals,
-            events,
-            lane,
-            system,
-            effort,
-            assignment,
-            structured,
-            hooks,
-            ..
-        } = self;
-        let kind = lane.kind.clone();
+    async fn go(&mut self) -> Result<String, ToolError> {
+        let kind = self.lane.kind.clone();
+        let (events, lane) = (self.events.clone(), self.lane.clone());
         let report = move |event: AgentEvent| {
             if matches!(
                 event,
@@ -453,36 +521,24 @@ impl Run {
             }
             events(lane.file(event));
         };
+        let opening = self.opening().await;
         let context = Context {
-            model: model.as_ref(),
-            registry: &registry,
-            approvals: &approvals,
-            system: &system,
-            effort,
+            model: self.model.as_ref(),
+            registry: &self.registry,
+            approvals: &self.approvals,
+            system: &self.system,
+            effort: self.effort,
             refresh: None,
             notebook: None,
             window: None,
             checkpoint: None,
-            hooks: hooks.as_deref(),
+            hooks: self.hooks.as_deref(),
         };
-        let mut history = Vec::new();
-        let opening = match &structured {
-            Some(wanted) => format!(
-                "{}\n\n{}",
-                subagent_assignment(&assignment),
-                render(STRUCTURED, &[("schema", pretty(&wanted.schema).as_str())])
-            ),
-            None => subagent_assignment(&assignment),
-        };
-        let opening = match &hooks {
-            Some(hooks) => with_start_context(hooks.subagent_start().await, opening),
-            None => opening,
-        };
-        run_turn(&context, &mut history, opening, &report)
+        run_turn(&context, &mut self.history, opening, &report)
             .await
             .map_err(|error| failed(&kind, &error))?;
-        let Some(wanted) = structured else {
-            let reply = last_reply(&history);
+        let Some(wanted) = &self.structured else {
+            let reply = last_reply(&self.history);
             return Ok(if reply.is_empty() {
                 "The agent finished without a reply.".to_owned()
             } else {
@@ -492,12 +548,17 @@ impl Run {
         if let Some(result) = wanted.accepted() {
             return Ok(result);
         }
-        run_turn(&context, &mut history, NUDGE.trim().to_owned(), &report)
-            .await
-            .map_err(|error| failed(&kind, &error))?;
+        run_turn(
+            &context,
+            &mut self.history,
+            NUDGE.trim().to_owned(),
+            &report,
+        )
+        .await
+        .map_err(|error| failed(&kind, &error))?;
         wanted
             .accepted()
-            .ok_or_else(|| wanted.missing(&kind, &history))
+            .ok_or_else(|| wanted.missing(&kind, &self.history))
     }
 }
 
@@ -511,7 +572,7 @@ struct Ended {
     handback: Option<Handback>,
 }
 
-/// Runs `run` once it took a seat of `nesting`'s throttle, which it holds until it ends, takes what it changed from its worktree when it has one, reports the end of its step through `events` when it is one of several, announces its end, and says how it ended.
+/// Runs `run` once it took a seat of `nesting`'s throttle, which it holds until it ends, takes what it changed from its worktree when it has one, keeps it on the roster for follow-ups when it finished and is one that is kept, its result then naming its handle, reports the end of its step through `events` when it is one of several, announces its end, and says how it ended.
 ///
 /// A subagent the reader stops through the roster ends at once, with the subagents it started, as failed with a note saying the reader stopped it.
 async fn finish(mut run: Run, events: Arc<EventSink>, nesting: Nesting) -> Ended {
@@ -520,22 +581,38 @@ async fn finish(mut run: Run, events: Arc<EventSink>, nesting: Nesting) -> Ended
     let mut enrolment = run.enrolment.take();
     let seat = run.seat.clone();
     let held = seat.clone();
+    let (roster, keeper) = (nesting.roster.clone(), nesting.keeper.clone());
     let work = async move {
         held.fill(nesting.throttle.take().await);
-        run.go().await
+        let outcome = run.go().await;
+        (outcome, run)
     };
-    let (outcome, halted) = match enrolment.as_mut() {
+    let (outcome, halted, ended) = match enrolment.as_mut() {
         Some(enrolment) => tokio::select! {
             biased;
-            () = enrolment.stopped() => (Err(stopped(&lane.kind)), true),
-            outcome = work => (outcome, false),
+            () = enrolment.stopped() => (Err(stopped(&lane.kind)), true, None),
+            (outcome, run) = work => (outcome, false, Some(run)),
         },
-        None => (work.await, false),
+        None => {
+            let (outcome, run) = work.await;
+            (outcome, false, Some(run))
+        }
     };
     if let Some(enrolment) = enrolment.as_mut() {
         enrolment.leave();
     }
     seat.vacate();
+    let outcome = match (outcome, ended) {
+        (Ok(text), Some(run)) if run.keeps() => {
+            let handle = run.handle.clone();
+            if roster.retire(&keeper, run) {
+                Ok(format!("{text}\n\n{}", kept_note(&handle)))
+            } else {
+                Ok(text)
+            }
+        }
+        (outcome, _) => outcome,
+    };
     let handback = match lease {
         Some(lease) => Some(lease.hand_back().await),
         None => None,
@@ -784,6 +861,9 @@ impl Task {
             system: String::new(),
             effort,
             assignment: item.task,
+            history: Vec::new(),
+            handle: self.settings.nesting.roster.handle(),
+            resumed: false,
             structured,
             isolated: item.isolated.unwrap_or(agent.isolated),
             definition: agent.clone(),
@@ -827,11 +907,13 @@ impl Task {
         Ok(given)
     }
 
-    /// Readies `run` to start, now that it is known where it works: a subagent that may start subagents of its own gets a `task` tool one level down, drawing on its own tools, asking its model by default, reporting under its lane, and isolating its subagents from the worktree it works in, when it works in one, so that what they change is handed back to it; then its system prompt is made for the tools it has, the folder it works in and the model it asks.
-    fn arm(&self, run: &mut Run) {
+    /// Gives `run` a `task` tool of its own when it may start subagents: one level down, drawing on its own tools, asking its model by default, reporting under its lane, keeping the subagents it started under its handle, and isolating its subagents from the worktree it works in, when it works in one, so that what they change is handed back to it.
+    fn equip(&self, run: &mut Run) {
         let directory = run.lease.as_ref().map(Lease::directory);
         if run.nests {
-            let pool = run.registry.filtered(|tool| tool.name() != SUBMIT_RESULT);
+            let pool = run
+                .registry
+                .filtered(|tool| tool.name() != SUBMIT_RESULT && tool.name() != "task");
             let (events, lane) = (self.settings.events.clone(), run.lane.clone());
             let filed: Arc<EventSink> = Arc::new(move |event| events(lane.file(event)));
             let isolation = match (&directory, &self.settings.isolation) {
@@ -856,16 +938,93 @@ impl Task {
                 jobs: self.settings.jobs.clone(),
                 isolation,
                 hooks: run.hooks.clone(),
-                nesting: self.settings.nesting.below(run.seat.clone(), &run.id),
+                nesting: self
+                    .settings
+                    .nesting
+                    .below(run.seat.clone(), &run.id, &run.handle),
             }));
             run.registry = run.registry.fitted();
         }
+    }
+
+    /// Readies `run` to start, now that it is known where it works: it gets a `task` tool of its own when it may start subagents, as [`Task::equip`] tells, and then its system prompt is made for the tools it has, the folder it works in and the model it asks.
+    fn arm(&self, run: &mut Run) {
+        self.equip(run);
+        let directory = run.lease.as_ref().map(Lease::directory);
         run.system = (self.settings.prompt)(
             &run.definition,
             &run.registry.names(),
             directory.as_deref(),
             &run.lane.model,
         );
+    }
+
+    /// Whether every tool the subagents of this tool are given only looks, as in plan mode.
+    fn only_looks(&self) -> bool {
+        self.settings.registry.iter().all(|tool| tool.read_only())
+    }
+
+    /// The subagents the call `call` with `args` starts, each ready to run: checked, given its model, its worktree when it is to work in one, its tools and its system prompt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::InvalidArguments`] for assignments that do not fit, and [`ToolError::Failed`] when an assignment cannot be prepared or a worktree cannot be made.
+    async fn fresh(&self, call: &str, args: Args) -> Result<Vec<Run>, ToolError> {
+        let items = args.items()?;
+        let several = items.len() > 1;
+        let mut runs = Vec::with_capacity(items.len());
+        for (index, item) in items.into_iter().enumerate() {
+            let place = several.then_some(index + 1);
+            let run = self
+                .prepare(call, place, item)
+                .await
+                .map_err(|error| match place {
+                    Some(_) => ToolError::Failed(format!("tasks[{index}]: {error}")),
+                    None => error,
+                })?;
+            runs.push(run);
+        }
+        let mut runs = self.isolate(runs).await?;
+        for run in &mut runs {
+            self.arm(run);
+        }
+        Ok(runs)
+    }
+
+    /// The finished subagent the call `call` with `args` sends a follow-up to, taken off the roster and ready to run again: it reports under this call, under an id of this call, with the approvals and the event sink of this tool, and keeps its conversation, its tools, its model and its system prompt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::InvalidArguments`] for arguments that fit no follow-up, and [`ToolError::Failed`] when no subagent this tool started is kept under the handle, or when it can change files while the subagents of this tool may only look; it stays kept then.
+    fn resume(&self, call: &str, args: Args) -> Result<Run, ToolError> {
+        let (handle, task, description) = args.follow_up()?;
+        let nesting = &self.settings.nesting;
+        let Some(mut run) = nesting.roster.recall(&nesting.keeper, &handle) else {
+            return Err(ToolError::Failed(format!(
+                "no finished subagent is kept as {handle}: it is not one you started, it runs a follow-up now, it failed or was stopped, or it was kept too long. Start a new subagent with a self-contained `task` instead."
+            )));
+        };
+        if self.only_looks() && !run.looks() {
+            let kind = run.lane.kind.clone();
+            nesting.roster.retire(&nesting.keeper, run);
+            return Err(ToolError::Failed(format!(
+                "the {kind} agent kept as {handle} can change files, which subagents may not do now; start a new subagent instead"
+            )));
+        }
+        run.lane = Lane {
+            call: call.to_owned(),
+            place: None,
+            kind: run.lane.kind.clone(),
+            label: headline(description.as_deref(), &task),
+            model: run.lane.model.clone(),
+        };
+        run.assignment = task;
+        run.resumed = true;
+        run.approvals = self.settings.approvals.clone();
+        run.events = self.settings.events.clone();
+        run.id = nesting.id_of(call, None);
+        self.equip(&mut run);
+        Ok(run)
     }
 
     /// Runs `runs` together, each once it took a seat of the shared throttle, with the seat of the subagent this tool belongs to given up meanwhile, then applies what those in worktrees of their own changed in the order given, and returns each one's lane and outcome in that order.
@@ -1035,6 +1194,7 @@ impl Tool for Task {
                         "required": ["task"]
                     }
                 },
+                "continue": { "type": "string", "description": "The handle of a finished subagent, as its result gave it, such as `sub-3`: `task` is then a follow-up sent to it, which it answers knowing everything it learned. Only `description` and `background` go with it." },
                 "background": { "type": "boolean", "description": "Start the subagents in the background and return a handle for each at once; `wait` returns their results." },
                 "isolated": isolated,
                 "model": model
@@ -1042,19 +1202,25 @@ impl Tool for Task {
         })
     }
 
-    /// Shared when every subagent the call with `args` starts only looks: all the tools subagents are given only look, as in plan mode, or the definition of every kind it names lists only tools that look. Exclusive otherwise, and for arguments that cannot be read, since a subagent that can write changes files as any writing tool does.
+    /// Shared when every subagent the call with `args` starts only looks: all the tools subagents are given only look, as in plan mode, the definition of every kind it names lists only tools that look, or the finished subagent it sends a follow-up to has only tools that look. Exclusive otherwise, and for arguments that cannot be read, since a subagent that can write changes files as any writing tool does.
     fn concurrency(&self, args: &Value) -> Concurrency {
-        if self.settings.registry.iter().all(|tool| tool.read_only()) {
+        if self.only_looks() {
             return Concurrency::Shared;
         }
+        let nesting = &self.settings.nesting;
         let looks = serde_json::from_value::<Args>(args.clone())
             .ok()
-            .and_then(|args| args.items().ok())
-            .is_some_and(|items| {
-                items.iter().all(|item| {
-                    self.agent(item.agent.as_deref().unwrap_or(DEFAULT_AGENT))
-                        .is_ok_and(AgentDefinition::read_only)
-                })
+            .is_some_and(|args| match &args.resume {
+                Some(handle) => nesting
+                    .roster
+                    .looks(&nesting.keeper, handle.trim())
+                    .unwrap_or(false),
+                None => args.items().is_ok_and(|items| {
+                    items.iter().all(|item| {
+                        self.agent(item.agent.as_deref().unwrap_or(DEFAULT_AGENT))
+                            .is_ok_and(AgentDefinition::read_only)
+                    })
+                }),
             });
         if looks {
             Concurrency::Shared
@@ -1093,9 +1259,11 @@ impl Tool for Task {
     ///
     /// Every assignment is checked, its model found, and every worktree asked for made, before any subagent starts. A single subagent's result is its last message or its structured result; several run at once and their outcomes are combined under headings, one failing leaving the others be. A subagent in a worktree of its own has what it changed applied to the working tree of the agent that started it when it ends, several in the order of the list, and its result says what became of it. In the background, each gets a handle for `wait` and the call returns at once; only the main agent can start subagents in the background.
     ///
+    /// A call giving `continue` starts none: it sends `task` as a follow-up to the finished subagent kept under that handle, which runs another turn of its conversation, and returns what it said last.
+    ///
     /// # Errors
     ///
-    /// Returns [`ToolError::InvalidArguments`] for arguments that do not fit the schema or a subagent asking for the background, and [`ToolError::Failed`] when an assignment cannot be prepared, a worktree cannot be made, or every subagent failed.
+    /// Returns [`ToolError::InvalidArguments`] for arguments that do not fit the schema or a subagent asking for the background, and [`ToolError::Failed`] when an assignment cannot be prepared, a worktree cannot be made, no finished subagent is kept under the handle given, or every subagent failed.
     async fn call_as(&self, id: &str, args: Value) -> Result<ToolOutput, ToolError> {
         let args: Args = parse_args(args)?;
         let background = args.background;
@@ -1105,24 +1273,12 @@ impl Tool for Task {
                     .to_owned(),
             ));
         }
-        let items = args.items()?;
-        let several = items.len() > 1;
-        let mut runs = Vec::with_capacity(items.len());
-        for (index, item) in items.into_iter().enumerate() {
-            let place = several.then_some(index + 1);
-            let run = self
-                .prepare(id, place, item)
-                .await
-                .map_err(|error| match place {
-                    Some(_) => ToolError::Failed(format!("tasks[{index}]: {error}")),
-                    None => error,
-                })?;
-            runs.push(run);
-        }
-        let mut runs = self.isolate(runs).await?;
-        for run in &mut runs {
-            self.arm(run);
-        }
+        let mut runs = if args.resume.is_some() {
+            vec![self.resume(id, args)?]
+        } else {
+            self.fresh(id, args).await?
+        };
+        let several = runs.len() > 1;
         for run in &mut runs {
             (self.settings.events)(run.lane.opened());
             run.enrolment = Some(self.settings.nesting.roster.enrol(
@@ -1158,7 +1314,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::testkit::{Router, call, deny_all, read_args, say, scratch};
+    use crate::testkit::{Router, call, deny_all, read_args, said, say, scratch};
 
     /// Whether a request comes from a subagent, going by the prompt the tests give them.
     fn is_sub(system: &str) -> bool {
@@ -1250,7 +1406,7 @@ mod tests {
         let Message::ToolResults(results) = &history[2] else {
             panic!("no results");
         };
-        assert_eq!(results[0].text, "it holds alpha");
+        assert_eq!(said(&results[0].text), "it holds alpha");
         assert!(!results[0].is_error);
         let log = log.lock().unwrap();
         assert!(log.contains(&AgentEvent::Spawned {
@@ -1375,8 +1531,8 @@ mod tests {
         };
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].call_id, "t1");
-        assert_eq!(results[0].text, "did first");
-        assert_eq!(results[1].text, "did second");
+        assert_eq!(said(&results[0].text), "did first");
+        assert_eq!(said(&results[1].text), "did second");
         assert_eq!(history.len(), 4);
     }
 
@@ -1432,7 +1588,7 @@ mod tests {
         assert!(started.text.contains("bg-1"));
         let finished = jobs.wait().await.unwrap();
         assert!(finished.ok);
-        assert_eq!(finished.text, "found it");
+        assert_eq!(said(&finished.text), "found it");
         assert!(matches!(
             log.lock().unwrap().first(),
             Some(AgentEvent::Spawned { id, .. }) if id == "t1"

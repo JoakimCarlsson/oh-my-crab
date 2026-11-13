@@ -10,7 +10,7 @@ use omc_providers::{ChatModel, Message, ProviderError, Reply, Request, Sink, Too
 use omc_tools::{Concurrency, Jobs, Registry, Tool, ToolError};
 use serde_json::{Value, json};
 
-use crate::testkit::{RequestSeen, Router, call, deny_all, read_args, say, scratch};
+use crate::testkit::{RequestSeen, Router, call, deny_all, read_args, said, say, scratch};
 use crate::{
     AgentEvent, Context, EventSink, MAX_CONCURRENT, MAX_TASKS, Task, TaskSettings, run_turn,
 };
@@ -221,7 +221,7 @@ async fn a_background_batch_yields_a_handle_each() {
     for _ in 0..3 {
         let finished = jobs.wait().await.unwrap();
         assert!(finished.ok);
-        texts.push(finished.text);
+        texts.push(said(&finished.text).to_owned());
     }
     texts.sort();
     assert_eq!(texts, vec!["done a", "done b", "done c"]);

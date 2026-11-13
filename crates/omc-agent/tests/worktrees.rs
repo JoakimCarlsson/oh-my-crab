@@ -483,7 +483,7 @@ async fn isolation_outside_a_repository_is_refused() {
         )
         .await
         .unwrap();
-    assert_eq!(shared.text, "worked");
+    assert!(shared.text.starts_with("worked\n\n(Subagent kept as "));
     let (unavailable, _) = task_tool(&plain, model, agents, None);
     let refused = unavailable
         .call_as("t4", json!({"task": "x", "isolated": true}))

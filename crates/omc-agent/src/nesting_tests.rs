@@ -9,7 +9,7 @@ use omc_providers::{ChatModel, Effort};
 use omc_tools::{Jobs, Registry, Tool, ToolError};
 use serde_json::json;
 
-use crate::testkit::{RequestSeen, Router, call, deny_all, say, scratch};
+use crate::testkit::{RequestSeen, Router, call, deny_all, said, say, scratch};
 use crate::{
     AgentEvent, EventSink, ModelPicker, Models, Nesting, Picked, Task, TaskSettings, Throttle,
 };
@@ -127,12 +127,12 @@ async fn definitions_and_calls_pick_the_model() {
         .call_as("t1", json!({"agent": "quick", "task": "x"}))
         .await
         .unwrap();
-    assert_eq!(by_definition.text, "small answered");
+    assert_eq!(said(&by_definition.text), "small answered");
     let by_call = task
         .call_as("t2", json!({"task": "y", "model": "small-1"}))
         .await
         .unwrap();
-    assert_eq!(by_call.text, "small answered");
+    assert_eq!(said(&by_call.text), "small answered");
     let overridden = task
         .call_as(
             "t3",
@@ -140,9 +140,9 @@ async fn definitions_and_calls_pick_the_model() {
         )
         .await
         .unwrap();
-    assert_eq!(overridden.text, "big answered");
+    assert_eq!(said(&overridden.text), "big answered");
     let inherited = task.call_as("t4", json!({"task": "w"})).await.unwrap();
-    assert_eq!(inherited.text, "big answered");
+    assert_eq!(said(&inherited.text), "big answered");
     assert_eq!(small.seen.lock().unwrap().len(), 2);
     assert_eq!(big.seen.lock().unwrap().len(), 2);
     assert_eq!(
@@ -247,7 +247,7 @@ async fn subagents_nest_down_to_the_deepest_level() {
         .call_as("t1", json!({"task": "level one"}))
         .await
         .unwrap();
-    assert_eq!(done.text, "one done");
+    assert_eq!(said(&done.text), "one done");
     let seen = model.seen.lock().unwrap();
     let level_one = seen.iter().find(|seen| of(seen, "level one")).unwrap();
     assert_eq!(level_one.system, "SUB:task+task");

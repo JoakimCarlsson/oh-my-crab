@@ -20,6 +20,9 @@ A subagent asks your model unless its kind names another (shown as `model:` belo
 # Background
 Set `background: true` to start the subagents and get a handle for each at once, so you can do other work meanwhile. Call `wait` to receive the result of the next background run to end; call it once per handle. Background runs go on if the user interrupts you, and stop when the conversation ends.
 
+# Follow-ups
+A finished subagent is kept for a while with everything it read and did, and its result ends with its handle, such as `sub-3`. To ask it for more ("now also fix X", "why did you rule out Y?"), set `continue` to that handle and `task` to the follow-up alone: it goes on from where it stopped, so NEVER repeat the assignment or start a new subagent that must investigate again. Only `description` and `background` go with `continue`. Subagents that were isolated, returned structured output, failed or were stopped are not kept; when a handle is gone the call says so, and you start a new subagent with a self-contained `task`.
+
 # Format
 `task`: self-contained (`# Target` files/non-goals, `# Change` steps/APIs, `# Acceptance` observable result).
 `description`: a few words naming the work, shown to the user.

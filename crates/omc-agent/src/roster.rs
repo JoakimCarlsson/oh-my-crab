@@ -1,14 +1,23 @@
-//! The subagents running in a conversation, each under the id [`crate::Nesting`] gives it, so that the reader can stop one of them without stopping the turn.
+//! The subagents of a conversation: the running ones, each under the id [`crate::Nesting`] gives it, so that the reader can stop one of them without stopping the turn, and the finished ones kept for a while, each under a handle, so that a follow-up reaches one with everything it learned.
 //!
 //! A subagent is announced with an [`AgentEvent::Subagent`] when it starts and again when it ends. Stopping one stops the subagents it started too, since their ids begin with its own.
+//!
+//! A finished subagent is kept with its conversation until a follow-up takes it, it grows older than the roster allows, or more are kept than the roster allows, when the one kept longest goes; the finished subagents it started itself go with it.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
 use crate::AgentEvent;
-use crate::task::EventSink;
+use crate::task::{EventSink, Run};
+
+/// How many finished subagents a conversation keeps for follow-ups by default.
+pub const KEPT_MOST: usize = 32;
+
+/// How long a finished subagent is kept for follow-ups by default.
+pub const KEPT_FOR: Duration = Duration::from_secs(30 * 60);
 
 /// How a subagent stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +59,16 @@ struct Entry {
     stop: watch::Sender<bool>,
 }
 
+/// One finished subagent kept for follow-ups.
+struct Retired {
+    /// The handle of the subagent that started it; empty when the main agent did.
+    keeper: String,
+    /// When it finished.
+    since: Instant,
+    /// The subagent, with its conversation.
+    run: Run,
+}
+
 /// What the roster holds.
 #[derive(Default)]
 struct Inner {
@@ -57,16 +76,146 @@ struct Inner {
     next: u64,
     /// The running subagents, by key.
     entries: HashMap<u64, Entry>,
+    /// How many handles were given out.
+    handles: u64,
+    /// The finished subagents kept for follow-ups, by handle.
+    retired: HashMap<String, Retired>,
 }
 
-/// The subagents running in a conversation, at every level, shared by every `task` tool of it.
-#[derive(Default)]
+impl Inner {
+    /// Takes out the finished subagent kept as `handle` and, at every depth, the finished subagents it started, and returns them all.
+    fn discard(&mut self, handle: &str) -> Vec<Retired> {
+        let mut gone = Vec::new();
+        let mut handles = vec![handle.to_owned()];
+        while let Some(handle) = handles.pop() {
+            gone.extend(self.retired.remove(&handle));
+            handles.extend(
+                self.retired
+                    .iter()
+                    .filter(|(_, retired)| retired.keeper == handle)
+                    .map(|(below, _)| below.clone()),
+            );
+        }
+        gone
+    }
+
+    /// Takes out the finished subagents kept for longer than `age` and, while more than `most` are kept, the one kept longest, each with the finished subagents it started, and returns them all.
+    fn prune(&mut self, most: usize, age: Duration) -> Vec<Retired> {
+        let now = Instant::now();
+        let old: Vec<String> = self
+            .retired
+            .iter()
+            .filter(|(_, retired)| now.duration_since(retired.since) >= age)
+            .map(|(handle, _)| handle.clone())
+            .collect();
+        let mut gone = Vec::new();
+        for handle in old {
+            gone.extend(self.discard(&handle));
+        }
+        while self.retired.len() > most {
+            let oldest = self
+                .retired
+                .iter()
+                .min_by_key(|(_, retired)| retired.since)
+                .map(|(handle, _)| handle.clone());
+            match oldest {
+                Some(handle) => gone.extend(self.discard(&handle)),
+                None => break,
+            }
+        }
+        gone
+    }
+}
+
+/// The subagents of a conversation, at every level, shared by every `task` tool of it: the running ones, and the finished ones kept for follow-ups.
 pub struct Roster {
-    /// The running subagents.
+    /// The subagents.
     inner: Mutex<Inner>,
+    /// The most finished subagents kept at once.
+    most: usize,
+    /// How long a finished subagent is kept.
+    age: Duration,
+}
+
+impl Default for Roster {
+    /// A roster keeping [`KEPT_MOST`] finished subagents for [`KEPT_FOR`] each.
+    fn default() -> Self {
+        Self::keeping(KEPT_MOST, KEPT_FOR)
+    }
 }
 
 impl Roster {
+    /// A roster keeping at most `most` finished subagents for follow-ups, each for `age`; with `most` at zero none is kept.
+    pub fn keeping(most: usize, age: Duration) -> Self {
+        Self {
+            inner: Mutex::new(Inner::default()),
+            most,
+            age,
+        }
+    }
+
+    /// How many finished subagents are kept for follow-ups now.
+    pub fn kept(&self) -> usize {
+        let mut inner = self.lock();
+        let gone = inner.prune(self.most, self.age);
+        let kept = inner.retired.len();
+        drop(inner);
+        drop(gone);
+        kept
+    }
+
+    /// A handle no subagent of the conversation has yet, for a subagent to be kept under once it finished.
+    pub(crate) fn handle(&self) -> String {
+        let mut inner = self.lock();
+        inner.handles += 1;
+        format!("sub-{}", inner.handles)
+    }
+
+    /// Keeps the finished subagent `run`, started by the subagent with the handle `keeper` or by the main agent when that is empty, under its own handle, and returns whether it is kept; the subagents kept too long, and the ones kept longest when there are too many, go.
+    pub(crate) fn retire(&self, keeper: &str, run: Run) -> bool {
+        let handle = run.handle.clone();
+        let mut inner = self.lock();
+        inner.retired.insert(
+            handle.clone(),
+            Retired {
+                keeper: keeper.to_owned(),
+                since: Instant::now(),
+                run,
+            },
+        );
+        let gone = inner.prune(self.most, self.age);
+        let kept = inner.retired.contains_key(&handle);
+        drop(inner);
+        drop(gone);
+        kept
+    }
+
+    /// Takes the finished subagent kept as `handle` off the roster, for a follow-up, when the subagent with the handle `keeper`, or the main agent when that is empty, started it and it is not kept too long; the finished subagents it started stay.
+    pub(crate) fn recall(&self, keeper: &str, handle: &str) -> Option<Run> {
+        let mut inner = self.lock();
+        let gone = inner.prune(self.most, self.age);
+        let own = inner
+            .retired
+            .get(handle)
+            .is_some_and(|retired| retired.keeper == keeper);
+        let run = own
+            .then(|| inner.retired.remove(handle))
+            .flatten()
+            .map(|retired| retired.run);
+        drop(inner);
+        drop(gone);
+        run
+    }
+
+    /// Whether the finished subagent kept as `handle`, started by `keeper`, only looks; nothing when no such subagent is kept.
+    pub(crate) fn looks(&self, keeper: &str, handle: &str) -> Option<bool> {
+        self.lock()
+            .retired
+            .get(handle)
+            .filter(|retired| retired.keeper == keeper)
+            .map(|retired| retired.run.looks())
+    }
+
     /// Stops the running subagent `id` and every running subagent it started, at any depth.
     ///
     /// Returns whether any subagent was stopped: `false` for an empty id, or one that names no running subagent.

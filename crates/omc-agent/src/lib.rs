@@ -43,13 +43,15 @@ pub use nesting::{DEFAULT_DEPTH, DEPTH_VARIABLE, MOST_DEPTH, Nesting, Throttle, 
 pub use picker::{ModelPicker, Models, Picked};
 pub use plans::approved_plan;
 pub use recall::{RECALL, spec as recall_spec};
-pub use roster::{Roster, SubagentNotice, SubagentState};
+pub use roster::{KEPT_FOR, KEPT_MOST, Roster, SubagentNotice, SubagentState};
 pub use steering::Steering;
 pub use task::{EventSink, MAX_CONCURRENT, MAX_TASKS, PromptBuilder, Task, TaskSettings};
 pub use worktree::{Isolation, LOCK_REASON, Merge, ToolsFor, prune as prune_worktrees};
 
 #[cfg(test)]
 mod compaction_tests;
+#[cfg(test)]
+mod follow_up_tests;
 #[cfg(test)]
 mod hooks_tests;
 #[cfg(test)]

@@ -17,6 +17,44 @@ definition can give an `output_schema`: the subagent then hands its result to
 `submit_result`, which checks it against the schema, and the main agent gets
 the checked JSON instead of prose.
 
+## Follow-ups
+
+A subagent that finished is kept in memory with its whole conversation, and
+its result ends with a line naming the handle it is kept under, such as
+`sub-3`. A `task` call that gives that handle as `continue` starts no
+subagent: its `task` is sent to the kept one as its next message, and the
+result is what it says last. It answers knowing everything it read and did, so
+a follow-up such as "now also fix X" does not pay for the investigation again,
+and its earlier requests are still in the provider's prompt cache when the
+follow-up comes soon. Only `description` and `background` go with `continue`;
+a call giving `agent`, `model`, `isolated`, `output_schema` or `tasks` with it
+is refused.
+
+The subagent keeps its tools, its model, its system prompt and its handle, and
+is kept again when the follow-up ends, so any number can follow. It runs under
+the new call: its work is filed there, it is announced with a `Subagent` event
+under an id made from that call, and it can be stopped by it. Hooks go on
+seeing it under the id it started with, and the hooks run when a subagent
+starts do not run again. A follow-up takes the subagent off the list while it
+runs, so a second follow-up to the same handle at the same time is refused,
+and one that fails or is stopped ends the subagent for good.
+
+Not every subagent is kept:
+
+- one that failed or was stopped;
+- one that worked in a worktree of its own, which is removed when it ends;
+- one asked for a structured result, so that its result stays the JSON it
+  handed back and nothing else;
+- one that can change files, while its follow-up comes in plan mode: the call
+  is refused, and the subagent stays kept for later.
+
+A conversation keeps at most 32 finished subagents, each for 30 minutes after
+it last finished; when there are more, the one kept longest goes. The finished
+subagents a subagent started itself are its own to continue, under its `task`
+tool, and go when it does. Kept subagents live in the `crab` process only: a
+conversation that is reopened has none, and a `continue` naming a handle that
+is gone fails with advice to start a new subagent with a full assignment.
+
 ## Models
 
 A subagent asks the model of the agent that starts it, unless its definition
