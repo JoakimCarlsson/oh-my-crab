@@ -68,13 +68,13 @@ out is refused as a bad command.
 
 1. The client starts `crab serve`.
 2. The client sends `Open`. Crab answers with `Settings` and `Commands`, then,
-   for a conversation opened with an id, `Titled` when it has a name and
-   `Resumed` with its saved turns, then `Trust` when the project brings
-   something that is left out until it is trusted. When opening fails, crab
-   sends `Failed` or `SignedOut` instead, and the client can send `Open`
-   again.
+   for a conversation opened with an id, `Titled` when it has a name,
+   `Resumed` with its saved turns and `Spent` when it has cost something, then
+   `Trust` when the project brings something that is left out until it is
+   trusted. When opening fails, crab sends `Failed` or `SignedOut` instead, and
+   the client can send `Open` again.
 3. The client sends `Prompt`. Crab streams the turn as events: `Started`,
-   `Said`, `Thought`, `Tool`, `Used`, `Plan`, `Background`, and requests that
+   `Said`, `Thought`, `Tool`, `Used`, `Spent`, `Plan`, `Background`, and requests that
    wait on the client (`Ask`, `Inquire`, `Language`). The turn ends with
    exactly one `Finished`, or with `SignedOut` when the account needs signing
    in again.
@@ -1312,6 +1312,7 @@ opened, when `before` goes back to before a turn, and after `Switch`. See
 | `window`   | integer            | optional | The context window of the model last used, in tokens.        |
 | `branch`   | string             | optional | The id of the branch `turns` are of; see [Branches](#branches). |
 | `branches` | list of `Branch`   | default  | Every branch, in the order they were made, the first first.  |
+| `spent`    | `Spent`            | optional | What the conversation has cost so far, when it has cost something; see [`Spent`](#spent). |
 
 A `PastTurn`:
 
@@ -1494,6 +1495,36 @@ is empty when the turn changed none of the files asked for.
 ```json
 {"Undone":{"turn":"t-4","files":["calc.py"]}}
 ```
+
+### `Spent`
+
+What the conversation has cost so far, whole: a client replaces what it showed
+before. Sent after every model request the provider reported the tokens of,
+those of subagents, summaries and cache warming included, so it also comes
+between turns; and when a saved conversation that has cost something is
+opened. See [what a conversation costs](long-conversations.md#what-a-conversation-costs).
+
+| Field    | Type                | Meaning                                                  |
+| -------- | ------------------- | -------------------------------------------------------- |
+| `models` | list of `ModelSpend` | What each model cost, in the order they were first asked. |
+
+`ModelSpend`:
+
+| Field         | Type              | Meaning                                                                                                                              |
+| ------------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `model`       | string            | The model's id; one served by another provider than the conversation's is `provider/id`.                                             |
+| `requests`    | integer           | Requests it answered.                                                                                                                |
+| `input`       | integer           | Input tokens neither read from nor written to the prompt cache.                                                                      |
+| `output`      | integer           | Tokens it wrote, reasoning included.                                                                                                 |
+| `cache_read`  | integer           | Input tokens read from the prompt cache.                                                                                             |
+| `cache_write` | integer           | Input tokens written to the prompt cache.                                                                                            |
+| `cost`        | optional integer  | What the requests cost at list prices, in millionths of a US dollar; `null` when the model's prices are not known.                   |
+| `missed`      | integer           | How much of `cost` was paid for cache misses, in millionths of a US dollar.                                                          |
+
+```json
+{"Spent":{"models":[{"model":"claude-haiku-5-5","requests":3,"input":412,"output":611,"cache_read":45936,"cache_write":23141,"cost":3698,"missed":0}]}}
+```
+
 
 ## Types the subcommands print and read
 

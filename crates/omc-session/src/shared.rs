@@ -99,6 +99,8 @@ pub(crate) struct Shared {
     pub(crate) warmer: Arc<Warmer>,
     /// The goal the agent works toward across turns, when the reader set one.
     pub(crate) goals: crate::goal::Goals,
+    /// What the conversation cost so far.
+    pub(crate) ledger: crate::spend::Ledger,
     /// The date turns tell the agent instead of today's, in tests.
     #[cfg(test)]
     pub(crate) today: Mutex<Option<String>>,
@@ -175,6 +177,7 @@ impl Shared {
             tree: Mutex::new(None),
             warmer: Arc::new(Warmer::default()),
             goals: crate::goal::Goals::default(),
+            ledger: crate::spend::Ledger::default(),
             #[cfg(test)]
             today: Mutex::new(None),
         })

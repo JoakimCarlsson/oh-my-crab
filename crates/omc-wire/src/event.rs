@@ -9,6 +9,7 @@ use crate::permission::Permission;
 use crate::plan::PlanStep;
 use crate::queue::Queued;
 use crate::setting::{Setting, Slash};
+use crate::spend::Spent;
 use crate::tool::{Background, Subagent, Tool};
 use crate::trust::TrustRequest;
 use crate::usage::Usage;
@@ -54,6 +55,9 @@ pub struct Conversation {
     /// Every branch of the conversation, in the order they were made, the first one first.
     #[serde(default)]
     pub branches: Vec<Branch>,
+    /// What the conversation has cost so far, when it has cost something; nothing from a harness that predates the field.
+    #[serde(default)]
+    pub spent: Option<Spent>,
 }
 
 /// What the agent did, in the order it did it.
@@ -149,6 +153,8 @@ pub enum Event {
         /// The files that changed, from the root of the repository.
         files: Vec<String>,
     },
+    /// What the conversation has cost so far, whole, for each model it asked, subagents and cache warming included; sent after every model request that was billed, and when a saved conversation that cost something is opened.
+    Spent(Spent),
 }
 
 /// The kind of a block of the agent's reply.

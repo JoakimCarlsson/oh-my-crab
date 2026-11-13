@@ -37,8 +37,10 @@ one prints it as an error.
   model, signed in as for `serve`, such as `OPENROUTER_API_KEY` for
   `openrouter`. It prints what the agent said after its last tool call, or
   with `--json` one object: `result`, `is_error`, `error`, `requests`,
-  `input_tokens` (every token sent, summed over the requests), `output_tokens`
-  and `tool_calls`. It exits 1 when the turn fails. For scripts, CI and
+  `input_tokens` (every token sent, summed over the requests), `output_tokens`,
+  `tool_calls` and `cost_usd`, what the run cost in US dollars at the models'
+  list prices with subagents included, left out when no model's prices are
+  known. It exits 1 when the turn fails. For scripts, CI and
   sandboxes: `crab exec --provider openrouter --model anthropic/claude-sonnet-4.5 --json "fix the failing test"`.
 - **`limits [provider] [--json] [--folder <folder>]`** asks each signed-in
   provider that meters a subscription allowance how much of it the account has

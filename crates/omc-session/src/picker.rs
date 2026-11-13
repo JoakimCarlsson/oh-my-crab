@@ -11,6 +11,7 @@ use omc_providers::{Effort, Provider, RemoteModel, Retention};
 
 use crate::settings::default_effort;
 use crate::shared::Shared;
+use crate::spend::Priced;
 
 /// How many model ids an error lists at most.
 const LISTED: usize = 20;
@@ -38,7 +39,7 @@ impl ModelPicker for SessionPicker {
 }
 
 impl SessionPicker {
-    /// The model `wanted` names, as [`ModelPicker::pick`] finds it, with the provider that serves it and its id there.
+    /// The model `wanted` names, as [`ModelPicker::pick`] finds it, with the provider that serves it and its id there; what its requests cost is counted toward the conversation.
     ///
     /// # Errors
     ///
@@ -70,17 +71,24 @@ impl SessionPicker {
         } else {
             format!("{}/{id}", provider.def().id)
         };
+        let remote = RemoteModel::new(
+            provider,
+            credentials,
+            id.clone(),
+            if same {
+                self.shared.retention()
+            } else {
+                Retention::default()
+            },
+            self.shared.home(),
+        );
         let picked = Picked {
-            model: Arc::new(RemoteModel::new(
+            model: Arc::new(Priced::of(
+                Arc::new(remote),
+                self.shared.clone(),
                 provider,
-                credentials,
-                id.clone(),
-                if same {
-                    self.shared.retention()
-                } else {
-                    Retention::default()
-                },
-                self.shared.home(),
+                &id,
+                false,
             )),
             name,
             effort,

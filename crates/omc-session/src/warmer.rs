@@ -34,7 +34,7 @@ const IDLE_CONTINUATION: f64 = 0.15;
 const MINIMUM_SAVING: f64 = 0.02;
 
 /// The key the cost of warming is saved under with the conversation.
-const SPENT_FACT: &str = "cache_warming";
+pub(crate) const SPENT_FACT: &str = "cache_warming";
 
 /// Which model and cache a request was sent to.
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -18,6 +18,7 @@ use crate::picker::SessionPicker;
 use crate::prefix::{Key, Planning, Prefix};
 use crate::settings::Mode;
 use crate::shared::{SessionHost, Shared};
+use crate::spend::Priced;
 use crate::toolset::{Inputs, Toolset};
 use crate::translate::translate_all;
 use crate::warmer::Recorder;
@@ -230,10 +231,20 @@ impl Turn {
         planner: Option<Planner>,
         job: Job,
     ) -> Ended {
-        let model: Arc<dyn ChatModel> = Arc::new(Metered {
-            inner: model,
-            shared: self.shared.clone(),
-        });
+        let priced = |main: bool| -> Arc<dyn ChatModel> {
+            Arc::new(Metered {
+                inner: Arc::new(Priced::of(
+                    model.clone(),
+                    self.shared.clone(),
+                    self.provider,
+                    &self.model,
+                    main,
+                )),
+                shared: self.shared.clone(),
+            })
+        };
+        let helper = priced(false);
+        let model = priced(true);
         let planner = planner.map(|planner| Planner {
             model: Arc::new(Metered {
                 inner: planner.model,
@@ -258,12 +269,12 @@ impl Turn {
         });
         let subagent_model: Arc<dyn ChatModel> = match &planner {
             Some(planner) => Arc::new(Switch {
-                main: model.clone(),
+                main: helper,
                 plan: planner.model.clone(),
                 effort: planner.effort,
                 planning: planning.clone(),
             }),
-            None => model.clone(),
+            None => helper,
         };
         let effort = self.shared.effort_now();
         let out = self.shared.out.clone();
@@ -1721,6 +1732,85 @@ mod tests {
                 "{mode:?}"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A model that answers as [`Delegating`] does and says what each request was billed.
+    struct Billing {
+        /// The model that answers.
+        inner: Delegating,
+    }
+
+    #[async_trait]
+    impl ChatModel for Billing {
+        /// Answers with a bill of a thousand input tokens and a hundred output tokens.
+        async fn complete(
+            &self,
+            request: Request<'_>,
+            sink: &mut dyn Sink,
+        ) -> Result<Reply, ProviderError> {
+            let reply = self.inner.complete(request, sink).await?;
+            Ok(Reply {
+                tokens: Some(omc_providers::Tokens {
+                    input: 1000,
+                    output: 100,
+                    ..omc_providers::Tokens::default()
+                }),
+                ..reply
+            })
+        }
+    }
+
+    /// Every request of a turn, a subagent's included, is added to what the conversation cost, which the client is told after each and which is saved with the conversation.
+    #[tokio::test]
+    async fn a_turn_is_charged_with_its_subagents() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/turn-spent");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (journal, _) = omc_agent::Journal::open(&dir.join("c.jsonl"), None).unwrap();
+        let (out, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared::new(out);
+        let id = "claude-opus-4-5";
+        shared.open(Provider::Claude, vec![id.into()], id.into(), Mode::Yolo);
+        shared.attach(Some(journal.clone()));
+        let mut turn = turn_in(&dir, &shared, Vec::new());
+        turn.model = id.into();
+        turn.discovered = Arc::new(Discovered {
+            agents: omc_context::builtin_agents(),
+            ..Discovered::default()
+        });
+        let model = Arc::new(Billing {
+            inner: Delegating {
+                subagents: Mutex::new(Vec::new()),
+                main: Mutex::new(0),
+            },
+        });
+        let Ended::Done(_) = turn
+            .run_with(model, Job::Prompt("go".into(), Vec::new()))
+            .await
+        else {
+            panic!("turn failed");
+        };
+        let told: Vec<omc_wire::Spent> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                Event::Spent(spent) => Some(spent),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(told.len(), 3);
+        let last = told.last().unwrap();
+        assert_eq!(last.models.len(), 1);
+        assert_eq!(last.models[0].model, id);
+        assert_eq!((last.requests(), last.tokens()), (3, 3300));
+        assert!(last.cost().is_some_and(|cost| cost > 0));
+        let reopened = crate::spend::Ledger::default();
+        assert_eq!(
+            reopened
+                .restore(journal.fact(crate::spend::SPENT_FACT))
+                .as_ref(),
+            Some(last)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

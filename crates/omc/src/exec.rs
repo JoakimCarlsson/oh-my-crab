@@ -45,6 +45,9 @@ pub(crate) struct Outcome {
     output_tokens: u64,
     /// How many tool calls the agent made.
     tool_calls: u64,
+    /// What the run cost in US dollars at the models' list prices, subagents included; left out when no model's prices are known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_usd: Option<f64>,
 }
 
 /// An [`Outcome`] being gathered from a turn's events, with the tool calls already counted.
@@ -213,6 +216,9 @@ fn take(event: &Event, tally: &mut Tally) {
             outcome.input_tokens += usage.used;
             outcome.output_tokens += usage.written;
         }
+        Event::Spent(spent) => {
+            outcome.cost_usd = spent.cost().map(omc_wire::dollars);
+        }
         Event::Said(text) => outcome.result.push_str(text),
         Event::Tool(tool) => {
             if tally.tools.insert(tool.id.clone()) {
@@ -278,7 +284,7 @@ fn report(exec: &Exec, outcome: &Outcome) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use omc_wire::Usage;
+    use omc_wire::{ModelSpend, Spent, Usage};
 
     #[test]
     fn options_are_read_and_the_rest_is_the_prompt() {
@@ -331,6 +337,14 @@ mod tests {
                 size: 1000,
                 written: 5,
             }),
+            Event::Spent(Spent {
+                models: vec![ModelSpend {
+                    model: "m".to_owned(),
+                    requests: 2,
+                    cost: Some(12_500),
+                    ..ModelSpend::default()
+                }],
+            }),
         ] {
             take(&event, &mut tally);
         }
@@ -339,6 +353,7 @@ mod tests {
         assert_eq!(tally.outcome.requests, 2);
         assert_eq!(tally.outcome.input_tokens, 250);
         assert_eq!(tally.outcome.output_tokens, 15);
+        assert_eq!(tally.outcome.cost_usd, Some(0.0125));
         assert!(tally.active);
     }
 

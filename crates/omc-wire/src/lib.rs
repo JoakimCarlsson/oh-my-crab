@@ -20,6 +20,7 @@ mod plan;
 mod provider;
 mod queue;
 mod setting;
+mod spend;
 mod tool;
 mod toolserver;
 mod trust;
@@ -42,6 +43,7 @@ pub use plan::{PlanStep, Progress};
 pub use provider::{KeySource, ProviderInfo, SignIn};
 pub use queue::{QueueState, Queued};
 pub use setting::{Pick, Setting, Slash};
+pub use spend::{ModelSpend, Spent, dollars, micros};
 pub use tool::{
     Background, Diff, Kind, Merge, Subagent, SubagentState, Tool, ToolInfo, ToolState, Worktree,
 };

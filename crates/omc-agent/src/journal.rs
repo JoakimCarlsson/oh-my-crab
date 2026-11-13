@@ -558,7 +558,7 @@ impl Journal {
         Ok((journal, history))
     }
 
-    /// Copies the branch the conversation saved at `source` is on, up to the turn `before` when that is given or whole otherwise, to `destination` as a conversation of its own: its messages and turns, its lost turns, its name, its settings, its notebook, the files its tool calls changed and the facts saved with it. The copy has one branch; `source` is only read, so it may be open elsewhere.
+    /// Copies the branch the conversation saved at `source` is on, up to the turn `before` when that is given or whole otherwise, to `destination` as a conversation of its own: its messages and turns, its lost turns, its name, its settings, its notebook, the files its tool calls changed and the facts saved with it, but for those under the keys `without`, which say something of `source` alone. The copy has one branch; `source` is only read, so it may be open elsewhere.
     ///
     /// # Errors
     ///
@@ -567,6 +567,7 @@ impl Journal {
         source: &Path,
         destination: &Path,
         before: Option<&str>,
+        without: &[&str],
     ) -> Result<(), JournalError> {
         let saved = Self::read(source)?;
         let mut line = Line {
@@ -626,7 +627,11 @@ impl Journal {
         for (call, files) in &saved.changes {
             write_record(file, &Written::Changes(call, files)).map_err(failed)?;
         }
-        for (key, value) in &saved.facts {
+        for (key, value) in saved
+            .facts
+            .iter()
+            .filter(|(key, _)| !without.contains(&key.as_str()))
+        {
             write_record(file, &Written::Fact(key, value)).map_err(failed)?;
         }
         file.sync_data().map_err(failed)
@@ -1881,7 +1886,7 @@ mod tests {
         assert_eq!(journal.branches().0, FIRST_BRANCH);
     }
 
-    /// Forking copies the branch the conversation is on up to a turn into a conversation of its own, with its name and settings, leaving the original as it was; a destination with a history is refused.
+    /// Forking copies the branch the conversation is on up to a turn into a conversation of its own, with its name, settings and facts but for the facts left out, leaving the original as it was; a destination with a history is refused.
     #[test]
     fn forking_copies_the_branch_up_to_a_turn() {
         let path = scratch("fork-source.jsonl");
@@ -1891,7 +1896,9 @@ mod tests {
         journal.save_title("Source").unwrap();
         journal.save_setting("mode", "yolo").unwrap();
         journal.save_notes("notebook").unwrap();
-        Journal::fork(&path, &copy, Some("c")).unwrap();
+        journal.save_fact("window", &json!(1000)).unwrap();
+        journal.save_fact("spent", &json!(3)).unwrap();
+        Journal::fork(&path, &copy, Some("c"), &["spent"]).unwrap();
         assert_eq!(journal.marks().len(), 3);
         drop(journal);
         let saved = Journal::read(&copy).unwrap();
@@ -1900,9 +1907,10 @@ mod tests {
         assert_eq!(saved.title.as_deref(), Some("Source"));
         assert_eq!(saved.settings, [("mode".to_owned(), "yolo".to_owned())]);
         assert_eq!(saved.notes, "notebook");
+        assert_eq!(saved.facts, [("window".to_owned(), json!(1000))]);
         assert_eq!(saved.branches.len(), 1);
-        assert!(Journal::fork(&path, &copy, None).is_err());
-        assert!(Journal::fork(&path, &scratch("fork-none.jsonl"), Some("zzz")).is_err());
+        assert!(Journal::fork(&path, &copy, None, &[]).is_err());
+        assert!(Journal::fork(&path, &scratch("fork-none.jsonl"), Some("zzz"), &[]).is_err());
         assert_eq!(Journal::read(&path).unwrap().history.len(), 6);
     }
 }

@@ -503,11 +503,19 @@ impl Session {
         if let Some(goal) = self.shared.goals.restore(saved) {
             self.shared.announce_goal(&goal);
         }
+        let spent = self
+            .journal
+            .as_ref()
+            .and_then(|journal| journal.fact(crate::spend::SPENT_FACT));
+        let spent = self.shared.ledger.restore(spent);
         if self.journal.is_some() {
             if let Some(title) = self.shared.title() {
                 self.say(Event::Titled(title));
             }
             self.say_history();
+        }
+        if let Some(spent) = spent {
+            self.say(Event::Spent(spent));
         }
         let source = if self.journal.is_some() {
             START_RESUME
@@ -727,6 +735,7 @@ impl Session {
             window: Some(window),
             branch,
             branches,
+            spent: self.shared.ledger.told(),
         }));
     }
 
@@ -1591,7 +1600,7 @@ fn load_history(
         .map_err(|error| format!("cannot open the conversation: {error}"))
 }
 
-/// The saved conversation `id` in `folder`: its name, the choices made about it and its turns, as the events a live conversation would have sent for them, read without opening the conversation, so that it works while the conversation is open elsewhere; an empty conversation when nothing was saved. The context size is left out, since it depends on a model.
+/// The saved conversation `id` in `folder`: its name, the choices made about it, what it cost and its turns, as the events a live conversation would have sent for them, read without opening the conversation, so that it works while the conversation is open elsewhere; an empty conversation when nothing was saved. The context size is left out, since it depends on a model.
 ///
 /// # Errors
 ///
@@ -1609,6 +1618,13 @@ pub fn history(id: &str, folder: Option<PathBuf>) -> Result<omc_wire::Conversati
         saved.fact("commands"),
         saved.window(),
     );
+    let spent = crate::spend::told(
+        saved
+            .facts
+            .iter()
+            .find(|(key, _)| key == crate::spend::SPENT_FACT)
+            .map(|(_, value)| value.clone()),
+    );
     Ok(omc_wire::Conversation {
         title: saved.title,
         settings: saved.settings,
@@ -1625,10 +1641,11 @@ pub fn history(id: &str, folder: Option<PathBuf>) -> Result<omc_wire::Conversati
         window,
         branch: Some(saved.branch),
         branches: crate::translate::branches(&saved.branches),
+        spent,
     })
 }
 
-/// Copies the branch the saved conversation `id` in `folder` is on, up to the turn `before` when that is given or whole otherwise, to the new saved conversation `copy` in the same folder, which a client can then open as a conversation of its own. It works while `id` is open elsewhere.
+/// Copies the branch the saved conversation `id` in `folder` is on, up to the turn `before` when that is given or whole otherwise, to the new saved conversation `copy` in the same folder, which a client can then open as a conversation of its own. It works while `id` is open elsewhere. The copy starts having cost nothing: what `id` cost stays with `id`.
 ///
 /// # Errors
 ///
@@ -1647,7 +1664,13 @@ pub fn fork(
     if !source.exists() {
         return Err(format!("no conversation is saved as {id}"));
     }
-    Journal::fork(&source, &destination, before).map_err(|error| error.to_string())
+    Journal::fork(
+        &source,
+        &destination,
+        before,
+        &[crate::spend::SPENT_FACT, crate::warmer::SPENT_FACT],
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Names the saved conversation `id` in `folder` `title`, which works on a conversation nobody has open.

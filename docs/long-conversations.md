@@ -130,3 +130,24 @@ Two settings shape the cache on Claude:
 Prices per model and cache lifetimes are in `crates/omc-providers/src/models.rs`.
 The requests that summarize a conversation for a compaction write nothing to
 the cache, since they are never sent again.
+
+## What a conversation costs
+
+Every model request is priced as it is answered and added up for each model:
+the conversation's model, the plan model, the models of subagents, summaries
+and cache warming. The client is told the total with a
+[`Spent`](wire-protocol.md#spent) event after each request, and it is saved
+with the conversation under `spent`, so a conversation opened again goes on
+counting from where it was. Going back to before a turn does not take back
+what the turns left behind cost, and a fork starts at nothing.
+
+The prices are list prices, so a conversation paid for by a subscription shows
+what it would have cost with an API key. A model whose prices are not known is
+counted in tokens only.
+
+The total also says how much was paid for cache misses. A request of the main
+loop that reads from the cache less of the conversation than the request
+before it sent, by more than 2,048 tokens, missed: the cached context expired
+while the conversation waited, or a compaction rewrote it. What the part that
+was not read cost beyond reading it from the cache counts as the miss. Requests
+of subagents and of the plan model are not watched for misses.
