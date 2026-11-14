@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use crate::catalog::{self, Cost, Entry};
-use crate::wires::{anthropic_messages, gemini};
+use crate::wires::{anthropic_messages, gemini, openai_responses};
 use crate::{Effort, Provider, Tokens, Wire};
 
 /// A model's generation as `major.minor`, parsed from its id.
@@ -284,7 +284,7 @@ pub fn context_window(provider: Provider, model: &str) -> u64 {
 pub fn efforts(provider: Provider, model: &str) -> Vec<Effort> {
     match provider.wire() {
         Wire::AnthropicMessages | Wire::Bedrock | Wire::Vertex => claude_efforts(model),
-        Wire::OpenAiResponses => codex_efforts(model),
+        Wire::OpenAiResponses => openai_responses::efforts(provider, model),
         Wire::ChatCompletions => Vec::new(),
         Wire::Gemini => gemini::efforts(model),
     }

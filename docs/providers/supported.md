@@ -23,7 +23,7 @@ These providers are built into the `omc` binary. To add one, see
 | `groq`       | ChatCompletions   | `GROQ_API_KEY`                        | `https://api.groq.com/openai/v1`, or `OMC_GROQ_URL`                            |
 | `cerebras`   | ChatCompletions   | `CEREBRAS_API_KEY`                    | `https://api.cerebras.ai/v1`, or `OMC_CEREBRAS_URL`                            |
 | `mistral`    | ChatCompletions   | `MISTRAL_API_KEY`                     | `https://api.mistral.ai/v1`, or `OMC_MISTRAL_URL`                              |
-| `openai`     | ChatCompletions   | `OPENAI_API_KEY`                      | `https://api.openai.com/v1`, or `OMC_OPENAI_URL`                               |
+| `openai`     | OpenAiResponses   | `OPENAI_API_KEY`                      | `https://api.openai.com/v1`, or `OMC_OPENAI_URL`                               |
 | `gemini`     | Gemini            | `GEMINI_API_KEY` / `GOOGLE_API_KEY`   | `https://generativelanguage.googleapis.com/v1beta`, or `OMC_GEMINI_URL`        |
 | `together`   | ChatCompletions   | `TOGETHER_API_KEY`                    | `https://api.together.ai/v1`, or `OMC_TOGETHER_URL`                            |
 | `fireworks`  | ChatCompletions   | `FIREWORKS_API_KEY`                   | `https://api.fireworks.ai/inference/v1`, or `OMC_FIREWORKS_URL`                |
@@ -33,13 +33,13 @@ These providers are built into the `omc` binary. To add one, see
 | `anthropic`  | AnthropicMessages | `ANTHROPIC_API_KEY`                   | `https://api.anthropic.com`, or `OMC_ANTHROPIC_URL`                            |
 | `bedrock`    | Bedrock           | AWS credentials, or `AWS_BEARER_TOKEN_BEDROCK` | `https://bedrock-runtime.<region>.amazonaws.com`, or `OMC_BEDROCK_URL` |
 | `vertex`     | Vertex            | Google Cloud credentials              | `https://<region>-aiplatform.googleapis.com`, or `OMC_VERTEX_URL`               |
+| `azure`      | OpenAiResponses   | `AZURE_OPENAI_API_KEY`                | `https://<resource>.openai.azure.com/openai/v1`; see [Azure OpenAI](#azure-openai) |
 
 Each API-key provider opens with a default model when none is picked:
 `kimi-for-coding` for `kimi-code`, `kimi-k2.7-code` for `moonshot`, `glm-5.3`
 for both Z.ai ids, `MiniMax-M3`, `deepseek-v4-pro`, `grok-4.7`,
 `openai/gpt-oss-120b` on Groq, `gpt-oss-120b` on Cerebras,
-`mistral-large-latest`, `gpt-6.1-terra` on OpenAI (its largest models take no
-tools over Chat Completions), `gemini-3.8-flash`, `MiniMaxAI/MiniMax-M3` on
+`mistral-large-latest`, `gpt-6.1-terra` on OpenAI, `gemini-3.8-flash`, `MiniMaxAI/MiniMax-M3` on
 Together and `accounts/fireworks/models/kimi-k2-thinking` on Fireworks. Gemini
 speaks its own API; see [gemini.md](gemini.md). The
 default leads the model list a client is offered; the rest is what the server's
@@ -133,8 +133,44 @@ Model ids are Vertex's, such as `claude-sonnet-5-5` (the default) or
 Vertex. Gemini on Vertex is not offered; use `gemini`. Caches are written
 with the five-minute lifetime and not kept warm.
 
-Servers crab has no definition for are added in `providers.json`; see
-[custom endpoints](custom-endpoints.md).
+### OpenAI
+
+`openai` speaks the Responses API at `https://api.openai.com/v1/responses`
+with `OPENAI_API_KEY` as a bearer token; `OMC_OPENAI_URL` points it at another
+host that serves the same API. Replies stream, tools are function tools, and
+images go as `input_image` parts. A model that reasons (the GPT generations
+from the fifth on, the `o` series, Codex and the open-weight GPT models) is
+sent `reasoning` with the effort picked, clamped to the levels the model takes,
+and `summary: "auto"`, so its reasoning summary streams as thinking. Every
+request asks for `store: false` and for the encrypted reasoning, which goes
+back with later requests in place of stored responses. The model list is the
+conversation models `GET /v1/models` lists, after the default.
+
+### Azure OpenAI
+
+`azure` speaks the Responses API to an Azure OpenAI resource, sending
+`AZURE_OPENAI_API_KEY` in the `api-key` header. Its address is, first set wins:
+
+- `AZURE_OPENAI_BASE_URL`, the whole API address, such as
+  `https://name.openai.azure.com/openai/v1`;
+- `AZURE_OPENAI_ENDPOINT`, the resource's endpoint, such as
+  `https://name.openai.azure.com`, with `/openai/v1` appended unless it
+  already names a path under `/openai`;
+- `AZURE_OPENAI_RESOURCE_NAME`, the resource's name, which makes
+  `https://<name>.openai.azure.com/openai/v1`.
+
+Requests go to `<address>/responses?api-version=<version>`, the version
+being `AZURE_OPENAI_API_VERSION`, or `v1` when unset. The model is the
+deployment's name: `AZURE_OPENAI_DEPLOYMENT` names the deployments offered,
+separated by commas, the first being the default; without it the resource's
+models are listed. A deployment is sent reasoning, as on `openai`, when its
+name names a model that reasons, such as `gpt-5-prod`.
+
+### Servers you declare
+
+Servers crab has no definition for, such as LiteLLM, vLLM, LM Studio or
+llama.cpp on another address, are added in `providers.json`, over Chat
+Completions or the Responses API; see [custom endpoints](custom-endpoints.md).
 
 The id is what you give when signing in or opening a conversation, for example
 `claude` or `copilot`. The definitions live in
@@ -182,7 +218,7 @@ A wire is a protocol. Several providers can share one.
 | `AnthropicMessages` | `crates/omc-providers/src/wires/anthropic_messages.rs` | Anthropic, with a subscription (`claude`) or an API key (`anthropic`)                        |
 | `Bedrock`           | `crates/omc-providers/src/wires/anthropic_messages.rs`, `crates/omc-providers/src/cloud/` | Claude on Amazon Bedrock: the Messages body, signed, over AWS's event stream |
 | `Vertex`            | `crates/omc-providers/src/wires/anthropic_messages.rs`, `crates/omc-providers/src/cloud/` | Claude on Google Vertex AI: the Messages body over `streamRawPredict`         |
-| `OpenAiResponses`   | `crates/omc-providers/src/wires/openai_responses.rs`   | the ChatGPT Codex backend                                                                    |
+| `OpenAiResponses`   | `crates/omc-providers/src/wires/openai_responses.rs`   | the ChatGPT Codex backend, the OpenAI API (`openai`), Azure OpenAI (`azure`) and custom endpoints declared with `"wire": "responses"` |
 | `ChatCompletions`   | `crates/omc-providers/src/wires/chat_completions.rs`   | anything that copies OpenAI Chat Completions: every provider above but the Claude ones and Codex, and custom endpoints |
 
 ## Sign-in methods

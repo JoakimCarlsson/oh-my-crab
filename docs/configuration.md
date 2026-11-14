@@ -103,8 +103,19 @@ find their cloud's credentials as below.
 | `lmstudio`   | none                                  | `OMC_LMSTUDIO_URL`   | `http://localhost:1234/v1`                                |
 | `llamacpp`   | none                                  | `OMC_LLAMACPP_URL`   | `http://localhost:9931/v1`                                |
 | `vllm`       | none                                  | `OMC_VLLM_URL`       | `http://localhost:8000/v1`                                |
+| `azure`      | `AZURE_OPENAI_API_KEY`                | see below            | `https://<resource>.openai.azure.com/openai/v1`           |
 
 More on each provider is in [Supported providers](providers/supported.md).
+
+`azure` reads where its resource is on every request:
+
+| Variable                     | What it does                                                                                   | Details |
+| ---------------------------- | ---------------------------------------------------------------------------------------------- | ------- |
+| `AZURE_OPENAI_ENDPOINT`      | The resource's endpoint, such as `https://name.openai.azure.com`; `/openai/v1` is appended.    | [Azure OpenAI](providers/supported.md#azure-openai) |
+| `AZURE_OPENAI_RESOURCE_NAME` | The resource's name, used when no endpoint is set.                                             | [Azure OpenAI](providers/supported.md#azure-openai) |
+| `AZURE_OPENAI_BASE_URL`      | The whole API address, which wins over both.                                                   | [Azure OpenAI](providers/supported.md#azure-openai) |
+| `AZURE_OPENAI_API_VERSION`   | The `api-version` every request names; `v1` when unset.                                        | [Azure OpenAI](providers/supported.md#azure-openai) |
+| `AZURE_OPENAI_DEPLOYMENT`    | The deployments offered as models, separated by commas, the first the default.                 | [Azure OpenAI](providers/supported.md#azure-openai) |
 
 ### Cloud credentials
 
@@ -173,7 +184,7 @@ Crab does not read these; it sets them for the hook commands it runs.
 | Path                                                          | What                                                                                                    | Written by                          | Details                                           |
 | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- | ----------------------------------- | ------------------------------------------------- |
 | `<config>/auth.json`                                          | Logins, saved API keys and the provider last signed in to; for `bedrock` and `vertex` an empty entry marks them signed in, their credentials staying with the cloud's own tools. A client can keep it elsewhere by opening the conversation with a `home` folder: then it is `<home>/auth.json`. | crab, when signing in or saving a key | [Providers](providers/overview.md)            |
-| `<config>/providers.json`                                     | Custom providers. Read once, when the providers are first listed. Moved by `OMC_PROVIDERS_FILE`, not by `home`. | the user                     | [Custom endpoints](providers/custom-endpoints.md) |
+| `<config>/providers.json`                                     | Custom providers and OpenAI-compatible servers. Read when the providers are first listed, and again when a client saves or removes a server. Moved by `OMC_PROVIDERS_FILE`, not by `home`. | the user                     | [Custom endpoints](providers/custom-endpoints.md) |
 | `<config>/hooks.json`                                         | The user's own hooks. Moved by `OMC_HOOKS_FILE`.                                                         | the user                            | [Hooks](extending/hooks.md)                       |
 | `<config>/mcp.json`                                           | The user's own tool servers, in the shape of `.mcp.json`. Read when a conversation opens. Moved by `OMC_MCP_FILE`. | the user                  | [Tool servers](extending/mcp.md)                  |
 | `<config>/extensions.json`                                    | The user's own extensions. Read when a conversation opens. Moved by `OMC_EXTENSIONS_FILE`.               | the user                            | [Extensions](extending/extensions.md)             |

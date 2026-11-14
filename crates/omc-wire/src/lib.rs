@@ -19,6 +19,7 @@ mod permission;
 mod plan;
 mod provider;
 mod queue;
+mod server;
 mod setting;
 mod spend;
 mod tool;
@@ -42,6 +43,7 @@ pub use permission::{Choice, Permission, Verdict};
 pub use plan::{PlanStep, Progress};
 pub use provider::{KeySource, ProviderInfo, SignIn};
 pub use queue::{QueueState, Queued};
+pub use server::{Server, ServerWire};
 pub use setting::{Pick, Setting, Slash};
 pub use spend::{ModelSpend, Spent, dollars, micros};
 pub use tool::{

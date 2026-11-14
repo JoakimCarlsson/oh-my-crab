@@ -197,9 +197,15 @@ mod tests {
             "anthropic",
             "bedrock",
             "vertex",
+            "azure",
         ] {
             assert!(ids.contains(&id), "{id} is not registered");
         }
+        let openai = Provider::from_id("openai").unwrap().def();
+        assert_eq!(openai.wire, Wire::OpenAiResponses);
+        let azure = Provider::from_id("azure").unwrap().def();
+        assert_eq!(azure.wire, Wire::OpenAiResponses);
+        assert!(matches!(azure.auth, Auth::ApiKey { env } if env == ["AZURE_OPENAI_API_KEY"]));
         let kimi = Provider::from_id("kimi-code").unwrap().def();
         assert_eq!(kimi.default_model, Some("kimi-for-coding"));
         assert!(

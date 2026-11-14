@@ -528,7 +528,8 @@ impl RemoteModel {
                 .await
             }
             Wire::OpenAiResponses => {
-                openai_responses::complete(credentials, &self.model, request, sink).await
+                openai_responses::complete(self.provider, credentials, &self.model, request, sink)
+                    .await
             }
             Wire::ChatCompletions => {
                 let base_url = chat_completions::base_url(self.provider, credentials);

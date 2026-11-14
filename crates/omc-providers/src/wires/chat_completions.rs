@@ -32,7 +32,10 @@ pub(crate) fn base_url(provider: Provider, credentials: &Credentials) -> String 
 }
 
 /// Adds the provider's headers, those kept with the login in their place where they share a name, and the bearer token to `request`.
-fn authorized(request: reqwest::RequestBuilder, target: &Target<'_>) -> reqwest::RequestBuilder {
+pub(crate) fn authorized(
+    request: reqwest::RequestBuilder,
+    target: &Target<'_>,
+) -> reqwest::RequestBuilder {
     let mut request = request;
     let own = &target.credentials.headers;
     for (name, value) in target.headers {

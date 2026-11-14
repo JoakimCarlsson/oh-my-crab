@@ -36,6 +36,12 @@ pub struct ProviderInfo {
     /// What credentials the provider is reached with besides any sign-in or key, and where they come from, as a client shows them, such as `Google Cloud credentials (gcloud or Application Default Credentials)`; nothing for a provider whose sign-in says it all. A provider that signs in as [`SignIn::None`] and names these is not a local server: it reads the credentials a cloud's own tools keep.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials: Option<String>,
+    /// Whether it is a server the user declared in the harness's configuration rather than a built-in provider; left out when it is not. Such a server is read, edited and removed with [`crate::Command::Servers`], [`crate::Command::SaveServer`] and [`crate::Command::RemoveServer`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub server: bool,
+    /// The models a declared server was given to offer, in order; empty when it was given none and its models are asked of it, and for every built-in provider.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
 }
 
 /// Where the API key a provider is signed in with comes from.

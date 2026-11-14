@@ -48,6 +48,11 @@ pub fn providers() -> Vec<ProviderInfo> {
                     .map(|name| (*name).to_owned())
                     .collect(),
                 credentials: credentials(&def.auth),
+                server: matches!(provider, Provider::Custom(_)),
+                models: match provider {
+                    Provider::Custom(custom) => custom.fixed_models().unwrap_or_default(),
+                    _ => Vec::new(),
+                },
             }
         })
         .collect()

@@ -309,6 +309,32 @@ impl Session {
                     .filter(|goal| !goal.is_empty());
                 self.carry_out(restart::Asked::Handoff(goal), &[], false);
             }
+            Command::Servers => self.say(match omc_providers::servers() {
+                Ok(servers) => Event::Servers(servers),
+                Err(reason) => Event::Failed(reason),
+            }),
+            Command::SaveServer(server) => self.say(match omc_providers::save_server(server) {
+                Ok(servers) => Event::Servers(servers),
+                Err(reason) => Event::Failed(reason),
+            }),
+            Command::RemoveServer { id } => self.say(match omc_providers::remove_server(&id) {
+                Ok(servers) => Event::Servers(servers),
+                Err(reason) => Event::Failed(reason),
+            }),
+            Command::FindModels { ticket, server } => {
+                let out = self.shared.out.clone();
+                tokio::spawn(async move {
+                    let (models, error) = match omc_providers::find_models(server).await {
+                        Ok(models) => (models, None),
+                        Err(reason) => (Vec::new(), Some(reason)),
+                    };
+                    let _ = out.send(Event::FoundModels {
+                        ticket,
+                        models,
+                        error,
+                    });
+                });
+            }
             Command::Close => {}
         }
     }

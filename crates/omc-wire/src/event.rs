@@ -8,6 +8,7 @@ use crate::language::LanguageRequest;
 use crate::permission::Permission;
 use crate::plan::PlanStep;
 use crate::queue::Queued;
+use crate::server::Server;
 use crate::setting::{Setting, Slash};
 use crate::spend::Spent;
 use crate::tool::{Background, Subagent, Tool};
@@ -168,6 +169,17 @@ pub enum Event {
         prompt: String,
         /// The id the harness saved the new conversation's first turn under, as with the id of a turn the client prompted itself.
         turn: String,
+    },
+    /// The OpenAI-compatible servers declared in the harness's configuration, in order, in answer to a [`crate::Command::Servers`], [`crate::Command::SaveServer`] or [`crate::Command::RemoveServer`]; no API key is sent back.
+    Servers(Vec<Server>),
+    /// The models a server offers, in answer to the [`crate::Command::FindModels`] under `ticket`.
+    FoundModels {
+        /// The ticket of the command answered.
+        ticket: u64,
+        /// The model ids, in the order the server gave them; empty when it could not be asked.
+        models: Vec<String>,
+        /// Why the server could not be asked, or nothing when it was.
+        error: Option<String>,
     },
 }
 

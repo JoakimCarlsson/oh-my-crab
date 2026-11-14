@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use crate::inquiry::Reply;
 use crate::language::LanguageAnswer;
 use crate::permission::Verdict;
+use crate::server::Server;
 use crate::toolserver::ToolServer;
 
 /// How a conversation is opened.
@@ -169,6 +170,22 @@ pub enum Command {
         /// What the new conversation should work toward, or nothing to carry on with what this one was doing.
         #[serde(default)]
         goal: Option<String>,
+    },
+    /// Asks for the OpenAI-compatible servers declared in the harness's configuration, answered with a [`crate::Event::Servers`]. Allowed before [`Command::Open`] and while a turn is running.
+    Servers,
+    /// Adds the server, or replaces the one with the same id, in the harness's configuration, and answers with the servers as they now stand in a [`crate::Event::Servers`]; the server is a provider from then on, for conversations opened after. Fails with a [`crate::Event::Failed`], changing nothing, when the server is not valid. Allowed before [`Command::Open`] and while a turn is running.
+    SaveServer(Server),
+    /// Takes the server `id` out of the harness's configuration, and answers with the servers left in a [`crate::Event::Servers`]. Fails with a [`crate::Event::Failed`] when no server has that id. Allowed before [`Command::Open`] and while a turn is running.
+    RemoveServer {
+        /// The id of the server.
+        id: String,
+    },
+    /// Asks which models `server` offers, saved or not, answered with a [`crate::Event::FoundModels`] under `ticket`: the models it was given, or those it lists at `GET {base_url}/models`. A server sent without `api_key` uses the key saved for its id. Allowed before [`Command::Open`] and while a turn is running.
+    FindModels {
+        /// The number the answer comes back under, chosen by the client.
+        ticket: u64,
+        /// The server to ask.
+        server: Server,
     },
 }
 

@@ -20,7 +20,7 @@ pub use chat::{
     ChatModel, Compaction, DeltaSink, Effort, Elided, Elision, Excised, Image, Message, Part,
     Pruning, RemoteModel, Reply, Request, Sink, Stop, Tokens, ToolCall, ToolResult, ToolSpec,
 };
-pub use custom::{Custom, custom_providers_path};
+pub use custom::{Custom, custom_providers_path, find_models, remove_server, save_server, servers};
 pub use error::ProviderError;
 pub use limits::{fetch as fetch_limits, supported as limits_supported};
 pub use models::{
@@ -35,7 +35,8 @@ use wires::{anthropic_messages, chat_completions, gemini, openai_responses};
 
 /// Lists the model ids the account can use with `provider`, best first.
 ///
-/// Everywhere but on the `claude` and `codex` subscriptions the provider's default
+/// A server the user declared with a fixed model list offers that list without
+/// asking it. Everywhere but on the `claude` and `codex` subscriptions the provider's default
 /// model leads the list, listed by the server or not, so that a conversation
 /// opened without a model picks it.
 ///
@@ -47,6 +48,11 @@ pub async fn list_models(
     provider: Provider,
     credentials: &Credentials,
 ) -> Result<Vec<String>, ProviderError> {
+    if let Provider::Custom(custom) = provider
+        && let Some(models) = custom.fixed_models()
+    {
+        return Ok(default_first(models, provider.def().default_model));
+    }
     match provider.wire() {
         Wire::AnthropicMessages | Wire::Bedrock | Wire::Vertex => {
             let listed = anthropic_messages::list_models(provider, credentials).await?;
@@ -56,7 +62,14 @@ pub async fn list_models(
                 default_first(listed, provider.def().default_model)
             })
         }
-        Wire::OpenAiResponses => openai_responses::list_models(credentials).await,
+        Wire::OpenAiResponses => {
+            let listed = openai_responses::list_models(provider, credentials).await?;
+            Ok(if provider == Provider::Codex {
+                listed
+            } else {
+                default_first(listed, provider.def().default_model)
+            })
+        }
         Wire::ChatCompletions => {
             let base_url = chat_completions::base_url(provider, credentials);
             let listed = chat_completions::list_models(chat_completions::Target {

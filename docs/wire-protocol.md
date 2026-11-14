@@ -44,7 +44,8 @@ below.
   `status`, `reload`), `LanguageAnswer` (`formatted`, `diagnostics`,
   `locations`, `hover`, `symbols`, `edits`, `unsupported`, `no_server`,
   `failed`, `actions`, `applied`, `servers`, `done`), `Severity` (`error`, `warning`, `information`, `hint`),
-  `SignIn` (`browser`, `device_code`, `api_key`, `none`) and `KeySource`,
+  `SignIn` (`browser`, `device_code`, `api_key`, `none`), `ServerWire`
+  (`chat_completions`, `responses`) and `KeySource`,
   which is internally tagged by a `from` field.
 - **Field names** are snake_case as written in Rust.
 - **Optional fields** (marked "optional" in the tables below) are written as
@@ -53,7 +54,8 @@ below.
 - **Defaulted fields** (marked "default") may be left out when sent to crab:
   a list defaults to `[]`, a string to `""`, a boolean to `false`. Crab still
   writes them in what it sends, except `key_env` and `credentials` in
-  `ProviderInfo`, which are left out when empty.
+  `ProviderInfo`, which are left out when empty, and `server` and `models`
+  in `ProviderInfo`, left out when false or empty.
 - **Unknown fields** in a message sent to crab are ignored, so a client may
   set a field a newer crab reads, such as `navigation` in `Open`, and an
   older crab goes on as if it were not there.
@@ -857,6 +859,80 @@ the two. When the model cannot write the prompt the turn ends with
 {"Handoff":{"goal":"Write the migration guide"}}
 ```
 
+### `Servers`
+
+Asks for the OpenAI-compatible servers declared in crab's configuration (see
+[custom endpoints](providers/custom-endpoints.md)), answered with `Servers`.
+Like `SaveServer`, `RemoveServer` and `FindModels`, it may be sent before
+`Open` and while a turn is running, so a client can run a settings page on a
+`crab serve` that holds no conversation.
+
+```json
+"Servers"
+```
+
+### `SaveServer`
+
+Adds a `Server`, or puts it in place of the one with the same `id`, in crab's
+configuration, and answers with `Servers` as they now stand. The server is a
+provider from then on: `crab providers` lists it, and `Open` takes its id.
+Fails with `Failed`, changing nothing, when the server is not valid: an id
+that is not lowercase letters, digits, `-` and `_` or is a built-in
+provider's, an address that is not `http://` or `https://`, both `api_key`
+and `api_key_env`, or a blank model. `api_key` left out or `null` keeps the
+key saved for the id, an empty string removes it, and any other value
+replaces it; `has_api_key` is ignored.
+
+```json
+{"SaveServer":{"id":"litellm","label":"LiteLLM","base_url":"http://localhost:4000/v1","wire":"responses","api_key_env":[],"api_key":"sk-local","has_api_key":false,"headers":[],"default_model":null,"models":["gpt-5"],"replay_reasoning":false}}
+```
+
+#### `Server` and `ServerWire`
+
+| Field              | Type             | Presence | Meaning                                                                                                    |
+| ------------------ | ---------------- | -------- | ---------------------------------------------------------------------------------------------------------- |
+| `id`               | string           | required | The provider id it is chosen by.                                                                           |
+| `label`            | string           | optional | The name a client shows; the id when `null`.                                                               |
+| `base_url`         | string           | required | The address `/chat/completions`, `/responses` and `/models` are appended to.                               |
+| `wire`             | `ServerWire`     | default  | `chat_completions` (the default) or `responses`.                                                           |
+| `api_key_env`      | list of string   | default  | The environment variables the key is read from, first first.                                              |
+| `api_key`          | string           | optional | The key, kept in the configuration. Crab always sends `null`; see `SaveServer` for what sending it does.  |
+| `has_api_key`      | bool             | default  | Whether a key is kept for the server; set by crab.                                                         |
+| `headers`          | list of pairs    | default  | Headers sent on every request, as `[name, value]`.                                                         |
+| `default_model`    | string           | optional | The model a conversation opens with when none is picked.                                                   |
+| `models`           | list of string   | default  | The models offered, in order; empty to ask the server at `GET {base_url}/models`.                          |
+| `replay_reasoning` | bool             | default  | Whether earlier reasoning goes back as `reasoning_content` on Chat Completions.                            |
+
+### `RemoveServer`
+
+Takes the server `id` out of crab's configuration and answers with the
+`Servers` left. Fails with `Failed` when no server has that id.
+
+| Field | Type   | Presence | Meaning                |
+| ----- | ------ | -------- | ---------------------- |
+| `id`  | string | required | The id of the server. |
+
+```json
+{"RemoveServer":{"id":"litellm"}}
+```
+
+### `FindModels`
+
+Asks which models a `Server`, saved or not, offers, answered with
+`FoundModels` under `ticket`: its `models` when it has some, else the chat
+models it lists at `GET {base_url}/models`, without embedding, speech and
+image models. A server sent without `api_key` is asked with the key saved for
+its id. Runs beside whatever else crab does.
+
+| Field    | Type     | Presence | Meaning                                                     |
+| -------- | -------- | -------- | ----------------------------------------------------------- |
+| `ticket` | integer  | required | A number the client picks, which the answer carries back.   |
+| `server` | `Server` | required | The server to ask.                                          |
+
+```json
+{"FindModels":{"ticket":3,"server":{"id":"box","label":null,"base_url":"http://localhost:8000/v1","wire":"chat_completions","api_key_env":[],"api_key":null,"has_api_key":false,"headers":[],"default_model":null,"models":[],"replay_reasoning":false}}}
+```
+
 ## Events
 
 Events are what crab sends. `Event` has these variants.
@@ -1625,6 +1701,31 @@ emptied.
 {"HandedOff":{"prompt":"You are taking over the parser rewrite...","turn":"handoff-1794563890123456789"}}
 ```
 
+### `Servers`
+
+The OpenAI-compatible servers declared in crab's configuration, as a list of
+`Server` in the order they are offered, in answer to `Servers`, `SaveServer`
+and `RemoveServer`. No key is sent: `api_key` is always `null`, and
+`has_api_key` says whether one is kept.
+
+```json
+{"Servers":[{"id":"litellm","label":"LiteLLM","base_url":"http://localhost:4000/v1","wire":"responses","api_key_env":[],"api_key":null,"has_api_key":true,"headers":[],"default_model":null,"models":["gpt-5"],"replay_reasoning":false}]}
+```
+
+### `FoundModels`
+
+The models a server offers, in answer to the `FindModels` under `ticket`.
+
+| Field    | Type           | Presence | Meaning                                                              |
+| -------- | -------------- | -------- | -------------------------------------------------------------------- |
+| `ticket` | integer        | required | The ticket of the `FindModels` answered.                             |
+| `models` | list of string | required | The model ids, in the server's order; empty when it was not reached. |
+| `error`  | string         | optional | Why the server could not be asked; `null` when it was.               |
+
+```json
+{"FoundModels":{"ticket":3,"models":["qwen3-coder-30b","llama-3.3-70b"],"error":null}}
+```
+
 
 ## Types the subcommands print and read
 
@@ -1643,9 +1744,17 @@ too.
 | `sign_in` | `SignIn`       | required | `browser` (answered by `LoginUrl`), `device_code` (by `LoginCode`), `api_key` or `none`.     |
 | `key_env` | list of string | default  | The environment variables an API key is read from; left out of the output when empty.        |
 | `credentials` | string     | optional | The cloud credentials the provider is reached with and where they come from, as a client shows them; left out of the output when there are none. A provider with `sign_in` `none` that names them is not a local server: it reads the credentials the cloud's own tools keep. |
+| `server`  | bool           | default  | Whether it is a server the user declared, which `SaveServer` and `RemoveServer` edit; left out of the output when false. |
+| `models`  | list of string | default  | The models a declared server was given to offer; left out of the output when empty, as for every built-in provider. |
 
 ```json
 [{"id":"claude","name":"Claude","sign_in":"browser"},{"id":"ollama","name":"Ollama","sign_in":"none"},{"id":"openrouter","name":"OpenRouter","sign_in":"api_key","key_env":["OPENROUTER_API_KEY"]},{"id":"copilot","name":"GitHub Copilot","sign_in":"device_code"},...]
+```
+
+A declared server comes after the built-in providers:
+
+```json
+[{"id":"litellm","name":"LiteLLM","sign_in":"none","server":true,"models":["gpt-5"]}]
 ```
 
 The cloud providers name their credentials:

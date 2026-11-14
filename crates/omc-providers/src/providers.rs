@@ -1,6 +1,7 @@
 //! The providers crab knows, one module each; add a provider by adding a module and an entry here.
 
 mod anthropic;
+mod azure;
 mod bedrock;
 mod cerebras;
 mod claude;
@@ -112,4 +113,6 @@ providers! {
     Bedrock => bedrock::DEF,
     /// Claude on Google Vertex AI, with Google Cloud credentials.
     Vertex => vertex::DEF,
+    /// Azure OpenAI over the Responses API, with an API key.
+    Azure => azure::DEF,
 }

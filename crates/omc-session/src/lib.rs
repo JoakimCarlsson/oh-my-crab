@@ -37,6 +37,7 @@ pub use hooks::{hooks, trust};
 pub use limits::render as render_limits;
 pub use listing::tools;
 pub use memory::memory;
+pub use omc_providers::{find_models, remove_server, save_server, servers};
 pub use permissions::{
     FILE_VARIABLE as PERMISSIONS_FILE_VARIABLE, add_permission, permissions, remove_permission,
 };

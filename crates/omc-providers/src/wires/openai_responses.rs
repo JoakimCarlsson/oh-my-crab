@@ -1,4 +1,6 @@
-//! Streaming responses against the ChatGPT Codex backend with an OAuth token.
+//! Streaming responses over the OpenAI Responses API: the ChatGPT Codex backend
+//! with an OAuth token, the OpenAI API and OpenAI-compatible servers with a
+//! bearer key, and Azure OpenAI with its `api-key` header.
 
 use base64::Engine;
 use futures_util::StreamExt;
@@ -9,9 +11,10 @@ use serde_json::{Value, json};
 use crate::chat::{Blocks, parse_arguments};
 use crate::identity;
 use crate::models::codex_efforts;
+use crate::wires::chat_completions;
 use crate::{
-    Effort, Message, Part, ProviderError, Reply, Request, Sink, Stop, Tokens, ToolCall, ToolSpec,
-    sse,
+    Effort, Message, Part, Provider, ProviderError, Reply, Request, Sink, Stop, Tokens, ToolCall,
+    ToolSpec, sse,
 };
 
 /// Responses endpoint of the Codex backend.
@@ -111,12 +114,12 @@ fn authorized(
     request
 }
 
-/// Lists the model ids the account can use, in the backend's priority order.
+/// Lists the model ids the Codex account can use, in the backend's priority order.
 ///
 /// # Errors
 ///
 /// Returns [`ProviderError`] on network failure or a non-success status.
-pub async fn list_models(credentials: &Credentials) -> Result<Vec<String>, ProviderError> {
+async fn list_codex_models(credentials: &Credentials) -> Result<Vec<String>, ProviderError> {
     let url = format!("{MODELS_URL}?client_version={CLIENT_VERSION}");
     let request = reqwest::Client::new().get(url);
     let response = authorized(request, credentials, "").send().await?;
@@ -243,9 +246,8 @@ pub(crate) fn tools_json(tools: &[ToolSpec]) -> Vec<Value> {
         .collect()
 }
 
-/// Picks the effort `model` serves that is closest to `wanted` without going over.
-fn clamp_effort(model: &str, wanted: Effort) -> Option<Effort> {
-    let levels = codex_efforts(model);
+/// Picks the effort among `levels` that is closest to `wanted` without going over, or the lightest when all are heavier.
+fn clamp_effort(levels: &[Effort], wanted: Effort) -> Option<Effort> {
     let rank = |effort: &Effort| Effort::ALL.iter().position(|e| e == effort);
     if levels.contains(&wanted) {
         return Some(wanted);
@@ -258,14 +260,219 @@ fn clamp_effort(model: &str, wanted: Effort) -> Option<Effort> {
         .copied()
 }
 
-/// The `reasoning` field of a request for `model` at `effort`, when it asks for reasoning.
-pub(crate) fn reasoning_param(model: &str, effort: Option<Effort>) -> Option<Value> {
-    let effort = clamp_effort(model, effort?)?;
+/// The `reasoning` field of a request at `effort` to a model that serves `levels`, when it asks for reasoning; the summary comes back as `auto` picks it.
+pub(crate) fn reasoning_param(levels: &[Effort], effort: Option<Effort>) -> Option<Value> {
+    let effort = clamp_effort(levels, effort?)?;
     Some(json!({ "effort": effort.as_str(), "summary": "auto" }))
 }
 
-/// Builds the request body for `model`.
-pub(crate) fn build_body(model: &str, request: &Request<'_>) -> Value {
+/// Whether `model`, outside the Codex backend, is one that reasons and takes a `reasoning` field: the fifth GPT generation on, the `o` series, Codex models and the open-weight GPT models. An Azure deployment or a server's model is judged by its name, whatever it is prefixed with.
+fn reasons(model: &str) -> bool {
+    let id = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    let o_series = id
+        .strip_prefix('o')
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
+    o_series
+        || id.contains("gpt-5")
+        || id.contains("gpt-6")
+        || id.contains("gpt-oss")
+        || id.contains("codex")
+}
+
+/// The effort levels `model` takes over the Responses API outside the Codex backend, lightest first; none when it does not reason.
+///
+/// The `o` series and the open-weight GPT models take low, medium and high; the GPT generations take what Codex offers for the same id.
+pub(crate) fn api_efforts(model: &str) -> Vec<Effort> {
+    if !reasons(model) {
+        return Vec::new();
+    }
+    let id = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    if id.starts_with('o') || id.contains("gpt-oss") {
+        return vec![Effort::Low, Effort::Medium, Effort::High];
+    }
+    codex_efforts(&id)
+}
+
+/// The effort levels `model` of `provider` takes, lightest first, as the host it is sent to serves them.
+pub(crate) fn efforts(provider: Provider, model: &str) -> Vec<Effort> {
+    match provider {
+        Provider::Codex => codex_efforts(model),
+        _ => api_efforts(model),
+    }
+}
+
+/// Where a Responses request goes and how it is signed, which also decides what its body may hold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Host {
+    /// The ChatGPT Codex backend, signed in with ChatGPT OAuth.
+    Codex,
+    /// The OpenAI API or an OpenAI-compatible server, sent the key as a bearer token.
+    Api {
+        /// The API address `/responses` and `/models` are appended to, without a trailing slash.
+        base_url: String,
+        /// Headers sent on every request.
+        headers: &'static [(&'static str, &'static str)],
+        /// Whether it is a server the user declared, which may not know the OpenAI API's caching and encrypted reasoning, and so is not sent them unless it reasons.
+        server: bool,
+    },
+    /// Azure OpenAI, sent the key in `api-key` and the API version in the query.
+    Azure {
+        /// The address of the resource's OpenAI API, such as `https://name.openai.azure.com/openai/v1`.
+        base_url: String,
+        /// The `api-version` every request names.
+        api_version: String,
+    },
+}
+
+/// The variable that names the whole Azure OpenAI API address, such as `https://name.openai.azure.com/openai/v1`.
+pub(crate) const AZURE_BASE_URL_ENV: &str = "AZURE_OPENAI_BASE_URL";
+
+/// The variable that names the Azure OpenAI resource endpoint, such as `https://name.openai.azure.com`, which `/openai/v1` is appended to.
+pub(crate) const AZURE_ENDPOINT_ENV: &str = "AZURE_OPENAI_ENDPOINT";
+
+/// The variable that names the Azure OpenAI resource, which the address is made from.
+pub(crate) const AZURE_RESOURCE_ENV: &str = "AZURE_OPENAI_RESOURCE_NAME";
+
+/// The variable that names the Azure OpenAI API version.
+pub(crate) const AZURE_API_VERSION_ENV: &str = "AZURE_OPENAI_API_VERSION";
+
+/// The variable that names the Azure OpenAI deployments to offer as models, separated by commas, the first the default.
+pub(crate) const AZURE_DEPLOYMENT_ENV: &str = "AZURE_OPENAI_DEPLOYMENT";
+
+/// The API version Azure OpenAI is asked for when none is set: the version-less v1 API.
+const AZURE_DEFAULT_API_VERSION: &str = "v1";
+
+/// Reads the Azure OpenAI address and API version through `lookup`, which gives a variable's value when it is set and not blank.
+///
+/// The address is `AZURE_OPENAI_BASE_URL` as it is, else `AZURE_OPENAI_ENDPOINT` with `/openai/v1` appended unless it already names a path under `/openai`, else the one `AZURE_OPENAI_RESOURCE_NAME` names.
+///
+/// # Errors
+///
+/// Returns [`ProviderError::Credentials`] naming the variables to set when none of them is.
+pub(crate) fn azure_host(lookup: impl Fn(&str) -> Option<String>) -> Result<Host, ProviderError> {
+    let base_url = if let Some(base) = lookup(AZURE_BASE_URL_ENV) {
+        base
+    } else if let Some(endpoint) = lookup(AZURE_ENDPOINT_ENV) {
+        let endpoint = endpoint.trim_end_matches('/').to_owned();
+        if endpoint.contains("/openai") {
+            endpoint
+        } else {
+            format!("{endpoint}/openai/v1")
+        }
+    } else if let Some(resource) = lookup(AZURE_RESOURCE_ENV) {
+        format!("https://{resource}.openai.azure.com/openai/v1")
+    } else {
+        return Err(ProviderError::Credentials(format!(
+            "Azure OpenAI needs an address; set {AZURE_ENDPOINT_ENV}, {AZURE_RESOURCE_ENV} or {AZURE_BASE_URL_ENV}"
+        )));
+    };
+    Ok(Host::Azure {
+        base_url: base_url.trim_end_matches('/').to_owned(),
+        api_version: lookup(AZURE_API_VERSION_ENV)
+            .unwrap_or_else(|| AZURE_DEFAULT_API_VERSION.to_owned()),
+    })
+}
+
+/// The value of the environment variable `name`, trimmed, when it is set and not blank.
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+impl Host {
+    /// The host requests of `provider`, signed in with `credentials`, go to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::Credentials`] when Azure OpenAI's address is not set.
+    pub(crate) fn of(provider: Provider, credentials: &Credentials) -> Result<Host, ProviderError> {
+        match provider {
+            Provider::Codex => Ok(Host::Codex),
+            Provider::Azure => azure_host(env_value),
+            _ => Ok(Host::Api {
+                base_url: chat_completions::base_url(provider, credentials),
+                headers: provider.def().headers,
+                server: matches!(provider, Provider::Custom(_)),
+            }),
+        }
+    }
+
+    /// The address responses are asked of.
+    pub(crate) fn responses_url(&self) -> String {
+        match self {
+            Host::Codex => URL.to_owned(),
+            Host::Api { base_url, .. } => format!("{base_url}/responses"),
+            Host::Azure {
+                base_url,
+                api_version,
+            } => format!("{base_url}/responses?api-version={api_version}"),
+        }
+    }
+
+    /// The address models are listed at.
+    pub(crate) fn models_url(&self) -> String {
+        match self {
+            Host::Codex => format!("{MODELS_URL}?client_version={CLIENT_VERSION}"),
+            Host::Api { base_url, .. } => format!("{base_url}/models"),
+            Host::Azure {
+                base_url,
+                api_version,
+            } => format!("{base_url}/models?api-version={api_version}"),
+        }
+    }
+
+    /// Adds the headers that sign `request` for `model` with `credentials`; `model` is empty for calls that are not chats.
+    fn sign(
+        &self,
+        request: reqwest::RequestBuilder,
+        credentials: &Credentials,
+        model: &str,
+    ) -> reqwest::RequestBuilder {
+        match self {
+            Host::Codex => authorized(request, credentials, model),
+            Host::Api {
+                base_url, headers, ..
+            } => chat_completions::authorized(
+                request,
+                &chat_completions::Target {
+                    credentials,
+                    base_url,
+                    headers,
+                    replay_reasoning: false,
+                },
+            ),
+            Host::Azure { .. } if credentials.access.is_empty() => request,
+            Host::Azure { .. } => request.header("api-key", &credentials.access),
+        }
+    }
+
+    /// The effort levels `model` takes on this host, lightest first.
+    fn efforts(&self, model: &str) -> Vec<Effort> {
+        match self {
+            Host::Codex => codex_efforts(model),
+            _ => api_efforts(model),
+        }
+    }
+}
+
+/// Builds the request body for `model` on `host`.
+///
+/// Every host is asked not to store the response and to stream it. Encrypted
+/// reasoning, which carries the model's reasoning to later requests without
+/// storing it, and the prompt cache key are asked of every host but a server
+/// the user declared, which is asked for encrypted reasoning only when it is
+/// sent a `reasoning` field.
+pub(crate) fn build_body(host: &Host, model: &str, request: &Request<'_>) -> Value {
     let mut body = json!({
         "model": model,
         "instructions": request.system,
@@ -275,13 +482,92 @@ pub(crate) fn build_body(model: &str, request: &Request<'_>) -> Value {
         "parallel_tool_calls": true,
         "stream": true,
         "store": false,
-        "include": ["reasoning.encrypted_content"],
-        "prompt_cache_key": identity::session_id(),
     });
-    if let Some(reasoning) = reasoning_param(model, request.effort) {
+    let reasoning = reasoning_param(&host.efforts(model), request.effort);
+    let server = matches!(host, Host::Api { server: true, .. });
+    if !server || reasoning.is_some() {
+        body["include"] = json!(["reasoning.encrypted_content"]);
+    }
+    if !server {
+        body["prompt_cache_key"] = json!(identity::session_id());
+    }
+    if let Some(reasoning) = reasoning {
         body["reasoning"] = reasoning;
     }
     body
+}
+
+/// Whether `id`, listed by the OpenAI API, names a model that holds a conversation over the Responses API, rather than an older completion, embedding or media model.
+fn openai_chat_model(id: &str) -> bool {
+    let id = id.to_ascii_lowercase();
+    let o_series = id
+        .strip_prefix('o')
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
+    (id.starts_with("gpt-") || id.starts_with("chatgpt-") || id.contains("codex") || o_series)
+        && !id.contains("instruct")
+        && !id.contains("audio")
+        && !id.contains("search")
+}
+
+/// The Azure OpenAI deployments `AZURE_OPENAI_DEPLOYMENT` names, in order, through `lookup`.
+pub(crate) fn azure_deployments(lookup: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    lookup(AZURE_DEPLOYMENT_ENV)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Lists the model ids `provider` offers with `credentials`.
+///
+/// Codex lists the account's models in priority order. Azure OpenAI offers the
+/// deployments `AZURE_OPENAI_DEPLOYMENT` names, and lists the resource's
+/// models when it names none. The OpenAI API lists its conversation models,
+/// and a server the user declared lists what it serves.
+///
+/// # Errors
+///
+/// Returns [`ProviderError`] on network failure, a non-success status, or an Azure address that is not set.
+pub async fn list_models(
+    provider: Provider,
+    credentials: &Credentials,
+) -> Result<Vec<String>, ProviderError> {
+    let host = Host::of(provider, credentials)?;
+    match &host {
+        Host::Codex => list_codex_models(credentials).await,
+        Host::Azure { .. } => {
+            let deployments = azure_deployments(env_value);
+            if !deployments.is_empty() {
+                return Ok(deployments);
+            }
+            fetch_models(&host, credentials).await
+        }
+        Host::Api { server: false, .. } => Ok(fetch_models(&host, credentials)
+            .await?
+            .into_iter()
+            .filter(|id| openai_chat_model(id))
+            .collect()),
+        Host::Api { server: true, .. } => fetch_models(&host, credentials).await,
+    }
+}
+
+/// Asks `host` for the models it serves, at its models address.
+///
+/// # Errors
+///
+/// Returns [`ProviderError`] on network failure or a non-success status.
+async fn fetch_models(
+    host: &Host,
+    credentials: &Credentials,
+) -> Result<Vec<String>, ProviderError> {
+    let request = reqwest::Client::new().get(host.models_url());
+    let response = host.sign(request, credentials, "").send().await?;
+    if !response.status().is_success() {
+        return Err(ProviderError::from_response(response).await);
+    }
+    Ok(chat_completions::model_ids(&response.json().await?))
 }
 
 /// Turns a `response.usage` object into token counts.
@@ -458,21 +744,40 @@ impl Accumulator {
     }
 }
 
-/// Sends the conversation to Codex using `model` and returns its reply,
+/// Sends the conversation to `provider` using `model` and returns its reply,
 /// streaming text and reasoning summary chunks to `sink`.
 ///
 /// # Errors
 ///
-/// Returns [`ProviderError`] on network failure, a non-success status or an
-/// error event inside the stream.
+/// Returns [`ProviderError`] on network failure, a non-success status, an
+/// error event inside the stream, or an Azure address that is not set.
 pub async fn complete(
+    provider: Provider,
     credentials: &Credentials,
     model: &str,
     request: Request<'_>,
     sink: &mut dyn Sink,
 ) -> Result<Reply, ProviderError> {
-    let body = build_body(model, &request);
-    let response = authorized(reqwest::Client::new().post(URL), credentials, model)
+    let host = Host::of(provider, credentials)?;
+    send(&host, credentials, model, request, sink).await
+}
+
+/// Sends the conversation to `host` using `model` and returns its reply, streaming chunks to `sink`.
+///
+/// # Errors
+///
+/// Same as [`complete`].
+async fn send(
+    host: &Host,
+    credentials: &Credentials,
+    model: &str,
+    request: Request<'_>,
+    sink: &mut dyn Sink,
+) -> Result<Reply, ProviderError> {
+    let body = build_body(host, model, &request);
+    let post = reqwest::Client::new().post(host.responses_url());
+    let response = host
+        .sign(post, credentials, model)
         .header("accept", "text/event-stream")
         .json(&body)
         .send()
@@ -615,7 +920,7 @@ mod tests {
             tools: &[],
             effort: Some(Effort::XHigh),
         };
-        let body = build_body("gpt-5.5", &request);
+        let body = build_body(&Host::Codex, "gpt-5.5", &request);
         assert_eq!(body["instructions"], "be brief");
         assert_eq!(
             body["reasoning"],
@@ -624,6 +929,7 @@ mod tests {
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(body["store"], false);
         let quiet = build_body(
+            &Host::Codex,
             "gpt-5.5",
             &Request {
                 effort: None,
@@ -636,7 +942,9 @@ mod tests {
     /// An effort the model lacks is clamped down to the nearest served level.
     #[test]
     fn effort_is_clamped_to_the_model() {
-        let sent = |model, effort| reasoning_param(model, Some(effort)).unwrap()["effort"].clone();
+        let sent = |model, effort| {
+            reasoning_param(&codex_efforts(model), Some(effort)).unwrap()["effort"].clone()
+        };
         assert_eq!(sent("gpt-5.5", Effort::Max), "xhigh");
         assert_eq!(sent("gpt-6-sol", Effort::Max), "max");
         assert_eq!(sent("gpt-5.1-codex-mini", Effort::Low), "medium");
@@ -785,5 +1093,275 @@ mod tests {
         let events = [json!({ "type": "response.output_text.delta", "delta": "half" })];
         let error = ended(&events, &mut Recorder::default()).unwrap_err();
         assert!(matches!(error, ProviderError::Unfinished), "{error}");
+    }
+
+    /// A host for the OpenAI API at `base_url`, or a declared server there when `server` is set.
+    fn api(base_url: &str, server: bool) -> Host {
+        Host::Api {
+            base_url: base_url.to_owned(),
+            headers: &[("X-Team", "infra")],
+            server,
+        }
+    }
+
+    /// A request saying `hi` at `effort`, with one tool.
+    fn hello(messages: &[Message], effort: Option<Effort>) -> Request<'_> {
+        static TOOLS: std::sync::OnceLock<Vec<ToolSpec>> = std::sync::OnceLock::new();
+        Request {
+            system: "sys",
+            messages,
+            tools: TOOLS.get_or_init(|| {
+                vec![ToolSpec {
+                    name: "read".into(),
+                    description: "d".into(),
+                    schema: json!({ "type": "object" }),
+                }]
+            }),
+            effort,
+        }
+    }
+
+    /// The OpenAI API is sent reasoning only for a model that reasons, clamped to its levels, and a declared server is sent no cache key and encrypted reasoning only with reasoning.
+    #[test]
+    fn api_bodies_follow_the_model() {
+        let messages = [
+            Message::User("hi".into()),
+            Message::Images(vec![crate::Image {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            }]),
+        ];
+        let openai = api("https://api.openai.com/v1", false);
+        let body = build_body(&openai, "gpt-5", &hello(&messages, Some(Effort::Max)));
+        assert_eq!(
+            body["reasoning"],
+            json!({ "effort": "high", "summary": "auto" })
+        );
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        assert!(body.get("prompt_cache_key").is_some());
+        assert_eq!(body["tools"][0]["name"], "read");
+        assert_eq!(body["input"][1]["content"][0]["type"], "input_image");
+        let plain = build_body(&openai, "gpt-4.1", &hello(&messages, Some(Effort::High)));
+        assert!(plain.get("reasoning").is_none());
+        let o3 = build_body(&openai, "o3", &hello(&messages, Some(Effort::XHigh)));
+        assert_eq!(o3["reasoning"]["effort"], "high");
+        let server = api("http://localhost:4000/v1", true);
+        let quiet = build_body(&server, "qwen3", &hello(&messages, Some(Effort::High)));
+        assert!(quiet.get("reasoning").is_none());
+        assert!(quiet.get("include").is_none() && quiet.get("prompt_cache_key").is_none());
+        let thinking = build_body(
+            &server,
+            "openai/gpt-oss-120b",
+            &hello(&messages, Some(Effort::Low)),
+        );
+        assert_eq!(thinking["reasoning"]["effort"], "low");
+        assert!(thinking.get("include").is_some());
+    }
+
+    /// The models that reason are told apart by their ids, wherever they are prefixed.
+    #[test]
+    fn api_efforts_follow_the_id() {
+        assert_eq!(
+            api_efforts("gpt-5"),
+            [Effort::Low, Effort::Medium, Effort::High]
+        );
+        assert_eq!(
+            api_efforts("o4-mini"),
+            [Effort::Low, Effort::Medium, Effort::High]
+        );
+        assert!(api_efforts("gpt-4o").is_empty());
+        assert!(api_efforts("llama-3.3-70b").is_empty());
+        assert!(!api_efforts("my-gpt-5.5-deployment").is_empty());
+        assert_eq!(efforts(Provider::Codex, "gpt-6-sol"), Effort::ALL);
+        assert!(efforts(Provider::OpenAi, "gpt-4.1").is_empty());
+    }
+
+    /// The Azure address comes from the base URL, the endpoint or the resource name, in that order, with the API version or `v1`.
+    #[test]
+    fn azure_address_comes_from_the_environment() {
+        let lookup = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+            }
+        };
+        let host = azure_host(lookup(&[(AZURE_RESOURCE_ENV, "res")])).unwrap();
+        assert_eq!(
+            host.responses_url(),
+            "https://res.openai.azure.com/openai/v1/responses?api-version=v1"
+        );
+        let host = azure_host(lookup(&[
+            (AZURE_ENDPOINT_ENV, "https://e.openai.azure.com/"),
+            (AZURE_RESOURCE_ENV, "res"),
+            (AZURE_API_VERSION_ENV, "2025-04-01-preview"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            host.models_url(),
+            "https://e.openai.azure.com/openai/v1/models?api-version=2025-04-01-preview"
+        );
+        let host = azure_host(lookup(&[
+            (AZURE_BASE_URL_ENV, "https://proxy.example.com/openai"),
+            (AZURE_ENDPOINT_ENV, "https://e.openai.azure.com"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            host.responses_url(),
+            "https://proxy.example.com/openai/responses?api-version=v1"
+        );
+        let missing = azure_host(lookup(&[])).unwrap_err();
+        assert!(
+            missing.to_string().contains(AZURE_ENDPOINT_ENV),
+            "{missing}"
+        );
+        assert_eq!(
+            azure_deployments(lookup(&[(AZURE_DEPLOYMENT_ENV, "gpt-5-prod, mini ,")])),
+            ["gpt-5-prod", "mini"]
+        );
+    }
+
+    /// Serves `body` with `kind` as its content type once on a local port and returns the address and the request it received.
+    fn serve_once(
+        kind: &'static str,
+        body: &'static str,
+    ) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut received = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                received.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&received).to_string();
+                if let Some(split) = text.find("\r\n\r\n") {
+                    let length = text
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(str::to_string)
+                        })
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if received.len() >= split + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            String::from_utf8_lossy(&received).to_string()
+        });
+        (address, handle)
+    }
+
+    /// A streamed Responses reply, with reasoning, text and a tool call.
+    const STREAM: &str = concat!(
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"hmm\"}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"hel\"}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":1,\"delta\":\"lo\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"read\",\"arguments\":\"{}\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n"
+    );
+
+    /// A request to the OpenAI API goes to `/responses` with the bearer key and the host's headers, and the stream comes back as a reply.
+    #[tokio::test]
+    async fn completes_against_the_api() {
+        let (address, server) = serve_once("text/event-stream", STREAM);
+        let credentials = Credentials::static_key("sk-test".to_owned());
+        let messages = [Message::User("hi".into())];
+        let mut sink = Recorder::default();
+        let host = api(&format!("{address}/v1"), false);
+        let reply = send(
+            &host,
+            &credentials,
+            "gpt-5",
+            hello(&messages, Some(Effort::Medium)),
+            &mut sink,
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.text, "hello");
+        assert_eq!(reply.thinking, "hmm");
+        assert_eq!(reply.tool_calls[0].name, "read");
+        assert_eq!(reply.tokens.map(|tokens| tokens.output), Some(2));
+        assert_eq!(sink.starts, [Part::Thinking, Part::Text]);
+        let received = server.join().unwrap();
+        let lower = received.to_ascii_lowercase();
+        assert!(lower.starts_with("post /v1/responses "), "{received}");
+        assert!(lower.contains("authorization: bearer sk-test"));
+        assert!(lower.contains("x-team: infra"));
+        assert!(!lower.contains("chatgpt-account-id") && !lower.contains("originator"));
+        let body: Value =
+            serde_json::from_str(&received[received.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+        assert_eq!(body["model"], "gpt-5");
+        assert_eq!(body["reasoning"]["effort"], "medium");
+    }
+
+    /// A request to Azure OpenAI names the API version in the query and sends the key in `api-key`, not as a bearer token.
+    #[tokio::test]
+    async fn completes_against_azure() {
+        let (address, server) = serve_once("text/event-stream", STREAM);
+        let credentials = Credentials::static_key("az-key".to_owned());
+        let host = Host::Azure {
+            base_url: format!("{address}/openai/v1"),
+            api_version: "preview".to_owned(),
+        };
+        let messages = [Message::User("hi".into())];
+        let reply = send(
+            &host,
+            &credentials,
+            "gpt-5-prod",
+            hello(&messages, None),
+            &mut Recorder::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.text, "hello");
+        let received = server.join().unwrap().to_ascii_lowercase();
+        assert!(
+            received.starts_with("post /openai/v1/responses?api-version=preview "),
+            "{received}"
+        );
+        assert!(received.contains("api-key: az-key"));
+        assert!(!received.contains("authorization:"));
+    }
+
+    /// The OpenAI API's model list keeps the models that hold a conversation, and a declared server's keeps all but embedding and media models.
+    #[tokio::test]
+    async fn lists_api_models() {
+        const LIST: &str = r#"{"object":"list","data":[{"id":"gpt-5"},{"id":"o3"},{"id":"text-embedding-3-large"},{"id":"davinci-002"},{"id":"gpt-3.5-turbo-instruct"},{"id":"gpt-4o-audio-preview"}]}"#;
+        let credentials = Credentials::static_key("sk".to_owned());
+        let (address, server) = serve_once("application/json", LIST);
+        let host = api(&address, false);
+        let listed: Vec<String> = fetch_models(&host, &credentials)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|id| openai_chat_model(id))
+            .collect();
+        assert_eq!(listed, ["gpt-5", "o3"]);
+        assert!(
+            server
+                .join()
+                .unwrap()
+                .to_ascii_lowercase()
+                .starts_with("get /models ")
+        );
+        let (address, _server) = serve_once("application/json", LIST);
+        let all = fetch_models(&api(&address, true), &credentials)
+            .await
+            .unwrap();
+        assert!(all.contains(&"davinci-002".to_owned()));
+        assert!(!all.iter().any(|id| id.contains("embedding")));
     }
 }
