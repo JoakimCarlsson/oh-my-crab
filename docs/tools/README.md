@@ -67,6 +67,7 @@ starts on, outside any function or in a file that is not code is shown as
 | ------ | -------------------------------------------------------------------------------------------------- | ------------- | ---- | ------------------ |
 | `bash` | Runs a shell command in the working folder; condenses noisy output; `background: true` returns a handle at once | yes, per command | no   | [calls](calls.md)  |
 | `wait` | Blocks until the next background `bash` command or `task` subagent ends, and returns its result    | no            | yes  | [background runs](../concepts.md#background-runs) |
+| `eval` | Runs Python or JavaScript in a kernel that keeps its state between calls | yes, per language | no   | [eval](eval.md)    |
 
 ## Web
 

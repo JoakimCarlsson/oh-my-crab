@@ -42,8 +42,8 @@ pub use tool::{
     parse_args, sanitize,
 };
 pub use tools::{
-    Ask, AstEdit, AstGrep, Bash, CheckpointTool, ContextNotes, Edit, ExitPlanMode, Glob, Grep,
-    LOAD_TOOLS, LoadTools, Lsp, MemoryEdit, MemorySearch, NewContext, Read, Remember, Rewind,
+    Ask, AstEdit, AstGrep, Bash, CheckpointTool, ContextNotes, Edit, Eval, ExitPlanMode, Glob,
+    Grep, LOAD_TOOLS, LoadTools, Lsp, MemoryEdit, MemorySearch, NewContext, Read, Remember, Rewind,
     SetTitle, Skill, Todo, Wait, WebSearch, Write, attached_image, encoded_image, one_line_summary,
     snapshot_tag,
 };

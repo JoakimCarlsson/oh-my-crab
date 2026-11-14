@@ -1486,6 +1486,7 @@ mod tests {
                 "ast_grep",
                 "bash",
                 "edit",
+                "eval",
                 "glob",
                 "grep",
                 "lsp",

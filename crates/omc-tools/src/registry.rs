@@ -7,7 +7,8 @@ use serde_json::Value;
 
 use crate::coerce::{coerce, prepare};
 use crate::tools::{
-    AstEdit, AstGrep, Bash, Edit, Glob, Grep, LOAD_TOOLS, LoadTools, Lsp, Read, WebSearch, Write,
+    AstEdit, AstGrep, Bash, Edit, Eval, Glob, Grep, LOAD_TOOLS, LoadTools, Lsp, Read, WebSearch,
+    Write,
 };
 use crate::{Deferral, Jobs, Languages, Sandbox, Tool, ToolError, ToolOutput};
 
@@ -73,6 +74,7 @@ impl Registry {
         });
         registry.register(Edit::with_languages(sandbox.clone(), languages.clone()));
         registry.register(AstEdit::new(sandbox.clone()));
+        registry.register(Eval::new(sandbox.clone()));
         registry.register(Lsp::new(sandbox.clone(), languages.clone()));
         registry.register(Write::with_languages(sandbox, languages));
         registry.register(WebSearch::new());
@@ -303,7 +305,7 @@ mod tests {
         );
         assert!(registry.read_only().get("lsp").unwrap().read_only());
         assert!(!registry.get("lsp").unwrap().read_only());
-        assert_eq!(registry.names().len(), 10);
+        assert_eq!(registry.names().len(), 11);
     }
 
     /// The tools that only look are shared and the ones that change things exclusive; `lsp` is shared except for the actions that write files.

@@ -130,6 +130,7 @@ mod tests {
                 "context_notes",
                 "debug",
                 "edit",
+                "eval",
                 "exit_plan_mode",
                 "glob",
                 "goal",

@@ -19,7 +19,7 @@ fn kind_of(name: &str, target: &str) -> Kind {
         "read" | "skill" => Kind::Read,
         "edit" | "write" | "ast_edit" => Kind::Edit,
         "grep" | "glob" | "ast_grep" | "web_search" => Kind::Search,
-        "bash" => Kind::Execute,
+        "bash" | "eval" => Kind::Execute,
         _ => Kind::Other,
     }
 }

@@ -408,6 +408,7 @@ fn fitting_lists_the_tools_and_withholds_some() {
     let script = looking.get(NAME).unwrap();
     assert!(script.read_only());
     assert!(!script.description().contains("tools.bash("));
+    assert!(!script.description().contains("tools.eval("));
     assert_eq!(
         Script::with_tools(Spill::disabled(), &tools.read_only()).exposed(),
         ["ast_grep", "glob", "grep", "lsp", "read", "web_search"]
