@@ -11,6 +11,7 @@ use omc_providers::{Effort, Provider, RemoteModel, Retention};
 
 use crate::settings::default_effort;
 use crate::shared::Shared;
+use crate::slots::{self, Named};
 use crate::spend::Priced;
 
 /// How many model ids an error lists at most.
@@ -45,7 +46,8 @@ impl SessionPicker {
     ///
     /// Same as [`ModelPicker::pick`].
     pub(crate) async fn locate(&self, wanted: &str) -> Result<(Provider, String, Picked), String> {
-        let wanted = wanted.trim();
+        let (wanted, asked) = self.selected(wanted)?;
+        let wanted = wanted.as_str();
         let listed = self.shared.models_listed();
         let exact = listed.iter().any(|id| id.eq_ignore_ascii_case(wanted));
         let (provider, id) = match provider_named(wanted).filter(|_| !exact) {
@@ -55,22 +57,38 @@ impl SessionPicker {
             Some((other, rest)) => (other, self.resolve_with(other, rest).await?),
             None => (self.provider, resolve(wanted, self.provider, &listed)?),
         };
-        let credentials = self
-            .shared
-            .with_home(omc_providers::credentials_for(provider))
-            .await
-            .map_err(|error| signed_out(provider, &error))?;
         let same = provider == self.provider;
         let efforts = omc_providers::efforts(provider, &id);
-        let effort = self
-            .effort
-            .filter(|effort| efforts.contains(effort))
+        let effort = asked
+            .filter(|effort| efforts.is_empty() || efforts.contains(effort))
+            .or_else(|| self.effort.filter(|effort| efforts.contains(effort)))
             .or_else(|| default_effort(&efforts));
         let name = if same {
             id.clone()
         } else {
             format!("{}/{id}", provider.def().id)
         };
+        #[cfg(test)]
+        if let Some(given) = self
+            .shared
+            .named_models
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id)
+            .cloned()
+        {
+            let picked = Picked {
+                model: given,
+                name,
+                effort,
+            };
+            return Ok((provider, id, picked));
+        }
+        let credentials = self
+            .shared
+            .with_home(omc_providers::credentials_for(provider))
+            .await
+            .map_err(|error| signed_out(provider, &error))?;
         let remote = RemoteModel::new(
             provider,
             credentials,
@@ -94,6 +112,49 @@ impl SessionPicker {
             effort,
         };
         Ok((provider, id, picked))
+    }
+
+    /// The model `wanted` names and the effort it asks for: the model of the slot `@name` names, which is the conversation's own for a slot that sets none, or the selector `wanted` is, as `provider/model` or `model` with an optional `:effort`.
+    ///
+    /// # Errors
+    ///
+    /// Fails, saying why, when `wanted` is not a valid name or selector, or names a slot there is not.
+    fn selected(&self, wanted: &str) -> Result<(String, Option<Effort>), String> {
+        let selector = match slots::parse_named(wanted)? {
+            Named::Model(selector) => selector,
+            Named::Slot(name) => match self.shared.slot_layers().model_of(&name)? {
+                Some(selector) => selector,
+                None => {
+                    let (provider, model) = self.shared.model().ok_or_else(|| {
+                        format!(
+                            "@{name} names the conversation's model, and no conversation is open"
+                        )
+                    })?;
+                    let model = if provider == self.provider {
+                        model
+                    } else {
+                        format!("{}/{model}", provider.def().id)
+                    };
+                    return Ok((model, None));
+                }
+            },
+        };
+        Ok((selector.model, selector.effort))
+    }
+
+    /// The model of the slot `slot` when it sets one of its own, as [`SessionPicker::locate`] finds it; nothing when the slot is left to the conversation's model.
+    ///
+    /// # Errors
+    ///
+    /// Fails, saying why, when the slot's model cannot be used.
+    pub(crate) async fn slot(
+        &self,
+        slot: &str,
+    ) -> Result<Option<(Provider, String, Picked)>, String> {
+        if self.shared.slot_layers().model_of(slot)?.is_none() {
+            return Ok(None);
+        }
+        self.locate(&format!("@{slot}")).await.map(Some)
     }
 
     /// The id `rest` names among the models of `provider`, another provider than the conversation's, which are listed for it.

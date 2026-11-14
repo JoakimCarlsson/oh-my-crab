@@ -145,6 +145,7 @@ fn context_on<'a>(
         window,
         checkpoint: None,
         hooks: None,
+        routing: None,
     }
 }
 
@@ -193,6 +194,39 @@ async fn compacts_past_the_threshold_before_the_request() {
         event,
         AgentEvent::Used(tokens) if tokens.context() > 0 && tokens.context() < 850
     )));
+}
+
+/// A turn whose routing names a summarizer has it write the summary, with its own effort, while the turn's own model answers the prompt.
+#[tokio::test]
+async fn the_summarizer_writes_the_summary() {
+    let model = Script::new(vec![say("answered")], Vec::new());
+    let fast = std::sync::Arc::new(Script::new(Vec::new(), Vec::new()));
+    let routing = crate::Routing {
+        summarizer: Some(crate::Picked {
+            model: fast.clone(),
+            name: "fast-1".to_owned(),
+            effort: Some(omc_providers::Effort::Low),
+        }),
+        fallback: None,
+    };
+    let registry = Registry::new();
+    let approvals = deny_all();
+    let mut history = earlier_turns(500, 900);
+    run_turn(
+        &Context {
+            routing: Some(&routing),
+            ..context_on(&model, &registry, &approvals, Some(1_000))
+        },
+        &mut history,
+        "next".into(),
+        &|_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(model.summary_requests(), 0);
+    assert_eq!(model.turn_requests().len(), 1);
+    assert_eq!(fast.summary_requests(), 1);
+    assert!(first_text(&model.turn_requests()[0]).contains("summary 1"));
 }
 
 /// A request the provider refuses as too long is compacted and sent again, once.

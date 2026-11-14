@@ -323,3 +323,199 @@ async fn handoff_starts_a_new_conversation_from_a_written_prompt() {
     assert!(matches!(&session.history[0], Message::User(text) if text.ends_with(HANDED)));
     assert_eq!(reply_at(&session.history, 1), "answer 2");
 }
+
+/// Keeps the slots of `session` in a file of its own under its folder, `fast` set to `fast-1`, which `fast` answers for.
+fn with_fast_slot(session: &Session, name: &str, fast: Arc<Scripted>) {
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../build/tests/omc-session/restart")
+        .join(name);
+    let files = crate::slots::SlotFiles {
+        user: Some(directory.join("slots.json")),
+        project: Some(directory.join(crate::slots::PROJECT_FILE)),
+    };
+    files
+        .set_slot(
+            omc_wire::SlotScope::User,
+            crate::slots::FAST,
+            None,
+            Some("claude/fast-1".into()),
+            Vec::new(),
+        )
+        .unwrap();
+    session.shared.set_slot_files(files);
+    session.shared.open(
+        Provider::Claude,
+        vec!["m".into(), "fast-1".into()],
+        "m".into(),
+        Mode::Yolo,
+    );
+    session
+        .shared
+        .named_models
+        .lock()
+        .unwrap()
+        .insert("fast-1".to_owned(), fast);
+}
+
+/// A question on the side and the prompt of a hand-off are written by the `fast` slot's model, while the conversation's model answers the prompts.
+#[tokio::test]
+async fn btw_and_handoff_ask_the_fast_slot() {
+    let model = Arc::new(Scripted::default());
+    let fast = Arc::new(Scripted::default());
+    let (mut session, mut events, mut finished) = opened("fast-slot", model.clone());
+    with_fast_slot(&session, "fast-slot", fast.clone());
+    session.handle(prompt("hello", "t1")).await;
+    settle(&mut session, &mut finished).await;
+    drain(&mut events);
+    session
+        .handle(Command::Btw {
+            question: "what did you say?".into(),
+        })
+        .await;
+    let answer = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match events.recv().await {
+                Some(Event::Aside { answer, .. }) => break answer,
+                Some(_) => {}
+                None => panic!("the conversation hung up"),
+            }
+        }
+    })
+    .await
+    .expect("no answer on the side");
+    assert_eq!(answer, SIDE);
+    assert_eq!(fast.seen.lock().unwrap().len(), 1);
+    assert_eq!(model.seen.lock().unwrap().len(), 1);
+    session.handle(prompt("/handoff", "t2")).await;
+    settle(&mut session, &mut finished).await;
+    settle(&mut session, &mut finished).await;
+    assert_eq!(fast.seen.lock().unwrap().len(), 2);
+    assert_eq!(model.seen.lock().unwrap().len(), 2);
+    assert_eq!(reply_at(&session.history, 1), "answer 2");
+}
+
+/// The slot and preset commands answer with the slots and presets as they then stand, a slot named for the model sets the conversation's model, and a slot that is not valid is refused.
+#[tokio::test]
+async fn slot_commands_round_trip() {
+    let model = Arc::new(Scripted::default());
+    let fast = Arc::new(Scripted::default());
+    let (mut session, mut events, _finished) = opened("slot-commands", model);
+    with_fast_slot(&session, "slot-commands", fast);
+    let _ = std::fs::remove_file(session.shared.slot_files().project.unwrap());
+    drain(&mut events);
+    let slots_of = |told: Vec<Event>| {
+        told.into_iter()
+            .find_map(|event| match event {
+                Event::Slots(slots) => Some(slots),
+                _ => None,
+            })
+            .expect("no slots were told")
+    };
+    session
+        .handle(Command::SetSlot {
+            name: "plan".into(),
+            scope: omc_wire::SlotScope::Project,
+            model: Some("claude/fast-1:low".into()),
+            backups: vec!["claude/m".into()],
+            provider: None,
+        })
+        .await;
+    let slots = slots_of(drain(&mut events));
+    let plan = slots.iter().find(|slot| slot.name == "plan").unwrap();
+    assert_eq!(plan.source, omc_wire::SlotSource::Project);
+    assert!(!plan.inherited);
+    assert_eq!(plan.backups, ["claude/m"]);
+    let review = slots.iter().find(|slot| slot.name == "review").unwrap();
+    assert!(review.inherited);
+    assert_eq!(review.resolved.as_deref(), Some("m"));
+    session
+        .handle(Command::SavePreset {
+            name: "duo".into(),
+            effort: None,
+        })
+        .await;
+    let presets = drain(&mut events)
+        .into_iter()
+        .find_map(|event| match event {
+            Event::Presets(presets) => Some(presets),
+            _ => None,
+        })
+        .expect("no presets were told");
+    assert_eq!(presets[0].name, "duo");
+    assert_eq!(presets[0].slots.len(), 2);
+    session
+        .handle(Command::ClearSlot {
+            name: "plan".into(),
+            scope: omc_wire::SlotScope::Project,
+            provider: None,
+        })
+        .await;
+    let slots = slots_of(drain(&mut events));
+    assert!(
+        slots
+            .iter()
+            .find(|slot| slot.name == "plan")
+            .unwrap()
+            .inherited
+    );
+    session
+        .handle(Command::ApplyPreset {
+            name: "duo".into(),
+            scope: omc_wire::SlotScope::User,
+        })
+        .await;
+    let slots = slots_of(drain(&mut events));
+    assert_eq!(
+        slots
+            .iter()
+            .find(|slot| slot.name == "plan")
+            .unwrap()
+            .source,
+        omc_wire::SlotSource::User
+    );
+    session
+        .handle(Command::DeletePreset { name: "duo".into() })
+        .await;
+    assert!(
+        drain(&mut events)
+            .iter()
+            .any(|event| matches!(event, Event::Presets(presets) if presets.is_empty()))
+    );
+    session
+        .handle(Command::SetSlot {
+            name: "bad name".into(),
+            scope: omc_wire::SlotScope::User,
+            model: Some("x".into()),
+            backups: Vec::new(),
+            provider: None,
+        })
+        .await;
+    assert!(
+        drain(&mut events)
+            .iter()
+            .any(|event| matches!(event, Event::Failed(_)))
+    );
+    session
+        .handle(Command::Set {
+            setting: "model".into(),
+            value: "@fast".into(),
+        })
+        .await;
+    assert_eq!(
+        session.shared.model(),
+        Some((Provider::Claude, "fast-1".to_owned()))
+    );
+    session
+        .handle(Command::Set {
+            setting: "model".into(),
+            value: "@nope".into(),
+        })
+        .await;
+    assert!(drain(&mut events).iter().any(
+        |event| matches!(event, Event::Failed(reason) if reason.contains("no model slot @nope"))
+    ));
+    assert_eq!(
+        session.shared.model(),
+        Some((Provider::Claude, "fast-1".to_owned()))
+    );
+}

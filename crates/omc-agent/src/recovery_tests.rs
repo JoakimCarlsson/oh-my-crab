@@ -109,6 +109,7 @@ fn context<'a>(
         window: None,
         checkpoint: None,
         hooks: None,
+        routing: None,
     }
 }
 
@@ -639,4 +640,100 @@ async fn approval_sees_the_arguments_that_run() {
     assert_eq!(asked[0].scope, r#"gate ["a.txt"]"#);
     assert_eq!(asked[0].summary, r#"["a.txt"]"#);
     assert_eq!(*gate.ran.lock().unwrap(), [json!({ "paths": ["a.txt"] })]);
+}
+
+/// Finds every backup it is asked for as `model`, under the name it was asked by, unless the name is `missing`.
+struct Backups {
+    /// The model every backup is.
+    model: std::sync::Arc<Outcomes>,
+}
+
+#[async_trait]
+impl crate::ModelPicker for Backups {
+    /// The backup `wanted` names, or a failure for `missing`.
+    async fn pick(&self, wanted: &str) -> Result<crate::Picked, String> {
+        if wanted == "missing" {
+            return Err("no such model".to_owned());
+        }
+        Ok(crate::Picked {
+            model: self.model.clone(),
+            name: wanted.to_owned(),
+            effort: None,
+        })
+    }
+}
+
+/// Runs one turn of `model` falling back on `backup` under the names `backups`, and returns how it ended and the events it reported.
+async fn turn_with_backups(
+    model: &Outcomes,
+    backup: std::sync::Arc<Outcomes>,
+    backups: &[&str],
+) -> (Result<(), AgentError>, Vec<AgentEvent>) {
+    let registry = Registry::new();
+    let approvals = Approvals::new(std::sync::Arc::new(DenyAll), true);
+    let routing = crate::Routing {
+        summarizer: None,
+        fallback: Some(crate::Fallback {
+            slot: "main".to_owned(),
+            from: "big".to_owned(),
+            backups: backups.iter().map(|name| (*name).to_owned()).collect(),
+            picker: std::sync::Arc::new(Backups { model: backup }),
+        }),
+    };
+    let events = Mutex::new(Vec::new());
+    let mut history = Vec::new();
+    let ended = run_turn(
+        &Context {
+            routing: Some(&routing),
+            ..context(model, &registry, &approvals)
+        },
+        &mut history,
+        "go".into(),
+        &|event| events.lock().unwrap().push(event),
+    )
+    .await;
+    (ended, events.into_inner().unwrap())
+}
+
+/// A model still overloaded after every retry hands the turn to the first backup that can be found, which answers it, and the client is told so once.
+#[tokio::test]
+async fn an_overloaded_model_falls_back_on_the_next_backup() {
+    let overloaded_now = || Err(failure("529", "overloaded", Some(Duration::ZERO)));
+    let model = Outcomes::new((0..=MAX_RETRIES).map(|_| overloaded_now()).collect());
+    let backup = std::sync::Arc::new(Outcomes::new(vec![Ok(say("backup answered"))]));
+    let (ended, events) = turn_with_backups(&model, backup.clone(), &["missing", "spare"]).await;
+    ended.unwrap();
+    assert_eq!(model.requests().len(), MAX_RETRIES as usize + 1);
+    assert_eq!(backup.requests().len(), 1);
+    let switched: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ModelFallback {
+                slot,
+                from,
+                to,
+                reason,
+            } => Some((slot.as_str(), from.as_str(), to.as_str(), reason.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        switched,
+        [("main", "big", "spare", "provider returned 529: overloaded")]
+    );
+}
+
+/// A sign-in failure ends the turn without asking a backup or telling of one.
+#[tokio::test]
+async fn an_auth_failure_does_not_fall_back() {
+    let model = Outcomes::new(vec![Err(failure("401", "invalid x-api-key", None))]);
+    let backup = std::sync::Arc::new(Outcomes::new(Vec::new()));
+    let (ended, events) = turn_with_backups(&model, backup.clone(), &["spare"]).await;
+    assert!(matches!(ended, Err(AgentError::Provider(_))));
+    assert!(backup.requests().is_empty());
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ModelFallback { .. }))
+    );
 }

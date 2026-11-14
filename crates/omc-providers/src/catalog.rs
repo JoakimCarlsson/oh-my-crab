@@ -109,6 +109,12 @@ pub(crate) struct Entry {
     /// What the model costs, when the catalog says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<Cost>,
+    /// Whether the model takes tool calls, when the catalog says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<bool>,
+    /// Whether the catalog marks the model as deprecated.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deprecated: bool,
 }
 
 impl Entry {
@@ -278,6 +284,12 @@ struct SourceModel {
     /// What the model costs.
     #[serde(default)]
     cost: Option<SourceCost>,
+    /// Whether the model takes tool calls.
+    #[serde(default)]
+    tool_call: Option<bool>,
+    /// Where the model stands, such as `deprecated`.
+    #[serde(default)]
+    status: Option<String>,
 }
 
 /// The kinds of input and output a models.dev model handles.
@@ -358,7 +370,21 @@ fn entry_of(model: &Value) -> Option<Entry> {
             cache_read: cost.cache_read,
             cache_write: cost.cache_write,
         }),
+        tools: model.tool_call,
+        deprecated: model.status.as_deref() == Some("deprecated"),
     })
+}
+
+/// The models the catalog lists for `provider` that are not deprecated and do not say they refuse tool calls, by id, in the catalog's order.
+pub(crate) fn current(provider: Provider) -> Vec<String> {
+    let catalog = loaded();
+    sources_of(provider.def().id)
+        .iter()
+        .filter_map(|source| catalog.providers.get(*source))
+        .flat_map(|models| models.iter())
+        .filter(|(_, entry)| !entry.deprecated && entry.tools != Some(false))
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 /// Builds the catalog crab keeps from the models.dev catalog `raw`: the providers of [`SOURCES`], with what crab reads of each text model.
@@ -515,6 +541,11 @@ mod tests {
                 "cost": { "input": 1, "output": 5, "cache_read": 0.1, "cache_write": 1.25,
                           "tiers": [{ "input": 2, "tier": { "type": "context", "size": 200000 } }] }
             },
+            "old-y-1": {
+                "id": "old-y-1", "status": "deprecated", "tool_call": true,
+                "modalities": { "input": ["text"], "output": ["text"] },
+                "limit": { "context": 1000, "output": 100 }
+            },
             "painter": {
                 "id": "painter", "modalities": { "input": ["text"], "output": ["image"] },
                 "limit": { "context": 1000, "output": 0 }
@@ -529,7 +560,10 @@ mod tests {
         let snapshot = from_models_dev(RAW).unwrap();
         assert_eq!(snapshot.providers.keys().collect::<Vec<_>>(), ["anthropic"]);
         let models = &snapshot.providers["anthropic"];
-        assert_eq!(models.keys().collect::<Vec<_>>(), ["claude-x-9"]);
+        assert_eq!(models.keys().collect::<Vec<_>>(), ["claude-x-9", "old-y-1"]);
+        assert!(models["old-y-1"].deprecated);
+        assert_eq!(models["old-y-1"].tools, Some(true));
+        assert_eq!(models["claude-x-9"].tools, None);
         let entry = &models["claude-x-9"];
         assert_eq!((entry.context, entry.output), (500_000, 64_000));
         assert_eq!(entry.window(), 400_000);

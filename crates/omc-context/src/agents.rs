@@ -35,7 +35,7 @@ pub struct AgentDefinition {
     pub output_schema: Option<serde_json::Value>,
     /// Whether it works in a git worktree of its own unless a call says otherwise, its changes handed back to the main agent's working tree as a patch when it ends.
     pub isolated: bool,
-    /// The model it asks, as the definition names it: an alias such as `haiku`, `sonnet` or `opus`, a model id, or a provider and a model id as `provider/model`; nothing, which `inherit` also says, for the model of the agent that starts it.
+    /// The model it asks, as the definition names it: an alias such as `haiku`, `sonnet` or `opus`, a model id, a provider and a model id as `provider/model`, or `@name` for the model of the slot `name`; `inherit` for the model of the agent that starts it; nothing for the model of the `subagent` slot, which is the model of the agent that starts it unless set.
     pub model: Option<String>,
     /// Where the definition is, or nothing for a built-in one.
     pub path: Option<PathBuf>,
@@ -162,10 +162,13 @@ fn flag(text: Option<&str>) -> bool {
         .is_some_and(|text| matches!(text.as_str(), "true" | "yes" | "on"))
 }
 
-/// The model `text`, the value of a definition's `model` key, names, unquoted and trimmed; nothing when it is missing, empty or `inherit`, in any case, which all mean the model of the agent that starts it.
+/// The model `text`, the value of a definition's `model` key, names, unquoted and trimmed, such as `haiku` or `@fast` for the model of a slot; `inherit`, in any case, as `inherit`, which asks for the model of the agent that starts it; nothing when it is missing or empty, which leaves it to the `subagent` slot.
 fn model_of(text: Option<&str>) -> Option<String> {
     let text = text?.trim().trim_matches(['"', '\'']).trim();
-    (!text.is_empty() && !text.eq_ignore_ascii_case("inherit")).then(|| text.to_owned())
+    if text.eq_ignore_ascii_case("inherit") {
+        return Some("inherit".to_owned());
+    }
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
 /// The JSON Schema `text` holds, when it holds a JSON object; anything else declares none.
@@ -420,7 +423,9 @@ mod tests {
             model("model: \"claude-sonnet-4-5\""),
             Some("claude-sonnet-4-5".to_owned())
         );
-        assert_eq!(model("model: Inherit"), None);
+        assert_eq!(model("model: Inherit"), Some("inherit".to_owned()));
+        assert_eq!(model("model: @fast"), Some("@fast".to_owned()));
+        assert_eq!(model("model: \"@plan\""), Some("@plan".to_owned()));
         assert_eq!(model("model:"), None);
         assert_eq!(model("description: d"), None);
         let toml = from_toml(

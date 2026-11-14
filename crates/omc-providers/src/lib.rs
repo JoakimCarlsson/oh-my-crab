@@ -24,8 +24,8 @@ pub use custom::{Custom, custom_providers_path, find_models, remove_server, save
 pub use error::ProviderError;
 pub use limits::{fetch as fetch_limits, supported as limits_supported};
 pub use models::{
-    ModelInfo, Pricing, Retention, cache_ttl, context_window, efforts, model_info, pricing,
-    warmable,
+    ModelInfo, Pricing, Retention, cache_ttl, catalog_models, context_window, efforts, model_info,
+    pricing, warmable,
 };
 pub use prompt::PROMPT;
 pub use provider::{Def, Provider, Wire, active_provider, credentials_for, login};

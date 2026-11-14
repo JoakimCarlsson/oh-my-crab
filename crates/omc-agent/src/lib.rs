@@ -7,6 +7,7 @@ mod backend;
 mod compaction;
 mod cow;
 mod crew;
+mod fallback;
 mod files;
 mod hooks;
 mod journal;
@@ -35,6 +36,7 @@ pub use aside::{answer_aside, write_handoff};
 pub use backend::{Backend, ISOLATION_VARIABLE, isolation_backend};
 pub use compaction::{COMPACT, context, replayed};
 pub use crew::{CREW_MOST, Crew, crew_tools};
+pub use fallback::{Fallback, Routing, worth_switching};
 pub use hooks::{
     Batched, Chained, CompactTrigger, Compacting, Followed, Gate, Hooks, MAX_STOP_IN_A_ROW,
     MAX_STOP_PER_TURN, Permit, Screened,

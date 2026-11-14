@@ -34,6 +34,10 @@ pub struct Models {
     pub current: String,
     /// Finds another model by name; nothing when subagents can only ask the default one, which refuses every call or definition naming a model.
     pub picker: Option<Arc<dyn ModelPicker>>,
+    /// The name [`Models::picker`] is asked for when neither the call nor the kind's definition names a model, such as `@subagent`; nothing leaves such subagents on the default one.
+    pub fallback: Option<String>,
+    /// The names tried in order when the model [`Models::fallback`] names fails in a way another model may not.
+    pub backups: Vec<String>,
 }
 
 impl Models {
@@ -42,6 +46,8 @@ impl Models {
         Self {
             current: current.to_owned(),
             picker: self.picker.clone(),
+            fallback: self.fallback.clone(),
+            backups: self.backups.clone(),
         }
     }
 }

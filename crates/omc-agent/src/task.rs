@@ -18,6 +18,7 @@ use omc_tools::{Concurrency, Jobs, Registry, Tool, ToolError, ToolOutput, parse_
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::fallback::{Fallback, Routing};
 use crate::nesting::{Nesting, Seat};
 use crate::picker::Models;
 use crate::roster::{Enrolment, SubagentNotice, SubagentState};
@@ -422,6 +423,8 @@ pub(crate) struct Run {
     structured: Option<Structured>,
     /// The kind of subagent it is.
     definition: AgentDefinition,
+    /// The backups of its slot, when its model came from one that has some.
+    routing: Option<Routing>,
     /// Whether it is to work in a git worktree of its own.
     isolated: bool,
     /// The worktree it works in, once it was given one.
@@ -538,6 +541,7 @@ impl Run {
             window: None,
             checkpoint: None,
             hooks: self.hooks.as_deref(),
+            routing: self.routing.as_ref(),
         };
         run_turn(&context, &mut self.history, opening, &report)
             .await
@@ -819,7 +823,7 @@ impl Task {
             })
     }
 
-    /// The model a subagent of the kind `agent` asks, what it is called and how hard it thinks: the one `wanted` by the call names, else the one its definition names, else the one of the agent starting it.
+    /// The model a subagent of the kind `agent` asks, what it is called and how hard it thinks: the one `wanted` by the call names, else the one its definition names, else the one [`Models::fallback`] names, else the one of the agent starting it; `inherit` named by the call or the definition picks the one of the agent starting it.
     ///
     /// # Errors
     ///
@@ -833,7 +837,17 @@ impl Task {
             .map(|name| (name, "the call"))
             .or_else(|| agent.model.as_deref().map(|name| (name, "its definition")))
             .map(|(name, by)| (name.trim(), by))
-            .filter(|(name, _)| !name.is_empty() && !name.eq_ignore_ascii_case("inherit"));
+            .filter(|(name, _)| !name.is_empty());
+        let named = match named {
+            Some((name, _)) if name.eq_ignore_ascii_case("inherit") => None,
+            Some(named) => Some(named),
+            None => self
+                .settings
+                .models
+                .fallback
+                .as_deref()
+                .map(|name| (name, "the subagent slot")),
+        };
         let inherited = || {
             (
                 self.settings.model.clone(),
@@ -859,6 +873,30 @@ impl Task {
         Ok((picked.model, picked.name, picked.effort))
     }
 
+    /// The backups a subagent of the kind `agent` falls back on, when its model, called `name`, is the one [`Models::fallback`] names because neither `wanted`, the call's model, nor its definition names one, and there are backups to try.
+    fn routing_for(
+        &self,
+        agent: &AgentDefinition,
+        wanted: Option<&str>,
+        name: &str,
+    ) -> Option<Routing> {
+        let unnamed = |text: Option<&str>| text.is_none_or(|text| text.trim().is_empty());
+        let models = &self.settings.models;
+        if !unnamed(wanted) || !unnamed(agent.model.as_deref()) || models.backups.is_empty() {
+            return None;
+        }
+        models.fallback.as_ref()?;
+        Some(Routing {
+            summarizer: None,
+            fallback: Some(Fallback {
+                slot: "subagent".to_owned(),
+                from: name.to_owned(),
+                backups: models.backups.clone(),
+                picker: models.picker.clone()?,
+            }),
+        })
+    }
+
     /// The subagent for `item`, reporting under the call `call` at `place` in its list when it is one of several.
     ///
     /// A subagent asked for a structured result, by the item or by its kind's definition, gets the `submit_result` tool for it. Its system prompt, and the `task` tool of its own when it gets one, are only made by [`Task::arm`], once it is known where it works.
@@ -880,6 +918,7 @@ impl Task {
             })?;
         }
         let (model, model_name, effort) = self.model_for(agent, item.model.as_deref()).await?;
+        let routing = self.routing_for(agent, item.model.as_deref(), &model_name);
         let mut registry = self.tools_for(agent);
         let structured = schema.map(|schema| {
             let slot = Slot::default();
@@ -913,6 +952,7 @@ impl Task {
             structured,
             isolated: item.isolated.unwrap_or(agent.isolated),
             definition: agent.clone(),
+            routing,
             lease: None,
             hooks,
             id,
@@ -1463,6 +1503,7 @@ mod tests {
                 window: None,
                 checkpoint: None,
                 hooks: None,
+                routing: None,
             },
             &mut history,
             prompt.into(),
@@ -1777,6 +1818,7 @@ mod tests {
                         window: None,
                         checkpoint: None,
                         hooks: None,
+                        routing: None,
                     },
                     &mut mine,
                     "go".into(),

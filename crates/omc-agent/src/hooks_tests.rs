@@ -163,6 +163,7 @@ async fn drive(model: &Router, dir: &std::path::Path, hooks: &Scripted) -> Vec<M
             window: None,
             checkpoint: None,
             hooks: Some(hooks),
+            routing: None,
         },
         &mut history,
         "go".into(),

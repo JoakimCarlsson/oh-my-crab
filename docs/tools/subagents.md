@@ -59,9 +59,14 @@ is gone fails with advice to start a new subagent with a full assignment.
 
 A subagent asks the model of the agent that starts it, unless its definition
 names a `model` or the call gives one, for the single assignment or for an
-item of `tasks`; the call's wins, and a call saying `inherit` keeps the model
-of the agent starting it whatever the definition says. A name is looked up
-among the models the conversation's provider listed when it opened:
+item of `tasks`; the call's wins, and a call or a definition saying `inherit`
+keeps the model of the agent starting it. When neither names one, the
+`subagent` slot's model is asked when the slot is set, and its backups take
+over when that model keeps failing (see
+[models and slots](../models-and-slots.md)). `@name` names the model of the
+slot `name`, and `:effort` after a name, as `haiku:low`, the effort it thinks
+at. A name is looked up among the models the conversation's provider listed
+when it opened:
 
 - an id equal to the name, in any case;
 - otherwise the first listed id holding the name, so that an alias such as
@@ -80,7 +85,8 @@ its model's default: medium when it offers that, else its lightest.
 A subagent's system prompt names the model it asks. Its own model requests do
 not count towards the conversation's context use: its `Used` events are not
 sent, whichever model it asks. In plan mode, a subagent that would ask the
-main agent's model asks the `plan_model` instead, when one is set.
+main agent's model asks the plan model instead, when `plan_model` or the
+`plan` slot sets one.
 
 ## The approved plan
 

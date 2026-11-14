@@ -103,12 +103,18 @@ pub(crate) struct Shared {
     pub(crate) goals: crate::goal::Goals,
     /// What the conversation cost so far.
     pub(crate) ledger: crate::spend::Ledger,
+    /// Where the model slots are kept: the user's file, and the project's once a trusted project is open.
+    slot_files: Mutex<crate::slots::SlotFiles>,
     /// The date turns tell the agent instead of today's, in tests.
     #[cfg(test)]
     pub(crate) today: Mutex<Option<String>>,
     /// The model turns and questions on the side ask instead of the provider's, in tests.
     #[cfg(test)]
     pub(crate) model_override: Mutex<Option<Arc<dyn omc_providers::ChatModel>>>,
+    /// The models the picker gives for model ids instead of the providers', in tests.
+    #[cfg(test)]
+    pub(crate) named_models:
+        Mutex<std::collections::HashMap<String, Arc<dyn omc_providers::ChatModel>>>,
 }
 
 /// Where the conversation keeps its logins.
@@ -184,10 +190,17 @@ impl Shared {
             warmer: Arc::new(Warmer::default()),
             goals: crate::goal::Goals::default(),
             ledger: crate::spend::Ledger::default(),
+            slot_files: Mutex::new(if cfg!(test) {
+                crate::slots::SlotFiles::default()
+            } else {
+                crate::slots::SlotFiles::locate(None)
+            }),
             #[cfg(test)]
             today: Mutex::new(None),
             #[cfg(test)]
             model_override: Mutex::new(None),
+            #[cfg(test)]
+            named_models: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -466,6 +479,34 @@ impl Shared {
         if let Err(error) = self.plans.save(plan, history.as_deref()) {
             self.say(Event::Failed(error));
         }
+    }
+
+    /// Where the model slots are kept now.
+    pub(crate) fn slot_files(&self) -> crate::slots::SlotFiles {
+        self.slot_files
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .clone()
+    }
+
+    /// Keeps the model slots in `files` from now on.
+    pub(crate) fn set_slot_files(&self, files: crate::slots::SlotFiles) {
+        *self
+            .slot_files
+            .lock()
+            .unwrap_or_else(|held| held.into_inner()) = files;
+    }
+
+    /// The model slots as their files and the environment set them now, resolved for the conversation's provider when one is open; a file that cannot be read is reported on standard error and sets nothing.
+    pub(crate) fn slot_layers(&self) -> crate::slots::Layers {
+        let provider = self.model().map(|(provider, _)| provider.def().id);
+        self.slot_files()
+            .load()
+            .unwrap_or_else(|reason| {
+                eprintln!("model slots ignored: {reason}");
+                crate::slots::Layers::with_env(Default::default(), None)
+            })
+            .for_provider(provider)
     }
 
     /// The models the provider listed when the conversation was opened, best first.

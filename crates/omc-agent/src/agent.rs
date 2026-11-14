@@ -20,6 +20,7 @@ use thiserror::Error;
 use tokio::sync::{RwLockReadGuard, RwLockWriteGuard};
 
 use crate::compaction;
+use crate::fallback::{Asked, Routing};
 use crate::hooks::{CompactTrigger, Compacting, Gate, Hooks, Permit, StopBound, with_note};
 use crate::loop_guard::LoopGuard;
 use crate::pruning;
@@ -95,6 +96,17 @@ pub enum AgentEvent {
         /// The files the call changed.
         changes: Vec<FileChange>,
     },
+    /// A request failed for good in a way another model may not, so the rest of the turn asks the next backup of the slot its model was chosen for.
+    ModelFallback {
+        /// The slot, such as `main` or `plan`.
+        slot: String,
+        /// The model that failed.
+        from: String,
+        /// The backup asked from now on.
+        to: String,
+        /// The first line of the failure.
+        reason: String,
+    },
 }
 
 /// Why a turn ended without a final answer.
@@ -146,6 +158,8 @@ pub struct Context<'a> {
     pub window: Option<u64>,
     /// The checks the user set up around tool calls and the end of the turn, when there are any.
     pub hooks: Option<&'a dyn Hooks>,
+    /// The other models the turn may ask: one for summaries, and backups when its own keeps failing.
+    pub routing: Option<&'a Routing>,
 }
 
 /// Passes the chunks of a reply on as events.
@@ -522,6 +536,7 @@ async fn drive(
     let mut guard = LoopGuard::default();
     let mut todos = TodoTracker::new(history);
     let mut stops = StopBound::default();
+    let mut asked = Asked::new(context.model, context.effort, context.routing);
     loop {
         let live = context.refresh.map(|refresh| refresh());
         let registry = live
@@ -556,9 +571,9 @@ async fn drive(
                 system,
                 messages: &messages,
                 tools: &specs,
-                effort: context.effort,
+                effort: asked.effort(),
             };
-            context.model.complete(request, &mut chunks).await
+            asked.model().complete(request, &mut chunks).await
         };
         let reply = match answered {
             Ok(reply) => reply,
@@ -586,7 +601,13 @@ async fn drive(
                 events(retry.finished(&error));
                 continue;
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                if asked.fall_back(&error, events).await {
+                    retries = 0;
+                    continue;
+                }
+                return Err(error.into());
+            }
         };
         retries = 0;
         if let Some(tokens) = reply.tokens {
@@ -921,9 +942,12 @@ async fn compact_history(
     };
     let at = history.len();
     events(compaction::started(at, tokens));
+    let summarizer = context
+        .routing
+        .and_then(|routing| routing.summarizer.as_ref());
     match compaction::summarize(
-        context.model,
-        context.effort,
+        summarizer.map_or(context.model, |picked| picked.model.as_ref()),
+        summarizer.map_or(context.effort, |picked| picked.effort),
         history,
         &plan,
         focus.as_deref(),
@@ -1708,6 +1732,7 @@ mod tests {
                 window: None,
                 checkpoint: None,
                 hooks: None,
+                routing: None,
             },
             &mut history,
             "read it".into(),
@@ -1753,6 +1778,7 @@ mod tests {
                 window: None,
                 checkpoint: None,
                 hooks: None,
+                routing: None,
             },
             history,
             "go".into(),
@@ -1832,6 +1858,7 @@ mod tests {
                 window: None,
                 checkpoint: None,
                 hooks: None,
+                routing: None,
             },
             &mut history,
             "look".into(),
@@ -1899,6 +1926,7 @@ mod tests {
                 window: None,
                 checkpoint: None,
                 hooks: None,
+                routing: None,
             },
             &mut history,
             "read it".into(),
@@ -1972,6 +2000,7 @@ mod tests {
                 window: None,
                 checkpoint: None,
                 hooks: None,
+                routing: None,
             },
             &mut history,
             "go".into(),
@@ -2014,6 +2043,7 @@ mod tests {
                 window: None,
                 checkpoint: None,
                 hooks: None,
+                routing: None,
             },
             &mut history,
             "go".into(),
@@ -2045,6 +2075,7 @@ mod tests {
                 window: None,
                 checkpoint: None,
                 hooks: None,
+                routing: None,
             },
             &mut history,
             "edit".into(),
@@ -2085,6 +2116,7 @@ mod tests {
                 window: None,
                 checkpoint: None,
                 hooks: None,
+                routing: None,
             },
             &mut history,
             "edit".into(),
@@ -2129,6 +2161,7 @@ mod tests {
                 window: None,
                 checkpoint: None,
                 hooks: None,
+                routing: None,
             },
             history,
             prompt.into(),

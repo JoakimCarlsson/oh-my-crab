@@ -466,6 +466,14 @@ pub fn model_info(provider: Provider, model: &str) -> Option<ModelInfo> {
     })
 }
 
+/// The models the catalog lists for `provider` that are current and take tool calls, by id with what the catalog says of each, in the catalog's order; a model the catalog marks deprecated or as refusing tool calls is left out.
+pub fn catalog_models(provider: Provider) -> Vec<(String, ModelInfo)> {
+    crate::catalog::current(provider)
+        .into_iter()
+        .filter_map(|id| model_info(provider, &id).map(|info| (id, info)))
+        .collect()
+}
+
 /// How long `provider` keeps the prompt cache entries a request to `model` writes when it asks for `retention`; nothing when the provider has no such lifetime or does not say.
 ///
 /// Codex keeps entries for at least five minutes of inactivity and offers no longer lifetime on the wire crab speaks. Bedrock and Vertex are asked for the five-minute lifetime only.

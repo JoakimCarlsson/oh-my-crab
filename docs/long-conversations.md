@@ -15,7 +15,7 @@ call_id "c1" to read it again.]`, as long as that saves at least 4,000 tokens.
 Outputs of `skill`, `context_notes` and `todo` are kept. A shake is saved like
 the leaving out of outputs, so a reopened conversation gives the model the same
 thing. When the context is still over the threshold, `crab` compacts the
-conversation before the next request. It asks the model for a structured summary of the
+conversation before the next request. It asks the model, the `fast` slot's when it is set (see [models and slots](models-and-slots.md)), for a structured summary of the
 older messages, building on the previous summary when there is one, and keeps
 about 20,000 tokens of the most recent messages as they are. The threshold is
 the window less 15% of it; on a window over 65,536 tokens it is at least 16,384

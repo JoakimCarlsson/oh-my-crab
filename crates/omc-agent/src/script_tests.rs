@@ -123,6 +123,7 @@ async fn drive(
             window: None,
             checkpoint: None,
             hooks,
+            routing: None,
         },
         &mut history,
         "go".into(),

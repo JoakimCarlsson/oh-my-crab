@@ -26,6 +26,7 @@ mod serve;
 mod session;
 mod settings;
 mod shared;
+mod slots;
 mod snapshots;
 mod spend;
 mod toolset;

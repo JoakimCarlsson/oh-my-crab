@@ -3,7 +3,10 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use omc_agent::{Chained, Context, EventSink, Hooks, Models, Scribe, compact, run_turn_steered};
+use omc_agent::{
+    Chained, Context, EventSink, Fallback, Hooks, Models, Routing, Scribe, compact,
+    run_turn_steered,
+};
 use omc_auth::AuthError;
 use omc_context::{Discovered, Environment, Locations};
 use omc_extensions::{ExtensionHooks, Prompted};
@@ -18,6 +21,7 @@ use crate::picker::SessionPicker;
 use crate::prefix::{Key, Planning, Prefix};
 use crate::settings::Mode;
 use crate::shared::{SessionHost, Shared};
+use crate::slots;
 use crate::spend::Priced;
 use crate::toolset::{Inputs, Toolset};
 use crate::translate::translate_all;
@@ -160,12 +164,16 @@ impl Turn {
         self.run_planned(model, planner, job).await
     }
 
-    /// The model the plan model setting names, when plan mode is on and it names one other than the conversation's; when it cannot be used, the client is told why and the conversation's model plans.
+    /// The model the plan model setting names, else the `plan` slot's when it sets one, when plan mode is on and it is other than the conversation's; when it cannot be used, the client is told why and the conversation's model plans.
     async fn planner(&self) -> Option<Planner> {
-        let wanted = self
-            .shared
-            .plan_model()
-            .filter(|_| self.shared.mode() == Mode::Plan)?;
+        if self.shared.mode() != Mode::Plan {
+            return None;
+        }
+        let slotted = || {
+            matches!(self.shared.slot_layers().model_of(slots::PLAN), Ok(Some(_)))
+                .then(|| format!("@{}", slots::PLAN))
+        };
+        let wanted = self.shared.plan_model().or_else(slotted)?;
         let picker = SessionPicker {
             shared: self.shared.clone(),
             provider: self.provider,
@@ -185,6 +193,41 @@ impl Turn {
                 )));
                 None
             }
+        }
+    }
+
+    /// The other models the turn asks: the `fast` slot's for summaries and hand-off prompts when it sets one, and the backups of the slot the turn's model was chosen for, `plan` when `planning` with the plan model `planner`, else `main`. A `fast` model that cannot be used is told to the client, and the turn's own model summarizes.
+    async fn routing(
+        &self,
+        picker: &Arc<SessionPicker>,
+        layers: &slots::Layers,
+        planner: Option<&str>,
+        planning: bool,
+    ) -> Routing {
+        let summarizer = match picker.slot(slots::FAST).await {
+            Ok(found) => found.map(|(_, _, picked)| picked),
+            Err(reason) => {
+                self.shared.say(omc_wire::Event::Failed(format!(
+                    "the fast model cannot be used, so {} summarizes: {reason}",
+                    self.model
+                )));
+                None
+            }
+        };
+        let (slot, from) = match planner.filter(|_| planning) {
+            Some(id) => (slots::PLAN, id.to_owned()),
+            None => (slots::MAIN, self.model.clone()),
+        };
+        let backups = layers.backups_of(slot);
+        let picker: Arc<dyn omc_agent::ModelPicker> = picker.clone();
+        Routing {
+            summarizer,
+            fallback: (!backups.is_empty()).then(|| Fallback {
+                slot: slot.to_owned(),
+                from,
+                backups,
+                picker,
+            }),
         }
     }
 
@@ -245,6 +288,10 @@ impl Turn {
                 shared: self.shared.clone(),
             }),
             ..planner
+        });
+        let planner_id = planner.as_ref().map(|planner| match planner.provider {
+            provider if provider == self.provider => planner.id.clone(),
+            provider => format!("{}/{}", provider.def().id, planner.id),
         });
         let window = omc_providers::context_window(self.provider, &self.model);
         let window = planner.as_ref().map_or(window, |planner| {
@@ -310,6 +357,16 @@ impl Turn {
             self.base.clone(),
         )));
         let checks = Chained::of(links);
+        let layers = self.shared.slot_layers();
+        let picker = Arc::new(SessionPicker {
+            shared: self.shared.clone(),
+            provider: self.provider,
+            effort,
+        });
+        let routing = self
+            .routing(&picker, &layers, planner_id.as_deref(), planning())
+            .await;
+        let subagent_slot = matches!(layers.model_of(slots::SUBAGENT), Ok(Some(_)));
         let toolset = Toolset::build(&Inputs {
             base: &self.base,
             denied: &self.denied,
@@ -318,11 +375,13 @@ impl Turn {
             model: subagent_model,
             models: Models {
                 current: self.model.clone(),
-                picker: Some(Arc::new(SessionPicker {
-                    shared: self.shared.clone(),
-                    provider: self.provider,
-                    effort,
-                })),
+                picker: Some(picker.clone()),
+                fallback: subagent_slot.then(|| format!("@{}", slots::SUBAGENT)),
+                backups: if subagent_slot {
+                    layers.backups_of(slots::SUBAGENT)
+                } else {
+                    Vec::new()
+                },
             },
             throttle: self.shared.throttle.clone(),
             roster: self.shared.roster.clone(),
@@ -396,6 +455,7 @@ impl Turn {
             window: Some(window),
             checkpoint: checkpoint.as_deref(),
             hooks: checks.as_deref(),
+            routing: Some(&routing),
         };
         let mut handed = None;
         let result = match job {
@@ -467,7 +527,11 @@ impl Turn {
                 .await
             }
             Job::Handoff(goal) => {
-                omc_agent::write_handoff(model.as_ref(), effort, &self.history, goal.as_deref())
+                let (writer, writer_effort) = match &routing.summarizer {
+                    Some(fast) => (fast.model.as_ref(), fast.effort),
+                    None => (model.as_ref(), effort),
+                };
+                omc_agent::write_handoff(writer, writer_effort, &self.history, goal.as_deref())
                     .await
                     .map(|prompt| handed = Some(prompt))
             }
@@ -2363,3 +2427,7 @@ mod tests {
         assert!(after.contains("<memory>") && after.ends_with("three"));
     }
 }
+
+#[cfg(test)]
+#[path = "slot_tests.rs"]
+mod slot_tests;

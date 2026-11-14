@@ -13,6 +13,8 @@
   receives.
 - [Configuration](configuration.md): every environment variable, file and
   setting.
+- [Models and slots](models-and-slots.md): which model does what, `@slot`
+  names, backups and presets.
 - [Troubleshooting](troubleshooting.md): retries, recovery, and what crab does
   when a request or the model goes wrong.
 

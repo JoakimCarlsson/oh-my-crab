@@ -6,6 +6,7 @@ use crate::inquiry::Reply;
 use crate::language::LanguageAnswer;
 use crate::permission::Verdict;
 use crate::server::Server;
+use crate::slot::SlotScope;
 use crate::toolserver::ToolServer;
 
 /// How a conversation is opened.
@@ -187,6 +188,59 @@ pub enum Command {
         /// The server to ask.
         server: Server,
     },
+    /// Asks for the model slots, answered with a [`crate::Event::Slots`]: each slot with the model it resolves to, where that comes from, and a suggestion for a slot with no model of its own. Allowed before [`Command::Open`], when the project's file and the conversation's model are not known yet, and while a turn is running.
+    Slots,
+    /// Sets the slot `name` in the file of `scope`: its model and its backups, replacing what that file held for it; a custom name is made. Answered with the slots as they now stand in a [`crate::Event::Slots`], or a [`crate::Event::Failed`], changing nothing, when a name or selector is not valid or the file cannot be written. Applies from the next request.
+    SetSlot {
+        /// The slot's name: letters, digits, `-` and `_`.
+        name: String,
+        /// The file to write.
+        #[serde(default)]
+        scope: SlotScope,
+        /// The model selector, as `provider/model` or `model` with an optional `:effort`; nothing keeps only the backups.
+        #[serde(default)]
+        model: Option<String>,
+        /// The selectors tried in order when the model fails, as the model is written.
+        #[serde(default)]
+        backups: Vec<String>,
+        /// The provider id whose assignment is set, such as `claude`; nothing sets the any-provider assignment.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
+    /// Takes the slot `name` out of the file of `scope`, so that it falls back to the other file or to the conversation's model. Answered like [`Command::SetSlot`].
+    ClearSlot {
+        /// The slot's name.
+        name: String,
+        /// The file to change.
+        #[serde(default)]
+        scope: SlotScope,
+        /// The provider id whose assignment is taken out; nothing takes out the any-provider assignment.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
+    /// Asks for the presets kept in the user's file, answered with a [`crate::Event::Presets`]. Allowed before [`Command::Open`] and while a turn is running.
+    Presets,
+    /// Saves every slot as it stands now, with the conversation's effort or `effort` when given, as the preset `name`, replacing one of that name. Answered with a [`crate::Event::Presets`], or a [`crate::Event::Failed`].
+    SavePreset {
+        /// The preset's name: letters, digits, `-` and `_`.
+        name: String,
+        /// The effort to keep with it instead of the conversation's.
+        #[serde(default)]
+        effort: Option<String>,
+    },
+    /// Sets every slot the file of `scope` holds to what the preset `name` holds, and the conversation's effort to its effort when it has one and the model takes it. Answered with a [`crate::Event::Slots`], or a [`crate::Event::Failed`] when there is no such preset.
+    ApplyPreset {
+        /// The preset's name.
+        name: String,
+        /// The file whose slots are replaced.
+        #[serde(default)]
+        scope: SlotScope,
+    },
+    /// Takes the preset `name` out of the user's file. Answered with a [`crate::Event::Presets`], or a [`crate::Event::Failed`] when there is no such preset.
+    DeletePreset {
+        /// The preset's name.
+        name: String,
+    },
 }
 
 #[cfg(test)]
@@ -272,6 +326,107 @@ mod tests {
         };
         let line = crate::encode(&handed).unwrap();
         assert_eq!(crate::decode::<crate::Event>(&line).unwrap(), handed);
+    }
+
+    /// The slot and preset commands read from the lines a client writes, with the scope left out meaning the user's file, and they and their answers survive a trip through a line.
+    #[test]
+    fn slot_commands_round_trip() {
+        let set: Command =
+            crate::decode(r#"{"SetSlot":{"name":"fast","model":"claude/haiku:low"}}"#).unwrap();
+        assert_eq!(
+            set,
+            Command::SetSlot {
+                name: "fast".to_owned(),
+                scope: SlotScope::User,
+                model: Some("claude/haiku:low".to_owned()),
+                backups: Vec::new(),
+                provider: None,
+            }
+        );
+        let codex: Command =
+            crate::decode(r#"{"SetSlot":{"name":"fast","model":"gpt-5-mini","provider":"codex"}}"#)
+                .unwrap();
+        assert!(matches!(
+            codex,
+            Command::SetSlot { provider: Some(ref id), .. } if id == "codex"
+        ));
+        let commands = [
+            Command::Slots,
+            set,
+            codex,
+            Command::ClearSlot {
+                name: "plan".to_owned(),
+                scope: SlotScope::Project,
+                provider: None,
+            },
+            Command::ClearSlot {
+                name: "plan".to_owned(),
+                scope: SlotScope::User,
+                provider: Some("claude".to_owned()),
+            },
+            Command::Presets,
+            Command::SavePreset {
+                name: "cheap".to_owned(),
+                effort: Some("low".to_owned()),
+            },
+            Command::ApplyPreset {
+                name: "cheap".to_owned(),
+                scope: SlotScope::User,
+            },
+            Command::DeletePreset {
+                name: "cheap".to_owned(),
+            },
+        ];
+        for command in commands {
+            assert_eq!(
+                crate::decode::<Command>(&crate::encode(&command).unwrap()).unwrap(),
+                command
+            );
+        }
+        let events = [
+            crate::Event::Slots(vec![crate::SlotInfo {
+                name: "fast".to_owned(),
+                model: None,
+                backups: Vec::new(),
+                resolved: Some("m".to_owned()),
+                source: crate::SlotSource::Main,
+                inherited: true,
+                suggested: Some("claude-haiku".to_owned()),
+                providers: vec![crate::SlotProvider {
+                    provider: "codex".to_owned(),
+                    model: Some("gpt-5-mini".to_owned()),
+                    backups: Vec::new(),
+                    suggested: None,
+                }],
+            }]),
+            crate::Event::Presets(vec![crate::PresetInfo {
+                name: "cheap".to_owned(),
+                slots: vec![crate::PresetSlot {
+                    name: "fast".to_owned(),
+                    model: Some("haiku".to_owned()),
+                    backups: vec!["openai/gpt-5-mini".to_owned()],
+                    providers: vec![crate::SlotProvider {
+                        provider: "claude".to_owned(),
+                        model: Some("claude/haiku".to_owned()),
+                        backups: Vec::new(),
+                        suggested: None,
+                    }],
+                }],
+                effort: None,
+            }]),
+            crate::Event::ModelFallback {
+                slot: "main".to_owned(),
+                from: "a".to_owned(),
+                to: "b".to_owned(),
+                reason: "provider returned 529: overloaded".to_owned(),
+            },
+        ];
+        for event in events {
+            assert_eq!(
+                crate::decode::<crate::Event>(&crate::encode(&event).unwrap()).unwrap(),
+                event
+            );
+        }
     }
 
     /// A trust answer and a trust request each survive a trip through a line, in the shape a client writes and reads.

@@ -365,6 +365,17 @@ pub(crate) fn translate(event: AgentEvent, window: u64) -> Option<Event> {
             ..bare(id)
         }),
         AgentEvent::Subagent(notice) => Event::Subagent(subagent_of(notice)),
+        AgentEvent::ModelFallback {
+            slot,
+            from,
+            to,
+            reason,
+        } => Event::ModelFallback {
+            slot,
+            from,
+            to,
+            reason,
+        },
         AgentEvent::Nested {
             parent,
             agent,
@@ -383,6 +394,7 @@ pub(crate) fn translate(event: AgentEvent, window: u64) -> Option<Event> {
                 call: format!("{parent}:{}", subagent.call),
                 ..subagent
             }),
+            fallback @ Event::ModelFallback { .. } => fallback,
             _ => return None,
         },
     })

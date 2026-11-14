@@ -10,6 +10,7 @@ use crate::plan::PlanStep;
 use crate::queue::Queued;
 use crate::server::Server;
 use crate::setting::{Setting, Slash};
+use crate::slot::{PresetInfo, SlotInfo};
 use crate::spend::Spent;
 use crate::tool::{Background, Subagent, Tool};
 use crate::trust::TrustRequest;
@@ -180,6 +181,21 @@ pub enum Event {
         models: Vec<String>,
         /// Why the server could not be asked, or nothing when it was.
         error: Option<String>,
+    },
+    /// The model slots, built-in ones first, then custom ones by name, in answer to [`crate::Command::Slots`], [`crate::Command::SetSlot`], [`crate::Command::ClearSlot`] and [`crate::Command::ApplyPreset`].
+    Slots(Vec<SlotInfo>),
+    /// The presets kept, by name, in answer to [`crate::Command::Presets`], [`crate::Command::SavePreset`] and [`crate::Command::DeletePreset`].
+    Presets(Vec<PresetInfo>),
+    /// A request to the model of `slot` failed, after it was sent again as often as is worth it, in a way another model may not, so the rest of the turn asks `to`, the slot's next backup, instead of `from`.
+    ModelFallback {
+        /// The slot whose backup is used, such as `main` or `plan`.
+        slot: String,
+        /// The model that failed.
+        from: String,
+        /// The model asked from now on in this turn.
+        to: String,
+        /// Why the request failed, as the provider said.
+        reason: String,
     },
 }
 

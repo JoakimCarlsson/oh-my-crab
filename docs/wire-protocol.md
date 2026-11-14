@@ -214,6 +214,16 @@ applied again when a conversation with an id is opened; `defaults` in `Open`
 gives values for the settings the saved conversation has no choice for, and a
 `model` given in `Open` wins over a saved model.
 
+Wherever a model is named, in `Open`'s `model`, `Set` on `model` or
+`plan_model`, and `defaults`, `@name` names the model of the slot `name` (see
+[models and slots](models-and-slots.md)). For `model` it is resolved when it
+is set: the slot's model is taken, without its provider when that is the
+conversation's, and its `:effort` sets `effort`; a slot left to the
+conversation's model leaves it as it is, and `@main` names the model the
+slot files set for `main`. `plan_model` keeps `@name` and resolves it at each
+turn. An unknown slot fails with `Failed` and changes nothing. `Open` without
+a model starts with the `main` slot's model when the files set one.
+
 ### History replay
 
 When `Open` carries a `conversation` id, crab keeps the conversation's
@@ -931,6 +941,115 @@ its id. Runs beside whatever else crab does.
 
 ```json
 {"FindModels":{"ticket":3,"server":{"id":"box","label":null,"base_url":"http://localhost:8000/v1","wire":"chat_completions","api_key_env":[],"api_key":null,"has_api_key":false,"headers":[],"default_model":null,"models":[],"replay_reasoning":false}}}
+```
+
+### `Slots`
+
+Asks for the model slots (see [models and slots](models-and-slots.md)),
+answered with `Slots`. Like `Presets`, it may be sent before `Open`, when the
+project's file and the conversation's model are not known yet, and while a
+turn is running.
+
+```json
+"Slots"
+```
+
+### `SetSlot`
+
+Sets one assignment of a slot in the file of `scope`: the one of `provider`,
+or the any-provider one when `provider` is left out, with its model and its
+backups, in place of what that file held for it. A name that is not built in
+makes a custom slot. Leaving out both `model` and `backups` takes the
+assignment out of the file.
+Answered with `Slots` as they now stand, or with `Failed`, changing nothing,
+when the name is not letters, digits, `-` and `_`, a selector is not valid or
+names a slot, or the file cannot be written; `Project` fails while no
+trusted project is open. Applies from the next request.
+
+| Field     | Type           | Presence | Meaning                                                                              |
+| --------- | -------------- | -------- | ------------------------------------------------------------------------------------ |
+| `name`    | string         | required | The slot, such as `fast`.                                                            |
+| `scope`   | `SlotScope`    | default  | `User` (the default), the user's file, or `Project`, the project's.                  |
+| `model`   | string         | optional | The selector: `provider/model` or `model`, with `:effort` when given.               |
+| `backups` | list of string | default  | The selectors tried in order when the model fails, written like `model`.             |
+| `provider` | string        | optional | The provider id, such as `codex`, whose assignment is set; left out for any provider. |
+
+```json
+{"SetSlot":{"name":"fast","scope":"User","model":"claude/haiku:low","backups":["openai/gpt-5-mini"]}}
+{"SetSlot":{"name":"fast","scope":"User","model":"codex/gpt-5-mini","backups":[],"provider":"codex"}}
+```
+
+### `ClearSlot`
+
+Takes one assignment of a slot out of the file of `scope`, the one of
+`provider` or the any-provider one, so that it falls back to the other file,
+the any-provider assignment or the conversation's model. Answered like
+`SetSlot`.
+
+| Field      | Type        | Presence | Meaning                                                             |
+| ---------- | ----------- | -------- | ------------------------------------------------------------------- |
+| `name`     | string      | required | The slot.                                                           |
+| `scope`    | `SlotScope` | default  | The file to change.                                                 |
+| `provider` | string      | optional | The provider id whose assignment goes; left out for any provider.   |
+
+```json
+{"ClearSlot":{"name":"plan","scope":"Project"}}
+{"ClearSlot":{"name":"plan","scope":"User","provider":"claude"}}
+```
+
+### `Presets`
+
+Asks for the presets, answered with `Presets`. Allowed before `Open` and
+while a turn is running.
+
+```json
+"Presets"
+```
+
+### `SavePreset`
+
+Saves every slot as it stands now, each layer applied, with `effort` or else
+the conversation's effort, as the preset `name` in the user's file, in place
+of one of that name. Answered with `Presets`, or with `Failed` when the name
+or the effort is not valid.
+
+| Field    | Type   | Presence | Meaning                                                       |
+| -------- | ------ | -------- | ------------------------------------------------------------- |
+| `name`   | string | required | The preset: letters, digits, `-` and `_`.                     |
+| `effort` | string | optional | The effort to keep instead of the conversation's, as `high`.  |
+
+```json
+{"SavePreset":{"name":"cheap","effort":"low"}}
+```
+
+### `ApplyPreset`
+
+Replaces every slot of the file of `scope` with those of the preset, then,
+while a conversation is open, sets its model to the preset's `main` slot when
+it sets one, and its effort to the preset's when the model takes it, as `Set`
+would. Answered with `Slots`, then with `Settings` when the conversation
+changed, or with `Failed` when there is no such preset.
+
+| Field   | Type        | Presence | Meaning                            |
+| ------- | ----------- | -------- | ---------------------------------- |
+| `name`  | string      | required | The preset.                        |
+| `scope` | `SlotScope` | default  | The file whose slots are replaced. |
+
+```json
+{"ApplyPreset":{"name":"cheap","scope":"User"}}
+```
+
+### `DeletePreset`
+
+Takes a preset out of the user's file, answered with `Presets`, or with
+`Failed` when there is no such preset.
+
+| Field  | Type   | Presence | Meaning     |
+| ------ | ------ | -------- | ----------- |
+| `name` | string | required | The preset. |
+
+```json
+{"DeletePreset":{"name":"cheap"}}
 ```
 
 ## Events
@@ -1724,6 +1843,63 @@ The models a server offers, in answer to the `FindModels` under `ticket`.
 
 ```json
 {"FoundModels":{"ticket":3,"models":["qwen3-coder-30b","llama-3.3-70b"],"error":null}}
+```
+
+### `Slots`
+
+The model slots in answer to `Slots`, `SetSlot`, `ClearSlot` and
+`ApplyPreset`: the built-in ones (`main`, `fast`, `plan`, `subagent`,
+`review`, `vision`) first, then the custom ones by name, each a `SlotInfo`.
+
+| Field       | Type           | Presence | Meaning                                                                                                                         |
+| ----------- | -------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `name`      | string         | required | The slot.                                                                                                                       |
+| `model`     | string         | optional | The selector the layers set for its any-provider assignment; `null` when none does.                                            |
+| `backups`   | list of string | default  | The any-provider assignment's backups, in order.                                                                                |
+| `resolved`  | string         | optional | The model it resolves to for the conversation's provider: that provider's, else any provider's, else the conversation's; `null` before `Open` for a slot left to it. |
+| `source`    | `SlotSource`   | required | Where `resolved` comes from: `Environment`, `Project`, `User`, or `Main` for the conversation's model.                         |
+| `inherited` | bool           | required | Whether it has no model of its own and takes the conversation's. `main` always does.                                           |
+| `suggested` | string         | optional | For a slot that inherits, a model the catalog suggests, as `provider/model`; never applied by crab.                            |
+| `providers` | list of `SlotProvider` | default | One per provider the reader is signed in to, the conversation's, and any provider a file sets an assignment for: its `provider` id, `model` (`null` for none), `backups`, and `suggested`, a model of that provider the catalog suggests when it sets none. Added after the first release; older crabs leave it out. |
+
+```json
+{"Slots":[{"name":"main","model":null,"backups":["openai/gpt-5"],"resolved":"claude-opus-4-5","source":"Main","inherited":true,"suggested":null,"providers":[]},{"name":"plan","model":null,"backups":[],"resolved":"claude/opus","source":"User","inherited":false,"suggested":null,"providers":[{"provider":"claude","model":"claude/opus","backups":[],"suggested":null},{"provider":"codex","model":null,"backups":[],"suggested":null}]},{"name":"fast","model":"claude/haiku:low","backups":[],"resolved":"claude/haiku:low","source":"User","inherited":false,"suggested":null},{"name":"vision","model":null,"backups":[],"resolved":"claude-opus-4-5","source":"Main","inherited":true,"suggested":null}]}
+```
+
+### `Presets`
+
+The presets, by name, each a `PresetInfo` holding a `PresetSlot` for each
+slot it sets, in answer to `Presets`, `SavePreset` and `DeletePreset`.
+
+| Field    | Type               | Presence | Meaning                                                          |
+| -------- | ------------------ | -------- | ---------------------------------------------------------------- |
+| `name`   | string             | required | The preset.                                                      |
+| `slots`  | list of `PresetSlot` | required | Each slot's `name`, any-provider `model` (`null` for none) and `backups`, and `providers`, its assignment for each provider as `SlotProvider`s with `suggested` always `null`. |
+| `effort` | string             | optional | The effort it sets; `null` leaves the effort as it is.           |
+
+```json
+{"Presets":[{"name":"cheap","slots":[{"name":"fast","model":"claude/haiku","backups":["openai/gpt-5-mini"]}],"effort":"low"}]}
+```
+
+### `ModelFallback`
+
+A request to the model of `slot` failed for good, after crab sent it again
+as often as is worth it, in a way another model may not: the provider was
+overloaded, rate limited or failing inside, or the model could not be had.
+The rest of the turn asks `to`, the slot's next backup that could be found.
+Sign-in failures, refused requests and context overflows never move to a
+backup. Sent for the main agent's turns, `main` or `plan`, and for subagents
+whose model came from `subagent`.
+
+| Field    | Type   | Presence | Meaning                                              |
+| -------- | ------ | -------- | ---------------------------------------------------- |
+| `slot`   | string | required | The slot, such as `main`.                            |
+| `from`   | string | required | The model that failed.                               |
+| `to`     | string | required | The model asked for the rest of the turn.            |
+| `reason` | string | required | The first line of the failure, as the provider said. |
+
+```json
+{"ModelFallback":{"slot":"main","from":"claude-opus-4-5","to":"openai/gpt-5","reason":"provider returned 529: overloaded"}}
 ```
 
 

@@ -100,8 +100,8 @@ and, but for `/btw`, is refused while a turn runs.
 | ----------------- | ------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
 | `/retry`          | `"Retry"`                       | Takes the last reply back out and answers the last prompt again, under the turn id it was saved with.            |
 | `/fresh`          | `"Fresh"`                       | Empties the conversation's context; the model, settings, name, goal and notebook stay.                          |
-| `/btw <question>` | `{"Btw":{"question":"..."}}`    | Asks the model a question about the conversation on the side, without tools; the answer comes as an `Aside` event and is not added to the conversation. Allowed while a turn runs. |
-| `/handoff [goal]` | `{"Handoff":{"goal":"..."}}`    | Has the model write a hand-off prompt, toward `goal` when one is given, then empties the conversation and starts it again with that prompt, telling the client with `HandedOff`. |
+| `/btw <question>` | `{"Btw":{"question":"..."}}`    | Asks the model, the `fast` slot's when it is set, a question about the conversation on the side, without tools; the answer comes as an `Aside` event and is not added to the conversation. Allowed while a turn runs. |
+| `/handoff [goal]` | `{"Handoff":{"goal":"..."}}`    | Has the model, the `fast` slot's when it is set, write a hand-off prompt, toward `goal` when one is given, then empties the conversation and starts it again with that prompt, telling the client with `HandedOff`. |
 
 A saved conversation keeps the turns `/fresh` and `/handoff` took out,
 recorded as lost, so a replayed history still shows them. The

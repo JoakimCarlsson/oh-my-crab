@@ -33,6 +33,8 @@ use crate::turn::{Ended, Job, Turn};
 
 #[path = "restart.rs"]
 mod restart;
+#[path = "slot_commands.rs"]
+mod slot_commands;
 
 /// A conversation that has been opened.
 struct Open {
@@ -335,6 +337,23 @@ impl Session {
                     });
                 });
             }
+            Command::Slots => self.say(self.slots_event()),
+            Command::SetSlot {
+                name,
+                scope,
+                model,
+                backups,
+                provider,
+            } => self.set_slot(&name, scope, provider.as_deref(), model, backups),
+            Command::ClearSlot {
+                name,
+                scope,
+                provider,
+            } => self.clear_slot(&name, scope, provider.as_deref()),
+            Command::Presets => self.say(self.presets_event()),
+            Command::SavePreset { name, effort } => self.save_preset(&name, effort),
+            Command::ApplyPreset { name, scope } => self.apply_preset(&name, scope).await,
+            Command::DeletePreset { name } => self.delete_preset(&name),
             Command::Close => {}
         }
     }
@@ -456,6 +475,34 @@ impl Session {
         let models = omc_providers::list_models(provider, &credentials)
             .await
             .unwrap_or_default();
+        let project = assessment
+            .standing
+            .reads_project()
+            .then_some(directory.as_path());
+        self.shared
+            .set_slot_files(crate::slots::SlotFiles::locate(project));
+        let layers = self
+            .shared
+            .slot_layers()
+            .for_provider(Some(provider.def().id));
+        let (model, opening_effort) = match model {
+            Some(named) => {
+                match slot_commands::conversation_model(&layers, provider, &models, None, &named) {
+                    Ok((model, effort)) => (Some(model), effort),
+                    Err(reason) => return self.say(Event::Failed(reason)),
+                }
+            }
+            None => match slot_commands::conversation_model(
+                &layers,
+                provider,
+                &models,
+                None,
+                &format!("@{}", crate::slots::MAIN),
+            ) {
+                Ok((model, effort)) => (Some(model), effort),
+                Err(_) => (None, None),
+            },
+        };
         let has_model = model.is_some();
         let model = match model.or_else(|| models.first().cloned()) {
             Some(model) => model,
@@ -522,6 +569,9 @@ impl Session {
             .as_ref()
             .map(|journal| journal.settings())
             .unwrap_or_default();
+        if let Some(effort) = opening_effort {
+            self.shared.set_effort(effort.as_str());
+        }
         let wanted = restored_settings(&defaults, &chosen);
         for (id, value) in &wanted {
             if id != MODEL || !has_model {
@@ -1299,10 +1349,24 @@ impl Session {
         }
     }
 
-    /// Gives the setting `setting` the value `value` and saves the choice with the conversation; the new value applies from the next request.
+    /// Gives the setting `setting` the value `value` and saves the choice with the conversation; the new value applies from the next request. A model named by a slot, as `@fast`, is the slot's model, saved as such, with the effort its selector gives.
     ///
     /// A switch to another model is put to the `PreModelSwitch` hooks first, which may keep it from happening, and the client is told why with [`Event::Failed`]; once the model changed, the `PostModelSwitch` hooks start, and their context is told to the model with the next prompt.
     async fn set(&mut self, setting: &str, value: &str) {
+        let resolved;
+        let mut effort = None;
+        let value = if setting == MODEL && self.open.is_some() {
+            match self.conversation_model(value) {
+                Ok((model, asked)) => {
+                    resolved = model;
+                    effort = asked;
+                    resolved.as_str()
+                }
+                Err(reason) => return self.say(Event::Failed(reason)),
+            }
+        } else {
+            value
+        };
         let from = self.shared.model().map(|(_, model)| model);
         let switching = from
             .clone()
@@ -1322,16 +1386,31 @@ impl Session {
             if let Some(from) = switching {
                 self.shared.lifecycle.switched(from, value.to_owned());
             }
+            if let Some(effort) = effort
+                && self.shared.set_effort(effort.as_str())
+            {
+                self.shared.save_setting(EFFORT, effort.as_str());
+                self.shared.announce();
+            }
         }
     }
 
     /// Gives the setting `setting` the value `value` without saving it; whether the setting took it.
     fn apply(&mut self, setting: &str, value: &str) -> bool {
         match setting {
-            MODEL if self.open.is_some() => {
-                self.shared.set_model(value);
-                true
-            }
+            MODEL if self.open.is_some() => match self.conversation_model(value) {
+                Ok((model, effort)) => {
+                    self.shared.set_model(&model);
+                    if let Some(effort) = effort {
+                        self.shared.set_effort(effort.as_str());
+                    }
+                    true
+                }
+                Err(reason) => {
+                    self.say(Event::Failed(reason));
+                    false
+                }
+            },
             MODE => Mode::parse(value).is_some_and(|mode| {
                 self.shared.set_mode(mode);
                 true

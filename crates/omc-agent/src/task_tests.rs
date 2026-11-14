@@ -563,6 +563,7 @@ async fn aborting_a_turn_aborts_a_whole_batch() {
                 window: None,
                 checkpoint: None,
                 hooks: None,
+                routing: None,
             },
             &mut history,
             "go".into(),

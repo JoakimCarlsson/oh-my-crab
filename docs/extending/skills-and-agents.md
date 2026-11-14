@@ -203,11 +203,16 @@ Look for `unsafe` blocks in the files named and explain each.
 - `isolated`: `true`, `yes` or `on` runs the subagent in a git worktree of its
   own unless the call says otherwise.
 - `model`: the model the subagent asks, as Claude Code writes it: an alias
-  (`haiku`, `sonnet`, `opus`), a model id, or `inherit`, the same as leaving it
-  out, for the model of the agent that starts it. A provider and a model id as
-  `provider/model` picks a model of another signed-in provider. A call's own
-  `model` wins over it. See [Subagents](../tools/subagents.md#models) for how
-  the name is looked up.
+  (`haiku`, `sonnet`, `opus`), a model id, or `inherit` for the model of the
+  agent that starts it. A provider and a model id as `provider/model` picks a
+  model of another signed-in provider, and `:effort` after it, as
+  `claude/haiku:low`, the effort it thinks at. `@name`, as `model: @fast`,
+  names the model of the slot `name` (see
+  [models and slots](../models-and-slots.md)); an unknown slot fails the call
+  that starts the subagent. Leaving it out asks the `subagent` slot's model,
+  which is the model of the agent that starts it unless the slot is set. A
+  call's own `model` wins over it. See
+  [Subagents](../tools/subagents.md#models) for how the name is looked up.
 - `tools` decides whether the subagent may start subagents of its own: it may
   when the list is missing or holds `task` (or Claude Code's `agent`), and the
   levels allowed are not used up.

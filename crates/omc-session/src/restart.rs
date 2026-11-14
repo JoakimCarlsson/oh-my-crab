@@ -4,6 +4,8 @@ use omc_providers::Message;
 use omc_wire::Event;
 
 use super::{START_CLEAR, Session};
+use crate::picker::SessionPicker;
+use crate::slots;
 use crate::spend::Priced;
 use crate::turn::{Ended, Job, connect};
 
@@ -178,7 +180,7 @@ impl Session {
         true
     }
 
-    /// Asks the model `question` on the side, on a task of its own, showing it the conversation as it stood when the last turn ended, and tells the client the answer with [`Event::Aside`], or why there is none with [`Event::Failed`]; the conversation is left as it is, and a running turn goes on.
+    /// Asks the model of the `fast` slot, else the conversation's, `question` on the side, on a task of its own, showing it the conversation as it stood when the last turn ended, and tells the client the answer with [`Event::Aside`], or why there is none with [`Event::Failed`]; the conversation is left as it is, and a running turn goes on.
     fn aside(&self, question: String) {
         if question.is_empty() {
             return self.say(Event::Failed(
@@ -191,14 +193,27 @@ impl Session {
         let shared = self.shared.clone();
         let history = self.history.clone();
         tokio::spawn(async move {
-            let answered = match connect(&shared, provider, &id).await {
-                Ok(model) => {
-                    let priced = Priced::of(model, shared.clone(), provider, &id, false);
-                    omc_agent::answer_aside(&priced, shared.effort_now(), &history, &question)
+            let picker = SessionPicker {
+                shared: shared.clone(),
+                provider,
+                effort: shared.effort_now(),
+            };
+            let answered = match picker.slot(slots::FAST).await {
+                Ok(Some((_, _, fast))) => {
+                    omc_agent::answer_aside(fast.model.as_ref(), fast.effort, &history, &question)
                         .await
                         .map_err(|error| error.to_string())
                 }
-                Err(ended) => Err(reason_of(ended)),
+                Err(reason) => Err(format!("the fast model cannot be used: {reason}")),
+                Ok(None) => match connect(&shared, provider, &id).await {
+                    Ok(model) => {
+                        let priced = Priced::of(model, shared.clone(), provider, &id, false);
+                        omc_agent::answer_aside(&priced, shared.effort_now(), &history, &question)
+                            .await
+                            .map_err(|error| error.to_string())
+                    }
+                    Err(ended) => Err(reason_of(ended)),
+                },
             };
             shared.say(match answered {
                 Ok(answer) => Event::Aside { question, answer },

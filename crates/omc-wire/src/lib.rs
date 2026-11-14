@@ -21,6 +21,7 @@ mod provider;
 mod queue;
 mod server;
 mod setting;
+mod slot;
 mod spend;
 mod tool;
 mod toolserver;
@@ -45,6 +46,7 @@ pub use provider::{KeySource, ProviderInfo, SignIn};
 pub use queue::{QueueState, Queued};
 pub use server::{Server, ServerWire};
 pub use setting::{Pick, Setting, Slash};
+pub use slot::{PresetInfo, PresetSlot, SlotInfo, SlotProvider, SlotScope, SlotSource};
 pub use spend::{ModelSpend, Spent, dollars, micros};
 pub use tool::{
     Background, Diff, Kind, Merge, Subagent, SubagentState, Tool, ToolInfo, ToolState, Worktree,

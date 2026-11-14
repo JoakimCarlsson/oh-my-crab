@@ -57,6 +57,7 @@ fn tool(
         models: Models {
             current: "big-1".to_owned(),
             picker,
+            ..Models::default()
         },
         registry: Arc::new(Registry::builtin(&dir).unwrap()),
         approvals: deny_all(),
