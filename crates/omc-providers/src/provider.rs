@@ -19,6 +19,8 @@ pub enum Wire {
     Bedrock,
     /// The Anthropic Messages API as Google Vertex AI serves it, through `streamRawPredict`.
     Vertex,
+    /// Google's Gemini API, through `streamGenerateContent`.
+    Gemini,
 }
 
 impl Wire {

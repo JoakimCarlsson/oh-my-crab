@@ -94,7 +94,7 @@ providers! {
     Mistral => mistral::DEF,
     /// The OpenAI API with an API key.
     OpenAi => openai::DEF,
-    /// Google Gemini through its OpenAI-compatible endpoint, with an API key.
+    /// Google Gemini through its native API, with an API key.
     Gemini => gemini::DEF,
     /// Together AI with an API key.
     Together => together::DEF,

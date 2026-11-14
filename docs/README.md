@@ -52,6 +52,7 @@
 - [Overview](providers/overview.md).
 - [Supported providers](providers/supported.md): addresses, keys and default
   models.
+- [Google Gemini](providers/gemini.md): the native Gemini API.
 - [Custom endpoints](providers/custom-endpoints.md).
 - [Adding a provider](providers/adding.md).
 

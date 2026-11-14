@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use crate::catalog::{self, Cost, Entry};
-use crate::wires::anthropic_messages;
+use crate::wires::{anthropic_messages, gemini};
 use crate::{Effort, Provider, Tokens, Wire};
 
 /// A model's generation as `major.minor`, parsed from its id.
@@ -241,6 +241,9 @@ pub(crate) fn codex_context_window(id: &str) -> u64 {
 /// The context window assumed for a model a server does not describe.
 const UNKNOWN_CONTEXT_WINDOW: u64 = 128_000;
 
+/// The context window assumed for a Gemini model the catalog does not describe, which every Gemini since 1.5 has.
+const GEMINI_CONTEXT_WINDOW: u64 = 1_048_576;
+
 /// The catalog's entry for `model` of `provider`: the provider's own, else, for a Claude model, Anthropic's.
 fn entry(provider: Provider, model: &str) -> Option<Entry> {
     catalog::find(provider, model).or_else(|| {
@@ -271,6 +274,7 @@ pub fn context_window(provider: Provider, model: &str) -> u64 {
         Wire::AnthropicMessages | Wire::Bedrock | Wire::Vertex => claude_context_window(model),
         Wire::OpenAiResponses => codex_context_window(model),
         Wire::ChatCompletions => UNKNOWN_CONTEXT_WINDOW,
+        Wire::Gemini => GEMINI_CONTEXT_WINDOW,
     }
 }
 
@@ -282,6 +286,7 @@ pub fn efforts(provider: Provider, model: &str) -> Vec<Effort> {
         Wire::AnthropicMessages | Wire::Bedrock | Wire::Vertex => claude_efforts(model),
         Wire::OpenAiResponses => codex_efforts(model),
         Wire::ChatCompletions => Vec::new(),
+        Wire::Gemini => gemini::efforts(model),
     }
 }
 
@@ -420,7 +425,7 @@ pub fn pricing(provider: Provider, model: &str) -> Option<Pricing> {
     match provider.wire() {
         Wire::AnthropicMessages | Wire::Bedrock | Wire::Vertex => claude_pricing(model),
         Wire::OpenAiResponses => codex_pricing(model),
-        Wire::ChatCompletions => None,
+        Wire::ChatCompletions | Wire::Gemini => None,
     }
 }
 

@@ -96,7 +96,7 @@ find their cloud's credentials as below.
 | `cerebras`   | `CEREBRAS_API_KEY`                    | `OMC_CEREBRAS_URL`   | `https://api.cerebras.ai/v1`                              |
 | `mistral`    | `MISTRAL_API_KEY`                     | `OMC_MISTRAL_URL`    | `https://api.mistral.ai/v1`                               |
 | `openai`     | `OPENAI_API_KEY`                      | `OMC_OPENAI_URL`     | `https://api.openai.com/v1`                               |
-| `gemini`     | `GEMINI_API_KEY`                      | `OMC_GEMINI_URL`     | `https://generativelanguage.googleapis.com/v1beta/openai` |
+| `gemini`     | `GEMINI_API_KEY`, else `GOOGLE_API_KEY` | `OMC_GEMINI_URL`   | `https://generativelanguage.googleapis.com/v1beta`        |
 | `together`   | `TOGETHER_API_KEY`                    | `OMC_TOGETHER_URL`   | `https://api.together.ai/v1`                              |
 | `fireworks`  | `FIREWORKS_API_KEY`                   | `OMC_FIREWORKS_URL`  | `https://api.fireworks.ai/inference/v1`                   |
 | `ollama`     | none                                  | `OMC_OLLAMA_URL`     | `http://localhost:11434/v1`                               |

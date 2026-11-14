@@ -2,4 +2,5 @@
 
 pub(crate) mod anthropic_messages;
 pub(crate) mod chat_completions;
+pub(crate) mod gemini;
 pub(crate) mod openai_responses;

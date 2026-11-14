@@ -24,7 +24,7 @@ These providers are built into the `omc` binary. To add one, see
 | `cerebras`   | ChatCompletions   | `CEREBRAS_API_KEY`                    | `https://api.cerebras.ai/v1`, or `OMC_CEREBRAS_URL`                            |
 | `mistral`    | ChatCompletions   | `MISTRAL_API_KEY`                     | `https://api.mistral.ai/v1`, or `OMC_MISTRAL_URL`                              |
 | `openai`     | ChatCompletions   | `OPENAI_API_KEY`                      | `https://api.openai.com/v1`, or `OMC_OPENAI_URL`                               |
-| `gemini`     | ChatCompletions   | `GEMINI_API_KEY`                      | `https://generativelanguage.googleapis.com/v1beta/openai`, or `OMC_GEMINI_URL` |
+| `gemini`     | Gemini            | `GEMINI_API_KEY` / `GOOGLE_API_KEY`   | `https://generativelanguage.googleapis.com/v1beta`, or `OMC_GEMINI_URL`        |
 | `together`   | ChatCompletions   | `TOGETHER_API_KEY`                    | `https://api.together.ai/v1`, or `OMC_TOGETHER_URL`                            |
 | `fireworks`  | ChatCompletions   | `FIREWORKS_API_KEY`                   | `https://api.fireworks.ai/inference/v1`, or `OMC_FIREWORKS_URL`                |
 | `lmstudio`   | ChatCompletions   | none                                  | `http://localhost:1234/v1`, or `OMC_LMSTUDIO_URL`                              |
@@ -40,7 +40,8 @@ for both Z.ai ids, `MiniMax-M3`, `deepseek-v4-pro`, `grok-4.7`,
 `openai/gpt-oss-120b` on Groq, `gpt-oss-120b` on Cerebras,
 `mistral-large-latest`, `gpt-6.1-terra` on OpenAI (its largest models take no
 tools over Chat Completions), `gemini-3.8-flash`, `MiniMaxAI/MiniMax-M3` on
-Together and `accounts/fireworks/models/kimi-k2-thinking` on Fireworks. The
+Together and `accounts/fireworks/models/kimi-k2-thinking` on Fireworks. Gemini
+speaks its own API; see [gemini.md](gemini.md). The
 default leads the model list a client is offered; the rest is what the server's
 `/models` lists, without embedding, speech and image models. Local servers take
 the first model they list.

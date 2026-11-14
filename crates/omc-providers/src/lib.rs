@@ -31,7 +31,7 @@ pub use prompt::PROMPT;
 pub use provider::{Def, Provider, Wire, active_provider, credentials_for, login};
 
 use omc_auth::Credentials;
-use wires::{anthropic_messages, chat_completions, openai_responses};
+use wires::{anthropic_messages, chat_completions, gemini, openai_responses};
 
 /// Lists the model ids the account can use with `provider`, best first.
 ///
@@ -64,6 +64,15 @@ pub async fn list_models(
                 base_url: &base_url,
                 headers: provider.def().headers,
                 replay_reasoning: provider.def().replay_reasoning,
+            })
+            .await?;
+            Ok(default_first(listed, provider.def().default_model))
+        }
+        Wire::Gemini => {
+            let base_url = gemini::base_url(provider, credentials);
+            let listed = gemini::list_models(gemini::Target {
+                credentials,
+                base_url: &base_url,
             })
             .await?;
             Ok(default_first(listed, provider.def().default_model))

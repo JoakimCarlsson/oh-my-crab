@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use omc_auth::Credentials;
 use serde_json::Value;
 
-use crate::wires::{anthropic_messages, chat_completions, openai_responses};
+use crate::wires::{anthropic_messages, chat_completions, gemini, openai_responses};
 use crate::{Provider, ProviderError, Retention, Wire};
 
 /// A tool the model may call, in provider-neutral form.
@@ -540,6 +540,14 @@ impl RemoteModel {
                 };
                 chat_completions::complete(target, &self.model, request, sink).await
             }
+            Wire::Gemini => {
+                let base_url = gemini::base_url(self.provider, credentials);
+                let target = gemini::Target {
+                    credentials,
+                    base_url: &base_url,
+                };
+                gemini::complete(target, &self.model, request, sink).await
+            }
         }
     }
 
@@ -564,9 +572,11 @@ impl RemoteModel {
                 )
                 .await
             }
-            Wire::OpenAiResponses | Wire::ChatCompletions | Wire::Bedrock | Wire::Vertex => {
-                Ok(None)
-            }
+            Wire::OpenAiResponses
+            | Wire::ChatCompletions
+            | Wire::Bedrock
+            | Wire::Vertex
+            | Wire::Gemini => Ok(None),
         }
     }
 }

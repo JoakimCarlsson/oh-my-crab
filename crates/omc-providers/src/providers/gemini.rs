@@ -1,4 +1,4 @@
-//! Google Gemini through its OpenAI-compatible endpoint, signed in with an API key from the environment.
+//! Google Gemini through its native `generateContent` API, signed in with an API key from the environment.
 
 use omc_auth::Auth;
 
@@ -8,12 +8,12 @@ use crate::provider::{Def, Wire};
 pub(super) static DEF: Def = Def {
     id: "gemini",
     label: "Google Gemini",
-    wire: Wire::ChatCompletions,
+    wire: Wire::Gemini,
     default_model: Some("gemini-3.8-flash"),
     auth: Auth::ApiKey {
-        env: &["GEMINI_API_KEY"],
+        env: &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
     },
-    base_url: "https://generativelanguage.googleapis.com/v1beta/openai",
+    base_url: "https://generativelanguage.googleapis.com/v1beta",
     base_url_env: Some("OMC_GEMINI_URL"),
     headers: &[],
     replay_reasoning: false,
