@@ -73,6 +73,8 @@ pub(crate) struct Shared {
     pub(crate) throttle: Arc<omc_agent::Throttle>,
     /// The subagents running in the conversation, at every level and in every turn, by which the reader stops one.
     pub(crate) roster: Arc<omc_agent::Roster>,
+    /// The long-lived subagents of the conversation, alive across turns until killed or the conversation ends.
+    pub(crate) crew: Arc<omc_agent::Crew>,
     /// The debugging sessions the `debug` tool keeps across calls.
     pub(crate) debuggers: Arc<omc_dap::Sessions>,
     /// The language services `edit` and `write` ask, chosen when the conversation is opened.
@@ -154,6 +156,7 @@ impl Shared {
             })),
             throttle: Arc::new(omc_agent::Throttle::default()),
             roster: Arc::new(omc_agent::Roster::default()),
+            crew: Arc::new(omc_agent::Crew::default()),
             debuggers: Arc::new(omc_dap::Sessions::new()),
             naming: Mutex::new(Naming::default()),
             login: Mutex::new(Login::default()),

@@ -94,6 +94,11 @@ starts on, outside any function or in a file that is not code is shown as
 | Tool            | What it does                                                                                 | Asks | Plan                       | Detail                     |
 | --------------- | -------------------------------------------------------------------------------------------- | ---- | -------------------------- | -------------------------- |
 | `task`          | Runs up to 32 subagents on self-contained assignments, optionally in worktrees or the background | no   | yes, with read-only subagents | [subagents](subagents.md) |
+| `agent_spawn`   | Starts a named long-lived subagent that keeps its conversation across turns                     | no   | yes, with read-only subagents | [long-lived subagents](subagents.md#long-lived-subagents) |
+| `agent_send`    | Sends a follow-up message to a live long-lived subagent                                          | no   | yes, to read-only subagents | [long-lived subagents](subagents.md#long-lived-subagents) |
+| `agent_wait`    | Blocks for the next reply of a long-lived subagent, with a timeout                               | no   | yes  | [long-lived subagents](subagents.md#long-lived-subagents) |
+| `agent_kill`    | Ends a long-lived subagent                                                                       | no   | yes  | [long-lived subagents](subagents.md#long-lived-subagents) |
+| `agent_list`    | Lists the long-lived subagents and how each stands                                               | no   | yes  | [long-lived subagents](subagents.md#long-lived-subagents) |
 | `submit_result` | *Sometimes.* Hands a subagent's typed result back, checked against the call's `output_schema` | no   | yes                        | [subagents](subagents.md) |
 
 `submit_result` is given only to a subagent asked for a typed result.
@@ -187,7 +192,7 @@ A client can deny any tool by name in `Open`; a denied tool is given to no
 one, subagents and scripts included.
 
 **Subagents** never get `exit_plan_mode`, `ask`, `todo`, `context_notes`,
-`new_context`, `checkpoint`, `rewind`, `wait`, `debug`, `set_title`, `goal`,
+`new_context`, `checkpoint`, `rewind`, `wait`, the `agent_*` tools, `debug`, `set_title`, `goal`,
 `remember` or `memory_edit`: the tools that talk to the reader, steer the
 conversation, change memory, or hold state that belongs to the conversation.
 They get a `task` tool of their own, which cannot start background runs, only
@@ -197,7 +202,7 @@ kind whose definition lists tools gets only those. In plan mode subagents get
 only the tools plan mode allows. Subagents and scripts do get `lsp`; in plan
 mode it is the copy that refuses changes other than dry runs.
 
-**Scripts** never get `script` itself, `task`, `ask`, `exit_plan_mode`,
+**Scripts** never get `script` itself, `task`, the `agent_*` tools, `ask`, `exit_plan_mode`,
 `todo`, `context_notes`, `new_context`, `checkpoint`, `rewind`, `wait`,
 `set_title`, `goal`, `submit_result`, `recall`, `skill`, `remember`,
 `memory_edit` or `load_tools`. A subagent's script calls only that subagent's tools. See

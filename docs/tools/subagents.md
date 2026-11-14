@@ -112,6 +112,41 @@ takes one again once they ended, so a tree of subagents waiting on each other
 can never hold every seat and stall. Approvals are shared with the main agent
 at every level, as are the hooks, which see each subagent under its own id.
 
+## Long-lived subagents
+
+`task` subagents end with their assignment. For a helper that should stay
+around, such as a tester the agent hands every change to, the main agent has
+five more tools:
+
+- `agent_spawn` starts a subagent of any kind under a `name` of its choosing
+  (letters, digits, `-` and `_`, at most 40) with a first `prompt`, and
+  returns at once. `agent`, `model` and `description` work as for `task`.
+- `agent_send` sends a live one a follow-up `message`, which it answers
+  knowing its whole conversation, after any message it is still on. It
+  returns at once and says how many replies the subagent owes.
+- `agent_wait` blocks until the next reply of the subagent `name`, at most
+  `timeout` seconds (300 by default, 1800 at most). Replies come in the order
+  of the messages. It returns at once when none is owed, and says so when the
+  wait times out, leaving the reply for the next `agent_wait`.
+- `agent_kill` ends one, stopping whatever it is doing; replies not yet taken
+  are dropped.
+- `agent_list` lists them: name, kind, whether `working`, `idle` or
+  `stopped`, replies owed, and what each was started to do.
+
+They live across turns until killed or the conversation ends, at most 16 at
+once. Each works in the main agent's folder, never in a worktree of its own,
+and kinds whose definition asks for a structured result cannot be spawned.
+Each turn of theirs takes a seat as any subagent does (see
+[Nesting](#nesting)), and their work is reported under the `agent_spawn` or
+`agent_send` call that gave them the message. Subagents never get these tools.
+In plan mode spawned subagents only get tools that look, and `agent_send`
+refuses one that can change files.
+
+They are announced with the same `Subagent` events as other subagents, with
+`background` set: `Running` when spawned, `Stopped` when killed or stopped by
+the reader with `StopSubagent`, which also ends a long-lived subagent. No new
+events or commands were needed.
+
 ## Stopping one subagent
 
 Every subagent, in the foreground, in the background or started by another

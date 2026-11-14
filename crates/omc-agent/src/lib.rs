@@ -5,6 +5,7 @@ mod approval;
 mod backend;
 mod compaction;
 mod cow;
+mod crew;
 mod files;
 mod hooks;
 mod journal;
@@ -31,6 +32,7 @@ pub use agent::{
 pub use approval::{ApprovalRequest, Approvals, Decision, Keeper, Place, Prompter, Standing};
 pub use backend::{Backend, ISOLATION_VARIABLE, isolation_backend};
 pub use compaction::{COMPACT, context, replayed};
+pub use crew::{CREW_MOST, Crew, crew_tools};
 pub use hooks::{
     Batched, Chained, CompactTrigger, Compacting, Followed, Gate, Hooks, MAX_STOP_IN_A_ROW,
     MAX_STOP_PER_TURN, Permit, Screened,
@@ -50,6 +52,8 @@ pub use worktree::{Isolation, LOCK_REASON, Merge, ToolsFor, prune as prune_workt
 
 #[cfg(test)]
 mod compaction_tests;
+#[cfg(test)]
+mod crew_tests;
 #[cfg(test)]
 mod follow_up_tests;
 #[cfg(test)]

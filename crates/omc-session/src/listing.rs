@@ -67,6 +67,7 @@ pub fn tools() -> Result<Vec<ToolInfo>, String> {
         models: omc_agent::Models::default(),
         throttle: shared.throttle.clone(),
         roster: shared.roster.clone(),
+        crew: shared.crew.clone(),
         approvals: shared.approvals.clone(),
         events: Arc::new(|_| {}),
         effort: None,
@@ -123,6 +124,11 @@ mod tests {
         assert_eq!(
             names,
             [
+                "agent_kill",
+                "agent_list",
+                "agent_send",
+                "agent_spawn",
+                "agent_wait",
                 "ask",
                 "ast_edit",
                 "ast_grep",

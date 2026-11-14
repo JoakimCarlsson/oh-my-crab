@@ -36,6 +36,11 @@ const WITHHELD: &[&str] = &[
     "checkpoint",
     "rewind",
     "wait",
+    "agent_spawn",
+    "agent_send",
+    "agent_wait",
+    "agent_kill",
+    "agent_list",
 ];
 
 /// The kind of subagent used when the call names none.
@@ -560,6 +565,47 @@ impl Run {
             .accepted()
             .ok_or_else(|| wanted.missing(&kind, &self.history))
     }
+
+    /// The kind of subagent it is.
+    pub(crate) fn kind(&self) -> &str {
+        &self.lane.kind
+    }
+
+    /// What it was started to do, in a few words.
+    pub(crate) fn label(&self) -> &str {
+        &self.lane.label
+    }
+
+    /// The event announcing it under the call it now reports under.
+    pub(crate) fn opened(&self) -> AgentEvent {
+        self.lane.opened()
+    }
+
+    /// How it is announced on the roster, as a subagent that runs apart from any one call.
+    pub(crate) fn notice(&self) -> SubagentNotice {
+        self.lane.notice(&self.id, true)
+    }
+
+    /// Readies it to answer `text`, sent by the call `call`, reporting its work under that call through `events`.
+    pub(crate) fn address(&mut self, call: &str, text: String, events: Arc<EventSink>) {
+        self.lane.call = call.to_owned();
+        self.lane.place = None;
+        self.assignment = text;
+        self.events = events;
+    }
+
+    /// Runs one turn on what it was last addressed with, once it took a seat of `throttle`, which it gives up after, and returns what it said last; the next message it is sent goes on from that conversation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Failed`] when a model request fails.
+    pub(crate) async fn answer(&mut self, throttle: &crate::Throttle) -> Result<String, ToolError> {
+        self.seat.fill(throttle.take().await);
+        let outcome = self.go().await;
+        self.seat.vacate();
+        self.resumed = true;
+        outcome
+    }
 }
 
 /// How a subagent ended, before what it changed in a worktree of its own is applied.
@@ -959,8 +1005,55 @@ impl Task {
         );
     }
 
+    /// A long-lived subagent of the kind `kind` (the default kind when `None`), started by the call `call` to do `task`, named by `description`, asking `model` when one is named: ready to run, working in the main agent's folder, with its tools and system prompt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Failed`] for an unknown kind, a model that cannot be used, or a kind whose definition asks for a structured result, which a long-lived subagent never hands back.
+    pub(crate) async fn enlist(
+        &self,
+        call: &str,
+        kind: Option<String>,
+        task: String,
+        description: Option<String>,
+        model: Option<String>,
+    ) -> Result<Run, ToolError> {
+        let mut run = self
+            .prepare(
+                call,
+                None,
+                Item {
+                    agent: kind,
+                    task,
+                    description,
+                    output_schema: None,
+                    isolated: Some(false),
+                    model,
+                },
+            )
+            .await?;
+        if run.structured.is_some() {
+            return Err(ToolError::Failed(format!(
+                "the {} agent hands back structured results, which a long-lived subagent cannot; start it with `task` instead",
+                run.lane.kind
+            )));
+        }
+        self.arm(&mut run);
+        Ok(run)
+    }
+
+    /// Where the work of the subagents of this tool is reported.
+    pub(crate) fn events(&self) -> Arc<EventSink> {
+        self.settings.events.clone()
+    }
+
+    /// Where this tool stands among the levels of subagents, with the roster and throttle they share.
+    pub(crate) fn nesting(&self) -> &Nesting {
+        &self.settings.nesting
+    }
+
     /// Whether every tool the subagents of this tool are given only looks, as in plan mode.
-    fn only_looks(&self) -> bool {
+    pub(crate) fn only_looks(&self) -> bool {
         self.settings.registry.iter().all(|tool| tool.read_only())
     }
 

@@ -26,6 +26,11 @@ pub const NAME: &str = "script";
 pub const WITHHELD: &[&str] = &[
     NAME,
     "task",
+    "agent_spawn",
+    "agent_send",
+    "agent_wait",
+    "agent_kill",
+    "agent_list",
     "ask",
     "exit_plan_mode",
     "todo",

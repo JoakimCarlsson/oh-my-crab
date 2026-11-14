@@ -334,6 +334,7 @@ impl Turn {
             },
             throttle: self.shared.throttle.clone(),
             roster: self.shared.roster.clone(),
+            crew: self.shared.crew.clone(),
             approvals: self.shared.approvals.clone(),
             events: events.clone(),
             effort,

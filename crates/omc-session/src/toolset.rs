@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use omc_agent::{
     Approvals, EventSink, Hooks, Isolation, Models, Nesting, Task, TaskSettings, Throttle,
+    crew_tools,
 };
 use omc_context::{Discovered, Environment, PromptInput, build_subagent_prompt, subagent_plan};
 use omc_memory::Memories;
@@ -34,6 +35,8 @@ pub(crate) struct Inputs<'a> {
     pub(crate) throttle: Arc<Throttle>,
     /// The subagents running in the conversation, by which the reader stops one.
     pub(crate) roster: Arc<omc_agent::Roster>,
+    /// The long-lived subagents of the conversation.
+    pub(crate) crew: Arc<omc_agent::Crew>,
     /// What is allowed without asking.
     pub(crate) approvals: Arc<Approvals>,
     /// Where the work of subagents is reported.
@@ -142,7 +145,7 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
     let environment = inputs.environment.clone();
     let tree = inputs.tree.clone();
     let approved_plan = inputs.approved_plan.clone();
-    registry.register(Task::new(TaskSettings {
+    let task = Arc::new(Task::new(TaskSettings {
         model: inputs.model.clone(),
         models: inputs.models.clone(),
         registry: sub_base,
@@ -171,6 +174,10 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
         nesting: Nesting::new(omc_agent::max_depth(), inputs.throttle.clone())
             .with_roster(inputs.roster.clone()),
     }));
+    registry.register_shared(task.clone());
+    for tool in crew_tools(task, inputs.crew.clone()) {
+        registry.register_shared(tool);
+    }
     for name in inputs.denied {
         registry.remove(name);
     }
@@ -298,6 +305,7 @@ mod tests {
             models: Models::default(),
             throttle: shared.throttle.clone(),
             roster: shared.roster.clone(),
+            crew: shared.crew.clone(),
             approvals: shared.approvals.clone(),
             events: Arc::new(|_| {}),
             effort: None,
@@ -389,6 +397,11 @@ mod tests {
         assert_eq!(
             tools.tools(true).names(),
             vec![
+                "agent_kill",
+                "agent_list",
+                "agent_send",
+                "agent_spawn",
+                "agent_wait",
                 "ask",
                 "ast_grep",
                 "context_notes",
@@ -411,6 +424,11 @@ mod tests {
         assert_eq!(
             tools.tools(false).names(),
             vec![
+                "agent_kill",
+                "agent_list",
+                "agent_send",
+                "agent_spawn",
+                "agent_wait",
                 "ask",
                 "ast_edit",
                 "ast_grep",
