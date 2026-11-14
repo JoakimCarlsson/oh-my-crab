@@ -155,6 +155,21 @@ pub enum Command {
     },
     /// Ends the conversation and the harness.
     Close,
+    /// Takes the last reply back out of the conversation and answers the reader's last prompt again: the conversation is cut back to before that prompt, the client is told the turns left with a [`crate::Event::Resumed`], and a turn starts with the prompt as the reader wrote it, under the id it was saved with. The same as the prompt `/retry`. Fails with a [`crate::Event::Failed`] while a turn is running or when the conversation has no prompt to answer again.
+    Retry,
+    /// Starts the conversation afresh: every message is taken out of what the model is given, the settings, the name, the goal and the notebook stay, and the client is told the turns left with a [`crate::Event::Resumed`]; a saved conversation keeps the turns, recorded as lost. The same as the prompt `/fresh`. Fails with a [`crate::Event::Failed`] while a turn is running.
+    Fresh,
+    /// Asks the model `question` on the side: it is shown the conversation as it stood when the last turn ended and answers with a [`crate::Event::Aside`], without tools, and neither the question nor the answer is added to the conversation. Allowed while a turn is running, which goes on undisturbed. The same as the prompt `/btw <question>`.
+    Btw {
+        /// What the reader asks.
+        question: String,
+    },
+    /// Hands the work over to a new conversation: a turn of its own has the model write a prompt that hands the conversation over, toward `goal` when one is given, then the conversation starts afresh as [`Command::Fresh`] does, the client is told the prompt with a [`crate::Event::HandedOff`], and a turn starts with it as the first turn of the new conversation. The same as the prompt `/handoff [goal]`. Fails with a [`crate::Event::Failed`] while a turn is running.
+    Handoff {
+        /// What the new conversation should work toward, or nothing to carry on with what this one was doing.
+        #[serde(default)]
+        goal: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -196,6 +211,50 @@ mod tests {
             crate::decode::<Command>(&crate::encode(&noted).unwrap()).unwrap(),
             noted
         );
+    }
+
+    /// The session commands read from the lines a client writes, a hand-off without a goal too, and survive a trip through a line.
+    #[test]
+    fn session_commands_round_trip() {
+        let lines = [
+            (r#""Retry""#, Command::Retry),
+            (r#""Fresh""#, Command::Fresh),
+            (
+                r#"{"Btw":{"question":"why?"}}"#,
+                Command::Btw {
+                    question: "why?".to_owned(),
+                },
+            ),
+            (r#"{"Handoff":{}}"#, Command::Handoff { goal: None }),
+            (
+                r#"{"Handoff":{"goal":"ship it"}}"#,
+                Command::Handoff {
+                    goal: Some("ship it".to_owned()),
+                },
+            ),
+        ];
+        for (line, command) in lines {
+            assert_eq!(crate::decode::<Command>(line).unwrap(), command);
+            assert_eq!(
+                crate::decode::<Command>(&crate::encode(&command).unwrap()).unwrap(),
+                command
+            );
+        }
+        let aside = crate::Event::Aside {
+            question: "why?".to_owned(),
+            answer: "because".to_owned(),
+        };
+        let line = crate::encode(&aside).unwrap();
+        assert_eq!(
+            line.trim_end(),
+            r#"{"Aside":{"question":"why?","answer":"because"}}"#
+        );
+        let handed = crate::Event::HandedOff {
+            prompt: "carry on".to_owned(),
+            turn: "handoff-1".to_owned(),
+        };
+        let line = crate::encode(&handed).unwrap();
+        assert_eq!(crate::decode::<crate::Event>(&line).unwrap(), handed);
     }
 
     /// A trust answer and a trust request each survive a trip through a line, in the shape a client writes and reads.

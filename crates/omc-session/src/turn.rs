@@ -43,6 +43,8 @@ pub(crate) enum Ended {
     SignedOut(String),
     /// It failed for this reason.
     Failed(String),
+    /// It wrote this prompt to hand the conversation over to a new one.
+    HandedOff(String),
 }
 
 /// The model a turn sends its requests to while plan mode is on, when the plan model setting names one other than the conversation's.
@@ -115,6 +117,8 @@ pub(crate) enum Job {
     Prompt(String, Vec<omc_providers::Image>),
     /// Summarize the older part of the conversation, giving particular attention to this when it is given.
     Compact(Option<String>),
+    /// Write the prompt that hands the conversation over to a new one, toward this goal when it is given.
+    Handoff(Option<String>),
 }
 
 /// Everything one turn needs.
@@ -148,24 +152,12 @@ pub(crate) struct Turn {
 impl Turn {
     /// Does `job` with the hosted model and says how it ended.
     pub(crate) async fn run(self, job: Job) -> Ended {
-        let credentials = match self
-            .shared
-            .with_home(omc_providers::credentials_for(self.provider))
-            .await
-        {
-            Ok(credentials) => credentials,
-            Err(AuthError::NotLoggedIn) => return Ended::SignedOut("not logged in".to_owned()),
-            Err(error) => return Ended::Failed(error.to_string()),
+        let model = match connect(&self.shared, self.provider, &self.model).await {
+            Ok(model) => model,
+            Err(ended) => return ended,
         };
-        let model = RemoteModel::new(
-            self.provider,
-            credentials,
-            self.model.clone(),
-            self.shared.retention(),
-            self.shared.home(),
-        );
         let planner = self.planner().await;
-        self.run_planned(Arc::new(model), planner, job).await
+        self.run_planned(model, planner, job).await
     }
 
     /// The model the plan model setting names, when plan mode is on and it names one other than the conversation's; when it cannot be used, the client is told why and the conversation's model plans.
@@ -405,6 +397,7 @@ impl Turn {
             checkpoint: checkpoint.as_deref(),
             hooks: checks.as_deref(),
         };
+        let mut handed = None;
         let result = match job {
             Job::Prompt(prompt, images) => {
                 let added = match self.submitted(&prompt).await {
@@ -473,13 +466,18 @@ impl Turn {
                 )
                 .await
             }
+            Job::Handoff(goal) => {
+                omc_agent::write_handoff(model.as_ref(), effort, &self.history, goal.as_deref())
+                    .await
+                    .map(|prompt| handed = Some(prompt))
+            }
         };
         if let Some(extensions) = &extensions {
             let failed = result.as_ref().err().map(ToString::to_string);
             extensions.turn_end(failed.as_deref()).await;
         }
         match result {
-            Ok(()) => Ended::Done(self.history),
+            Ok(()) => handed.map_or(Ended::Done(self.history), Ended::HandedOff),
             Err(error) => {
                 if let (Some(hooks), Some(kind)) = (&self.hooks, failure_kind(&error)) {
                     let text = error.to_string();
@@ -578,6 +576,42 @@ impl Turn {
             }
         }
     }
+}
+
+/// The model `provider` serves as `model`, signed in with the conversation's credentials; in tests, the model the conversation was given instead, when it was given one.
+///
+/// # Errors
+///
+/// Returns how the turn ends when the credentials cannot be had: [`Ended::SignedOut`] when the reader is not signed in, and [`Ended::Failed`] otherwise.
+pub(crate) async fn connect(
+    shared: &Shared,
+    provider: Provider,
+    model: &str,
+) -> Result<Arc<dyn ChatModel>, Ended> {
+    #[cfg(test)]
+    if let Some(given) = shared
+        .model_override
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    {
+        return Ok(given);
+    }
+    let credentials = match shared
+        .with_home(omc_providers::credentials_for(provider))
+        .await
+    {
+        Ok(credentials) => credentials,
+        Err(AuthError::NotLoggedIn) => return Err(Ended::SignedOut("not logged in".to_owned())),
+        Err(error) => return Err(Ended::Failed(error.to_string())),
+    };
+    Ok(Arc::new(RemoteModel::new(
+        provider,
+        credentials,
+        model.to_owned(),
+        shared.retention(),
+        shared.home(),
+    )))
 }
 
 /// How a conversation started, as `SessionStart` hooks are told it, when it was just compacted.
@@ -1420,6 +1454,7 @@ mod tests {
             history = match turn.run_with(model.clone(), job).await {
                 Ended::Done(after) => after,
                 Ended::Failed(reason) | Ended::SignedOut(reason) => panic!("turn failed: {reason}"),
+                Ended::HandedOff(prompt) => panic!("turn handed over: {prompt}"),
             };
         }
         assert!(shared.lifecycle.pending().is_empty());

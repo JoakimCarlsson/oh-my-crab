@@ -155,6 +155,20 @@ pub enum Event {
     },
     /// What the conversation has cost so far, whole, for each model it asked, subagents and cache warming included; sent after every model request that was billed, and when a saved conversation that cost something is opened.
     Spent(Spent),
+    /// The answer to a question asked on the side with a [`crate::Command::Btw`], which is not part of the conversation; a question that cannot be answered is told with a [`Event::Failed`] instead.
+    Aside {
+        /// What the reader asked.
+        question: String,
+        /// What the model answered.
+        answer: String,
+    },
+    /// The conversation was handed over to a new one, in answer to a [`crate::Command::Handoff`]: it started afresh, and a turn starts with `prompt`, whose events follow as for a prompt the reader sent.
+    HandedOff {
+        /// The prompt the model wrote to hand the conversation over, which the new conversation starts with.
+        prompt: String,
+        /// The id the harness saved the new conversation's first turn under, as with the id of a turn the client prompted itself.
+        turn: String,
+    },
 }
 
 /// The kind of a block of the agent's reply.

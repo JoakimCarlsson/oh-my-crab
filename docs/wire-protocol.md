@@ -439,7 +439,7 @@ running.
 
 | Field     | Type           | Presence | Meaning                                                                                                     |
 | --------- | -------------- | -------- | ----------------------------------------------------------------------------------------------------------- |
-| `text`    | string         | required | What the reader wrote. `/compact`, `/goal`, `/guided-goal` and `/<skill>` are understood here.              |
+| `text`    | string         | required | What the reader wrote. `/compact`, `/goal`, `/guided-goal`, `/retry`, `/fresh`, `/btw`, `/handoff` and `/<skill>` are understood here. |
 | `files`   | list of path   | required | Files attached, by path.                                                                                    |
 | `turn`    | string         | optional | The id the client knows the turn by; saved with the turn so the client can go back to before it.            |
 | `context` | string         | optional | Words the model is told before the reader's, which are not saved as what the reader wrote.                  |
@@ -469,6 +469,12 @@ answered with `Failed`. Setting and resuming are refused while a turn runs.
 `/guided-goal`, optionally followed by an idea, starts a turn under the `turn`
 id sent in which the agent asks the reader what the goal should be and then
 sets it, which sends a `Goal` event; it is refused while a turn runs.
+
+`/retry`, `/fresh`, `/btw <question>` and `/handoff [goal]` do what the
+commands `Retry`, `Fresh`, `Btw` and `Handoff` do; each takes no files. Sent
+as a prompt, `/fresh` ends with `Finished`, `/retry` and `/handoff` end with
+the `Finished` of the turn they start, and `/btw` is answered with `Aside`
+alone.
 
 ### `Choose`
 
@@ -785,6 +791,70 @@ Ends the conversation, and the `crab` process exits. See
 
 ```json
 "Close"
+```
+
+### `Retry`
+
+Takes the last reply back out of the conversation and answers the reader's
+last prompt again. The conversation is cut back to before that prompt, crab
+sends `Resumed` with the turns left, and a turn starts with the prompt as the
+reader wrote it, under the `turn` id it was saved with (none for a
+conversation that is not saved), and ends with `Finished`. Images attached to
+the prompt are sent again; files that are not images are not read again.
+Fails with `Failed` while a turn is running or when the conversation has no
+prompt. The same as the prompt `/retry`.
+
+```json
+"Retry"
+```
+
+### `Fresh`
+
+Starts the conversation afresh: every message is taken out of what the model
+is given, and crab sends `Resumed` with the turns left. The provider, model,
+settings, name, goal and notebook stay. A saved conversation keeps its turns,
+recorded as lost, so a replayed history still shows them. The `SessionStart`
+hooks run again, with `clear`. Fails with `Failed` while a turn is running.
+The same as the prompt `/fresh`.
+
+```json
+"Fresh"
+```
+
+### `Btw`
+
+Asks the model a question on the side, and crab answers with `Aside`. The
+model is shown a record of the conversation as it stood when the last turn
+ended, and is offered no tools; neither the question nor the answer is added
+to the conversation, and no `Finished` follows. Allowed while a turn is
+running, which goes on undisturbed. A question that cannot be answered is
+told with `Failed`. The same as the prompt `/btw <question>`.
+
+| Field      | Type   | Presence | Meaning           |
+| ---------- | ------ | -------- | ----------------- |
+| `question` | string | required | What the reader asks. |
+
+```json
+{"Btw":{"question":"Which file holds the parser?"}}
+```
+
+### `Handoff`
+
+Hands the work over to a new conversation. A turn of its own has the model
+write a prompt that hands the conversation over, toward `goal` when one is
+given. The conversation then starts afresh as `Fresh` does, crab sends
+`HandedOff` with the prompt, and a turn starts with it as the first turn of
+the new conversation, ending with `Finished`; there is no `Finished` between
+the two. When the model cannot write the prompt the turn ends with
+`Finished` and the reason, and the conversation stays as it was. Fails with
+`Failed` while a turn is running. The same as the prompt `/handoff [goal]`.
+
+| Field  | Type   | Presence | Meaning                                                                  |
+| ------ | ------ | -------- | ------------------------------------------------------------------------ |
+| `goal` | string | optional | What the new conversation should work toward; carry on the same work when left out. |
+
+```json
+{"Handoff":{"goal":"Write the migration guide"}}
 ```
 
 ## Events
@@ -1523,6 +1593,36 @@ opened. See [what a conversation costs](long-conversations.md#what-a-conversatio
 
 ```json
 {"Spent":{"models":[{"model":"claude-haiku-5-5","requests":3,"input":412,"output":611,"cache_read":45936,"cache_write":23141,"cost":3698,"missed":0}]}}
+```
+
+### `Aside`
+
+The answer to a question asked with `Btw`. It is not part of the
+conversation, so a replayed history does not show it.
+
+| Field      | Type   | Presence | Meaning                |
+| ---------- | ------ | -------- | ---------------------- |
+| `question` | string | required | What the reader asked. |
+| `answer`   | string | required | What the model answered. |
+
+```json
+{"Aside":{"question":"Which file holds the parser?","answer":"src/parse.rs."}}
+```
+
+### `HandedOff`
+
+The conversation was handed over to a new one, in answer to `Handoff`: it
+started afresh, and a turn starts with `prompt`, whose events follow as for a
+prompt the reader sent. Sent after the `Resumed` that shows the conversation
+emptied.
+
+| Field    | Type   | Presence | Meaning                                                                                                     |
+| -------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------- |
+| `prompt` | string | required | The prompt the model wrote, which the new conversation starts with.                                         |
+| `turn`   | string | required | The id crab saved the new conversation's first turn under: `handoff-` and a number. Use it as the id of a turn the client prompted. |
+
+```json
+{"HandedOff":{"prompt":"You are taking over the parser rewrite...","turn":"handoff-1794563890123456789"}}
 ```
 
 

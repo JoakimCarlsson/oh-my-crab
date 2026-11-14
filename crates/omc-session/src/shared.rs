@@ -106,6 +106,9 @@ pub(crate) struct Shared {
     /// The date turns tell the agent instead of today's, in tests.
     #[cfg(test)]
     pub(crate) today: Mutex<Option<String>>,
+    /// The model turns and questions on the side ask instead of the provider's, in tests.
+    #[cfg(test)]
+    pub(crate) model_override: Mutex<Option<Arc<dyn omc_providers::ChatModel>>>,
 }
 
 /// Where the conversation keeps its logins.
@@ -183,6 +186,8 @@ impl Shared {
             ledger: crate::spend::Ledger::default(),
             #[cfg(test)]
             today: Mutex::new(None),
+            #[cfg(test)]
+            model_override: Mutex::new(None),
         })
     }
 

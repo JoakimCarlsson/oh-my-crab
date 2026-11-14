@@ -123,8 +123,9 @@ What came back:
 
 - `Settings`: everything the client can change, with the value each has now.
   `model: null` took the provider's first model.
-- `Commands`: what can follow a `/` in a prompt: `/compact`, and one command
-  per skill found on disk.
+- `Commands`: what can follow a `/` in a prompt: `/compact`, `/goal`,
+  `/guided-goal`, `/retry`, `/fresh`, `/btw`, `/handoff`, and one command per
+  skill found on disk.
 - `Resumed`: the saved conversation. `conversation` gives it an id, so `crab`
   saves it and can open it again later; this one is new, so it has no turns.
   Leave `conversation` out and nothing is saved.

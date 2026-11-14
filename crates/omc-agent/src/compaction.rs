@@ -128,7 +128,7 @@ pub(crate) fn push_reply(messages: &mut Vec<Message>, reply: Reply) {
 }
 
 /// The latest compaction in `history` and its position, when there is one.
-fn latest(history: &[Message]) -> Option<(usize, &Compaction)> {
+pub(crate) fn latest(history: &[Message]) -> Option<(usize, &Compaction)> {
     history
         .iter()
         .enumerate()
@@ -548,7 +548,7 @@ impl Sink for Quiet {
 /// The messages at `positions` in `history` as plain text for the summarizer, so that it reads them as a record rather than as a conversation to carry on.
 ///
 /// Thinking is left out, since what providers return of it is a digest that can be longer than what it stands for; tool results and call arguments are cut to [`CLIP_CHARS`].
-fn transcript(history: &[Message], positions: &[usize]) -> String {
+pub(crate) fn transcript(history: &[Message], positions: &[usize]) -> String {
     let mut parts = Vec::new();
     for message in positions.iter().map(|&at| &history[at]) {
         match message {

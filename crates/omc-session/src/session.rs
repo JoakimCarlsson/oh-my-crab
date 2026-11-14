@@ -31,6 +31,9 @@ use crate::shared::Shared;
 use crate::snapshots::{End, Snapshots};
 use crate::turn::{Ended, Job, Turn};
 
+#[path = "restart.rs"]
+mod restart;
+
 /// A conversation that has been opened.
 struct Open {
     /// The provider that serves it.
@@ -244,6 +247,9 @@ impl Session {
                     });
                     return self.start(Job::Compact(focus), mark);
                 }
+                if let Some(asked) = restart::request(&text) {
+                    return self.carry_out(asked, &files, true);
+                }
                 if let Some(asked) = goal::request(&text) {
                     return self.goal(asked, &files, turn, text);
                 }
@@ -291,6 +297,18 @@ impl Session {
             Command::Changes { turn } => self.changes(turn),
             Command::Restore { turn } => self.restore(turn),
             Command::Undo { turn, paths } => self.undo(turn, &paths),
+            Command::Retry => self.carry_out(restart::Asked::Retry, &[], false),
+            Command::Fresh => self.carry_out(restart::Asked::Fresh, &[], false),
+            Command::Btw { question } => {
+                let question = question.trim().to_owned();
+                self.carry_out(restart::Asked::Btw(question), &[], false);
+            }
+            Command::Handoff { goal } => {
+                let goal = goal
+                    .map(|goal| goal.trim().to_owned())
+                    .filter(|goal| !goal.is_empty());
+                self.carry_out(restart::Asked::Handoff(goal), &[], false);
+            }
             Command::Close => {}
         }
     }
@@ -995,6 +1013,7 @@ impl Session {
                     self.pursue(progress);
                 }
             }
+            Ended::HandedOff(prompt) => self.hand_over(prompt),
             Ended::SignedOut(reason) => {
                 self.pause_goal(&reason);
                 self.shared.warmer.stop();
@@ -1841,8 +1860,31 @@ fn commands_of(discovered: &Discovered) -> Vec<Slash> {
         name: goal::GUIDED_COMMAND.to_owned(),
         description: "Work out a goal with the agent first: it asks what done means, how to check it and where to stop, then sets the goal and starts on it".to_owned(),
     };
+    let restart = [
+        (
+            restart::RETRY_COMMAND,
+            "Take the last reply back out of the conversation and answer the last prompt again",
+        ),
+        (
+            restart::FRESH_COMMAND,
+            "Start the conversation afresh with an empty context, keeping its settings",
+        ),
+        (
+            restart::BTW_COMMAND,
+            "Ask a question on the side about the conversation, without adding it to the conversation: /btw <question>",
+        ),
+        (
+            restart::HANDOFF_COMMAND,
+            "Have the agent write a hand-off prompt and start a new conversation with it: /handoff [goal]",
+        ),
+    ]
+    .map(|(name, description)| Slash {
+        name: name.to_owned(),
+        description: description.to_owned(),
+    });
     [compact, goal, guided]
         .into_iter()
+        .chain(restart)
         .chain(discovered.skills.iter().map(|skill| Slash {
             name: skill.name.clone(),
             description: skill.description.clone(),
@@ -1962,7 +2004,7 @@ mod tests {
         };
         session.rescan();
         assert!(events.try_recv().is_err());
-        add_skill(&directory, "fresh");
+        add_skill(&directory, "brand-new");
         session.rescan();
         let Ok(Event::Commands(commands)) = events.try_recv() else {
             panic!("the new skill was not announced");
@@ -1974,7 +2016,11 @@ mod tests {
                 COMPACT_COMMAND,
                 goal::GOAL_COMMAND,
                 goal::GUIDED_COMMAND,
-                "fresh"
+                restart::RETRY_COMMAND,
+                restart::FRESH_COMMAND,
+                restart::BTW_COMMAND,
+                restart::HANDOFF_COMMAND,
+                "brand-new"
             ]
         );
         let open = session.open.as_ref().unwrap();

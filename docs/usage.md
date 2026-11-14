@@ -90,6 +90,23 @@ one prints it as an error.
   user or the folder's project, or takes one out. See
   [permission rules](extending/permissions.md).
 
+## Session commands
+
+A conversation held by `serve` understands these commands, sent as a prompt
+starting with `/` or as a wire command of the same name. Each takes no files
+and, but for `/btw`, is refused while a turn runs.
+
+| Prompt            | Wire command                    | What it does                                                                                                     |
+| ----------------- | ------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `/retry`          | `"Retry"`                       | Takes the last reply back out and answers the last prompt again, under the turn id it was saved with.            |
+| `/fresh`          | `"Fresh"`                       | Empties the conversation's context; the model, settings, name, goal and notebook stay.                          |
+| `/btw <question>` | `{"Btw":{"question":"..."}}`    | Asks the model a question about the conversation on the side, without tools; the answer comes as an `Aside` event and is not added to the conversation. Allowed while a turn runs. |
+| `/handoff [goal]` | `{"Handoff":{"goal":"..."}}`    | Has the model write a hand-off prompt, toward `goal` when one is given, then empties the conversation and starts it again with that prompt, telling the client with `HandedOff`. |
+
+A saved conversation keeps the turns `/fresh` and `/handoff` took out,
+recorded as lost, so a replayed history still shows them. The
+[wire protocol](wire-protocol.md#retry) gives the events each sends.
+
 How saved conversations, queued prompts and the rest fit together is in
 [concepts](concepts.md). The commands and events are defined in
 `crates/omc-wire`. `crates/omc-client` is a small blocking client for programs

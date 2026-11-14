@@ -2,6 +2,7 @@
 
 mod agent;
 mod approval;
+mod aside;
 mod backend;
 mod compaction;
 mod cow;
@@ -30,6 +31,7 @@ pub use agent::{
     AgentError, AgentEvent, Context, Live, compact, run_turn, run_turn_recorded, run_turn_steered,
 };
 pub use approval::{ApprovalRequest, Approvals, Decision, Keeper, Place, Prompter, Standing};
+pub use aside::{answer_aside, write_handoff};
 pub use backend::{Backend, ISOLATION_VARIABLE, isolation_backend};
 pub use compaction::{COMPACT, context, replayed};
 pub use crew::{CREW_MOST, Crew, crew_tools};
