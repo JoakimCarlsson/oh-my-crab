@@ -132,6 +132,7 @@ mod tests {
                 "edit",
                 "eval",
                 "exit_plan_mode",
+                "github",
                 "glob",
                 "goal",
                 "grep",

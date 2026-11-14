@@ -7,8 +7,8 @@ use serde_json::Value;
 
 use crate::coerce::{coerce, prepare};
 use crate::tools::{
-    AstEdit, AstGrep, Bash, Edit, Eval, Glob, Grep, LOAD_TOOLS, LoadTools, Lsp, Read, WebSearch,
-    Write,
+    AstEdit, AstGrep, Bash, Edit, Eval, GitHub, Glob, Grep, LOAD_TOOLS, LoadTools, Lsp, Read,
+    WebSearch, Write,
 };
 use crate::{Deferral, Jobs, Languages, Sandbox, Tool, ToolError, ToolOutput};
 
@@ -76,6 +76,7 @@ impl Registry {
         registry.register(AstEdit::new(sandbox.clone()));
         registry.register(Eval::new(sandbox.clone()));
         registry.register(Lsp::new(sandbox.clone(), languages.clone()));
+        registry.register(GitHub::new(&sandbox));
         registry.register(Write::with_languages(sandbox, languages));
         registry.register(WebSearch::new());
         registry
@@ -301,11 +302,19 @@ mod tests {
         let registry = Registry::builtin(crate::testutil::scratch("registry-read-only")).unwrap();
         assert_eq!(
             registry.read_only().names(),
-            vec!["ast_grep", "glob", "grep", "lsp", "read", "web_search"]
+            vec![
+                "ast_grep",
+                "github",
+                "glob",
+                "grep",
+                "lsp",
+                "read",
+                "web_search"
+            ]
         );
         assert!(registry.read_only().get("lsp").unwrap().read_only());
         assert!(!registry.get("lsp").unwrap().read_only());
-        assert_eq!(registry.names().len(), 11);
+        assert_eq!(registry.names().len(), 12);
     }
 
     /// The tools that only look are shared and the ones that change things exclusive; `lsp` is shared except for the actions that write files.

@@ -101,3 +101,35 @@ has no year and ignores it, Parallel and Exa without a key and DeepSeek get an
 ignore it. Each service gets 20 seconds. A search sends the query off the
 machine, so it asks for approval
 outside yolo mode, under one scope for all searches.
+
+## The `github` tool
+
+`github` works with GitHub through the `gh` command line tool, signed in as
+the user, in the working directory, so that its repository is the default.
+`repo` names another as `owner/name`. Each call takes one `action`:
+
+| Action        | Runs                                                   | Result                                                                  |
+| ------------- | ------------------------------------------------------ | ----------------------------------------------------------------------- |
+| `pr_view`     | `gh pr view <number> --json ...`                       | state, branches, size, review and merge state, checks, description, files, reviews, comments |
+| `pr_diff`     | `gh pr diff <number>`                                  | the unified diff; with `name_only`, the changed files                   |
+| `pr_checkout` | `gh pr checkout <number>`                              | the local branch it is on; `branch` names it, `force` resets it         |
+| `issue_view`  | `gh issue view <number> --json ...`                    | state, labels, assignees, description, comments                         |
+| `search`      | `gh search issues\|prs\|code -- <query>`               | one entry per result, `limit` of them (10 by default, at most 50)       |
+| `run_watch`   | `gh run view <run> --json ...`, again every `interval` | each job's outcome, then the last `tail` log lines of each failed job   |
+
+`run_watch` without `run` watches the latest run of the current branch. It
+looks every `interval` seconds (10 by default, at least 3) until the run is
+completed or `timeout` seconds have passed (600 by default, at most 3600);
+a run still going at the end is reported as it stands, to be watched again.
+The log of a failed job is `gh run view --log-failed` for that job, its lines
+without the job, step and time stamp `gh` puts before each. A result longer
+than 60,000 characters is cut, with a note. Each `gh` command gets two
+minutes and runs without prompts.
+
+When `gh` is not installed the error says where to get it; when it is not
+signed in, the error says to run `gh auth login` or set `GH_TOKEN`.
+
+Every call asks first outside yolo mode. "Always allow" covers the actions
+that only look, under one scope; `pr_checkout`, which changes the working
+directory, is approved under a scope of its own, runs alone and is refused in
+plan mode and in agents that only look.

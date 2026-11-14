@@ -1487,6 +1487,7 @@ mod tests {
                 "bash",
                 "edit",
                 "eval",
+                "github",
                 "glob",
                 "grep",
                 "lsp",

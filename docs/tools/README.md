@@ -75,6 +75,7 @@ starts on, outside any function or in a file that is not code is shown as
 | ------------ | --------------------------------------------------------------------------------- | ----------------- | ---- | --------------------------------------- |
 | `read`       | Given a URL, `pr://`, `issue://` or `gh://` path, reads a web page or GitHub      | yes, per site     | yes  | [web and GitHub](web-and-github.md)     |
 | `web_search` | Sends one query to a search service and returns ranked results                    | yes, all searches | yes  | [web and GitHub](web-and-github.md)     |
+| `github`     | Views, diffs and checks out pull requests, views issues, searches GitHub and waits for Actions runs, through `gh` | yes; checkout apart | yes, but not `pr_checkout` | [web and GitHub](web-and-github.md#the-github-tool) |
 
 ## Debug
 
