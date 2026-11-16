@@ -45,6 +45,8 @@ pub struct SubagentNotice {
     pub label: String,
     /// What the model it asks is called, when that is known.
     pub model: Option<String>,
+    /// The work category it was started in, when it was started in one.
+    pub category: Option<String>,
     /// Whether it runs in the background.
     pub background: bool,
     /// How it stands.
@@ -356,6 +358,7 @@ mod tests {
             agent: "task".to_owned(),
             label: "work".to_owned(),
             model: None,
+            category: None,
             background: false,
             state: SubagentState::Running,
         }

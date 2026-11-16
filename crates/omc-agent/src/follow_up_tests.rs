@@ -36,6 +36,7 @@ fn tool(name: &str, model: Arc<Router>, roster: Arc<Roster>) -> (Task, Log) {
     let sink = log.clone();
     let events: Arc<EventSink> = Arc::new(move |event| sink.lock().unwrap().push(event));
     let task = Task::new(TaskSettings {
+        categories: Vec::new(),
         model,
         models: crate::Models::default(),
         registry: Arc::new(Registry::builtin(&dir).unwrap()),

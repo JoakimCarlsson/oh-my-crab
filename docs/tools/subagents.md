@@ -27,8 +27,8 @@ result is what it says last. It answers knowing everything it read and did, so
 a follow-up such as "now also fix X" does not pay for the investigation again,
 and its earlier requests are still in the provider's prompt cache when the
 follow-up comes soon. Only `description` and `background` go with `continue`;
-a call giving `agent`, `model`, `isolated`, `output_schema` or `tasks` with it
-is refused.
+a call giving `agent`, `model`, `category`, `isolated`, `output_schema` or
+`tasks` with it is refused.
 
 The subagent keeps its tools, its model, its system prompt and its handle, and
 is kept again when the follow-up ends, so any number can follow. It runs under
@@ -88,6 +88,35 @@ sent, whichever model it asks. In plan mode, a subagent that would ask the
 main agent's model asks the plan model instead, when `plan_model` or the
 `plan` slot sets one.
 
+## Categories
+
+With the `orchestrator` setting on, `task` and `agent_spawn` take a
+`category`: the name of a work category, as
+[models and slots](../models-and-slots.md#categories) describes them. The
+description of `task` then lists every category with what it is for, and
+tells the agent to give `category` rather than `model`. With the setting off
+neither tool has the parameter, and their descriptions say nothing of
+categories.
+
+- `category` goes with the single assignment, or with an item of `tasks`. A
+  call-level `category` applies to the items that name neither a category
+  nor a model of their own, and a call-level `model` likewise.
+- The subagent asks the model of the category's slot, found as `@name` is. A
+  category that sets no model asks the conversation's. The category decides
+  the model whatever the subagent's kind names, and the slot's backups take
+  over when that model keeps failing.
+- `agent` still picks the kind of subagent, `task` when left out: its tools
+  and its role. The category only decides the model and adds its `prompt`,
+  when it has one, to the end of the subagent's system prompt under a
+  heading naming the category.
+- `category` and `model` on one assignment is an error asking for only one.
+  A category there is none of is an error listing those there are. A
+  `category` given while the setting is off is an error saying so.
+- A follow-up with `continue` keeps the subagent's model and prompt, and
+  takes no `category`.
+- Subagents do not route by category: the `task` tool of a nested subagent
+  has no `category`.
+
 ## The approved plan
 
 While the main agent carries out a plan the reader approved, every subagent
@@ -126,7 +155,8 @@ five more tools:
 
 - `agent_spawn` starts a subagent of any kind under a `name` of its choosing
   (letters, digits, `-` and `_`, at most 40) with a first `prompt`, and
-  returns at once. `agent`, `model` and `description` work as for `task`.
+  returns at once. `agent`, `model`, `category` and `description` work as for
+  `task`.
 - `agent_send` sends a live one a follow-up `message`, which it answers
   knowing its whole conversation, after any message it is still on. It
   returns at once and says how many replies the subagent owes.

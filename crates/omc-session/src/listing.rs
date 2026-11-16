@@ -65,6 +65,7 @@ pub fn tools() -> Result<Vec<ToolInfo>, String> {
         }),
         model: Arc::new(Unused),
         models: omc_agent::Models::default(),
+        categories: Vec::new(),
         throttle: shared.throttle.clone(),
         roster: shared.roster.clone(),
         crew: shared.crew.clone(),

@@ -182,7 +182,7 @@ pub enum Event {
         /// Why the server could not be asked, or nothing when it was.
         error: Option<String>,
     },
-    /// The model slots, built-in ones first, then custom ones by name, in answer to [`crate::Command::Slots`], [`crate::Command::SetSlot`], [`crate::Command::ClearSlot`] and [`crate::Command::ApplyPreset`].
+    /// The model slots, the job slots first, then the built-in categories, then custom ones by name, in answer to [`crate::Command::Slots`], [`crate::Command::SetSlot`], [`crate::Command::ClearSlot`], [`crate::Command::DescribeSlot`] and [`crate::Command::ApplyPreset`].
     Slots(Vec<SlotInfo>),
     /// The presets kept, by name, in answer to [`crate::Command::Presets`], [`crate::Command::SavePreset`] and [`crate::Command::DeletePreset`].
     Presets(Vec<PresetInfo>),

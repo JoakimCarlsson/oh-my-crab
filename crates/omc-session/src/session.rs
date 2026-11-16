@@ -24,8 +24,8 @@ use crate::lifecycle::IDLE_AFTER;
 use crate::permissions::{self, FileKeeper, PermissionsFile};
 use crate::prompt::compose;
 use crate::settings::{
-    CACHE, CHECKPOINTS, EFFORT, MEMORY, MODE, MODEL, Mode, OFF, ON, PLAN_AUTOSAVE, PLAN_MODEL,
-    SNAPSHOTS, WARMING, parse_retention,
+    CACHE, CHECKPOINTS, EFFORT, MEMORY, MODE, MODEL, Mode, OFF, ON, ORCHESTRATOR, PLAN_AUTOSAVE,
+    PLAN_MODEL, SNAPSHOTS, WARMING, parse_retention,
 };
 use crate::shared::Shared;
 use crate::snapshots::{End, Snapshots};
@@ -350,6 +350,12 @@ impl Session {
                 scope,
                 provider,
             } => self.clear_slot(&name, scope, provider.as_deref()),
+            Command::DescribeSlot {
+                name,
+                scope,
+                description,
+                prompt,
+            } => self.describe_slot(&name, scope, description, prompt),
             Command::Presets => self.say(self.presets_event()),
             Command::SavePreset { name, effort } => self.save_preset(&name, effort),
             Command::ApplyPreset { name, scope } => self.apply_preset(&name, scope).await,
@@ -1419,6 +1425,13 @@ impl Session {
             CHECKPOINTS => match value {
                 ON | OFF => {
                     self.shared.set_checkpoints(value == ON);
+                    true
+                }
+                _ => false,
+            },
+            ORCHESTRATOR => match value {
+                ON | OFF => {
+                    self.shared.set_orchestrator(value == ON);
                     true
                 }
                 _ => false,

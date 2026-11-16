@@ -373,6 +373,7 @@ async fn subagents_run_the_hooks_as_themselves() {
     });
     let events: Arc<EventSink> = Arc::new(|_| {});
     let task = Task::new(TaskSettings {
+        categories: Vec::new(),
         models: crate::Models::default(),
         nesting: crate::Nesting::default(),
         model,
@@ -447,6 +448,7 @@ async fn a_subagent_starts_with_the_hooks_context() {
     let model = Router::new(|_| say("ok"));
     let events: Arc<EventSink> = Arc::new(|_| {});
     let task = Task::new(TaskSettings {
+        categories: Vec::new(),
         model: model.clone(),
         registry: Arc::new(Registry::builtin(&dir).unwrap()),
         approvals: deny_all(),

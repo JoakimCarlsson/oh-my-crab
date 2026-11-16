@@ -39,6 +39,8 @@ struct State {
     effort: Option<Effort>,
     /// Whether the agent has the checkpoint and rewind tools.
     checkpoints: bool,
+    /// Whether orchestrator mode is on, in which the agent hands work to subagents by work category.
+    orchestrator: bool,
     /// Whether the files are kept before and after each turn.
     snapshots: bool,
     /// How long the provider is asked to keep the prompt cache entries requests write.
@@ -179,6 +181,7 @@ impl Shared {
                 resume: Mode::Asking,
                 effort: None,
                 checkpoints: false,
+                orchestrator: false,
                 snapshots: true,
                 retention: Retention::Short,
                 warming: true,
@@ -392,6 +395,7 @@ impl Shared {
                 efforts: &efforts,
                 effort: state.effort,
                 checkpoints: state.checkpoints,
+                orchestrator: state.orchestrator,
                 snapshots: state.snapshots,
                 retention: omc_providers::cache_ttl(provider, &state.model, Retention::Long)
                     .map(|_| state.retention),
@@ -557,6 +561,19 @@ impl Shared {
             self.warmer.stop();
         }
         self.checkpoint.clear();
+    }
+
+    /// Whether orchestrator mode is on.
+    pub(crate) fn orchestrator(&self) -> bool {
+        self.state(|state| state.orchestrator)
+    }
+
+    /// Turns orchestrator mode on or off for the turns that start from now on; turning it either way stops warming the last request, whose system prompt and tool list the next turn no longer sends.
+    pub(crate) fn set_orchestrator(&self, enabled: bool) {
+        let was = self.state(|state| std::mem::replace(&mut state.orchestrator, enabled));
+        if was != enabled {
+            self.warmer.stop();
+        }
     }
 
     /// Whether the files are kept before and after each turn.
@@ -744,6 +761,27 @@ mod tests {
         shared.announce();
         let settings = announced(&mut events);
         let setting = settings.iter().find(|s| s.id == "checkpoints").unwrap();
+        assert_eq!(setting.current, "on");
+    }
+
+    /// Orchestrator mode is off until the setting turns it on, and turning it either way stops warming the last request.
+    #[tokio::test]
+    async fn orchestrator_mode_is_a_setting() {
+        let (shared, mut events) = opened();
+        assert!(!shared.orchestrator());
+        shared.announce();
+        let settings = announced(&mut events);
+        let setting = settings.iter().find(|s| s.id == "orchestrator").unwrap();
+        assert_eq!(setting.current, "off");
+        shared.warmer.arm();
+        shared.set_orchestrator(false);
+        assert!(shared.warmer.armed());
+        shared.set_orchestrator(true);
+        assert!(!shared.warmer.armed());
+        assert!(shared.orchestrator());
+        shared.announce();
+        let settings = announced(&mut events);
+        let setting = settings.iter().find(|s| s.id == "orchestrator").unwrap();
         assert_eq!(setting.current, "on");
     }
 

@@ -30,6 +30,9 @@ pub(crate) const ON: &str = "on";
 /// The value of the checkpoints setting that withholds the tools.
 pub(crate) const OFF: &str = "off";
 
+/// The id of the setting that turns orchestrator mode, in which the agent hands work to subagents by work category, on or off; it takes [`ON`] and [`OFF`].
+pub(crate) const ORCHESTRATOR: &str = "orchestrator";
+
 /// The id of the setting that picks how long the provider keeps the prompt cache.
 pub(crate) const CACHE: &str = "cache";
 
@@ -113,6 +116,8 @@ pub(crate) struct Offer<'a> {
     pub(crate) effort: Option<Effort>,
     /// Whether the agent has the checkpoint and rewind tools.
     pub(crate) checkpoints: bool,
+    /// Whether orchestrator mode is on.
+    pub(crate) orchestrator: bool,
     /// Whether the files are kept before and after each turn.
     pub(crate) snapshots: bool,
     /// The prompt cache lifetime in use, when the provider offers a choice.
@@ -292,6 +297,24 @@ pub(crate) fn offered(offer: &Offer<'_>) -> Vec<Setting> {
         ],
     });
     settings.push(Setting {
+        id: ORCHESTRATOR.to_owned(),
+        category: ORCHESTRATOR.to_owned(),
+        name: "Orchestrator mode".to_owned(),
+        current: if offer.orchestrator { ON } else { OFF }.to_owned(),
+        picks: vec![
+            pick(
+                OFF,
+                "Off",
+                "The agent does the work itself and names models for the subagents it starts",
+            ),
+            pick(
+                ON,
+                "On",
+                "The agent leads: it hands work to subagents by work category, each category a model slot, and reviews what comes back",
+            ),
+        ],
+    });
+    settings.push(Setting {
         id: CHECKPOINTS.to_owned(),
         category: CHECKPOINTS.to_owned(),
         name: "Checkpoints".to_owned(),
@@ -342,6 +365,7 @@ mod tests {
             efforts,
             effort,
             checkpoints: false,
+            orchestrator: false,
             snapshots: true,
             retention: None,
             warming: None,
@@ -370,6 +394,7 @@ mod tests {
                 "plan_model",
                 "plan_autosave",
                 "snapshots",
+                "orchestrator",
                 "checkpoints"
             ]
         );
@@ -397,7 +422,7 @@ mod tests {
     /// Effort is hidden when the model takes none, and otherwise falls back to medium.
     #[test]
     fn effort_follows_the_model() {
-        assert_eq!(offered(&offer(&[], &[], None)).len(), 6);
+        assert_eq!(offered(&offer(&[], &[], None)).len(), 7);
         let settings = offered(&offer(&[], &Effort::ALL, None));
         let effort = &settings[2];
         assert_eq!(
@@ -452,6 +477,23 @@ mod tests {
         );
         offer.checkpoints = true;
         assert_eq!(offered(&offer).last().unwrap().current, "on");
+    }
+
+    /// Orchestrator mode is offered just before the checkpoints, off unless it was turned on.
+    #[test]
+    fn orchestrator_mode_is_off_by_default() {
+        let models = [];
+        let mut offer = offer(&models, &[], None);
+        let find = |settings: Vec<Setting>| {
+            let at = settings.len() - 2;
+            (settings[at].id.clone(), settings[at].current.clone())
+        };
+        assert_eq!(
+            find(offered(&offer)),
+            (ORCHESTRATOR.to_owned(), OFF.to_owned())
+        );
+        offer.orchestrator = true;
+        assert_eq!(find(offered(&offer)).1, ON);
     }
 
     /// Modes round-trip through their values.

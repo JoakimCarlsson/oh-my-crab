@@ -46,7 +46,7 @@ pub use journal::{
     STOPPED_NOTE, Saved, Scribe,
 };
 pub use nesting::{DEFAULT_DEPTH, DEPTH_VARIABLE, MOST_DEPTH, Nesting, Throttle, max_depth};
-pub use picker::{ModelPicker, Models, Picked};
+pub use picker::{Category, ModelPicker, Models, Picked};
 pub use plans::approved_plan;
 pub use recall::{RECALL, spec as recall_spec};
 pub use roster::{KEPT_FOR, KEPT_MOST, Roster, SubagentNotice, SubagentState};
@@ -54,6 +54,8 @@ pub use steering::Steering;
 pub use task::{EventSink, MAX_CONCURRENT, MAX_TASKS, PromptBuilder, Task, TaskSettings};
 pub use worktree::{Isolation, LOCK_REASON, Merge, ToolsFor, prune as prune_worktrees};
 
+#[cfg(test)]
+mod category_tests;
 #[cfg(test)]
 mod compaction_tests;
 #[cfg(test)]

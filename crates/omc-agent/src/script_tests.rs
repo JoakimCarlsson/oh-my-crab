@@ -330,6 +330,7 @@ async fn subagents_script_with_their_own_tools() {
     let base = tools(&dir);
     let mut registry = base.clone();
     registry.register(Task::new(TaskSettings {
+        categories: Vec::new(),
         models: crate::Models::default(),
         nesting: crate::Nesting::default(),
         model: model.clone(),

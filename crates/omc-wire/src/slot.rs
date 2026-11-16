@@ -47,6 +47,15 @@ pub struct SlotInfo {
     /// The slot's assignment for each provider that has one or that the reader is signed in to, by provider id.
     #[serde(default)]
     pub providers: Vec<SlotProvider>,
+    /// What kind of work the slot is for, in a sentence or two, when it says; a category is offered to the agent by this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The text added to the system prompt of a subagent started in this slot as a category, when it has some.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Whether the slot is a work category: every slot other than the six job slots `main`, `fast`, `plan`, `subagent`, `review` and `vision`.
+    #[serde(default)]
+    pub category: bool,
 }
 
 /// One slot's assignment for one provider, used by conversations of that provider before the any-provider assignment.

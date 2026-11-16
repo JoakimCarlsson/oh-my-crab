@@ -46,8 +46,62 @@ pub(crate) const REVIEW: &str = "review";
 /// The slot of describing images for a model that cannot read them; reserved until crab does.
 pub(crate) const VISION: &str = "vision";
 
-/// The slots every conversation has, in the order they are listed.
+/// The job slots every conversation has, in the order they are listed: the roles crab itself asks a model for.
 pub(crate) const BUILT_IN: [&str; 6] = [MAIN, FAST, PLAN, SUBAGENT, REVIEW, VISION];
+
+/// The work categories every conversation has, in the order they are listed, each with what kind of work it is for. None sets a model, so each asks the conversation's until a file gives it one.
+pub(crate) const CATEGORIES: [(&str, &str); 5] = [
+    (
+        "quick",
+        "Small, well-specified changes: single-file edits, renames, typo and config fixes.",
+    ),
+    (
+        "deep",
+        "Multi-step implementation and debugging that needs careful reasoning across files.",
+    ),
+    (
+        "ultrabrain",
+        "The hardest problems: architecture decisions, subtle bugs, correctness arguments.",
+    ),
+    (
+        "visual",
+        "User interface, layout, styling and other design-sensitive work.",
+    ),
+    (
+        "writing",
+        "Documentation, prose, comments and release notes.",
+    ),
+];
+
+/// Whether the slot `name` is a work category: any slot other than the job slots of [`BUILT_IN`].
+pub(crate) fn is_category(name: &str) -> bool {
+    !BUILT_IN.contains(&name)
+}
+
+/// What kind of work the built-in category `name` is for; nothing for any other slot.
+fn default_description(name: &str) -> Option<&'static str> {
+    CATEGORIES
+        .iter()
+        .find(|(category, _)| *category == name)
+        .map(|(_, description)| *description)
+}
+
+/// `text` trimmed, or nothing when nothing is left of it.
+fn filled(text: Option<String>) -> Option<String> {
+    text.map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+}
+
+/// A work category as the agent is offered it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Category {
+    /// The name of its slot.
+    pub(crate) name: String,
+    /// What kind of work it is for; empty when nothing says.
+    pub(crate) description: String,
+    /// The text added to the system prompt of a subagent started in it, when it has some.
+    pub(crate) prompt: Option<String>,
+}
 
 /// A model as a selector names it: the model, with its provider before a `/` when given, and the effort after a `:` when given.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -160,7 +214,7 @@ impl Assignment {
     }
 }
 
-/// What one file sets for a slot: the any-provider assignment, written flat as the slot's own `model` and `backups`, and an assignment for each provider under `providers`, by provider id.
+/// What one file sets for a slot: the any-provider assignment, written flat as the slot's own `model` and `backups`, an assignment for each provider under `providers`, by provider id, and what the slot is for as a work category.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SlotEntry {
     /// The assignment used for every provider that has none of its own.
@@ -169,6 +223,12 @@ pub(crate) struct SlotEntry {
     /// The assignments of single providers, by provider id, such as `claude`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) providers: BTreeMap<String, Assignment>,
+    /// What kind of work the slot is for, in a sentence or two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) description: Option<String>,
+    /// The text added to the system prompt of a subagent started in this slot as a category.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) prompt: Option<String>,
 }
 
 impl SlotEntry {
@@ -177,13 +237,16 @@ impl SlotEntry {
     pub(crate) fn any(any: Assignment) -> Self {
         Self {
             any,
-            providers: BTreeMap::new(),
+            ..Self::default()
         }
     }
 
-    /// Whether it sets nothing for any provider.
+    /// Whether it sets nothing: no assignment for any provider, no description and no prompt.
     fn is_empty(&self) -> bool {
-        self.any.is_empty() && self.providers.values().all(Assignment::is_empty)
+        self.any.is_empty()
+            && self.providers.values().all(Assignment::is_empty)
+            && self.description.is_none()
+            && self.prompt.is_none()
     }
 
     /// The assignment of `provider`, or the any-provider one when `provider` is nothing.
@@ -280,27 +343,69 @@ impl Layers {
         std::iter::once(&self.user).chain(self.project.iter())
     }
 
-    /// Every slot's name: the built-in ones first, then the custom ones any layer sets, by name.
+    /// Every slot's name: the job slots first, then the built-in categories, then the custom ones any layer sets, by name.
     pub(crate) fn names(&self) -> Vec<String> {
         let mut custom: Vec<String> = self
             .files()
             .flat_map(|file| file.slots.keys())
             .chain(self.env.keys())
-            .filter(|name| !BUILT_IN.contains(&name.as_str()))
+            .filter(|name| {
+                !BUILT_IN.contains(&name.as_str()) && default_description(name).is_none()
+            })
             .cloned()
             .collect();
         custom.sort();
         custom.dedup();
         BUILT_IN
             .iter()
-            .map(|name| (*name).to_owned())
+            .copied()
+            .chain(CATEGORIES.iter().map(|(name, _)| *name))
+            .map(str::to_owned)
             .chain(custom)
             .collect()
     }
 
-    /// Whether `name` is a slot: a built-in one, or one a layer sets.
+    /// Whether `name` is a slot: a job slot, a built-in category, or one a layer sets.
     pub(crate) fn knows(&self, name: &str) -> bool {
         self.names().iter().any(|known| known == name)
+    }
+
+    /// What the files set for the slot `name` in the field `field` picks, the project's over the user's.
+    fn written(&self, name: &str, field: impl Fn(&SlotEntry) -> Option<&String>) -> Option<String> {
+        let from = |file: &SlotsFile| file.slots.get(name).and_then(&field).cloned();
+        self.project
+            .as_ref()
+            .and_then(from)
+            .or_else(|| from(&self.user))
+    }
+
+    /// What kind of work the slot `name` is for, as the files say it, the project's over the user's; nothing when neither does.
+    fn described(&self, name: &str) -> Option<String> {
+        self.written(name, |entry| entry.description.as_ref())
+    }
+
+    /// What kind of work the slot `name` is for: what the files say, the project's over the user's, else what a built-in category is for; nothing when nothing says.
+    pub(crate) fn description_of(&self, name: &str) -> Option<String> {
+        self.described(name)
+            .or_else(|| default_description(name).map(str::to_owned))
+    }
+
+    /// The text added to the system prompt of a subagent started in the slot `name` as a category, as the files set it, the project's over the user's; nothing when neither does.
+    pub(crate) fn prompt_of(&self, name: &str) -> Option<String> {
+        self.written(name, |entry| entry.prompt.as_ref())
+    }
+
+    /// The work categories, every slot that is no job slot: the built-in ones first, in the order of [`CATEGORIES`], then the custom ones by name, each with what it is for and what it adds to a subagent's prompt.
+    pub(crate) fn categories(&self) -> Vec<Category> {
+        self.names()
+            .into_iter()
+            .filter(|name| is_category(name))
+            .map(|name| Category {
+                description: self.description_of(&name).unwrap_or_default(),
+                prompt: self.prompt_of(&name),
+                name,
+            })
+            .collect()
     }
 
     /// The ids of the providers any layer gives the slot `name` an assignment of its own, by id.
@@ -414,7 +519,7 @@ impl Layers {
         presets
     }
 
-    /// The slots as the client is shown them: each with its any-provider model and backups, the model it resolves to for the conversation's provider with `main`, the conversation's model when it is open, where that comes from, and the assignment of every provider in `signed_in` and of every provider a layer sets one for; `suggest` gives the suggestion for a slot and a provider id when the provider has no model for it.
+    /// The slots as the client is shown them: each with its any-provider model and backups, the model it resolves to for the conversation's provider with `main`, the conversation's model when it is open, where that comes from, the assignment of every provider in `signed_in` and of every provider a layer sets one for, what it is for and what it adds to a subagent's prompt, and whether it is a category; `suggest` gives the suggestion for a slot and a provider id when the provider has no model for it.
     pub(crate) fn infos(
         &self,
         main: Option<&str>,
@@ -464,13 +569,16 @@ impl Layers {
                     model: any.model,
                     backups: any.backups,
                     providers,
+                    description: self.description_of(&name),
+                    prompt: self.prompt_of(&name),
+                    category: is_category(&name),
                     name,
                 }
             })
             .collect()
     }
 
-    /// Every slot as it stands now, every assignment of it, as a preset keeps it, with `effort`.
+    /// Every slot as it stands now, every assignment of it and what the files say it is for and adds to a subagent's prompt, as a preset keeps it, with `effort`.
     pub(crate) fn snapshot(&self, effort: Option<String>) -> Preset {
         Preset {
             slots: self
@@ -488,6 +596,8 @@ impl Layers {
                             })
                             .filter(|(_, assignment)| !assignment.is_empty())
                             .collect(),
+                        description: self.described(&name),
+                        prompt: self.prompt_of(&name),
                     };
                     (!entry.is_empty()).then_some((name, entry))
                 })
@@ -652,7 +762,32 @@ impl SlotFiles {
         })
     }
 
-    /// Takes the assignment of `provider`, or the any-provider one when it is nothing, of the slot `name` out of the file of `scope`, and the slot when it then sets nothing.
+    /// Sets the description and the prompt of the slot `name` in the file of `scope` to `description` and `prompt`, trimmed, clearing the one that is nothing or empty and leaving its assignments alone; the slot is made when the file has none, and taken out when it then sets nothing.
+    ///
+    /// # Errors
+    ///
+    /// Fails, writing nothing, when the name is not valid, or the file cannot be read or written.
+    pub(crate) fn describe_slot(
+        &self,
+        scope: SlotScope,
+        name: &str,
+        description: Option<String>,
+        prompt: Option<String>,
+    ) -> Result<(), String> {
+        check_name(name)?;
+        let (description, prompt) = (filled(description), filled(prompt));
+        self.change(scope, |file| {
+            let entry = file.slots.entry(name.to_owned()).or_default();
+            entry.description = description;
+            entry.prompt = prompt;
+            if entry.is_empty() {
+                file.slots.remove(name);
+            }
+            Ok(())
+        })
+    }
+
+    /// Takes the assignment of `provider`, or the any-provider one when it is nothing, of the slot `name` out of the file of `scope`, keeping its description and prompt, and the slot when it then sets nothing.
     ///
     /// # Errors
     ///
@@ -939,7 +1074,23 @@ mod tests {
             Some(format!("suggested-{name}"))
         });
         let names: Vec<&str> = infos.iter().map(|info| info.name.as_str()).collect();
-        assert_eq!(names, [MAIN, FAST, PLAN, SUBAGENT, REVIEW, VISION, "docs"]);
+        assert_eq!(
+            names,
+            [
+                MAIN,
+                FAST,
+                PLAN,
+                SUBAGENT,
+                REVIEW,
+                VISION,
+                "quick",
+                "deep",
+                "ultrabrain",
+                "visual",
+                "writing",
+                "docs"
+            ]
+        );
         let fast = &infos[1];
         assert!(!fast.inherited);
         assert_eq!(fast.resolved.as_deref(), Some("claude/haiku"));
@@ -1110,6 +1261,196 @@ mod tests {
             None
         );
         assert_eq!(suggest(PLAN, Provider::Claude, "big", &[], &catalog), None);
+    }
+
+    /// The built-in categories are slots without a file naming them, each with its description and no model; a file's entry of the same name overrides the model, the description and the prompt field by field, the project's file over the user's.
+    #[test]
+    fn built_in_categories_are_known_and_overridden_per_field() {
+        let layers = Layers::default();
+        for (name, description) in CATEGORIES {
+            assert!(layers.knows(name), "{name}");
+            assert_eq!(layers.model_of(name).unwrap(), None);
+            assert_eq!(layers.description_of(name).as_deref(), Some(description));
+            assert_eq!(layers.prompt_of(name), None);
+        }
+        assert_eq!(layers.description_of(FAST), None);
+        let mut user = SlotsFile::default();
+        user.slots.insert(
+            "quick".to_owned(),
+            SlotEntry {
+                prompt: Some("Be brief.".to_owned()),
+                ..any("claude/haiku", &[])
+            },
+        );
+        user.slots.insert(
+            "deep".to_owned(),
+            SlotEntry {
+                description: Some("The user's deep.".to_owned()),
+                prompt: Some("The user's prompt.".to_owned()),
+                ..SlotEntry::default()
+            },
+        );
+        let mut project = SlotsFile::default();
+        project.slots.insert(
+            "deep".to_owned(),
+            SlotEntry {
+                description: Some("The project's deep.".to_owned()),
+                ..SlotEntry::default()
+            },
+        );
+        let layers = Layers {
+            user,
+            project: Some(project),
+            ..Layers::default()
+        };
+        assert_eq!(
+            layers.model_of("quick").unwrap().unwrap().model,
+            "claude/haiku"
+        );
+        assert_eq!(
+            layers.description_of("quick").as_deref(),
+            Some(CATEGORIES[0].1)
+        );
+        assert_eq!(layers.prompt_of("quick").as_deref(), Some("Be brief."));
+        assert_eq!(
+            layers.description_of("deep").as_deref(),
+            Some("The project's deep.")
+        );
+        assert_eq!(
+            layers.prompt_of("deep").as_deref(),
+            Some("The user's prompt.")
+        );
+        let infos = layers.infos(None, &[], &|_, _| None);
+        let quick = infos.iter().find(|info| info.name == "quick").unwrap();
+        assert!(quick.category);
+        assert_eq!(quick.prompt.as_deref(), Some("Be brief."));
+        assert_eq!(quick.description.as_deref(), Some(CATEGORIES[0].1));
+        let fast = infos.iter().find(|info| info.name == FAST).unwrap();
+        assert!(!fast.category);
+        assert_eq!((&fast.description, &fast.prompt), (&None, &None));
+    }
+
+    /// The categories are the built-in ones in their order, then the custom slots by name, never a job slot; a custom one nothing describes has an empty description.
+    #[test]
+    fn categories_are_listed_in_a_stable_order() {
+        let mut user = SlotsFile::default();
+        user.slots
+            .insert("zeta".to_owned(), any("claude/opus", &[]));
+        user.slots.insert(
+            "alpha".to_owned(),
+            SlotEntry {
+                description: Some("First things.".to_owned()),
+                prompt: Some("Go first.".to_owned()),
+                ..SlotEntry::default()
+            },
+        );
+        user.slots.insert(FAST.to_owned(), any("claude/haiku", &[]));
+        let layers = Layers {
+            user,
+            ..Layers::default()
+        };
+        let categories = layers.categories();
+        let names: Vec<&str> = categories.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "quick",
+                "deep",
+                "ultrabrain",
+                "visual",
+                "writing",
+                "alpha",
+                "zeta"
+            ]
+        );
+        assert_eq!(categories[0].description, CATEGORIES[0].1);
+        assert_eq!(
+            categories[5],
+            Category {
+                name: "alpha".to_owned(),
+                description: "First things.".to_owned(),
+                prompt: Some("Go first.".to_owned()),
+            }
+        );
+        assert_eq!(categories[6].description, "");
+    }
+
+    /// Describing a slot writes its description and prompt beside its model, which it leaves alone; they read back, stay when the model is cleared, are kept in a preset, and the slot leaves the file once nothing is left of it. A file without them reads as before and is written without them.
+    #[test]
+    fn descriptions_and_prompts_are_kept_in_the_file() {
+        let dir = scratch("describe");
+        let path = dir.join("user/slots.json");
+        let files = SlotFiles {
+            user: Some(path.clone()),
+            project: None,
+        };
+        files
+            .set_slot(
+                SlotScope::User,
+                "quick",
+                None,
+                Some("claude/haiku".into()),
+                Vec::new(),
+            )
+            .unwrap();
+        let plain = std::fs::read_to_string(&path).unwrap();
+        assert!(!plain.contains("description") && !plain.contains("prompt"));
+        files
+            .describe_slot(
+                SlotScope::User,
+                "quick",
+                Some(" Tiny edits. ".into()),
+                Some("Be brief.".into()),
+            )
+            .unwrap();
+        assert!(
+            files
+                .describe_slot(SlotScope::User, "bad name", Some("x".into()), None)
+                .is_err()
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"description\": \"Tiny edits.\""), "{text}");
+        let layers = files.load().unwrap();
+        assert_eq!(
+            layers.model_of("quick").unwrap().unwrap().model,
+            "claude/haiku"
+        );
+        assert_eq!(
+            layers.description_of("quick").as_deref(),
+            Some("Tiny edits.")
+        );
+        assert_eq!(layers.prompt_of("quick").as_deref(), Some("Be brief."));
+        let preset = layers.snapshot(None);
+        assert_eq!(
+            preset.slots["quick"].description.as_deref(),
+            Some("Tiny edits.")
+        );
+        assert!(!preset.slots.contains_key("deep"));
+        files.clear_slot(SlotScope::User, "quick", None).unwrap();
+        let layers = files.load().unwrap();
+        assert_eq!(layers.model_of("quick").unwrap(), None);
+        assert_eq!(layers.prompt_of("quick").as_deref(), Some("Be brief."));
+        files
+            .describe_slot(SlotScope::User, "quick", Some("Tiny edits.".into()), None)
+            .unwrap();
+        assert_eq!(files.load().unwrap().prompt_of("quick"), None);
+        files
+            .describe_slot(SlotScope::User, "quick", Some("  ".into()), None)
+            .unwrap();
+        let layers = files.load().unwrap();
+        assert!(layers.user.slots.is_empty());
+        assert_eq!(
+            layers.description_of("quick").as_deref(),
+            Some(CATEGORIES[0].1)
+        );
+        files.apply_preset(SlotScope::User, &preset).unwrap();
+        let layers = files.load().unwrap();
+        assert_eq!(layers.prompt_of("quick").as_deref(), Some("Be brief."));
+        assert_eq!(
+            layers.model_of("quick").unwrap().unwrap().model,
+            "claude/haiku"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A provider's own assignment comes first, then the any-provider one, then main, with the backups of the assignment that applies; a Claude conversation and a Codex one get different `fast` models, and the environment overrides only the any-provider model.

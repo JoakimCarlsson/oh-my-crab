@@ -207,7 +207,7 @@ pub enum Command {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
     },
-    /// Takes the slot `name` out of the file of `scope`, so that it falls back to the other file or to the conversation's model. Answered like [`Command::SetSlot`].
+    /// Takes the any-provider assignment of the slot `name`, or the assignment of `provider`, out of the file of `scope`, so that it falls back to the other file or to the conversation's model. The slot's description and prompt stay; the slot leaves the file only when nothing is left of it. Answered like [`Command::SetSlot`].
     ClearSlot {
         /// The slot's name.
         name: String,
@@ -217,6 +217,20 @@ pub enum Command {
         /// The provider id whose assignment is taken out; nothing takes out the any-provider assignment.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
+    },
+    /// Sets the description and the prompt of the slot `name` in the file of `scope` to exactly what is given, clearing the one left out or empty, and leaves its model, backups and provider assignments alone; the slot is made when the file has none of that name, and leaves the file when nothing is left of it. Answered like [`Command::SetSlot`].
+    DescribeSlot {
+        /// The slot's name: letters, digits, `-` and `_`.
+        name: String,
+        /// The file to write.
+        #[serde(default)]
+        scope: SlotScope,
+        /// What kind of work the slot is for, in a sentence or two; nothing clears it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        /// The text added to the system prompt of a subagent started in this slot as a category; nothing clears it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
     },
     /// Asks for the presets kept in the user's file, answered with a [`crate::Event::Presets`]. Allowed before [`Command::Open`] and while a turn is running.
     Presets,
@@ -364,6 +378,12 @@ mod tests {
                 scope: SlotScope::User,
                 provider: Some("claude".to_owned()),
             },
+            Command::DescribeSlot {
+                name: "quick".to_owned(),
+                scope: SlotScope::Project,
+                description: Some("Small edits.".to_owned()),
+                prompt: None,
+            },
             Command::Presets,
             Command::SavePreset {
                 name: "cheap".to_owned(),
@@ -398,6 +418,9 @@ mod tests {
                     backups: Vec::new(),
                     suggested: None,
                 }],
+                description: Some("Small edits.".to_owned()),
+                prompt: Some("Be brief.".to_owned()),
+                category: true,
             }]),
             crate::Event::Presets(vec![crate::PresetInfo {
                 name: "cheap".to_owned(),

@@ -39,6 +39,20 @@ fn follow_reply(streamed: &Mutex<String>, event: &omc_agent::AgentEvent) {
     }
 }
 
+/// The work categories of `layers` as the `task` tool offers them in orchestrator mode, each with the backups of its slot.
+fn offered_categories(layers: &slots::Layers) -> Vec<omc_agent::Category> {
+    layers
+        .categories()
+        .into_iter()
+        .map(|category| omc_agent::Category {
+            backups: layers.backups_of(&category.name),
+            name: category.name,
+            description: category.description,
+            prompt: category.prompt,
+        })
+        .collect()
+}
+
 /// How a turn ended.
 pub(crate) enum Ended {
     /// It answered; this is the conversation so far.
@@ -367,6 +381,12 @@ impl Turn {
             .routing(&picker, &layers, planner_id.as_deref(), planning())
             .await;
         let subagent_slot = matches!(layers.model_of(slots::SUBAGENT), Ok(Some(_)));
+        let orchestrator = self.shared.orchestrator();
+        let categories = if orchestrator {
+            offered_categories(&layers)
+        } else {
+            Vec::new()
+        };
         let toolset = Toolset::build(&Inputs {
             base: &self.base,
             denied: &self.denied,
@@ -383,6 +403,7 @@ impl Turn {
                     Vec::new()
                 },
             },
+            categories,
             throttle: self.shared.throttle.clone(),
             roster: self.shared.roster.clone(),
             crew: self.shared.crew.clone(),
@@ -408,6 +429,7 @@ impl Turn {
             provider: self.provider,
             model: self.model.clone(),
             checkpoints: checkpoint.is_some(),
+            orchestrator,
             memory: memories.is_some(),
         };
         let prefix = self.shared.prefix(&key, || {

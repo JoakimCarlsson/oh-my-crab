@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use crate::fallback::{Fallback, Routing};
 use crate::nesting::{Nesting, Seat};
-use crate::picker::Models;
+use crate::picker::{Category, Models};
 use crate::roster::{Enrolment, SubagentNotice, SubagentState};
 use crate::submit::{SUBMIT_RESULT, Slot, SubmitResult};
 use crate::worktree::{self, Handback, Isolation, Lease, Merge};
@@ -78,6 +78,8 @@ pub struct TaskSettings {
     pub model: Arc<dyn ChatModel>,
     /// What that model is called, and how other models are found by name.
     pub models: Models,
+    /// The work categories an assignment may be handed to with `category` instead of naming a model; empty while orchestrator mode is off, which refuses every call giving one.
+    pub categories: Vec<Category>,
     /// The tools subagents may draw from.
     pub registry: Arc<Registry>,
     /// What is allowed without asking, shared with the main agent.
@@ -120,6 +122,8 @@ struct Args {
     isolated: Option<bool>,
     /// The model the subagents ask, for the single assignment or the items of `tasks` that name none; their kind's definition decides when nothing does.
     model: Option<String>,
+    /// The work category the subagents are handed to, for the single assignment or the items of `tasks` that name neither a category nor a model.
+    category: Option<String>,
     /// The handle of a finished subagent that `task` is a follow-up for.
     #[serde(rename = "continue")]
     resume: Option<String>,
@@ -140,10 +144,12 @@ struct Item {
     isolated: Option<bool>,
     /// The model it asks.
     model: Option<String>,
+    /// The work category it is handed to, whose slot decides the model it asks.
+    category: Option<String>,
 }
 
 impl Args {
-    /// The assignments the call asks for: the single `task`, or the items of `tasks` with the call's `agent`, `output_schema`, `isolated` and `model` filled in where they give none.
+    /// The assignments the call asks for: the single `task`, or the items of `tasks` with the call's `agent`, `output_schema`, `isolated`, `model` and `category` filled in where they give none; an item that names a model or a category of its own takes neither of the two from the call.
     ///
     /// # Errors
     ///
@@ -157,6 +163,7 @@ impl Args {
             tasks,
             isolated,
             model,
+            category,
             ..
         } = self;
         let invalid = |reason: String| Err(ToolError::InvalidArguments(reason));
@@ -170,6 +177,7 @@ impl Args {
                 output_schema,
                 isolated,
                 model,
+                category,
             }]),
             (None, Some(list)) if list.is_empty() => invalid("`tasks` is empty".to_owned()),
             (None, Some(list)) if list.len() > MAX_TASKS => invalid(format!(
@@ -178,12 +186,19 @@ impl Args {
             )),
             (None, Some(list)) => Ok(list
                 .into_iter()
-                .map(|item| Item {
-                    agent: item.agent.or_else(|| agent.clone()),
-                    output_schema: item.output_schema.or_else(|| output_schema.clone()),
-                    isolated: item.isolated.or(isolated),
-                    model: item.model.or_else(|| model.clone()),
-                    ..item
+                .map(|item| {
+                    let chose = item.model.is_some() || item.category.is_some();
+                    let inherit = |own: Option<String>, shared: &Option<String>| {
+                        own.or_else(|| shared.clone().filter(|_| !chose))
+                    };
+                    Item {
+                        agent: item.agent.or_else(|| agent.clone()),
+                        output_schema: item.output_schema.or_else(|| output_schema.clone()),
+                        isolated: item.isolated.or(isolated),
+                        model: inherit(item.model, &model),
+                        category: inherit(item.category, &category),
+                        ..item
+                    }
                 })
                 .collect()),
         }
@@ -201,6 +216,7 @@ impl Args {
             ("`tasks`", self.tasks.is_some()),
             ("`isolated`", self.isolated.is_some()),
             ("`model`", self.model.is_some()),
+            ("`category`", self.category.is_some()),
         ]
         .into_iter()
         .filter_map(|(name, given)| given.then_some(name))
@@ -236,6 +252,8 @@ struct Lane {
     label: String,
     /// What the model it asks is called; empty when it is not known.
     model: String,
+    /// The work category it was handed to, when it was handed to one.
+    category: Option<String>,
 }
 
 impl Lane {
@@ -308,7 +326,7 @@ impl Lane {
         }
     }
 
-    /// How the subagent with the id `id` is announced, running in the background when `background` says so.
+    /// How the subagent with the id `id` is announced, with the model it asks and the work category it was handed to, running in the background when `background` says so.
     fn notice(&self, id: &str, background: bool) -> SubagentNotice {
         SubagentNotice {
             id: id.to_owned(),
@@ -316,6 +334,7 @@ impl Lane {
             agent: self.kind.clone(),
             label: self.label.clone(),
             model: Some(self.model.clone()).filter(|model| !model.is_empty()),
+            category: self.category.clone(),
             background,
             state: SubagentState::Running,
         }
@@ -409,6 +428,8 @@ pub(crate) struct Run {
     lane: Lane,
     /// Its system prompt.
     system: String,
+    /// What its work category adds to its system prompt, under a heading naming the category, when it was handed to one that adds something.
+    addition: Option<String>,
     /// How hard it thinks.
     effort: Option<Effort>,
     /// What it is to do: its assignment, or the follow-up it was sent.
@@ -769,10 +790,104 @@ impl Task {
                 ("nesting", nesting_note(&settings.nesting).as_str()),
             ],
         );
+        let description = match categories_note(&settings.categories) {
+            Some(note) => format!("{description}\n\n{note}"),
+            None => description,
+        };
         Self {
             settings,
             description,
         }
+    }
+
+    /// The work categories an assignment may be handed to; empty while orchestrator mode is off.
+    pub(crate) fn categories(&self) -> &[Category] {
+        &self.settings.categories
+    }
+
+    /// The work category an assignment is handed to, when it names one as `wanted`; `model` is the model it names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::InvalidArguments`] when orchestrator mode is off, so that there are no categories, or when the assignment names a model as well, and [`ToolError::Failed`], listing the categories there are, when there is none of that name.
+    fn category(
+        &self,
+        wanted: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<Option<&Category>, ToolError> {
+        let Some(name) = wanted.map(str::trim).filter(|name| !name.is_empty()) else {
+            return Ok(None);
+        };
+        let categories = &self.settings.categories;
+        if categories.is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "`category` only works in orchestrator mode, which is off; leave it out".to_owned(),
+            ));
+        }
+        if model.is_some_and(|model| !model.trim().is_empty()) {
+            return Err(ToolError::InvalidArguments(format!(
+                "give only one of `category` and `model`: the category {name} decides the model"
+            )));
+        }
+        categories
+            .iter()
+            .find(|category| category.name == name)
+            .map(Some)
+            .ok_or_else(|| {
+                let known: Vec<&str> = categories
+                    .iter()
+                    .map(|category| category.name.as_str())
+                    .collect();
+                ToolError::Failed(format!(
+                    "unknown category {name}; available: {}",
+                    known.join(", ")
+                ))
+            })
+    }
+
+    /// The model a subagent of the kind `agent` handed to `category` asks, what it is called and how hard it thinks: the model of the category's slot, which [`Models::picker`] finds as `@name` and which is the conversation's for a slot that sets none; the one of the agent starting it when models cannot be picked here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Failed`], saying why, when the model of the category cannot be used.
+    async fn category_model(
+        &self,
+        agent: &AgentDefinition,
+        category: &Category,
+    ) -> Result<(Arc<dyn ChatModel>, String, Option<Effort>), ToolError> {
+        let Some(picker) = &self.settings.models.picker else {
+            return Ok((
+                self.settings.model.clone(),
+                self.settings.models.current.clone(),
+                self.settings.effort,
+            ));
+        };
+        let picked = picker
+            .pick(&format!("@{}", category.name))
+            .await
+            .map_err(|why| {
+                ToolError::Failed(format!(
+                    "the model of the category {} cannot be used for the {} agent: {why}",
+                    category.name, agent.name
+                ))
+            })?;
+        Ok((picked.model, picked.name, picked.effort))
+    }
+
+    /// The backups a subagent handed to `category` falls back on when its model, called `name`, keeps failing: those of the category's slot, when it has some and models can be picked here.
+    fn category_routing(&self, category: &Category, name: &str) -> Option<Routing> {
+        if category.backups.is_empty() {
+            return None;
+        }
+        Some(Routing {
+            summarizer: None,
+            fallback: Some(Fallback {
+                slot: category.name.clone(),
+                from: name.to_owned(),
+                backups: category.backups.clone(),
+                picker: self.settings.models.picker.clone()?,
+            }),
+        })
     }
 
     /// The tools `agent` gets: those of the registry the tool was given, less what is withheld, and only those the definition lists when it lists any; a tool that depends on what else the agent has, such as `script`, is fitted to them.
@@ -899,11 +1014,11 @@ impl Task {
 
     /// The subagent for `item`, reporting under the call `call` at `place` in its list when it is one of several.
     ///
-    /// A subagent asked for a structured result, by the item or by its kind's definition, gets the `submit_result` tool for it. Its system prompt, and the `task` tool of its own when it gets one, are only made by [`Task::arm`], once it is known where it works.
+    /// An item handed to a work category asks the model of the category's slot, with the slot's backups, whatever its kind's definition names, and has what the category adds to the prompt kept for [`Task::arm`]. A subagent asked for a structured result, by the item or by its kind's definition, gets the `submit_result` tool for it. Its system prompt, and the `task` tool of its own when it gets one, are only made by [`Task::arm`], once it is known where it works.
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Failed`] for an unknown kind or a model that cannot be used, and [`ToolError::InvalidArguments`] for a schema that is not one.
+    /// Returns [`ToolError::Failed`] for an unknown kind or category or a model that cannot be used, and [`ToolError::InvalidArguments`] for a schema that is not one, a category given with a model, or a category given while orchestrator mode is off.
     async fn prepare(
         &self,
         call: &str,
@@ -917,8 +1032,16 @@ impl Task {
                 ToolError::InvalidArguments(format!("output_schema: {reason}"))
             })?;
         }
-        let (model, model_name, effort) = self.model_for(agent, item.model.as_deref()).await?;
-        let routing = self.routing_for(agent, item.model.as_deref(), &model_name);
+        let category = self.category(item.category.as_deref(), item.model.as_deref())?;
+        let (model, model_name, effort) = match category {
+            Some(category) => self.category_model(agent, category).await?,
+            None => self.model_for(agent, item.model.as_deref()).await?,
+        };
+        let routing = match category {
+            Some(category) => self.category_routing(category, &model_name),
+            None => self.routing_for(agent, item.model.as_deref(), &model_name),
+        };
+        let addition = category.and_then(category_addition);
         let mut registry = self.tools_for(agent);
         let structured = schema.map(|schema| {
             let slot = Slot::default();
@@ -942,8 +1065,10 @@ impl Task {
                 kind: agent.name.clone(),
                 label: headline(item.description.as_deref(), &item.task),
                 model: model_name,
+                category: category.map(|category| category.name.clone()),
             },
             system: String::new(),
+            addition,
             effort,
             assignment: item.task,
             history: Vec::new(),
@@ -993,7 +1118,7 @@ impl Task {
         Ok(given)
     }
 
-    /// Gives `run` a `task` tool of its own when it may start subagents: one level down, drawing on its own tools, asking its model by default, reporting under its lane, keeping the subagents it started under its handle, and isolating its subagents from the worktree it works in, when it works in one, so that what they change is handed back to it.
+    /// Gives `run` a `task` tool of its own when it may start subagents: one level down, without work categories, drawing on its own tools, asking its model by default, reporting under its lane, keeping the subagents it started under its handle, and isolating its subagents from the worktree it works in, when it works in one, so that what they change is handed back to it.
     fn equip(&self, run: &mut Run) {
         let directory = run.lease.as_ref().map(Lease::directory);
         if run.nests {
@@ -1013,6 +1138,7 @@ impl Task {
                 _ => self.settings.isolation.clone(),
             };
             run.registry.register(Task::new(TaskSettings {
+                categories: Vec::new(),
                 model: run.model.clone(),
                 models: self.settings.models.named(&run.lane.model),
                 registry: Arc::new(pool),
@@ -1033,23 +1159,27 @@ impl Task {
         }
     }
 
-    /// Readies `run` to start, now that it is known where it works: it gets a `task` tool of its own when it may start subagents, as [`Task::equip`] tells, and then its system prompt is made for the tools it has, the folder it works in and the model it asks.
+    /// Readies `run` to start, now that it is known where it works: it gets a `task` tool of its own when it may start subagents, as [`Task::equip`] tells, and then its system prompt is made for the tools it has, the folder it works in and the model it asks, followed by what its work category adds when it has one that does.
     fn arm(&self, run: &mut Run) {
         self.equip(run);
         let directory = run.lease.as_ref().map(Lease::directory);
-        run.system = (self.settings.prompt)(
+        let system = (self.settings.prompt)(
             &run.definition,
             &run.registry.names(),
             directory.as_deref(),
             &run.lane.model,
         );
+        run.system = match &run.addition {
+            Some(addition) => format!("{system}\n\n{addition}"),
+            None => system,
+        };
     }
 
-    /// A long-lived subagent of the kind `kind` (the default kind when `None`), started by the call `call` to do `task`, named by `description`, asking `model` when one is named: ready to run, working in the main agent's folder, with its tools and system prompt.
+    /// A long-lived subagent of the kind `kind` (the default kind when `None`), started by the call `call` to do `task`, named by `description`, asking `model` when one is named or the model of the work category `category` when one is: ready to run, working in the main agent's folder, with its tools and system prompt.
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Failed`] for an unknown kind, a model that cannot be used, or a kind whose definition asks for a structured result, which a long-lived subagent never hands back.
+    /// Returns [`ToolError::Failed`] for an unknown kind or category, a model that cannot be used, or a kind whose definition asks for a structured result, which a long-lived subagent never hands back, and [`ToolError::InvalidArguments`] for a category given with a model or while orchestrator mode is off.
     pub(crate) async fn enlist(
         &self,
         call: &str,
@@ -1057,6 +1187,7 @@ impl Task {
         task: String,
         description: Option<String>,
         model: Option<String>,
+        category: Option<String>,
     ) -> Result<Run, ToolError> {
         let mut run = self
             .prepare(
@@ -1069,6 +1200,7 @@ impl Task {
                     output_schema: None,
                     isolated: Some(false),
                     model,
+                    category,
                 },
             )
             .await?;
@@ -1150,6 +1282,7 @@ impl Task {
             kind: run.lane.kind.clone(),
             label: headline(description.as_deref(), &task),
             model: run.lane.model.clone(),
+            category: run.lane.category.clone(),
         };
         run.assignment = task;
         run.resumed = true;
@@ -1237,6 +1370,41 @@ fn nesting_note(nesting: &Nesting) -> String {
     }
 }
 
+/// The schema of the `category` argument, which `task` and `agent_spawn` declare while there are `categories`, the work categories; nothing when there are none. It lists no names, so that a category made later in the conversation is still taken.
+pub(crate) fn category_schema(categories: &[Category]) -> Option<Value> {
+    if categories.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "type": "string",
+        "description": "The work category the subagent is handed to, as the description of `task` lists them, which decides the model it asks; give this instead of `model`, never both."
+    }))
+}
+
+/// What the description of the `task` tool says about `categories`, the work categories assignments may be handed to: how to pick one and what each is for, naming no models; nothing when there are none.
+fn categories_note(categories: &[Category]) -> Option<String> {
+    if categories.is_empty() {
+        return None;
+    }
+    let listed = categories
+        .iter()
+        .map(|category| match category.description.trim() {
+            "" => format!("- `{}`", category.name),
+            description => format!("- `{}`: {description}", category.name),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "# Categories\nOrchestrator mode is on: hand every assignment to a work category with `category` rather than naming a `model`; the category decides the model the subagent asks. Set `category` for the call, or per item of `tasks`; NEVER together with `model`. Pick the cheapest category that fits, and hand the work to a stronger one when a result misses the bar. `agent` still picks the kind of subagent.\n{listed}"
+    ))
+}
+
+/// What `category` adds to the system prompt of a subagent handed to it, under a heading naming the category; nothing when it adds nothing.
+fn category_addition(category: &Category) -> Option<String> {
+    let prompt = category.prompt.as_deref()?.trim();
+    (!prompt.is_empty()).then(|| format!("# Category: {}\n{prompt}", category.name))
+}
+
 /// The text of the last reply in `history`.
 fn last_reply(history: &[Message]) -> String {
     history
@@ -1287,7 +1455,7 @@ impl Tool for Task {
         &self.description
     }
 
-    /// Returns the argument schema.
+    /// Returns the argument schema, which takes `category` only while there are work categories.
     fn schema(&self) -> Value {
         let agent = json!({ "type": "string", "description": "The kind of subagent; omit for the default." });
         let description = json!({ "type": "string", "description": "A few words naming the work, shown to the user." });
@@ -1303,7 +1471,7 @@ impl Tool for Task {
             "type": "string",
             "description": "The model the subagent asks instead of its kind's or yours: an alias (`haiku`, `sonnet`, `opus`, `inherit`), a model id, or `provider/model` for another signed-in provider."
         });
-        json!({
+        let mut schema = json!({
             "type": "object",
             "properties": {
                 "agent": agent,
@@ -1332,7 +1500,12 @@ impl Tool for Task {
                 "isolated": isolated,
                 "model": model
             }
-        })
+        });
+        if let Some(category) = category_schema(&self.settings.categories) {
+            schema["properties"]["category"] = category.clone();
+            schema["properties"]["tasks"]["items"]["properties"]["category"] = category;
+        }
+        schema
     }
 
     /// Shared when every subagent the call with `args` starts only looks: all the tools subagents are given only look, as in plan mode, the definition of every kind it names lists only tools that look, or the finished subagent it sends a follow-up to has only tools that look. Exclusive otherwise, and for arguments that cannot be read, since a subagent that can write changes files as any writing tool does.
@@ -1466,6 +1639,7 @@ mod tests {
         let events: Arc<EventSink> = Arc::new(move |event| log.lock().unwrap().push(event));
         let mut registry = base.clone();
         registry.register(Task::new(TaskSettings {
+            categories: Vec::new(),
             models: crate::Models::default(),
             nesting: crate::Nesting::default(),
             model,
@@ -1701,6 +1875,7 @@ mod tests {
         let dir = scratch("task-background");
         let jobs = Arc::new(Jobs::new(|_| {}));
         let task = Task::new(TaskSettings {
+            categories: Vec::new(),
             models: crate::Models::default(),
             nesting: crate::Nesting::default(),
             model,
@@ -1788,6 +1963,7 @@ mod tests {
         let base = Registry::builtin(&dir).unwrap();
         let mut registry = base.clone();
         registry.register(Task::new(TaskSettings {
+            categories: Vec::new(),
             models: crate::Models::default(),
             nesting: crate::Nesting::default(),
             model: model.clone(),

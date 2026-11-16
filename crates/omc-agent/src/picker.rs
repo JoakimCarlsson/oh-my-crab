@@ -27,6 +27,19 @@ pub trait ModelPicker: Send + Sync {
     async fn pick(&self, wanted: &str) -> Result<Picked, String>;
 }
 
+/// A work category an assignment may be handed to instead of naming a model: a model slot with a description, whose model the subagent asks.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Category {
+    /// The name of the category and of its slot, which [`Models::picker`] is asked for as `@name`.
+    pub name: String,
+    /// What kind of work it is for, as the agent is told; empty when nothing says.
+    pub description: String,
+    /// The text added to the system prompt of a subagent started in it, when it has some.
+    pub prompt: Option<String>,
+    /// The names tried in order when the category's model fails in a way another model may not.
+    pub backups: Vec<String>,
+}
+
 /// Where the models of subagents come from.
 #[derive(Clone, Default)]
 pub struct Models {

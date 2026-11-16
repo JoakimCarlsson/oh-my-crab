@@ -141,6 +141,9 @@ pub struct Subagent {
     /// What the model it asks is called, when that is known.
     #[serde(default)]
     pub model: Option<String>,
+    /// The work category it was started in, whose slot decided the model it asks; left out when it was started without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
     /// Whether it runs in the background.
     pub background: bool,
     /// How it stands.
@@ -158,4 +161,46 @@ pub enum SubagentState {
     Failed,
     /// The reader stopped it, or the turn it ran in was stopped.
     Stopped,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A running subagent called `model`, started in `category`.
+    fn subagent(model: Option<&str>, category: Option<&str>) -> Subagent {
+        Subagent {
+            id: "toolu_07/2".to_owned(),
+            call: "toolu_07".to_owned(),
+            agent: "scout".to_owned(),
+            label: "Find the parser".to_owned(),
+            model: model.map(str::to_owned),
+            category: category.map(str::to_owned),
+            background: false,
+            state: SubagentState::Running,
+        }
+    }
+
+    /// A subagent started in a category names it and its model on the wire, and reads back as it was written.
+    #[test]
+    fn a_subagent_carries_its_category_and_model() {
+        let sent = subagent(Some("gpt-5-mini"), Some("quick"));
+        let line = serde_json::to_value(&sent).unwrap();
+        assert_eq!(line["category"], "quick");
+        assert_eq!(line["model"], "gpt-5-mini");
+        assert_eq!(serde_json::from_value::<Subagent>(line).unwrap(), sent);
+    }
+
+    /// A subagent started without a category leaves the field out, and a line written before the field existed still reads, with no category.
+    #[test]
+    fn a_subagent_without_a_category_leaves_it_out() {
+        let sent = subagent(Some("claude-sonnet-4-5"), None);
+        let line = serde_json::to_value(&sent).unwrap();
+        assert!(line.get("category").is_none());
+        let old = r#"{"id":"toolu_07/2","call":"toolu_07","agent":"scout","label":"Find the parser","background":false,"state":"Running"}"#;
+        assert_eq!(
+            serde_json::from_str::<Subagent>(old).unwrap(),
+            subagent(None, None)
+        );
+    }
 }

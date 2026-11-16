@@ -16,6 +16,9 @@ const RUNTIME: &str = include_str!("prompts/runtime.md");
 /// What the main agent's prompt says while the conversation has no name.
 const UNNAMED: &str = include_str!("prompts/unnamed.md");
 
+/// What the main agent's prompt says about delegation while orchestrator mode is on, in place of holding subagents back.
+const ORCHESTRATOR: &str = include_str!("prompts/orchestrator.md");
+
 /// The prompt of a subagent.
 const SUBAGENT: &str = include_str!("prompts/subagent.md");
 
@@ -38,11 +41,15 @@ pub struct PromptInput<'a> {
     pub plan: bool,
     /// Whether the conversation has no name yet, which the prompt then asks the agent to give it.
     pub unnamed: bool,
+    /// Whether orchestrator mode is on, in which the main agent's prompt tells it to lead and hand work to subagents by work category; it only shows when the agent has the `task` tool.
+    pub orchestrator: bool,
     /// The outline of the working directory from [`crate::workspace_tree`], made once when the conversation started; empty for none.
     pub tree: &'a str,
 }
 
 /// The system prompt of the main agent for `input`.
+///
+/// With orchestrator mode on and the `task` tool among the tools, the prompt tells the agent to lead and hand work to subagents by work category, also after a [`crate::SYSTEM_FILE`]; with it off the prompt is what it is without the mode.
 ///
 /// A [`crate::SYSTEM_FILE`] that was found takes the place of crab's built-in instructions, ahead of the skills, the tool inventory, the project and the rules of plan mode, which stay; an [`crate::APPEND_SYSTEM_FILE`] goes after the project, before the rules of plan mode. It holds nothing that changes from day to day, so that the provider's prompt cache keeps it; the date and the branch go to the agent in [`crate::environment_reminder`] instead.
 pub fn build_prompt(input: PromptInput<'_>) -> String {
@@ -59,6 +66,11 @@ pub fn build_prompt(input: PromptInput<'_>) -> String {
     vars.extend([("skills", skills.as_str()), ("tools", tools.as_str())]);
     let runtime = render(RUNTIME, &vars);
     let unnamed = if input.unnamed { UNNAMED } else { "" };
+    let orchestrator = if input.orchestrator {
+        ORCHESTRATOR.trim()
+    } else {
+        ""
+    };
     let append = appended(input.discovered);
     let base = input
         .discovered
@@ -68,6 +80,7 @@ pub fn build_prompt(input: PromptInput<'_>) -> String {
     vars.extend([
         ("runtime", runtime.as_str()),
         ("unnamed", unnamed),
+        ("orchestrator", orchestrator),
         ("project", project.as_str()),
         ("append", append),
         ("plan", plan.as_str()),
@@ -227,6 +240,7 @@ mod tests {
             tools: &tools,
             plan: false,
             unnamed: false,
+            orchestrator: false,
             tree: "",
         });
         assert!(!prompt.contains("<workspace-tree>"));
@@ -270,6 +284,7 @@ mod tests {
             tools: &tools,
             plan: true,
             unnamed: false,
+            orchestrator: false,
             tree: "",
         });
         assert!(prompt.contains("Plan mode active"));
@@ -300,6 +315,7 @@ mod tests {
                 tools: &[],
                 plan: false,
                 unnamed: false,
+                orchestrator: false,
                 tree: "src/\n  lib.rs",
             },
             "Be a scout.",
@@ -335,6 +351,7 @@ mod tests {
             tools: &[],
             plan: false,
             unnamed: false,
+            orchestrator: false,
             tree: &tree,
         });
         let start = prompt.find("<workspace-tree>").unwrap();
@@ -366,10 +383,70 @@ mod tests {
             tools: &tools,
             plan: false,
             unnamed,
+            orchestrator: false,
             tree: "",
         };
         assert!(build_prompt(input(true)).contains("call `set_title` once"));
         assert!(!build_prompt(input(false)).contains("call `set_title` once"));
+    }
+
+    /// Orchestrator mode adds its rules to the delegation section in place of holding subagents back, only for an agent that has `task`, also after a `SYSTEM.md`; with it off the prompt is the same as before.
+    #[test]
+    fn orchestrator_mode_shapes_the_delegation_section() {
+        let base = scratch("system-orchestrator");
+        let locations = Locations {
+            directory: base.clone(),
+            root: None,
+            home: None,
+            claude: None,
+            codex: None,
+            crab: None,
+            project: true,
+        };
+        let discovered = Discovered::default();
+        let environment = Environment::detect(&locations, "m");
+        let with_task: Vec<String> = ["read", "task"].map(String::from).to_vec();
+        let without: Vec<String> = vec!["read".to_owned()];
+        let input = |tools, orchestrator| PromptInput {
+            environment: &environment,
+            discovered: &discovered,
+            tools,
+            plan: false,
+            unnamed: false,
+            orchestrator,
+            tree: "",
+        };
+        let off = build_prompt(input(&with_task, false));
+        let on = build_prompt(input(&with_task, true));
+        assert!(off.contains("# Delegation\nNo subagents unless"));
+        assert!(!off.contains("Orchestrator mode") && !off.contains("`category`"));
+        assert!(on.contains("# Delegation\nOrchestrator mode on. You lead"));
+        assert!(!on.contains("No subagents unless"));
+        for told in [
+            "by `category`",
+            "cheapest category that fits",
+            "the subagent starts blank",
+            "one writer per area",
+            "unverified work is not done",
+            "with `continue`",
+        ] {
+            assert!(on.contains(told), "{told}");
+        }
+        assert!(on.contains("with `continue`; NEVER a new one that must learn everything again.\n- Fan genuine slices"));
+        assert_eq!(
+            build_prompt(input(&without, true)),
+            build_prompt(input(&without, false))
+        );
+        put(&base, ".oh-my-crab/SYSTEM.md", "You are a pirate.\n");
+        let replaced = discover(&locations, &[]);
+        let own = |orchestrator| {
+            build_prompt(PromptInput {
+                discovered: &replaced,
+                ..input(&with_task, orchestrator)
+            })
+        };
+        assert!(own(true).contains("You are a pirate.\n\n# Delegation\nOrchestrator mode on."));
+        assert!(!own(false).contains("# Delegation"));
     }
 
     /// A `SYSTEM.md` replaces crab's built-in instructions but keeps the skills, the tools, the project and plan mode; an `APPEND_SYSTEM.md` follows the project in the main prompt and the environment in a subagent's, which never takes the `SYSTEM.md`.
@@ -410,6 +487,7 @@ mod tests {
             tools: &tools,
             plan: true,
             unnamed: true,
+            orchestrator: false,
             tree: "",
         };
         let prompt = build_prompt(input);

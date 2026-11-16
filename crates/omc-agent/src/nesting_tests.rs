@@ -53,6 +53,7 @@ fn tool(
     let sink = log.clone();
     let events: Arc<EventSink> = Arc::new(move |event| sink.lock().unwrap().push(event));
     let task = Task::new(TaskSettings {
+        categories: Vec::new(),
         model,
         models: Models {
             current: "big-1".to_owned(),

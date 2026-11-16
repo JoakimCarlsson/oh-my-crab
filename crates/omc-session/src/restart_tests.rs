@@ -64,7 +64,7 @@ impl ChatModel for Scripted {
 /// A conversation open in a folder of its own named `name` under the build folder, asking `model`; with the events it sends and where its turns report their end.
 fn opened(
     name: &str,
-    model: Arc<Scripted>,
+    model: Arc<dyn ChatModel>,
 ) -> (
     Session,
     UnboundedReceiver<Event>,
@@ -518,4 +518,195 @@ async fn slot_commands_round_trip() {
         session.shared.model(),
         Some((Provider::Claude, "fast-1".to_owned()))
     );
+}
+
+/// A request as [`Recording`] keeps it: its system prompt, and the description and the schema of the `task` tool it offered, when it offered one.
+type Recorded = (String, Option<(String, serde_json::Value)>);
+
+/// A model that keeps the system prompt and the `task` tool of every request, and, as a lead in orchestrator mode, hands its first prompt there to the category `quick` before it answers.
+#[derive(Default)]
+struct Recording {
+    /// Whether it hands work to the category `quick` once its system prompt says orchestrator mode is on.
+    leads: bool,
+    /// How many times it handed work on.
+    handed: AtomicUsize,
+    /// The system prompt of every request, with the description and the schema of the `task` tool it offered, in order.
+    seen: Mutex<Vec<Recorded>>,
+}
+
+#[async_trait]
+impl ChatModel for Recording {
+    /// Records the request, then calls `task` with the category `quick` when it leads and has not yet, and answers `done` otherwise.
+    async fn complete(
+        &self,
+        request: Request<'_>,
+        _sink: &mut dyn Sink,
+    ) -> Result<Reply, ProviderError> {
+        let task = request
+            .tools
+            .iter()
+            .find(|tool| tool.name == "task")
+            .map(|tool| (tool.description.clone(), tool.schema.clone()));
+        self.seen
+            .lock()
+            .unwrap()
+            .push((request.system.to_owned(), task));
+        let hands = self.leads
+            && request.system.contains("Orchestrator mode on")
+            && self.handed.fetch_add(1, Ordering::SeqCst) == 0;
+        Ok(if hands {
+            Reply {
+                tool_calls: vec![omc_providers::ToolCall {
+                    id: "call-1".to_owned(),
+                    name: "task".to_owned(),
+                    arguments: serde_json::json!({"task": "rename it", "category": "quick"}),
+                }],
+                ..Reply::default()
+            }
+        } else {
+            Reply {
+                text: "done".to_owned(),
+                ..Reply::default()
+            }
+        })
+    }
+}
+
+/// The values of the `orchestrator` setting the `Settings` events among `events` report, in order.
+fn orchestrator_reported(events: &[Event]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Settings(settings) => settings
+                .iter()
+                .find(|setting| setting.id == "orchestrator")
+                .map(|setting| setting.current.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// With the `orchestrator` setting off the system prompt and the `task` tool say nothing of categories; turning it on makes a new prefix that tells the agent to lead and lists the categories, and a `task` call naming one runs the subagent on the model of that slot with the slot's prompt after its system prompt; turning it off again brings back the prompt and the tool as they were. Each change is reported with a `Settings` event giving the new value.
+#[tokio::test]
+async fn orchestrator_mode_hands_work_to_categories() {
+    let name = "orchestrator";
+    let lead = Arc::new(Recording {
+        leads: true,
+        ..Recording::default()
+    });
+    let worker = Arc::new(Recording::default());
+    let (mut session, mut events, mut finished) = opened(name, lead.clone());
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../build/tests/omc-session/restart")
+        .join(name);
+    let files = crate::slots::SlotFiles {
+        user: Some(directory.join("slots.json")),
+        project: None,
+    };
+    files
+        .set_slot(
+            omc_wire::SlotScope::User,
+            "quick",
+            None,
+            Some("claude/quick-1".into()),
+            Vec::new(),
+        )
+        .unwrap();
+    session.shared.set_slot_files(files);
+    session.shared.open(
+        Provider::Claude,
+        vec!["m".into(), "quick-1".into()],
+        "m".into(),
+        Mode::Yolo,
+    );
+    session
+        .shared
+        .named_models
+        .lock()
+        .unwrap()
+        .insert("quick-1".to_owned(), worker.clone());
+    drain(&mut events);
+    session
+        .handle(Command::DescribeSlot {
+            name: "quick".into(),
+            scope: omc_wire::SlotScope::User,
+            description: None,
+            prompt: Some("Be brief.".into()),
+        })
+        .await;
+    let slots = drain(&mut events)
+        .into_iter()
+        .find_map(|event| match event {
+            Event::Slots(slots) => Some(slots),
+            _ => None,
+        })
+        .expect("no slots were told");
+    let quick = slots.iter().find(|slot| slot.name == "quick").unwrap();
+    assert!(quick.category && !quick.inherited);
+    assert_eq!(quick.prompt.as_deref(), Some("Be brief."));
+    assert!(quick.description.as_deref().unwrap().starts_with("Small,"));
+    session
+        .handle(Command::DescribeSlot {
+            name: "bad name".into(),
+            scope: omc_wire::SlotScope::User,
+            description: Some("x".into()),
+            prompt: None,
+        })
+        .await;
+    assert!(
+        drain(&mut events)
+            .iter()
+            .any(|event| matches!(event, Event::Failed(_)))
+    );
+    session.handle(prompt("hello", "t1")).await;
+    settle(&mut session, &mut finished).await;
+    let off = lead.seen.lock().unwrap()[0].clone();
+    let (off_description, off_schema) = off.1.clone().expect("no task tool was offered");
+    assert!(!off.0.contains("Orchestrator mode") && off.0.contains("No subagents unless"));
+    assert!(!off_description.contains("# Categories"));
+    assert!(off_schema["properties"].get("category").is_none());
+    session
+        .handle(Command::Set {
+            setting: "orchestrator".into(),
+            value: "loud".into(),
+        })
+        .await;
+    assert!(!session.shared.orchestrator());
+    session
+        .handle(Command::Set {
+            setting: "orchestrator".into(),
+            value: "on".into(),
+        })
+        .await;
+    assert!(session.shared.orchestrator());
+    assert_eq!(orchestrator_reported(&drain(&mut events)), ["on"]);
+    session.handle(prompt("rename the thing", "t2")).await;
+    settle(&mut session, &mut finished).await;
+    let on = lead.seen.lock().unwrap()[1].clone();
+    let (on_description, on_schema) = on.1.clone().expect("no task tool was offered");
+    assert!(on.0.contains("Orchestrator mode on. You lead"));
+    assert!(on_description.starts_with(&off_description));
+    assert!(
+        on_description.contains("# Categories") && on_description.contains("- `quick`: Small,")
+    );
+    assert!(!on_description.contains("quick-1"));
+    assert_eq!(on_schema["properties"]["category"]["type"], "string");
+    let worked = worker.seen.lock().unwrap().clone();
+    assert_eq!(worked.len(), 1);
+    assert!(worked[0].0.ends_with("# Category: quick\nBe brief."));
+    assert!(worked[0].1.as_ref().is_none_or(|(description, schema)| {
+        !description.contains("# Categories") && schema["properties"].get("category").is_none()
+    }));
+    assert_eq!(lead.seen.lock().unwrap().len(), 3);
+    session
+        .handle(Command::Set {
+            setting: "orchestrator".into(),
+            value: "off".into(),
+        })
+        .await;
+    assert_eq!(orchestrator_reported(&drain(&mut events)), ["off"]);
+    session.handle(prompt("thanks", "t3")).await;
+    settle(&mut session, &mut finished).await;
+    let again = lead.seen.lock().unwrap()[3].clone();
+    assert_eq!(again, off);
 }

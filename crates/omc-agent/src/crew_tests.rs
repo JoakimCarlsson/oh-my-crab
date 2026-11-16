@@ -42,6 +42,7 @@ fn tools(
     let sink = log.clone();
     let events: Arc<EventSink> = Arc::new(move |event| sink.lock().unwrap().push(event));
     let task = Arc::new(Task::new(TaskSettings {
+        categories: Vec::new(),
         model,
         models: crate::Models::default(),
         registry: Arc::new(Registry::builtin(&dir).unwrap()),

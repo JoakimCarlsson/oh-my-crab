@@ -183,7 +183,7 @@ the plan model cannot be used, the client is told with a `Failed` event and
 A `Settings` event lists what the client can change, with the value each has
 now: `model`, `mode`, `effort` (when the model takes one), `cache` and
 `cache_warming` (when the provider offers them), `memory`, `plan_model`,
-`plan_autosave` and `checkpoints`.
+`plan_autosave`, `orchestrator` and `checkpoints`.
 The client changes one with `Set`, and `crab` answers with a new `Settings`
 event. A new value applies from the next request.
 
@@ -268,8 +268,8 @@ Providers cache the start of a request (the tools, then the system prompt,
 then the messages) only while it stays byte for byte the same. So `crab`
 builds the system prompt and the tool list once per conversation, when its
 first turn starts, and sends them unchanged after that. They are rebuilt only
-when the model changes or the `checkpoints` or `memory` setting is turned on
-or off. The system prompt holds crab's instructions (or the user's or the
+when the model changes or the `checkpoints`, `orchestrator` or `memory`
+setting is turned on or off. The system prompt holds crab's instructions (or the user's or the
 project's `SYSTEM.md` in their place, and any `APPEND_SYSTEM.md` after them;
 see [the system prompt](extending/skills-and-agents.md#the-system-prompt)),
 the instruction files that always apply (`AGENTS.md`, `CLAUDE.md` and the

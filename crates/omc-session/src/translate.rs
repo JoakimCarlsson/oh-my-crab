@@ -408,6 +408,7 @@ fn subagent_of(notice: omc_agent::SubagentNotice) -> omc_wire::Subagent {
         agent: notice.agent,
         label: notice.label,
         model: notice.model,
+        category: notice.category,
         background: notice.background,
         state: match notice.state {
             omc_agent::SubagentState::Running => omc_wire::SubagentState::Running,
@@ -604,7 +605,7 @@ mod tests {
         assert_eq!(deep.agent.as_deref(), Some("scout"));
     }
 
-    /// A subagent's announcement passes through the calls it is nested under, its call id chained as their tool ids are, its own id left as it is.
+    /// A subagent's announcement passes through the calls it is nested under, its call id chained as their tool ids are, its own id, its model and its work category left as they are.
     #[test]
     fn nested_subagent_announcements_chain_their_call() {
         let notice = omc_agent::SubagentNotice {
@@ -612,7 +613,8 @@ mod tests {
             call: "s1".into(),
             agent: "scout".into(),
             label: "look".into(),
-            model: None,
+            model: Some("small-1".into()),
+            category: Some("quick".into()),
             background: false,
             state: omc_agent::SubagentState::Stopped,
         };
@@ -633,6 +635,8 @@ mod tests {
         assert_eq!(subagent.id, "c1/2:s1");
         assert_eq!(subagent.call, "c1:2:s1");
         assert_eq!(subagent.state, omc_wire::SubagentState::Stopped);
+        assert_eq!(subagent.model.as_deref(), Some("small-1"));
+        assert_eq!(subagent.category.as_deref(), Some("quick"));
     }
 
     /// The worktree of an isolated subagent is reported on its call, or on its step of a call, with what became of its changes once it ended.

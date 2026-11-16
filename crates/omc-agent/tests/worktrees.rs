@@ -151,6 +151,7 @@ fn task_tool(
     let sink = log.clone();
     let events: Arc<EventSink> = Arc::new(move |event| sink.lock().unwrap().push(event));
     let task = Task::new(TaskSettings {
+        categories: Vec::new(),
         models: omc_agent::Models::default(),
         nesting: omc_agent::Nesting::default(),
         model,
@@ -178,6 +179,7 @@ fn task_tool_with(
     jobs: Arc<Jobs>,
 ) -> Task {
     Task::new(TaskSettings {
+        categories: Vec::new(),
         models: omc_agent::Models::default(),
         nesting: omc_agent::Nesting::default(),
         model,
@@ -635,6 +637,7 @@ async fn a_subagent_the_reader_stops_has_its_changes_held() {
     let log: Log = Arc::new(Mutex::new(Vec::new()));
     let sink = log.clone();
     let task = Task::new(TaskSettings {
+        categories: Vec::new(),
         models: omc_agent::Models::default(),
         nesting: omc_agent::Nesting::default().with_roster(roster.clone()),
         model: Arc::new(WritesThenHangs),

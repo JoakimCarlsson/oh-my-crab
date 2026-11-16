@@ -206,6 +206,7 @@ The settings crab offers today:
 | `plan_model`    | `plan_model`    | `same`, the provider's models, or any model as `model` or `provider/model` | always            |
 | `plan_autosave` | `plan_autosave` | `on`, `off`                               | always                                     |
 | `snapshots`     | `snapshots`     | `on`, `off`                               | always                                     |
+| `orchestrator`  | `orchestrator`  | `on`, `off`                               | always                                     |
 | `checkpoints`   | `checkpoints`   | `on`, `off`                               | always                                     |
 
 A client should not hard-code this list: show what `Settings` offers. `yolo`
@@ -983,7 +984,9 @@ trusted project is open. Applies from the next request.
 
 Takes one assignment of a slot out of the file of `scope`, the one of
 `provider` or the any-provider one, so that it falls back to the other file,
-the any-provider assignment or the conversation's model. Answered like
+the any-provider assignment or the conversation's model. The slot's
+`description` and `prompt` stay in the file; `DescribeSlot` clears those. The
+slot leaves the file only when nothing is left of it. Answered like
 `SetSlot`.
 
 | Field      | Type        | Presence | Meaning                                                             |
@@ -995,6 +998,31 @@ the any-provider assignment or the conversation's model. Answered like
 ```json
 {"ClearSlot":{"name":"plan","scope":"Project"}}
 {"ClearSlot":{"name":"plan","scope":"User","provider":"claude"}}
+```
+
+### `DescribeSlot`
+
+Sets the description and the prompt of a slot in the file of `scope` to
+exactly what is given: one that is left out or empty is cleared. The slot's
+model, backups and provider assignments are left alone. A slot the file does
+not hold yet is made, and one left with nothing set is taken out of the file.
+The description says what kind of work a
+[category](models-and-slots.md#categories) is for; the prompt is added to the
+system prompt of a subagent started in it. Answered like `SetSlot`, with the
+same `Failed` for a name that is not letters, digits, `-` and `_` or a file
+that cannot be written. Applies from the next turn. Added after the first
+release.
+
+| Field         | Type        | Presence | Meaning                                                              |
+| ------------- | ----------- | -------- | -------------------------------------------------------------------- |
+| `name`        | string      | required | The slot, such as `quick`.                                           |
+| `scope`       | `SlotScope` | default  | `User` (the default), the user's file, or `Project`, the project's.  |
+| `description` | string      | optional | What kind of work the slot is for, in a sentence or two; left out clears it. |
+| `prompt`      | string      | optional | Text for the system prompt of subagents started in it; left out clears it.   |
+
+```json
+{"DescribeSlot":{"name":"quick","scope":"User","description":"Small, well-specified edits.","prompt":"Change only what the assignment names."}}
+{"DescribeSlot":{"name":"quick","scope":"Project"}}
 ```
 
 ### `Presets`
@@ -1251,6 +1279,7 @@ subagents, and once more in another state when it ends. Carries a `Subagent`:
 | `agent`      | string | required | The kind of subagent.                                                     |
 | `label`      | string | required | What it is doing, in a few words.                                         |
 | `model`      | string | optional | The model it asks, when that is known.                                    |
+| `category`   | string | optional | The [work category](models-and-slots.md#categories) it was started in, by `task` or `agent_spawn` in orchestrator mode; `model` is then the model of that category's slot. Left out when it was started without one. Added after the first release; older crabs leave it out. |
 | `background` | bool   | required | Whether it runs in the background.                                        |
 | `state`      | string | required | How it stands, a `SubagentState`.                                         |
 
@@ -1265,7 +1294,12 @@ stopped).
 ```json
 {"Subagent":{"id":"toolu_07/2","call":"toolu_07","agent":"scout","label":"Find the parser","model":"claude-sonnet-4-5","background":false,"state":"Running"}}
 {"Subagent":{"id":"toolu_07/2","call":"toolu_07","agent":"scout","label":"Find the parser","model":"claude-sonnet-4-5","background":false,"state":"Stopped"}}
+{"Subagent":{"id":"toolu_09","call":"toolu_09","agent":"task","label":"Rename the flag","model":"gpt-5-mini","category":"quick","background":false,"state":"Running"}}
 ```
+
+`Subagent` events are sent while the conversation runs and are not kept in its
+journal: a restored conversation replays none, since no subagent of it runs
+any more.
 
 ### `Halted`
 
@@ -1847,9 +1881,11 @@ The models a server offers, in answer to the `FindModels` under `ticket`.
 
 ### `Slots`
 
-The model slots in answer to `Slots`, `SetSlot`, `ClearSlot` and
-`ApplyPreset`: the built-in ones (`main`, `fast`, `plan`, `subagent`,
-`review`, `vision`) first, then the custom ones by name, each a `SlotInfo`.
+The model slots in answer to `Slots`, `SetSlot`, `ClearSlot`, `DescribeSlot`
+and `ApplyPreset`: the job slots (`main`, `fast`, `plan`, `subagent`,
+`review`, `vision`) first, then the built-in categories (`quick`, `deep`,
+`ultrabrain`, `visual`, `writing`), then the custom ones by name, each a
+`SlotInfo`.
 
 | Field       | Type           | Presence | Meaning                                                                                                                         |
 | ----------- | -------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------- |
@@ -1861,9 +1897,12 @@ The model slots in answer to `Slots`, `SetSlot`, `ClearSlot` and
 | `inherited` | bool           | required | Whether it has no model of its own and takes the conversation's. `main` always does.                                           |
 | `suggested` | string         | optional | For a slot that inherits, a model the catalog suggests, as `provider/model`; never applied by crab.                            |
 | `providers` | list of `SlotProvider` | default | One per provider the reader is signed in to, the conversation's, and any provider a file sets an assignment for: its `provider` id, `model` (`null` for none), `backups`, and `suggested`, a model of that provider the catalog suggests when it sets none. Added after the first release; older crabs leave it out. |
+| `description` | string       | optional | What kind of work the slot is for: the project's file's, else the user's, else the built-in category's own. Left out when nothing says. Added after the first release. |
+| `prompt`    | string         | optional | The text added to the system prompt of a subagent started in the slot as a category. Left out when no file sets one. Added after the first release. |
+| `category`  | bool           | default  | Whether the slot is a work category: any slot other than the six job slots. Added after the first release; older crabs leave it out. |
 
 ```json
-{"Slots":[{"name":"main","model":null,"backups":["openai/gpt-5"],"resolved":"claude-opus-4-5","source":"Main","inherited":true,"suggested":null,"providers":[]},{"name":"plan","model":null,"backups":[],"resolved":"claude/opus","source":"User","inherited":false,"suggested":null,"providers":[{"provider":"claude","model":"claude/opus","backups":[],"suggested":null},{"provider":"codex","model":null,"backups":[],"suggested":null}]},{"name":"fast","model":"claude/haiku:low","backups":[],"resolved":"claude/haiku:low","source":"User","inherited":false,"suggested":null},{"name":"vision","model":null,"backups":[],"resolved":"claude-opus-4-5","source":"Main","inherited":true,"suggested":null}]}
+{"Slots":[{"name":"main","model":null,"backups":["openai/gpt-5"],"resolved":"claude-opus-4-5","source":"Main","inherited":true,"suggested":null,"providers":[]},{"name":"plan","model":null,"backups":[],"resolved":"claude/opus","source":"User","inherited":false,"suggested":null,"providers":[{"provider":"claude","model":"claude/opus","backups":[],"suggested":null},{"provider":"codex","model":null,"backups":[],"suggested":null}]},{"name":"fast","model":"claude/haiku:low","backups":[],"resolved":"claude/haiku:low","source":"User","inherited":false,"suggested":null},{"name":"vision","model":null,"backups":[],"resolved":"claude-opus-4-5","source":"Main","inherited":true,"suggested":null},{"name":"quick","model":"claude/haiku","backups":[],"resolved":"claude/haiku","source":"User","inherited":false,"suggested":null,"description":"Small, well-specified changes: single-file edits, renames, typo and config fixes.","prompt":"Change only what the assignment names.","category":true}]}
 ```
 
 ### `Presets`

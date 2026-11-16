@@ -227,6 +227,8 @@ struct SpawnArgs {
     description: Option<String>,
     /// The model it asks.
     model: Option<String>,
+    /// The work category it is handed to, whose slot decides the model it asks.
+    category: Option<String>,
 }
 
 #[async_trait]
@@ -241,9 +243,9 @@ impl Tool for AgentSpawn {
         "Start a long-lived subagent under a name: it works on `prompt` in the background and stays alive with its conversation across turns until agent_kill or the end of the conversation. Get its reply with agent_wait, send it more with agent_send, see all of them with agent_list. For a one-off assignment use `task` instead."
     }
 
-    /// Returns the argument schema.
+    /// Returns the argument schema, which takes `category` only while there are work categories.
     fn schema(&self) -> Value {
-        json!({
+        let mut schema = json!({
             "type": "object",
             "properties": {
                 "name": { "type": "string", "description": "The name it is known by, such as `tester`: letters, digits, `-` and `_`." },
@@ -253,7 +255,11 @@ impl Tool for AgentSpawn {
                 "model": { "type": "string", "description": "The model it asks instead of its kind's or yours." }
             },
             "required": ["name", "prompt"]
-        })
+        });
+        if let Some(category) = crate::task::category_schema(self.task.categories()) {
+            schema["properties"]["category"] = category;
+        }
+        schema
     }
 
     /// Exclusive, since the subagent may change files.
@@ -299,6 +305,7 @@ impl Tool for AgentSpawn {
                 args.prompt.clone(),
                 args.description,
                 args.model,
+                args.category,
             )
             .await?;
         let nesting = self.task.nesting();

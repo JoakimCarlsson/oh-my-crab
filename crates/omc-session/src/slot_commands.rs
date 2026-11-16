@@ -146,6 +146,21 @@ impl Session {
         self.after_slots(changed);
     }
 
+    /// Sets the description and the prompt of the slot `name` in the file of `scope` to `description` and `prompt`, clearing the one that is nothing or empty, and tells the client the slots.
+    pub(super) fn describe_slot(
+        &self,
+        name: &str,
+        scope: SlotScope,
+        description: Option<String>,
+        prompt: Option<String>,
+    ) {
+        let changed =
+            self.shared
+                .slot_files()
+                .describe_slot(scope, name.trim(), description, prompt);
+        self.after_slots(changed);
+    }
+
     /// Saves every slot as it stands, with `effort` or else the conversation's, as the preset `name`, and tells the client the presets.
     pub(super) fn save_preset(&self, name: &str, effort: Option<String>) {
         let effort = effort

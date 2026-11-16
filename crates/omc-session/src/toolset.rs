@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use omc_agent::{
-    Approvals, EventSink, Hooks, Isolation, Models, Nesting, Task, TaskSettings, Throttle,
-    crew_tools,
+    Approvals, Category, EventSink, Hooks, Isolation, Models, Nesting, Task, TaskSettings,
+    Throttle, crew_tools,
 };
 use omc_context::{Discovered, Environment, PromptInput, build_subagent_prompt, subagent_plan};
 use omc_memory::Memories;
@@ -18,6 +18,7 @@ use omc_tools::{
 pub(crate) type PlanSource = dyn Fn() -> Option<Arc<str>> + Send + Sync;
 
 /// What the tools and prompts of a turn are built from.
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct Inputs<'a> {
     /// The built-in tools, tool-server tools and the skill tool.
     pub(crate) base: &'a Registry,
@@ -31,6 +32,8 @@ pub(crate) struct Inputs<'a> {
     pub(crate) model: Arc<dyn ChatModel>,
     /// What that model is called, and how subagents find another by name.
     pub(crate) models: Models,
+    /// The work categories the agent hands assignments to; empty unless orchestrator mode is on.
+    pub(crate) categories: Vec<Category>,
     /// The seats subagents take to run, shared by all of them.
     pub(crate) throttle: Arc<Throttle>,
     /// The subagents running in the conversation, by which the reader stops one.
@@ -148,6 +151,7 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
     let task = Arc::new(Task::new(TaskSettings {
         model: inputs.model.clone(),
         models: inputs.models.clone(),
+        categories: inputs.categories.clone(),
         registry: sub_base,
         approvals: inputs.approvals.clone(),
         events: inputs.events.clone(),
@@ -162,6 +166,7 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
                     tools,
                     plan: false,
                     unnamed: false,
+                    orchestrator: false,
                     tree: &tree,
                 },
                 &agent.prompt,
@@ -303,6 +308,7 @@ mod tests {
             }),
             model: Arc::new(Silent),
             models: Models::default(),
+            categories: Vec::new(),
             throttle: shared.throttle.clone(),
             roster: shared.roster.clone(),
             crew: shared.crew.clone(),
@@ -552,6 +558,7 @@ mod tests {
                 provider: omc_providers::Provider::Claude,
                 model: "m".into(),
                 checkpoints: false,
+                orchestrator: false,
                 memory: false,
             },
             &tools,
@@ -588,6 +595,43 @@ mod tests {
             )
             .await;
         assert!(!matches!(ran, Err(omc_tools::ToolError::Unknown(_))));
+    }
+
+    /// Without categories `task` and `agent_spawn` take no `category`; with them both do, in both modes, and the description of `task` lists them.
+    #[test]
+    fn categories_reach_the_subagent_tools() {
+        let (off, on) = with_inputs(&[], None, None, |inputs| {
+            let mut leading = inputs.clone();
+            leading.categories = vec![Category {
+                name: "quick".to_owned(),
+                description: "Small edits.".to_owned(),
+                prompt: None,
+                backups: Vec::new(),
+            }];
+            (Toolset::build(inputs), Toolset::build(&leading))
+        });
+        for plan in [false, true] {
+            for name in ["task", "agent_spawn"] {
+                let takes = |tools: &Toolset| {
+                    tools.tools(plan).get(name).unwrap().schema()["properties"]
+                        .get("category")
+                        .is_some()
+                };
+                assert!(!takes(&off) && takes(&on), "{name}");
+            }
+            let described = |tools: &Toolset| {
+                let task = tools.tools(plan).get("task").unwrap();
+                task.description().contains("# Categories")
+            };
+            assert!(!described(&off) && described(&on));
+            assert!(
+                on.tools(plan)
+                    .get("task")
+                    .unwrap()
+                    .description()
+                    .ends_with("- `quick`: Small edits.")
+            );
+        }
     }
 
     /// A tool the client denied is kept from subagents as well as from the agent, in both modes.

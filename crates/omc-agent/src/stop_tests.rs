@@ -56,6 +56,7 @@ fn tool(
     let mut agents = builtin_agents();
     agents[1].tools.as_mut().unwrap().push("task".into());
     let task = Task::new(TaskSettings {
+        categories: Vec::new(),
         model,
         models: crate::Models::default(),
         registry: Arc::new(Registry::builtin(&dir).unwrap()),

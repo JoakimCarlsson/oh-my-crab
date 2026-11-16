@@ -22,7 +22,7 @@ use crate::toolset::Toolset;
 /// Says whether plan mode is on now.
 pub(crate) type Planning = Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// What a prefix is made for. A new prefix is made when any of it changes: a new model has no cache to keep, and turning the checkpoint tools or memory on or off is the reader's choice to change the tools.
+/// What a prefix is made for. A new prefix is made when any of it changes: a new model has no cache to keep, and turning the checkpoint tools, orchestrator mode or memory on or off is the reader's choice to change the tools.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Key {
     /// The provider that serves the model.
@@ -31,6 +31,8 @@ pub(crate) struct Key {
     pub(crate) model: String,
     /// Whether the agent has the checkpoint and rewind tools.
     pub(crate) checkpoints: bool,
+    /// Whether orchestrator mode is on, which changes the system prompt and what the `task` and `agent_spawn` tools take.
+    pub(crate) orchestrator: bool,
     /// Whether the agent has its memory.
     pub(crate) memory: bool,
 }
@@ -61,7 +63,7 @@ pub(crate) struct Prefix {
 }
 
 impl Prefix {
-    /// Makes the prefix for `key` from `toolset`: every tool of either mode, described as it is now, with `recall` among them although the agent only answers it once the history has been pruned or compacted, and a system prompt for that tool list outside plan mode, describing `environment`, the working directory outline `tree` and `discovered`, which asks the agent to name the conversation when it is `unnamed`.
+    /// Makes the prefix for `key` from `toolset`: every tool of either mode, described as it is now, with `recall` among them although the agent only answers it once the history has been pruned or compacted, and a system prompt for that tool list outside plan mode, describing `environment`, the working directory outline `tree` and `discovered`, which asks the agent to name the conversation when it is `unnamed` and to lead by work category when the key says orchestrator mode is on.
     pub(crate) fn freeze(
         key: Key,
         toolset: &Toolset,
@@ -109,6 +111,7 @@ impl Prefix {
             tools: &names,
             plan: false,
             unnamed,
+            orchestrator: key.orchestrator,
             tree,
         });
         Self {

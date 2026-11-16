@@ -26,7 +26,8 @@ conversation with no slots set behaves as if slots did not exist. Crab does
 not name conversations with a model, so no slot is used for titles.
 
 Users may add slots of their own, named with letters, digits, `-` and `_`,
-and use them anywhere a model is named, such as in an agent definition.
+and use them anywhere a model is named, such as in an agent definition. Every
+slot other than the six above is a [category](#categories).
 
 ## Selectors
 
@@ -98,10 +99,71 @@ written before slots had providers read as they are. `providers` holds the
 assignment of each provider by id.
 
 A `main` model in a file is the model a conversation opened without one
-starts with. A client changes the files with the `SetSlot` and `ClearSlot`
-commands, giving a `provider` to change one provider's assignment, and reads
+starts with. A client changes the files with the `SetSlot`, `ClearSlot` and
+`DescribeSlot` commands, giving a `provider` to change one provider's
+assignment, and reads
 every slot, each provider's assignment, the model it resolves to and where
 that comes from with `Slots`.
+
+## Categories
+
+A **category** is a kind of work: every slot other than the six job slots
+above. It holds a model like any slot, and two things more:
+
+- `description`: what kind of work it is for, in a sentence or two;
+- `prompt`: text added to the system prompt of a subagent started in it,
+  under a heading naming the category.
+
+Crab comes with five categories. None sets a model, so each asks the
+conversation's model until a file gives it one:
+
+| Category     | What it is for                                                                      |
+| ------------ | ----------------------------------------------------------------------------------- |
+| `quick`      | Small, well-specified changes: single-file edits, renames, typo and config fixes.   |
+| `deep`       | Multi-step implementation and debugging that needs careful reasoning across files.  |
+| `ultrabrain` | The hardest problems: architecture decisions, subtle bugs, correctness arguments.   |
+| `visual`     | User interface, layout, styling and other design-sensitive work.                    |
+| `writing`    | Documentation, prose, comments and release notes.                                   |
+
+They are always there, in `Slots` and as `@quick` and the like, whether or
+not a file names them. An entry of the same name in `slots.json` gives one a
+model, another description or a prompt, each on its own: what the entry
+leaves out stays as it was. A slot of any other name is a category of the
+user's own.
+
+```json
+{
+  "slots": {
+    "quick": { "model": "claude/haiku:low", "backups": ["openai/gpt-5-mini"] },
+    "ultrabrain": {
+      "model": "claude/opus:max",
+      "prompt": "State your assumptions and argue why the result is correct."
+    },
+    "migrations": {
+      "model": "claude/sonnet",
+      "description": "Database schema changes and data migrations.",
+      "prompt": "Every migration needs a way back."
+    }
+  }
+}
+```
+
+`description` and `prompt` belong to the slot, not to one provider's
+assignment. The project's file wins over the user's for each of the two on
+its own. The `DescribeSlot` command sets both in one file, clearing the one
+it leaves out; `SetSlot` and `ClearSlot` leave them alone, and presets keep
+and apply them with the rest of the slot.
+
+The agent is offered the categories only in **orchestrator mode**, the
+`orchestrator` setting, which is off by default. With it on, the main agent
+leads: it plans, hands the work to subagents by naming a `category` in `task`
+and `agent_spawn` instead of a model, checks what comes back, and answers.
+The `task` tool lists every category with its description, the built-in ones
+first and then the user's by name, and names no models; crab runs the
+subagent on the category's model, with the category's backups and prompt.
+See [Subagents](tools/subagents.md#categories). With the setting off nothing
+about a conversation changes, and `@name` still names a category's model
+anywhere a model is named, as for any slot.
 
 ## Backups
 
@@ -115,7 +177,8 @@ turn starts with the slot's own model again. Sign-in failures, refused or
 malformed requests and context overflows never move to a backup.
 
 Backups are tried for the conversation's turns, under `main`, or `plan` while
-the plan model plans, and for subagents whose model came from `subagent`.
+the plan model plans, for subagents whose model came from `subagent`, and
+for subagents started in a category, under the category's name.
 
 ## Presets
 

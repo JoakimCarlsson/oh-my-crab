@@ -48,7 +48,7 @@ NEVER open guessed files.{{#if has_glob}} Read `glob` hits only.{{/if}}{{#if has
 
 {{#if has_task}}
 # Delegation
-No subagents unless user or applicable instruction file/skill explicitly requests subagents, delegation, or parallel agent work, or the work is a broad read-only investigation that would flood your context.
+{{#if orchestrator}}{{orchestrator}}{{else}}No subagents unless user or applicable instruction file/skill explicitly requests subagents, delegation, or parallel agent work, or the work is a broad read-only investigation that would flood your context.{{/if}}
 - Fan genuine slices out in one `task` call with `tasks`. NEVER pad, serialize independent work, or spawn then idle.
 - Need data back (findings to merge, lists to act on) → give `output_schema`; you get checked JSON, not prose.
 - Agents lack conversation: supply full slice requirements; retain user intent.
