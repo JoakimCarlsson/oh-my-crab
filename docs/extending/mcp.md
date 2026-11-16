@@ -191,8 +191,10 @@ tool. `crab tools` prints only crab's own tools.
 
 Arguments are put right against the tool's schema before the call, as for
 crab's own tools (see [How tool calls run](../tools/calls.md)). The result is
-the `text` parts of the server's answer joined by newlines; images and other
-kinds of content are dropped. When the server marks the result `isError`, or
+the `text` parts of the server's answer joined by newlines, and its images
+are handed to the model, shrunk as `read` shrinks them; an image that cannot
+be handed on leaves an `[image dropped: <reason>]` line instead. Other kinds
+of content are dropped. When the server marks the result `isError`, or
 answers with a JSON-RPC error, the call fails and the model reads the text or
 the error's message as the failure.
 
