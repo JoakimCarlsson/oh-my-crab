@@ -431,9 +431,9 @@ fn stop_git_above(ceiling: &Path) {
     unsafe { std::env::set_var("GIT_CEILING_DIRECTORIES", ceiling) };
 }
 
-/// Asking for isolation outside a git repository starts nothing and says why, and so does asking where isolation is not available; without asking, a kind whose definition works isolated is refused too, unless the call says otherwise.
+/// Asking for isolation outside a git repository where no copy can be made runs the subagent in the working tree instead, its result saying that isolation was unavailable and why, and so does a kind whose definition works isolated; asking where isolation is not available at all starts nothing and says why.
 #[tokio::test]
-async fn isolation_outside_a_repository_is_refused() {
+async fn isolation_outside_a_repository_falls_back() {
     let plain = scratch("isolated-plain");
     stop_git_above(plain.parent().unwrap());
     let bench = Bench {
@@ -461,23 +461,28 @@ async fn isolation_outside_a_repository_is_refused() {
         agents.clone(),
         Some(isolation(&plain, &bench, Backend::Worktree)),
     );
-    let refused = task
+    let fell_back = task
         .call_as("t1", json!({"task": "x", "isolated": true}))
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap()
+        .text;
+    assert!(fell_back.starts_with("worked\n\n"), "{fell_back}");
     assert!(
-        refused.contains("is not in a git working tree"),
-        "{refused}"
+        fell_back.contains("Isolation was unavailable"),
+        "{fell_back}"
+    );
+    assert!(
+        fell_back.contains("is not in a git working tree"),
+        "{fell_back}"
     );
     let by_definition = task
         .call_as("t2", json!({"task": "x", "agent": "fixer"}))
         .await
-        .unwrap_err()
-        .to_string();
-    assert!(by_definition.contains("is not in a git working tree"));
-    assert!(model.seen.lock().unwrap().is_empty());
-    assert!(log.lock().unwrap().is_empty());
+        .unwrap()
+        .text;
+    assert!(by_definition.contains("Isolation was unavailable"));
+    assert_eq!(model.seen.lock().unwrap().len(), 2);
+    assert!(!log.lock().unwrap().is_empty());
     let shared = task
         .call_as(
             "t3",
@@ -958,7 +963,7 @@ async fn a_cloned_subagent_outside_a_repository_hands_its_edits_back() {
     assert!(tool_outputs(&log)[0].contains("noise"));
 }
 
-/// Outside a repository, `worktree` refuses isolation as before, while `cow` clones.
+/// Outside a repository, `worktree` makes no copy and runs the subagent in the folder with a note saying so, while `cow` clones.
 #[tokio::test]
 async fn outside_a_repository_only_clones_isolate() {
     if !clones_here("plain-backends-probe") {
@@ -972,14 +977,15 @@ async fn outside_a_repository_only_clones_isolate() {
         builtin_agents(),
         Some(isolation(&bench.linked, &bench, Backend::Worktree)),
     );
-    let refused = task
+    let fell_back = task
         .call_as("t1", json!({"task": "x", "isolated": true}))
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap()
+        .text;
     assert!(
-        refused.contains("is not in a git working tree"),
-        "{refused}"
+        fell_back.contains("Isolation was unavailable")
+            && fell_back.contains("is not in a git working tree"),
+        "{fell_back}"
     );
     let (task, _) = task_tool(
         &bench.linked,

@@ -48,12 +48,41 @@ Not every subagent is kept:
 - one that can change files, while its follow-up comes in plan mode: the call
   is refused, and the subagent stays kept for later.
 
-A conversation keeps at most 32 finished subagents, each for 30 minutes after
+A conversation keeps at most 64 finished subagents, each for 6 hours after
 it last finished; when there are more, the one kept longest goes. The finished
 subagents a subagent started itself are its own to continue, under its `task`
-tool, and go when it does. Kept subagents live in the `crab` process only: a
-conversation that is reopened has none, and a `continue` naming a handle that
-is gone fails with advice to start a new subagent with a full assignment.
+tool, and go when it does. A result names a handle only when the subagent is
+really kept. Kept subagents live in the `crab` process only: a conversation
+that is reopened has none. A `continue` naming a handle that is gone fails,
+saying why: it was evicted to make room, it expired, the subagent that started
+it went, it was isolated, it returned structured output, it failed, it was
+stopped, a follow-up to it runs now, it is not one the caller started, or no
+subagent got that handle since `crab` opened the conversation; the error
+advises starting a new subagent with a full assignment.
+
+## Cost and budget
+
+What a subagent costs is counted per subagent, at the list prices the
+conversation's own totals use: its own model requests, those of the subagents
+it started, which count toward it as well as toward themselves, across every
+follow-up it runs. The conversation's totals are unchanged by this and count
+each request once. When a model it asked has known prices, its result ends
+with one line saying what it cost, such as `(Subagent cost: $0.42.)`, or
+`(Subagent cost: $0.10 this run, $0.52 in all.)` after a follow-up; with no
+known prices there is no line. A client sees the cost so far in the `spent`
+field of the `Subagent` events, sent again each time a request is answered
+(see the [wire protocol](../wire-protocol.md#subagent)).
+
+The `subagent_budget` setting caps what one subagent run may spend, in US
+dollars: a run started by `task`, or a follow-up sent with `continue`, which
+starts its own count, and what the subagents it starts spend counts toward it.
+It is `off` by default, and a client sets it with the `Set` command, as
+`{"Set":{"setting":"subagent_budget","value":"5"}}`. Once a run has spent more,
+it is stopped after the step it is in, when the batch of tool calls running
+has finished, without asking its model again; its result is what it said last
+and a `# Budget` section saying the budget stopped it and what it spent. It
+counts as finished, so it is kept for a follow-up. Requests to models whose
+prices are not known never count toward the budget.
 
 ## Models
 
@@ -281,8 +310,11 @@ it; otherwise none is applied, and they are saved in the conversation's output
 folder as a unified diff, which `git apply` and `patch -p1` read, with the
 files that conflict named, just as a patch that does not apply is inside a
 repository. Where clones cannot be made, or with `OMC_ISOLATION=worktree`, a
-call asking for isolation outside a repository is refused with the reason and
-starts nothing, rather than running the subagents unisolated.
+subagent asking for isolation outside a repository is not refused: it runs
+without a copy of its own, in the working tree of the agent that started it,
+and its result ends with an `# Isolation` section saying that isolation was
+unavailable and why. Its changes are then already in that working tree, and
+subagents running at the same time may touch the same files.
 
 ### Nesting
 

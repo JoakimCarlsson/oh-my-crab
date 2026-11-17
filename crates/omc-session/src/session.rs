@@ -26,7 +26,7 @@ use crate::permissions::{self, FileKeeper, PermissionsFile};
 use crate::prompt::compose;
 use crate::settings::{
     CACHE, CHECKPOINTS, EFFORT, MEMORY, MODE, MODEL, Mode, OFF, ON, ORCHESTRATOR, PLAN_AUTOSAVE,
-    PLAN_MODEL, SNAPSHOTS, WARMING, parse_retention,
+    PLAN_MODEL, SNAPSHOTS, SUBAGENT_BUDGET, WARMING, parse_budget, parse_retention,
 };
 use crate::shared::Shared;
 use crate::snapshots::{End, Snapshots};
@@ -217,6 +217,9 @@ const END_RESUME: &str = "resume";
 
 /// Why a conversation ended, as `SessionEnd` hooks are told it, when a new conversation was opened in its place.
 const END_CLEAR: &str = "clear";
+
+/// Added to the reason a turn failed when its prompt stayed in the conversation, so the reader knows it need not be written again.
+const KEPT_PROMPT: &str = "; the prompt is kept in the conversation: send /retry to try it again, or send a new prompt and the model sees both";
 
 impl Session {
     /// Carries out one command; any command means the reader is there, so crab is no longer waiting to tell the hooks it is idle.
@@ -1081,7 +1084,7 @@ impl Session {
         self.shared.approvals.set_keeper(keeper);
     }
 
-    /// Takes in the end of turn `number`; a turn that was cancelled meanwhile is ignored. A turn that crashed has its saved history settled as a stopped turn's is, since it never cut it back itself, then ends as a failed one does.
+    /// Takes in the end of turn `number`; a turn that was cancelled meanwhile is ignored. A turn that crashed has its saved history settled as a stopped turn's is, since it never cut it back itself, then ends as a failed one does. A turn that failed in a way that passes with time keeps its prompt in the conversation, unanswered, and the client is told so after the reason, with [`KEPT_PROMPT`].
     ///
     /// A turn that answered is followed by a turn for the prompt that has waited longest for it, when one still waits; the others wait for that turn. When the turn failed or needs signing in again, the prompts waiting are dropped instead, and its last request, which a failed turn's history no longer ends with, is no longer kept warm. When no turn follows, crab starts waiting to tell the hooks it is idle.
     fn finish(&mut self, number: u64, how: Ended) {
@@ -1108,6 +1111,14 @@ impl Session {
                     reason,
                     account: None,
                 });
+                self.drop_queue();
+            }
+            Ended::Unanswered(reason, history) => {
+                self.pause_goal(&format!("the turn failed: {reason}"));
+                self.shared.warmer.stop();
+                self.shared.checkpoint.clear();
+                self.history = history;
+                self.say(Event::Finished(Some(format!("{reason}{KEPT_PROMPT}"))));
                 self.drop_queue();
             }
             Ended::Failed(reason) => {
@@ -1444,6 +1455,10 @@ impl Session {
                 }
                 _ => false,
             },
+            SUBAGENT_BUDGET => parse_budget(value).is_some_and(|budget| {
+                self.shared.roster.set_budget(budget);
+                true
+            }),
             ORCHESTRATOR => match value {
                 ON | OFF => {
                     self.shared.set_orchestrator(value == ON);
@@ -3102,9 +3117,28 @@ mod tests {
         session.finish(1, Ended::Crashed("the turn crashed: boom".into()));
         let saved = Journal::read(&path).unwrap().history;
         assert_eq!(saved, session.history);
-        assert!(saved.iter().all(|message| !matches!(
+        for (at, message) in saved.iter().enumerate() {
+            let Message::Assistant(reply) = message else {
+                continue;
+            };
+            if reply.tool_calls.is_empty() {
+                continue;
+            }
+            let Some(Message::ToolResults(results)) = saved.get(at + 1) else {
+                panic!("the calls at {at} have no results");
+            };
+            for call in &reply.tool_calls {
+                let result = results
+                    .iter()
+                    .find(|result| result.call_id == call.id)
+                    .unwrap_or_else(|| panic!("the call {} has no result", call.id));
+                assert!(result.is_error);
+                assert!(result.text.contains("the turn failed"), "{}", result.text);
+            }
+        }
+        assert!(saved.iter().any(|message| matches!(
             message,
-            Message::Assistant(reply) if !reply.tool_calls.is_empty()
+            Message::Assistant(reply) if reply.tool_calls.iter().any(|call| call.id == "t1")
         )));
         let told: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
         assert_eq!(

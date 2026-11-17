@@ -128,6 +128,11 @@ minutes and runs without prompts.
 
 When `gh` is not installed the error says where to get it; when it is not
 signed in, the error says to run `gh auth login` or set `GH_TOKEN`.
+When the working directory is not inside a git repository, such as a folder
+holding several repositories side by side, the error says to pass `repo` (and
+`run` for `run_watch`, which has no current branch then) or to run from inside
+a repository, and names the git repositories directly under the working
+directory. It never picks one of them by itself.
 
 Every call asks first outside yolo mode. "Always allow" covers the actions
 that only look, under one scope; `pr_checkout`, which changes the working

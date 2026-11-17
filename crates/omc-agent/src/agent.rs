@@ -28,6 +28,7 @@ use crate::pruning;
 use crate::recall::{self, RECALL};
 use crate::recovery::{self, MAX_CUT_CALLS, MAX_RECOVERIES, Retry};
 use crate::shake;
+use crate::stall;
 use crate::steering::{self, Steering};
 use crate::text_calls;
 use crate::todos::TodoTracker;
@@ -127,6 +128,13 @@ pub enum AgentError {
         "the model's replies kept running into the output limit before their tool calls were complete"
     )]
     OutputLimit,
+}
+
+impl AgentError {
+    /// Whether a turn that failed with this error keeps what it added to the history, its prompt first: so it does when a model request kept failing in a way that passes with time, such as a rate limit or an overloaded provider, until its retries were used up or the provider asked for a longer wait than is waited for. The prompt then stays in the conversation, unanswered, for the next turn, a retry or a resume to carry, rather than being dropped and having to be written again.
+    pub fn keeps_history(&self) -> bool {
+        matches!(self, AgentError::Provider(error) if error.is_transient())
+    }
 }
 
 /// The tools and system prompt to use for the next request, when they can change while a turn runs.
@@ -239,7 +247,9 @@ fn rewind(history: &mut Vec<Message>, length: usize, report: &str, scribe: Optio
 /// Tools that need approval run only when `approvals` allows the call; a denied
 /// call is answered to the model with an error result. New messages are appended to `history`. When the turn fails, `history` is
 /// restored to what it was before the call, so it never holds a tool call
-/// without its result. Tool failures are not errors here: they are sent to the
+/// without its result; unless the failure is one that passes with time, as
+/// [`AgentError::keeps_history`] says, when the prompt and the steps finished
+/// stay, so the prompt is not lost. Tool failures are not errors here: they are sent to the
 /// model as results. `events` observes streamed text and tool activity.
 ///
 /// A request that fails in a way that is likely to pass, such as an overloaded
@@ -281,7 +291,7 @@ pub async fn run_turn(
 
 /// Runs a turn like [`run_turn`], and appends what is added to `history` to `scribe`'s journal as it happens: the prompt, each model reply and each batch of tool results.
 ///
-/// When the turn fails, the journal is cut back to the history before the turn, or to the notes message when the turn started a fresh context window. The checkpoint, when there is one, is forgotten when the turn ends. The journal is synced when the turn ends. A journal that cannot be written to is reported on standard error and does not stop the turn.
+/// When the turn fails, the journal is cut back to the history before the turn, or to the notes message when the turn started a fresh context window, and the turn is recorded as lost; a failure that [`AgentError::keeps_history`] cuts nothing back and loses nothing, so the prompt stays saved, unanswered. The checkpoint, when there is one, is forgotten when the turn ends. The journal is synced when the turn ends. A journal that cannot be written to is reported on standard error and does not stop the turn.
 ///
 /// # Errors
 ///
@@ -347,6 +357,8 @@ pub async fn resume_turn(
 
 /// Drives a turn whose messages from `start` on are in `history` and saved already, until the model stops calling tools, then settles `history` and the journal of `scribe` as [`run_turn_steered`] describes; `resets` is how many times the notebook had started a fresh context window when the turn began.
 ///
+/// A turn that fails with an error that [`AgentError::keeps_history`] is not cut back: its prompt and every step it finished stay in `history` and in the journal, and the turn is not recorded as lost.
+///
 /// # Errors
 ///
 /// Same as [`run_turn`].
@@ -373,7 +385,7 @@ async fn carry_on(
         }
         (result, _) => result,
     };
-    if result.is_err() {
+    if result.as_ref().is_err_and(|error| !error.keeps_history()) {
         let keep = if context.notebook.map_or(0, Notebook::resets) == resets {
             start
         } else {
@@ -546,6 +558,8 @@ fn append_notice(results: &mut [ToolResult], notice: &str) {
 ///
 /// A reply without tool calls whose text holds a call written out as text is never run; it is followed up once a turn with a notice telling the model to make the call if it meant to.
 ///
+/// A finished reply without tool calls whose last sentences announce work the agent is about to do, such as "Launching the fixers now", is followed up once a turn with a notice telling the model to do it now or say what blocks it; a reply that asks the user something, offers something or reports finished work is not.
+///
 /// A follow-up keeps the finished answer in the history and sends its notice with the next request only; the model's next reply is kept as a reply of its own, and an empty one ends the turn.
 ///
 /// When the provider refuses a request while the history holds images, the
@@ -571,6 +585,7 @@ async fn drive(
     let mut recoveries = 0;
     let mut cut_calls = 0;
     let mut written_noticed = false;
+    let mut stall_noticed = false;
     let mut following_up = false;
     let mut notice: Option<Cow<'static, str>> = None;
     let mut cut: Option<Reply> = None;
@@ -688,7 +703,12 @@ async fn drive(
             return Err(AgentError::OutputLimit);
         }
         let follow_up = if calls.is_empty() {
-            match follow_up(&reply, registry, &mut written_noticed, &mut todos) {
+            match follow_up(
+                &reply,
+                registry,
+                (&mut written_noticed, &mut stall_noticed),
+                &mut todos,
+            ) {
                 Some(notice) => Some(notice),
                 None if reply.stop != Stop::Length => stops.next(context.hooks, &said).await,
                 None => None,
@@ -739,6 +759,7 @@ async fn drive(
             history,
             &calls,
             &capture,
+            scribe,
         )
         .await;
         if let Some(hooks) = context.hooks {
@@ -755,6 +776,11 @@ async fn drive(
                 &mut results,
                 &with_note(String::new(), &format!("A hook stopped the turn: {reason}")),
             );
+            history.push(Message::ToolResults(results));
+            record(scribe, &history[history.len() - 1]);
+            return Ok(());
+        }
+        if steering.is_some_and(|steering| steering.halted()) {
             history.push(Message::ToolResults(results));
             record(scribe, &history[history.len() - 1]);
             return Ok(());
@@ -812,18 +838,23 @@ async fn drive(
     }
 }
 
-/// The notice to follow up `answer`, a reply without tool calls that would end the turn, with: that it wrote a call of a tool in `registry` out as text, when it did and the model was not yet told so this turn, which `written_noticed` keeps; otherwise, for a finished answer, that the list `todos` tracks still has open items, once a turn. Nothing when the turn is to end.
+/// The notice to follow up `answer`, a reply without tool calls that would end the turn, with: that it wrote a call of a tool in `registry` out as text, when it did and the model was not yet told so this turn; otherwise that it announced work it is about to do and made no call, when the model was not yet told so this turn; otherwise, for a finished answer, that the list `todos` tracks still has open items, once a turn. `noticed` keeps whether the model was told of a written call and of an announcement this turn, so that neither notice is sent twice and a model that keeps announcing cannot keep the turn going. Nothing when the turn is to end.
 fn follow_up(
     answer: &Reply,
     registry: &Registry,
-    written_noticed: &mut bool,
+    noticed: (&mut bool, &mut bool),
     todos: &mut TodoTracker,
 ) -> Option<String> {
+    let (written_noticed, stall_noticed) = noticed;
     if !*written_noticed
         && let Some(written) = text_calls::notice(answer, &|name| registry.get(name).is_some())
     {
         *written_noticed = true;
         return Some(written);
+    }
+    if !*stall_noticed && let Some(stalled) = stall::notice(answer) {
+        *stall_noticed = true;
+        return Some(stalled.to_owned());
     }
     (answer.stop == Stop::Finished)
         .then(|| todos.finishing(answer))
@@ -1068,6 +1099,8 @@ fn tool_specs(registry: &Registry) -> Vec<ToolSpec> {
 /// call once more, after it ran, and may add a note to its result or replace it.
 ///
 /// A tool that runs other tools, such as `script`, runs them through a [`Nested`] caller, so that each of its calls goes through the same steps and is reported under it.
+///
+/// The journal of `scribe`, when there is one, is told when each call starts running and how each call ended, so that a turn stopped in the middle of the batch can tell the model which of its calls finished, which were running and which never started.
 async fn run_calls(
     registry: &Registry,
     approvals: &Approvals,
@@ -1075,6 +1108,7 @@ async fn run_calls(
     history: &[Message],
     calls: &[ToolCall],
     events: &(dyn Fn(AgentEvent) + Send + Sync),
+    scribe: Option<&Scribe>,
 ) -> (Vec<ToolResult>, Option<String>) {
     let gate = tokio::sync::RwLock::new(());
     let halt = std::sync::Mutex::new(None);
@@ -1119,11 +1153,16 @@ async fn run_calls(
             }
         }
     }
+    if let Some(scribe) = scribe {
+        for result in slots.iter().flatten() {
+            scribe.ran(result);
+        }
+    }
     for wave in waves(admitted) {
         let indices: Vec<usize> = wave.iter().map(|(index, _)| *index).collect();
         let done = join_all(
             wave.into_iter()
-                .map(|(index, ready)| batch.run_call(&calls[index], ready)),
+                .map(|(index, ready)| batch.run_noted(&calls[index], ready, scribe)),
         )
         .await;
         for (index, result) in indices.into_iter().zip(done) {
@@ -1321,6 +1360,23 @@ impl Batch<'_> {
         }
         let mut result = finish(call, done.text, done.is_error, done.changes, self.events);
         result.images = done.images.into_iter().map(image).collect();
+        result
+    }
+
+    /// Runs `call`, admitted as `ready`, like [`Batch::run_call`], telling the journal of `scribe`, when there is one, that the call started running and then how it ended.
+    async fn run_noted(
+        &self,
+        call: &ToolCall,
+        ready: Ready<'_>,
+        scribe: Option<&Scribe>,
+    ) -> ToolResult {
+        if let Some(scribe) = scribe {
+            scribe.began(&call.id);
+        }
+        let result = self.run_call(call, ready).await;
+        if let Some(scribe) = scribe {
+            scribe.ran(&result);
+        }
         result
     }
 

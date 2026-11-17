@@ -410,6 +410,7 @@ impl Shared {
                 effort: state.effort,
                 checkpoints: state.checkpoints,
                 orchestrator: state.orchestrator,
+                subagent_budget: self.roster.budget(),
                 snapshots: state.snapshots,
                 retention: omc_providers::cache_ttl(provider, &state.model, Retention::Long)
                     .map(|_| state.retention),

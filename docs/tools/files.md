@@ -1,5 +1,16 @@
 # Reading files
 
+## Where file tools reach
+
+The tools that read, write and search files take paths inside the working
+directory, or inside the user's scratch directory: `scratch` under the user's
+cache directory, which is `$XDG_CACHE_HOME/scratch` or `~/.cache/scratch` on
+Linux. Both are checked the same way: `.` and `..` are folded away and
+symbolic links followed as far as the path exists, so a link or a `..` that
+leads out of both is refused. Every other path is refused with an error that
+names the two places, and `read` may also open the files that hold the whole
+of a cut tool output. Approval works as it does for any other path.
+
 ## Reading code
 
 `read` of a code file without a line selector returns an outline instead of

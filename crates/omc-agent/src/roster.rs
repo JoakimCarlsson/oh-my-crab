@@ -2,7 +2,7 @@
 //!
 //! A subagent is announced with an [`AgentEvent::Subagent`] when it starts and again when it ends. Stopping one stops the subagents it started too, since their ids begin with its own.
 //!
-//! A finished subagent is kept with its conversation until a follow-up takes it, it grows older than the roster allows, or more are kept than the roster allows, when the one kept longest goes; the finished subagents it started itself go with it.
+//! A finished subagent is kept with its conversation until a follow-up takes it, it grows older than the roster allows, or more are kept than the roster allows, when the one kept longest goes; the finished subagents it started itself go with it. The roster remembers why each handle it gave out is not kept, so that a follow-up to one that is gone is told why.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -14,10 +14,58 @@ use crate::AgentEvent;
 use crate::task::{EventSink, Run};
 
 /// How many finished subagents a conversation keeps for follow-ups by default.
-pub const KEPT_MOST: usize = 32;
+pub const KEPT_MOST: usize = 64;
 
-/// How long a finished subagent is kept for follow-ups by default.
-pub const KEPT_FOR: Duration = Duration::from_secs(30 * 60);
+/// How long a finished subagent is kept for follow-ups by default, after it last finished.
+pub const KEPT_FOR: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Why a subagent that was given a handle is not kept for follow-ups under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Fate {
+    /// More finished subagents were kept than the roster allows, and it was the one kept longest.
+    Evicted,
+    /// It was kept longer than the roster allows after it last finished.
+    Expired,
+    /// The subagent with this handle, which started it, went, and it went along.
+    WentWith(String),
+    /// It worked in a worktree of its own, which was removed when it ended.
+    Isolated,
+    /// It handed back a structured result.
+    Structured,
+    /// It ended with an error.
+    Failed,
+    /// It was stopped before it ended.
+    Stopped,
+    /// A follow-up to it runs now.
+    Busy,
+}
+
+impl Fate {
+    /// Says why the subagent is not kept, in words for the agent that asked for it; `most` and `age` are the roster's limits.
+    fn reason(&self, most: usize, age: Duration) -> String {
+        match self {
+            Self::Evicted => format!(
+                "it was evicted to make room: a conversation keeps at most {most} finished subagents, and it had been kept longest"
+            ),
+            Self::Expired => format!(
+                "it expired: finished subagents are kept for {} minutes after they last finish",
+                age.as_secs() / 60
+            ),
+            Self::WentWith(keeper) => {
+                format!("the subagent {keeper} that started it is no longer kept, and it went with it")
+            }
+            Self::Isolated => {
+                "it was isolated: it worked in a worktree of its own, which was removed when it ended, so it is never kept".to_owned()
+            }
+            Self::Structured => {
+                "it returned structured output, so that its result stays the data it handed back; such subagents are never kept".to_owned()
+            }
+            Self::Failed => "it failed, which ends a subagent for good".to_owned(),
+            Self::Stopped => "it was stopped before it finished, which ends a subagent for good".to_owned(),
+            Self::Busy => "a follow-up to it runs now; wait for that one to end".to_owned(),
+        }
+    }
+}
 
 /// How a subagent stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +99,8 @@ pub struct SubagentNotice {
     pub background: bool,
     /// How it stands.
     pub state: SubagentState,
+    /// What it has cost so far, its own requests and those of the subagents it started, across its follow-ups; none before its first answered request.
+    pub spent: Option<omc_wire::SubagentSpend>,
 }
 
 /// One running subagent: its id, and the switch that stops it.
@@ -82,20 +132,25 @@ struct Inner {
     handles: u64,
     /// The finished subagents kept for follow-ups, by handle.
     retired: HashMap<String, Retired>,
+    /// Why each handle given out that is not kept now is not.
+    fates: HashMap<String, Fate>,
 }
 
 impl Inner {
-    /// Takes out the finished subagent kept as `handle` and, at every depth, the finished subagents it started, and returns them all.
-    fn discard(&mut self, handle: &str) -> Vec<Retired> {
+    /// Takes out the finished subagent kept as `handle`, which goes for `fate`, and, at every depth, the finished subagents it started, and returns them all; each is remembered with why it went.
+    fn discard(&mut self, handle: &str, fate: Fate) -> Vec<Retired> {
         let mut gone = Vec::new();
-        let mut handles = vec![handle.to_owned()];
-        while let Some(handle) = handles.pop() {
-            gone.extend(self.retired.remove(&handle));
+        let mut handles = vec![(handle.to_owned(), fate)];
+        while let Some((handle, fate)) = handles.pop() {
+            if let Some(retired) = self.retired.remove(&handle) {
+                gone.push(retired);
+                self.fates.insert(handle.clone(), fate);
+            }
             handles.extend(
                 self.retired
                     .iter()
                     .filter(|(_, retired)| retired.keeper == handle)
-                    .map(|(below, _)| below.clone()),
+                    .map(|(below, _)| (below.clone(), Fate::WentWith(handle.clone()))),
             );
         }
         gone
@@ -112,7 +167,7 @@ impl Inner {
             .collect();
         let mut gone = Vec::new();
         for handle in old {
-            gone.extend(self.discard(&handle));
+            gone.extend(self.discard(&handle, Fate::Expired));
         }
         while self.retired.len() > most {
             let oldest = self
@@ -121,7 +176,7 @@ impl Inner {
                 .min_by_key(|(_, retired)| retired.since)
                 .map(|(handle, _)| handle.clone());
             match oldest {
-                Some(handle) => gone.extend(self.discard(&handle)),
+                Some(handle) => gone.extend(self.discard(&handle, Fate::Evicted)),
                 None => break,
             }
         }
@@ -137,7 +192,12 @@ pub struct Roster {
     most: usize,
     /// How long a finished subagent is kept.
     age: Duration,
+    /// The most US dollars one subagent run may spend before it is stopped, in millionths of a dollar; none for no limit.
+    budget: std::sync::atomic::AtomicU64,
 }
+
+/// The value of [`Roster::budget`]'s field that means no limit.
+const NO_BUDGET: u64 = u64::MAX;
 
 impl Default for Roster {
     /// A roster keeping [`KEPT_MOST`] finished subagents for [`KEPT_FOR`] each.
@@ -153,7 +213,27 @@ impl Roster {
             inner: Mutex::new(Inner::default()),
             most,
             age,
+            budget: std::sync::atomic::AtomicU64::new(NO_BUDGET),
         }
+    }
+
+    /// The most US dollars one subagent run may spend before it is stopped after the step it is in; none when there is no limit, the default.
+    pub fn budget(&self) -> Option<f64> {
+        match self.budget.load(std::sync::atomic::Ordering::Relaxed) {
+            NO_BUDGET => None,
+            micros => Some(omc_wire::dollars(micros)),
+        }
+    }
+
+    /// Sets the most US dollars one subagent run may spend to `dollars`, for the runs that start from now on; none, or an amount that is not above zero, removes the limit.
+    pub fn set_budget(&self, dollars: Option<f64>) {
+        let micros = dollars
+            .filter(|dollars| dollars.is_finite() && *dollars > 0.0)
+            .map_or(NO_BUDGET, |dollars| {
+                omc_wire::micros(dollars).min(NO_BUDGET - 1)
+            });
+        self.budget
+            .store(micros, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// How many finished subagents are kept for follow-ups now.
@@ -177,6 +257,7 @@ impl Roster {
     pub(crate) fn retire(&self, keeper: &str, run: Run) -> bool {
         let handle = run.handle.clone();
         let mut inner = self.lock();
+        inner.fates.remove(&handle);
         inner.retired.insert(
             handle.clone(),
             Retired {
@@ -192,18 +273,37 @@ impl Roster {
         kept
     }
 
+    /// Remembers that the subagent with the handle `handle` is not kept, and why, so that a follow-up to it is told.
+    pub(crate) fn forget(&self, handle: &str, fate: Fate) {
+        self.lock().fates.insert(handle.to_owned(), fate);
+    }
+
     /// Takes the finished subagent kept as `handle` off the roster, for a follow-up, when the subagent with the handle `keeper`, or the main agent when that is empty, started it and it is not kept too long; the finished subagents it started stay.
-    pub(crate) fn recall(&self, keeper: &str, handle: &str) -> Option<Run> {
+    ///
+    /// # Errors
+    ///
+    /// Returns why no such subagent is kept, in words for the agent that asked: it went and why, it is not one `keeper` started, or the handle was never given out in this conversation as this process holds it.
+    pub(crate) fn recall(&self, keeper: &str, handle: &str) -> Result<Run, String> {
         let mut inner = self.lock();
         let gone = inner.prune(self.most, self.age);
-        let own = inner
-            .retired
-            .get(handle)
-            .is_some_and(|retired| retired.keeper == keeper);
-        let run = own
-            .then(|| inner.retired.remove(handle))
-            .flatten()
-            .map(|retired| retired.run);
+        let found = match inner.retired.get(handle) {
+            Some(retired) if retired.keeper == keeper => Ok(()),
+            Some(_) => Err("it is not one you started".to_owned()),
+            None => Err(match inner.fates.get(handle) {
+                Some(fate) => fate.reason(self.most, self.age),
+                None => "no subagent got that handle in this conversation since crab started it; handles do not survive a reopened conversation".to_owned(),
+            }),
+        };
+        let run = found.and_then(|()| {
+            inner
+                .retired
+                .remove(handle)
+                .map(|retired| retired.run)
+                .ok_or_else(|| "it is no longer kept".to_owned())
+        });
+        if run.is_ok() {
+            inner.fates.insert(handle.to_owned(), Fate::Busy);
+        }
         drop(inner);
         drop(gone);
         run
@@ -307,6 +407,21 @@ pub(crate) struct Enrolment {
 }
 
 impl Enrolment {
+    /// How the subagent was announced, with what it cost so far once that was set.
+    pub(crate) fn notice(&self) -> SubagentNotice {
+        self.notice.clone()
+    }
+
+    /// Where its announcements go.
+    pub(crate) fn events(&self) -> Arc<EventSink> {
+        self.events.clone()
+    }
+
+    /// Records that the subagent has cost `spent` so far, which its end is announced with.
+    pub(crate) fn spent(&mut self, spent: Option<omc_wire::SubagentSpend>) {
+        self.notice.spent = spent;
+    }
+
     /// Waits until the subagent is to stop; never returns when that does not happen.
     pub(crate) async fn stopped(&mut self) {
         if self.stopped.wait_for(|stop| *stop).await.is_err() {
@@ -361,6 +476,7 @@ mod tests {
             category: None,
             background: false,
             state: SubagentState::Running,
+            spent: None,
         }
     }
 
@@ -422,5 +538,38 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    /// A handle remembered as not kept is refused with why, each fate in its own words.
+    #[test]
+    fn forgotten_handles_say_why() {
+        let roster = Roster::default();
+        for (fate, words) in [
+            (Fate::Failed, "it failed"),
+            (Fate::Stopped, "stopped"),
+            (Fate::Isolated, "isolated"),
+            (Fate::Structured, "structured output"),
+            (Fate::Evicted, "evicted"),
+            (Fate::Expired, "expired"),
+            (Fate::WentWith("sub-1".to_owned()), "sub-1"),
+        ] {
+            roster.forget("sub-2", fate);
+            let why = roster.recall("", "sub-2").err().unwrap();
+            assert!(why.contains(words), "{why}");
+        }
+    }
+
+    /// The subagent budget is off by default, takes a positive amount, and is turned off again by none or an amount that is not above zero.
+    #[test]
+    fn the_budget_is_off_until_set() {
+        let roster = Roster::default();
+        assert_eq!(roster.budget(), None);
+        roster.set_budget(Some(2.5));
+        assert_eq!(roster.budget(), Some(2.5));
+        roster.set_budget(Some(0.0));
+        assert_eq!(roster.budget(), None);
+        roster.set_budget(Some(1.0));
+        roster.set_budget(None);
+        assert_eq!(roster.budget(), None);
     }
 }

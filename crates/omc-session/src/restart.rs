@@ -79,7 +79,10 @@ fn handoff_id() -> String {
 /// Why a model could not be had, as `ended` says it.
 fn reason_of(ended: Ended) -> String {
     match ended {
-        Ended::SignedOut(reason) | Ended::Failed(reason) | Ended::Crashed(reason) => reason,
+        Ended::SignedOut(reason)
+        | Ended::Failed(reason)
+        | Ended::Unanswered(reason, _)
+        | Ended::Crashed(reason) => reason,
         Ended::Done(_) | Ended::HandedOff(_) => "the model could not be reached".to_owned(),
     }
 }

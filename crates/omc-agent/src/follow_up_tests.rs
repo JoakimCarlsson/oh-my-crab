@@ -154,11 +154,11 @@ async fn the_longest_kept_goes_when_there_are_too_many() {
     assert_eq!(roster.kept(), 1);
     let done = task.call_as("t2", json!({"task": "c"})).await.unwrap();
     assert!(done.text.contains("kept as sub-3"));
-    assert!(
-        task.call_as("t3", json!({"continue": "sub-1", "task": "more"}))
-            .await
-            .is_err()
-    );
+    let evicted = task
+        .call_as("t3", json!({"continue": "sub-1", "task": "more"}))
+        .await
+        .unwrap_err();
+    assert!(evicted.to_string().contains("evicted"), "{evicted}");
     assert!(
         task.call_as("t4", json!({"continue": "sub-3", "task": "more"}))
             .await
@@ -179,11 +179,11 @@ async fn subagents_kept_too_long_are_gone() {
     task.call_as("t1", json!({"task": "a"})).await.unwrap();
     assert_eq!(briefly.kept(), 1);
     tokio::time::sleep(Duration::from_millis(80)).await;
-    assert!(
-        task.call_as("t2", json!({"continue": "sub-1", "task": "more"}))
-            .await
-            .is_err()
-    );
+    let expired = task
+        .call_as("t2", json!({"continue": "sub-1", "task": "more"}))
+        .await
+        .unwrap_err();
+    assert!(expired.to_string().contains("expired"), "{expired}");
     assert_eq!(briefly.kept(), 0);
 }
 
@@ -208,5 +208,29 @@ async fn structured_results_are_not_kept() {
         serde_json::from_str::<serde_json::Value>(&done.text).unwrap(),
         json!({"n": 1})
     );
+    assert!(!done.text.contains("kept as"));
     assert_eq!(roster.kept(), 0);
+    let refused = task
+        .call_as("t2", json!({"continue": "sub-1", "task": "more"}))
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("structured output"),
+        "{refused}"
+    );
+}
+
+/// A follow-up to a handle no subagent of the conversation got says so.
+#[tokio::test]
+async fn unknown_handles_say_why() {
+    let roster = Arc::new(Roster::default());
+    let (task, _) = tool("follow-up-why", counting(), roster);
+    let unknown = task
+        .call_as("t1", json!({"continue": "sub-9", "task": "more"}))
+        .await
+        .unwrap_err();
+    assert!(
+        unknown.to_string().contains("no subagent got that handle"),
+        "{unknown}"
+    );
 }

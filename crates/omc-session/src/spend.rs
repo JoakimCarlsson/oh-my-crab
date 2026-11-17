@@ -260,9 +260,15 @@ impl Priced {
         }
     }
 
-    /// Charges the conversation for `tokens`, when the provider said what a request was billed; `main` says it was a request of the main loop.
+    /// Charges the conversation for `tokens`, when the provider said what a request was billed, and the subagent run the request was made for, when it was made for one, at the same prices; `main` says it was a request of the main loop.
     fn charge(&self, tokens: Option<Tokens>, main: bool) {
         if let Some(tokens) = tokens {
+            omc_agent::charge(
+                &tokens,
+                self.pricing
+                    .as_ref()
+                    .map(|pricing| pricing.cost(&tokens, self.retention)),
+            );
             self.shared.charge(&Bill {
                 model: &self.name,
                 tokens,
@@ -409,5 +415,91 @@ mod tests {
         assert!(again.missed() > 0);
         assert_eq!(reopened.restore(None), None);
         assert_eq!(reopened.restore(Some(serde_json::json!("nonsense"))), None);
+    }
+
+    /// A model that answers every request with `done`, billed a thousand input and a hundred output tokens.
+    struct Billed;
+
+    #[async_trait]
+    impl ChatModel for Billed {
+        /// Answers with a fixed text and what it was billed.
+        async fn complete(
+            &self,
+            _request: Request<'_>,
+            _sink: &mut dyn Sink,
+        ) -> Result<Reply, ProviderError> {
+            Ok(Reply {
+                text: "done".to_owned(),
+                tokens: Some(Tokens {
+                    input: 1000,
+                    output: 100,
+                    ..Tokens::default()
+                }),
+                ..Reply::default()
+            })
+        }
+    }
+
+    /// A subagent's requests are counted once in what the conversation cost, at the same prices its result names, so metering a subagent adds nothing to the conversation's totals.
+    #[tokio::test]
+    async fn a_subagent_is_counted_once_in_the_conversation() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/spend-subagent");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (out, _events) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared::new(out);
+        let model = "claude-opus-5-5";
+        shared.open(
+            Provider::Claude,
+            vec![model.into()],
+            model.into(),
+            crate::settings::Mode::Yolo,
+        );
+        let priced: Arc<dyn ChatModel> = Arc::new(Priced::of(
+            Arc::new(Billed),
+            shared.clone(),
+            Provider::Claude,
+            model,
+            false,
+        ));
+        let task = omc_agent::Task::new(omc_agent::TaskSettings {
+            categories: Vec::new(),
+            model: priced,
+            models: omc_agent::Models::default(),
+            registry: Arc::new(omc_tools::Registry::builtin(&dir).unwrap()),
+            approvals: shared.approvals.clone(),
+            events: Arc::new(|_| {}),
+            agents: omc_context::builtin_agents(),
+            effort: None,
+            prompt: Arc::new(|_, _, _, _| "SUB".to_owned()),
+            jobs: Arc::new(omc_tools::Jobs::new(|_| {})),
+            isolation: None,
+            hooks: None,
+            nesting: omc_agent::Nesting::default(),
+        });
+        let done = omc_tools::Tool::call(&task, serde_json::json!({"task": "look"}))
+            .await
+            .unwrap();
+        let spent = shared.ledger.told().unwrap();
+        assert_eq!(spent.models.len(), 1);
+        assert_eq!(spent.models[0].requests, 1);
+        let cost = omc_providers::pricing(Provider::Claude, model)
+            .unwrap()
+            .cost(
+                &Tokens {
+                    input: 1000,
+                    output: 100,
+                    ..Tokens::default()
+                },
+                shared.retention(),
+            );
+        assert_eq!(spent.models[0].cost, Some(micros(cost)));
+        assert!(
+            done.text
+                .ends_with(&format!("(Subagent cost: ${cost:.2}.)")),
+            "{}",
+            done.text
+        );
     }
 }

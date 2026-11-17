@@ -12,6 +12,7 @@ mod files;
 mod hooks;
 mod journal;
 mod loop_guard;
+mod meter;
 mod nesting;
 mod open_calls;
 pub mod permissions;
@@ -22,6 +23,7 @@ mod recall;
 mod recovery;
 mod roster;
 mod shake;
+mod stall;
 mod steering;
 mod submit;
 mod task;
@@ -47,6 +49,7 @@ pub use journal::{
     Branch, FIRST_BRANCH, INTERRUPTED, INTERRUPTED_CALL, Journal, JournalError, Lost, Mark, Marked,
     STOPPED, STOPPED_NOTE, Saved, Scribe,
 };
+pub use meter::charge;
 pub use nesting::{DEFAULT_DEPTH, DEPTH_VARIABLE, MOST_DEPTH, Nesting, Throttle, max_depth};
 pub use picker::{Category, ModelPicker, Models, Picked};
 pub use plans::approved_plan;
@@ -74,6 +77,8 @@ mod recovery_tests;
 mod scheduling_tests;
 #[cfg(test)]
 mod script_tests;
+#[cfg(test)]
+mod spend_tests;
 #[cfg(test)]
 mod steering_tests;
 #[cfg(test)]

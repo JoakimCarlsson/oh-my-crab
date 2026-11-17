@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::Roster;
+use crate::meter::Meter;
 
 /// The environment variable that sets how many levels of subagents may run below the main agent.
 pub const DEPTH_VARIABLE: &str = "OMC_SUBAGENT_DEPTH";
@@ -98,6 +99,8 @@ pub struct Nesting {
     pub(crate) keeper: String,
     /// The subagents of the conversation, at every level, by which the reader stops a running one and a follow-up reaches a finished one.
     pub roster: Arc<Roster>,
+    /// The meter of the subagent this tool belongs to, which what the subagents it starts cost reaches too; none for the main agent's tool.
+    pub(crate) meter: Option<Arc<Meter>>,
 }
 
 impl Nesting {
@@ -111,6 +114,7 @@ impl Nesting {
             scope: String::new(),
             keeper: String::new(),
             roster: Arc::new(Roster::default()),
+            meter: None,
         }
     }
 
@@ -125,8 +129,14 @@ impl Nesting {
         self.depth < self.most
     }
 
-    /// Where the `task` tool of a subagent this tool starts stands: one level further down, holding `seat`, its subagents put under `id` and, once they finished, kept under `handle`.
-    pub(crate) fn below(&self, seat: Arc<Seat>, id: &str, handle: &str) -> Self {
+    /// Where the `task` tool of a subagent this tool starts stands: one level further down, holding `seat`, its subagents put under `id` and, once they finished, kept under `handle`, what they cost reaching `meter` too.
+    pub(crate) fn below(
+        &self,
+        seat: Arc<Seat>,
+        id: &str,
+        handle: &str,
+        meter: Option<Arc<Meter>>,
+    ) -> Self {
         Self {
             depth: self.depth + 1,
             most: self.most,
@@ -135,6 +145,7 @@ impl Nesting {
             scope: id.to_owned(),
             keeper: handle.to_owned(),
             roster: self.roster.clone(),
+            meter,
         }
     }
 
@@ -192,7 +203,7 @@ mod tests {
         let top = Nesting::new(2, Arc::new(Throttle::new(2)));
         assert!(top.nests());
         assert_eq!(top.id_of("t1", Some(2)), "t1/2");
-        let below = top.below(Arc::new(Seat::default()), "t1/2", "sub-1");
+        let below = top.below(Arc::new(Seat::default()), "t1/2", "sub-1", None);
         assert_eq!(below.depth, 2);
         assert!(!below.nests());
         assert_eq!(below.id_of("s1", None), "t1/2:s1");
@@ -205,7 +216,7 @@ mod tests {
         let seat = Arc::new(Seat::default());
         seat.fill(throttle.take().await);
         assert_eq!(throttle.free(), 0);
-        let nesting = Nesting::new(2, throttle.clone()).below(seat, "t1", "sub-1");
+        let nesting = Nesting::new(2, throttle.clone()).below(seat, "t1", "sub-1", None);
         let inside = nesting
             .lending(async {
                 let child = throttle.take().await;

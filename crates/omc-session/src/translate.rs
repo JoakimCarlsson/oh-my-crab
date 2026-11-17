@@ -436,6 +436,7 @@ fn subagent_of(notice: omc_agent::SubagentNotice) -> omc_wire::Subagent {
             omc_agent::SubagentState::Failed => omc_wire::SubagentState::Failed,
             omc_agent::SubagentState::Stopped => omc_wire::SubagentState::Stopped,
         },
+        spent: notice.spent,
     }
 }
 
@@ -637,6 +638,7 @@ mod tests {
             category: Some("quick".into()),
             background: false,
             state: omc_agent::SubagentState::Stopped,
+            spent: None,
         };
         let Some(Event::Subagent(subagent)) = translate(
             AgentEvent::Nested {

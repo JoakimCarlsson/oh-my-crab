@@ -10,7 +10,7 @@ mod render;
 #[cfg(test)]
 mod tests;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -428,8 +428,41 @@ impl GitHub {
             return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.to_lowercase().contains("not a git repository") {
+            return Err(ToolError::Failed(no_repository(&self.root)));
+        }
         Err(ToolError::Failed(command::failure(program, args, &stderr)))
     }
+}
+
+/// What to tell the model when `root`, the working directory, is in no git repository, so that `gh` and `git` have no repository to use: to pass `repo`, and `run` for `run_watch`, or work from inside a repository, naming the git repositories directly under `root` when there are some.
+fn no_repository(root: &Path) -> String {
+    let mut text = format!(
+        "the working directory {} is not a git repository, so there is no repository to use by default; pass `repo` as owner/name (and, for run_watch, `run`, since there is no current branch), or run from inside a repository",
+        root.display()
+    );
+    let children = repositories_in(root);
+    if !children.is_empty() {
+        text.push_str(&format!(
+            ". Git repositories directly under it: {}",
+            children.join(", ")
+        ));
+    }
+    text
+}
+
+/// The names of the folders directly under `root` that are git repositories, holding a `.git` folder or file, sorted; none when `root` cannot be read.
+fn repositories_in(root: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir() && entry.path().join(".git").exists())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
 }
 
 /// What to tell the model when `program` is not installed.

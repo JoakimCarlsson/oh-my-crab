@@ -21,12 +21,13 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::fallback::{Fallback, Routing};
+use crate::meter::{self, Meter, Tally};
 use crate::nesting::{Nesting, Seat};
 use crate::picker::{Category, Models};
-use crate::roster::{Enrolment, SubagentNotice, SubagentState};
+use crate::roster::{Enrolment, Fate, SubagentNotice, SubagentState};
 use crate::submit::{SUBMIT_RESULT, Slot, SubmitResult};
 use crate::worktree::{self, Handback, Isolation, Lease, Merge};
-use crate::{AgentError, AgentEvent, Approvals, Context, Hooks, run_turn};
+use crate::{AgentError, AgentEvent, Approvals, Context, Hooks, Steering, run_turn_steered};
 
 /// The tools a subagent never gets from the agent that starts it: that agent's own `task` tool, since a subagent that may start subagents gets one of its own, and the ones that talk to the reader about the main agent's work.
 const WITHHELD: &[&str] = &[
@@ -360,6 +361,7 @@ impl Lane {
             category: self.category.clone(),
             background,
             state: SubagentState::Running,
+            spent: None,
         }
     }
 
@@ -432,6 +434,22 @@ fn stopped(kind: &str) -> ToolError {
     ))
 }
 
+/// `run`, which asked to be isolated, set to work in the main agent's working tree instead, because no copy of a folder outside any git repository could be made for the `reason` given; its result says so. A run that did not ask to be isolated is returned as it is.
+fn unisolate(mut run: Run, reason: &str) -> Run {
+    if run.isolated {
+        run.isolated = false;
+        run.unisolated = Some(reason.to_owned());
+    }
+    run
+}
+
+/// The note a subagent's result ends with when it asked to be isolated but worked in the main agent's working tree, because no copy could be made for `reason`.
+fn unisolated_note(reason: &str) -> String {
+    format!(
+        "# Isolation\nIsolation was unavailable, so this subagent worked directly in your working tree, not in a copy of its own: its changes are already there, and subagents running at the same time may have touched the same files. Why: {reason}"
+    )
+}
+
 /// What the result of a finished subagent kept as `handle` says after its text, so that the agent starting it can send it a follow-up.
 fn kept_note(handle: &str) -> String {
     format!("(Subagent kept as {handle}; `continue: \"{handle}\"` sends it a follow-up.)")
@@ -471,6 +489,8 @@ pub(crate) struct Run {
     routing: Option<Routing>,
     /// Whether it is to work in a git worktree of its own.
     isolated: bool,
+    /// Why it works in the main agent's working tree although it asked to be isolated, when no copy could be made of a folder that is in no git repository.
+    unisolated: Option<String>,
     /// The worktree it works in, once it was given one.
     lease: Option<Lease>,
     /// The checks the user set up, as they apply to this subagent.
@@ -483,6 +503,59 @@ pub(crate) struct Run {
     seat: Arc<Seat>,
     /// Its place on the roster of running subagents, once it was announced.
     enrolment: Option<Enrolment>,
+    /// What it costs, across its follow-ups, which what the subagents it starts cost reaches too.
+    meter: Arc<Meter>,
+    /// The most US dollars its current run may spend before it is stopped after the step it is in; none for no limit.
+    budget: Option<f64>,
+}
+
+/// What ends a subagent's run once it spent more than its budget: the run's meter, what the meter held when the run started, and the most US dollars the run may spend.
+struct Budget {
+    /// The subagent's meter.
+    meter: Arc<Meter>,
+    /// What the meter held when the run started.
+    start: Tally,
+    /// The most US dollars the run may spend.
+    limit: f64,
+}
+
+impl Budget {
+    /// What the run spent so far.
+    fn spent(&self) -> Tally {
+        meter::since(&self.start, &self.meter.tally())
+    }
+
+    /// Whether the run spent more than it may; requests to models whose prices are not known never count.
+    fn passed(&self) -> bool {
+        let spent = self.spent();
+        spent.is_priced() && spent.dollars > self.limit
+    }
+}
+
+impl Steering for Budget {
+    /// Sends no messages.
+    fn next(&self, _at: usize) -> Option<(String, Vec<omc_providers::Image>)> {
+        None
+    }
+
+    /// Ends the turn once the run spent more than it may.
+    fn halted(&self) -> bool {
+        self.passed()
+    }
+}
+
+/// The result of a subagent of the kind `kind` whose budget ended its run: what it said last, `said`, and a note that the budget stopped it and what `budget` saw it spend.
+fn budget_ended(kind: &str, said: &str, budget: &Budget) -> String {
+    let said = if said.is_empty() {
+        "(It had written no reply yet.)"
+    } else {
+        said
+    };
+    format!(
+        "{said}\n\n# Budget\nThe {kind} agent was stopped by its cost budget before it finished: it spent ${:.2} this run, more than the ${:.2} one subagent run may spend. What it said last is above; its work may be incomplete.",
+        budget.spent().dollars,
+        budget.limit
+    )
 }
 
 impl Run {
@@ -529,9 +602,15 @@ impl Run {
             .all(|tool| tool.read_only() || tool.name() == "task")
     }
 
-    /// Whether the subagent is kept for follow-ups once it finished: one that worked in a worktree of its own is not, since that is removed when it ends, and neither is one asked for a structured result, which stays the data it handed back.
-    fn keeps(&self) -> bool {
-        !self.isolated && self.structured.is_none()
+    /// Why the subagent is not kept for follow-ups once it finished, or nothing when it is: one that worked in a worktree of its own is not, since that is removed when it ends, and neither is one asked for a structured result, which stays the data it handed back.
+    fn unkept(&self) -> Option<Fate> {
+        if self.isolated {
+            Some(Fate::Isolated)
+        } else if self.structured.is_some() {
+            Some(Fate::Structured)
+        } else {
+            None
+        }
     }
 
     /// The message the subagent's turn starts with: the follow-up as it is for one that finished before, and otherwise its assignment, with how to hand back a structured result when it is asked for one, after what the hooks add when a subagent starts.
@@ -574,6 +653,12 @@ impl Run {
             events(lane.file(event));
         };
         let opening = self.opening().await;
+        let budget = self.budget.map(|limit| Budget {
+            meter: self.meter.clone(),
+            start: self.meter.tally(),
+            limit,
+        });
+        let steering = budget.as_ref().map(|budget| budget as &dyn Steering);
         let context = Context {
             model: self.model.as_ref(),
             registry: &self.registry,
@@ -587,9 +672,23 @@ impl Run {
             hooks: self.hooks.as_deref(),
             routing: self.routing.as_ref(),
         };
-        run_turn(&context, &mut self.history, opening, &report)
-            .await
-            .map_err(|error| failed(&kind, &error))?;
+        run_turn_steered(
+            &context,
+            &mut self.history,
+            opening,
+            Vec::new(),
+            &report,
+            None,
+            steering,
+        )
+        .await
+        .map_err(|error| failed(&kind, &error))?;
+        if let Some(budget) = &budget
+            && budget.passed()
+            && matches!(self.history.last(), Some(Message::ToolResults(_)))
+        {
+            return Ok(budget_ended(&kind, &said_last(&self.history), budget));
+        }
         let Some(wanted) = &self.structured else {
             let reply = last_reply(&self.history);
             return Ok(if reply.is_empty() {
@@ -601,11 +700,14 @@ impl Run {
         if let Some(result) = wanted.accepted() {
             return Ok(result);
         }
-        run_turn(
+        run_turn_steered(
             &context,
             &mut self.history,
             NUDGE.trim().to_owned(),
+            Vec::new(),
             &report,
+            None,
+            steering,
         )
         .await
         .map_err(|error| failed(&kind, &error))?;
@@ -697,9 +799,24 @@ async fn finish(mut run: Run, events: Arc<EventSink>, nesting: Nesting) -> Ended
     let seat = run.seat.clone();
     let held = seat.clone();
     let (roster, keeper) = (nesting.roster.clone(), nesting.keeper.clone());
+    let handle = run.handle.clone();
+    let unisolated = run.unisolated.take();
+    let meter = run.meter.clone();
+    run.budget = roster.budget();
+    let before = meter.tally();
+    if let Some(enrolment) = enrolment.as_ref() {
+        let (notice, sink) = (enrolment.notice(), enrolment.events());
+        meter.watch(Some(Arc::new(move |spent| {
+            sink(AgentEvent::Subagent(SubagentNotice {
+                spent: Some(spent),
+                ..notice.clone()
+            }));
+        })));
+    }
+    let charged = meter.clone();
     let work = async move {
         held.fill(nesting.throttle.take().await);
-        let outcome = run.go().await;
+        let outcome = meter::metered(charged, run.go()).await;
         (outcome, run)
     };
     let (outcome, halted, ended) = match enrolment.as_mut() {
@@ -718,16 +835,32 @@ async fn finish(mut run: Run, events: Arc<EventSink>, nesting: Nesting) -> Ended
     }
     seat.vacate();
     let outcome = match (outcome, ended) {
-        (Ok(text), Some(run)) if run.keeps() => {
-            let handle = run.handle.clone();
-            if roster.retire(&keeper, run) {
-                Ok(format!("{text}\n\n{}", kept_note(&handle)))
-            } else {
+        (Ok(text), Some(run)) => match run.unkept() {
+            None if roster.retire(&keeper, run) => Ok(format!("{text}\n\n{}", kept_note(&handle))),
+            None => Ok(text),
+            Some(fate) => {
+                roster.forget(&handle, fate);
                 Ok(text)
             }
+        },
+        (outcome, _) => {
+            roster.forget(&handle, if halted { Fate::Stopped } else { Fate::Failed });
+            outcome
         }
-        (outcome, _) => outcome,
     };
+    let outcome = match unisolated {
+        Some(reason) => outcome.map(|text| format!("{text}\n\n{}", unisolated_note(&reason))),
+        None => outcome,
+    };
+    meter.watch(None);
+    let after = meter.tally();
+    let outcome = match meter::cost_line(&meter::since(&before, &after), &after) {
+        Some(line) => outcome.map(|text| format!("{text}\n\n{line}")),
+        None => outcome,
+    };
+    if let Some(enrolment) = enrolment.as_mut() {
+        enrolment.spent((after.requests > 0).then(|| after.told()));
+    }
     let handback = match lease {
         Some(lease) => Some(lease.hand_back().await),
         None => None,
@@ -1262,6 +1395,7 @@ impl Task {
             resumed: false,
             structured,
             isolated: item.isolated.unwrap_or(agent.isolated),
+            unisolated: None,
             definition: agent.clone(),
             routing,
             lease: None,
@@ -1270,14 +1404,16 @@ impl Task {
             nests: self.nests(agent),
             seat: Arc::new(Seat::default()),
             enrolment: None,
+            meter: Meter::below(self.settings.nesting.meter.clone()),
+            budget: None,
         })
     }
 
-    /// `runs`, with a worktree of its own given to each that is to work in one, all made from one snapshot of the working tree of the agent starting them.
+    /// `runs`, with a worktree of its own given to each that is to work in one, all made from one snapshot of the working tree of the agent starting them. When that working tree is in no git repository and no copy of it can be made, each that is to work in one runs in it instead, its result saying that isolation was unavailable and why.
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Failed`], saying why, when a worktree cannot be made: isolation is not available, the folder is not in a git repository, git is missing or fails. The worktrees made before are removed again.
+    /// Returns [`ToolError::Failed`], saying why, when isolation is not available here, or a worktree of a git repository cannot be made because git fails. The worktrees made before are removed again.
     async fn isolate(&self, runs: Vec<Run>) -> Result<Vec<Run>, ToolError> {
         if !runs.iter().any(|run| run.isolated) {
             return Ok(runs);
@@ -1288,16 +1424,25 @@ impl Task {
                     .to_owned(),
             ));
         };
-        let snapshot = worktree::snapshot(isolation)
-            .await
-            .map_err(ToolError::Failed)?;
+        let snapshot = match worktree::snapshot(isolation).await {
+            Ok(snapshot) => snapshot,
+            Err(reason) if !worktree::in_repository(&isolation.directory).await => {
+                return Ok(runs
+                    .into_iter()
+                    .map(|run| unisolate(run, &reason))
+                    .collect());
+            }
+            Err(reason) => return Err(ToolError::Failed(reason)),
+        };
+        let outside = snapshot.is_pristine();
         let mut given = Vec::with_capacity(runs.len());
         for mut run in runs {
             if run.isolated {
-                let lease = worktree::lease(isolation, &snapshot)
-                    .await
-                    .map_err(ToolError::Failed)?;
-                run.enter(lease, &snapshot, isolation)?;
+                match worktree::lease(isolation, &snapshot).await {
+                    Ok(lease) => run.enter(lease, &snapshot, isolation)?,
+                    Err(reason) if outside => run = unisolate(run, &reason),
+                    Err(reason) => return Err(ToolError::Failed(reason)),
+                }
             }
             given.push(run);
         }
@@ -1336,10 +1481,12 @@ impl Task {
                 jobs: self.settings.jobs.clone(),
                 isolation,
                 hooks: run.hooks.clone(),
-                nesting: self
-                    .settings
-                    .nesting
-                    .below(run.seat.clone(), &run.id, &run.handle),
+                nesting: self.settings.nesting.below(
+                    run.seat.clone(),
+                    &run.id,
+                    &run.handle,
+                    Some(run.meter.clone()),
+                ),
             }));
             run.registry = run.registry.fitted();
         }
@@ -1449,15 +1596,15 @@ impl Task {
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::InvalidArguments`] for arguments that fit no follow-up, and [`ToolError::Failed`] when no subagent this tool started is kept under the handle, or when it can change files while the subagents of this tool may only look; it stays kept then.
+    /// Returns [`ToolError::InvalidArguments`] for arguments that fit no follow-up, and [`ToolError::Failed`] when no subagent this tool started is kept under the handle, saying why, or when it can change files while the subagents of this tool may only look; it stays kept then.
     fn resume(&self, call: &str, args: Args) -> Result<Run, ToolError> {
         let (handle, task, description) = args.follow_up()?;
         let nesting = &self.settings.nesting;
-        let Some(mut run) = nesting.roster.recall(&nesting.keeper, &handle) else {
-            return Err(ToolError::Failed(format!(
-                "no finished subagent is kept as {handle}: it is not one you started, it runs a follow-up now, it failed or was stopped, or it was kept too long. Start a new subagent with a self-contained `task` instead."
-            )));
-        };
+        let mut run = nesting.roster.recall(&nesting.keeper, &handle).map_err(|why| {
+            ToolError::Failed(format!(
+                "no finished subagent is kept as {handle}: {why}. Start a new subagent with a self-contained `task` instead."
+            ))
+        })?;
         if self.only_looks() && !run.looks() {
             let kind = run.lane.kind.clone();
             nesting.roster.retire(&nesting.keeper, run);
@@ -1610,6 +1757,20 @@ fn categories_note(categories: &[Category]) -> Option<String> {
 fn category_addition(category: &Category) -> Option<String> {
     let prompt = category.prompt.as_deref()?.trim();
     (!prompt.is_empty()).then(|| format!("# Category: {}\n{prompt}", category.name))
+}
+
+/// The last text the agent of `history` wrote, skipping replies that only called tools; empty when it wrote none.
+fn said_last(history: &[Message]) -> String {
+    history
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            Message::Assistant(reply) if !reply.text.trim().is_empty() => {
+                Some(reply.text.trim().to_owned())
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 /// The text of the last reply in `history`.
@@ -1841,6 +2002,7 @@ impl Tool for Task {
 mod tests {
     use std::sync::Mutex;
 
+    use crate::run_turn;
     use omc_context::builtin_agents;
     use omc_providers::Message;
     use omc_tools::Registry;

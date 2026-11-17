@@ -244,7 +244,11 @@ turn differs from the live one in a few ways:
   that were streamed.
 - A turn that answered has no `Finished` event; a turn that was stopped ends
   with `Halted` and `Finished` with `null`, and one that failed ends with
-  `Finished` carrying the reason.
+  `Finished` carrying the reason. A turn that failed in a way that passes with
+  time, such as a rate limit after every retry, keeps its prompt in the
+  conversation instead of being recorded as lost; a conversation reopened
+  before anything answered it shows it as interrupted, and `Resume` goes on
+  with it.
 - `Used` follows the tool calls of the reply it measured, instead of coming
   before them.
 - A compaction shows as a finished `compact` call whose output is its summary.
@@ -551,7 +555,10 @@ Names the conversation, replacing any name it has. Crab answers with
 
 ### `Cancel`
 
-Stops the running turn, subagents included. Crab sends `Halted`, then
+Stops the running turn, subagents included. What the turn finished stays in
+the conversation; each tool call of a batch that was running is given a result
+that tells the model whether it finished, with its result, was interrupted
+while it ran, or never started. Crab sends `Halted`, then
 `Finished` with `null`, then a `Queued` event in the `Dropped` state for each
 waiting prompt. With no turn running, it still drops waiting prompts and
 declines open questions, and sends nothing else.
@@ -1287,9 +1294,12 @@ between turns, and they are stopped by `Open` and `Close`.
 
 ### `Subagent`
 
-A subagent started, or ended. Sent once in the `Running` state when it starts,
-for subagents in the foreground, in the background and started by other
-subagents, and once more in another state when it ends. Carries a `Subagent`:
+A subagent started, made progress, or ended. Sent once in the `Running` state
+when it starts, for subagents in the foreground, in the background and started
+by other subagents, again in the `Running` state with its `spent` each time a
+model request made for it, or for a subagent it started, is answered, and once
+more in another state when it ends. A client keeps the latest event of each
+`id`. Carries a `Subagent`:
 
 | Field        | Type   | Presence | Meaning                                                                   |
 | ------------ | ------ | -------- | ------------------------------------------------------------------------- |
@@ -1301,6 +1311,14 @@ subagents, and once more in another state when it ends. Carries a `Subagent`:
 | `category`   | string | optional | The [work category](models-and-slots.md#categories) it was started in, by `task` or `agent_spawn` in orchestrator mode; `model` is then the model of that category's slot. Left out when it was started without one. Added after the first release; older crabs leave it out. |
 | `background` | bool   | required | Whether it runs in the background.                                        |
 | `state`      | string | required | How it stands, a `SubagentState`.                                         |
+| `spent`      | object | optional | What it has cost so far, a `SubagentSpend`: its own requests and those of the subagents it started, across every follow-up it ran. Left out before its first answered request. Added after the first release; older crabs leave it out. |
+
+A `SubagentSpend` holds `requests`, `input`, `output`, `cache_read` and
+`cache_write`, whole numbers counted as in a `ModelSpend` of
+[`Spent`](#spent), and `cost`, what the requests cost at the models' list
+prices in millionths of a US dollar, left out when no model it asked has known
+prices. What a subagent costs is also in the conversation's `Spent`, counted
+once; the two are not to be added up.
 
 The id is the `task` call id, followed by `/` and the place in the list,
 counted from one, when the call started several. The id of a subagent started
@@ -1314,6 +1332,7 @@ stopped).
 {"Subagent":{"id":"toolu_07/2","call":"toolu_07","agent":"scout","label":"Find the parser","model":"claude-sonnet-4-5","background":false,"state":"Running"}}
 {"Subagent":{"id":"toolu_07/2","call":"toolu_07","agent":"scout","label":"Find the parser","model":"claude-sonnet-4-5","background":false,"state":"Stopped"}}
 {"Subagent":{"id":"toolu_09","call":"toolu_09","agent":"task","label":"Rename the flag","model":"gpt-5-mini","category":"quick","background":false,"state":"Running"}}
+{"Subagent":{"id":"toolu_09","call":"toolu_09","agent":"task","label":"Rename the flag","model":"gpt-5-mini","category":"quick","background":false,"state":"Running","spent":{"requests":2,"input":5210,"output":640,"cache_read":18000,"cache_write":2100,"cost":21450}}}
 ```
 
 `Subagent` events are sent while the conversation runs and are not kept in its

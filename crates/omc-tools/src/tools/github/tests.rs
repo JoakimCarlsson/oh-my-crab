@@ -4,7 +4,7 @@ use serde_json::json;
 
 use super::command::{Request, SearchKind, failure};
 use super::render::{self, Check, Job};
-use super::{GitHub, check_repo, cut};
+use super::{GitHub, check_repo, cut, no_repository};
 use crate::{Concurrency, Sandbox, Tool};
 
 /// Joins the arguments of `request` with spaces, for comparing.
@@ -265,4 +265,22 @@ async fn checkout_is_exclusive_and_refused_when_looking() {
     assert!(error.to_string().contains("does not allow"), "{error}");
     let error = tool.call(json!({"action": "pr_view"})).await.unwrap_err();
     assert!(error.to_string().contains("needs `number`"), "{error}");
+}
+
+/// Outside a repository the failure tells the model to pass `repo` and names the git repositories directly under the working directory, not the other folders.
+#[test]
+fn outside_a_repository_names_the_repositories_below() {
+    let dir = crate::testutil::scratch("github-no-repository");
+    std::fs::create_dir_all(dir.join("beta/.git")).unwrap();
+    std::fs::create_dir_all(dir.join("alpha")).unwrap();
+    std::fs::write(dir.join("alpha/.git"), "gitdir: elsewhere\n").unwrap();
+    std::fs::create_dir_all(dir.join("plain")).unwrap();
+    let text = no_repository(&dir);
+    assert!(text.contains("pass `repo`"), "{text}");
+    assert!(
+        text.ends_with("Git repositories directly under it: alpha, beta"),
+        "{text}"
+    );
+    let empty = crate::testutil::scratch("github-no-repository-empty");
+    assert!(!no_repository(&empty).contains("directly under it"));
 }

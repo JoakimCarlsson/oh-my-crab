@@ -21,6 +21,29 @@ pub struct Spent {
     pub models: Vec<ModelSpend>,
 }
 
+/// What one subagent has cost so far: its own requests and those of the subagents it started, across every follow-up it ran.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SubagentSpend {
+    /// How many requests were answered.
+    #[serde(default)]
+    pub requests: u64,
+    /// The input tokens that were neither read from nor written to the prompt cache.
+    #[serde(default)]
+    pub input: u64,
+    /// The tokens written, reasoning included.
+    #[serde(default)]
+    pub output: u64,
+    /// The input tokens read from the prompt cache.
+    #[serde(default)]
+    pub cache_read: u64,
+    /// The input tokens written to the prompt cache.
+    #[serde(default)]
+    pub cache_write: u64,
+    /// What the requests cost at the models' list prices, in millionths of a US dollar; nothing when no model it asked has known prices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<u64>,
+}
+
 /// What the requests sent to one model cost.
 #[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ModelSpend {

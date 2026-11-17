@@ -1,16 +1,23 @@
-//! Confinement of tool paths to the working directory.
+//! Confinement of tool paths to the working directory and the user's scratch directory.
 
 use std::path::{Component, Path, PathBuf};
 
 use crate::{Spill, ToolError};
 
-/// The directory tools may touch, with the logic to keep them inside it, and the folder long output is saved in, which tools may read as well.
+/// The directories tools may touch, the working directory and the user's scratch directory, with the logic to keep them inside those, and the folder long output is saved in, which tools may read as well.
 #[derive(Debug, Clone)]
 pub struct Sandbox {
     /// The canonical working directory.
     root: PathBuf,
+    /// The scratch directory tools may read and write besides the working directory, with symlinks followed as far as it exists; none when the user has no cache directory.
+    scratch: Option<PathBuf>,
     /// Where output too long to show is saved.
     spill: Spill,
+}
+
+/// The user's scratch directory: `scratch` under the user's cache directory, which is `$XDG_CACHE_HOME` or `~/.cache` on Linux; none when the user has no cache directory.
+fn scratch_dir() -> Option<PathBuf> {
+    dirs::cache_dir().map(|cache| cache.join("scratch"))
 }
 
 impl Sandbox {
@@ -22,8 +29,20 @@ impl Sandbox {
     pub fn new(root: impl AsRef<Path>) -> Result<Self, ToolError> {
         Ok(Self {
             root: root.as_ref().canonicalize()?,
+            scratch: scratch_dir().and_then(|dir| canonicalize_existing(&dir)),
             spill: Spill::default(),
         })
+    }
+
+    /// The sandbox letting tools reach `scratch` besides the working directory, instead of the user's scratch directory; none lets them reach only the working directory.
+    pub fn with_scratch(mut self, scratch: Option<&Path>) -> Self {
+        self.scratch = scratch.and_then(canonicalize_existing);
+        self
+    }
+
+    /// The scratch directory tools may reach besides the working directory, when there is one.
+    pub fn scratch(&self) -> Option<&Path> {
+        self.scratch.as_deref()
     }
 
     /// The sandbox saving output too long to show in `spill` instead of the process's own folder.
@@ -59,16 +78,16 @@ impl Sandbox {
         }
     }
 
-    /// Resolves `path` against the root and checks that it stays inside.
+    /// Resolves `path` against the root and checks that it stays inside the root or the scratch directory.
     ///
     /// Relative paths are joined to the root, `.` and `..` are folded away, and
     /// symlinks are followed for the part of the path that exists, so a link
-    /// pointing outside is rejected. The path itself need not exist.
+    /// pointing outside both is rejected. The path itself need not exist.
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::OutsidePath`] when the resolved path is not inside
-    /// the root.
+    /// Returns [`ToolError::OutsidePath`] when the resolved path is inside
+    /// neither the root nor the scratch directory.
     pub fn resolve(&self, path: &str) -> Result<PathBuf, ToolError> {
         let outside = || ToolError::OutsidePath(path.to_string());
         let joined = self.root.join(path);
@@ -85,7 +104,12 @@ impl Sandbox {
             }
         }
         let resolved = canonicalize_existing(&folded).ok_or_else(outside)?;
-        if resolved.starts_with(&self.root) {
+        if resolved.starts_with(&self.root)
+            || self
+                .scratch
+                .as_ref()
+                .is_some_and(|scratch| resolved.starts_with(scratch))
+        {
             Ok(resolved)
         } else {
             Err(outside())
@@ -117,7 +141,9 @@ impl Sandbox {
     pub fn describe(&self, path: &str) -> String {
         match self.resolve(path) {
             Ok(resolved) => self.display(&resolved),
-            Err(_) => format!("{path} (OUTSIDE the working directory; will be rejected)"),
+            Err(_) => format!(
+                "{path} (OUTSIDE the working directory and the scratch directory; will be rejected)"
+            ),
         }
     }
 
@@ -180,7 +206,7 @@ mod tests {
     #[test]
     fn rejects_paths_outside_the_root() {
         let dir = scratch("sandbox-outside");
-        let sandbox = Sandbox::new(&dir).unwrap();
+        let sandbox = Sandbox::new(&dir).unwrap().with_scratch(None);
         assert!(matches!(
             sandbox.resolve("../escape.txt"),
             Err(ToolError::OutsidePath(_))
@@ -198,7 +224,7 @@ mod tests {
         let dir = scratch("sandbox-symlink");
         let outside = scratch("sandbox-symlink-target");
         std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
-        let sandbox = Sandbox::new(&dir).unwrap();
+        let sandbox = Sandbox::new(&dir).unwrap().with_scratch(None);
         assert!(matches!(
             sandbox.resolve("link/file.txt"),
             Err(ToolError::OutsidePath(_))
@@ -210,7 +236,10 @@ mod tests {
     fn reads_saved_output_outside_the_root() {
         let dir = scratch("sandbox-spill");
         let saved = scratch("sandbox-spill-saved");
-        let sandbox = Sandbox::new(&dir).unwrap().with_spill(Spill::new(&saved));
+        let sandbox = Sandbox::new(&dir)
+            .unwrap()
+            .with_scratch(None)
+            .with_spill(Spill::new(&saved));
         let path = sandbox.spill().save("bash", b"out").unwrap();
         let text = path.display().to_string();
         assert_eq!(sandbox.resolve_readable(&text).unwrap(), path);
@@ -230,9 +259,57 @@ mod tests {
         let dir = scratch("sandbox-dangling");
         let outside = scratch("sandbox-dangling-target");
         std::os::unix::fs::symlink(outside.join("missing.txt"), dir.join("link")).unwrap();
-        let sandbox = Sandbox::new(&dir).unwrap();
+        let sandbox = Sandbox::new(&dir).unwrap().with_scratch(None);
         assert!(matches!(
             sandbox.resolve("link"),
+            Err(ToolError::OutsidePath(_))
+        ));
+    }
+
+    /// Paths in the scratch directory resolve for reading and writing, whether or not they exist yet, while its siblings and traversal out of it are rejected.
+    #[test]
+    fn reaches_the_scratch_directory() {
+        let dir = scratch("sandbox-scratch-root");
+        let cache = scratch("sandbox-scratch-cache");
+        let pad = cache.join("scratch");
+        std::fs::create_dir_all(&pad).unwrap();
+        let sandbox = Sandbox::new(&dir).unwrap().with_scratch(Some(&pad));
+        let inside = pad.join("project/notes.txt").display().to_string();
+        assert!(
+            sandbox
+                .resolve(&inside)
+                .unwrap()
+                .starts_with(sandbox.scratch().unwrap())
+        );
+        assert!(sandbox.resolve_readable(&inside).is_ok());
+        let sibling = cache.join("other.txt").display().to_string();
+        assert!(matches!(
+            sandbox.resolve(&sibling),
+            Err(ToolError::OutsidePath(_))
+        ));
+        let traversal = pad.join("project/../../other.txt").display().to_string();
+        assert!(matches!(
+            sandbox.resolve(&traversal),
+            Err(ToolError::OutsidePath(_))
+        ));
+        assert!(matches!(
+            sandbox.resolve("../escape.txt"),
+            Err(ToolError::OutsidePath(_))
+        ));
+    }
+
+    /// A symlink in the scratch directory pointing out of both roots is rejected.
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinks_that_leave_the_scratch_directory() {
+        let dir = scratch("sandbox-scratch-link-root");
+        let pad = scratch("sandbox-scratch-link-pad");
+        let outside = scratch("sandbox-scratch-link-target");
+        std::os::unix::fs::symlink(&outside, pad.join("link")).unwrap();
+        let sandbox = Sandbox::new(&dir).unwrap().with_scratch(Some(&pad));
+        let through = pad.join("link/file.txt").display().to_string();
+        assert!(matches!(
+            sandbox.resolve(&through),
             Err(ToolError::OutsidePath(_))
         ));
     }

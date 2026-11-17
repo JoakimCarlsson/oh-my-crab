@@ -175,6 +175,16 @@ pub const INTERRUPTED: &str = "interrupted";
 /// The result a tool call is given when its turn is resumed after the harness stopped while the call ran, so that the model knows its outcome is unknown.
 pub const INTERRUPTED_CALL: &str = "The harness stopped before this call finished, so its result is lost. It may have run in part or in full: check what it did before running it again.";
 
+/// What the result of a tool call that finished before its turn was stopped opens with, before the call's own result; `{ended}` says how the turn ended.
+const FINISHED_CALL: &str = "This call finished before {ended}. Its result:";
+
+/// The result of a tool call that was running when its turn was stopped; `{ended}` says how the turn ended.
+const RUNNING_CALL: &str = "Interrupted: {ended} while this call was running, so its result is lost. It may have run in part or in full: check what it did before running it again.";
+
+/// The result of a tool call that had not started when its turn was stopped; `{ended}` says how the turn ended.
+const UNSTARTED_CALL: &str =
+    "Not run: {ended} before this call started, so nothing it would have done happened.";
+
 /// A turn the harness stopped in the middle of, as the history was opened: what it had done, which was cut back, kept so that [`Journal::resume`] can put it back and the turn can go on.
 struct Unfinished {
     /// The length of the history once the turn was cut back, where `tail` goes back in.
@@ -307,6 +317,8 @@ struct State {
     current: usize,
     /// The turn the harness stopped in the middle of, while it can still be resumed: until anything else changes the history.
     unfinished: Option<Unfinished>,
+    /// The tool calls of the reply the history ends with that started running, by id, in the order they started, each with its result once it ended; emptied whenever a message is appended or the history is cut back, so that it only ever tells of the batch that is running. It is never written to the file.
+    progress: Vec<(String, Option<omc_providers::ToolResult>)>,
 }
 
 impl State {
@@ -583,6 +595,7 @@ impl Journal {
                 branches,
                 current,
                 unfinished,
+                progress: Vec::new(),
             }),
         });
         Ok((journal, history))
@@ -865,6 +878,7 @@ impl Journal {
         state.epoch += 1;
         state.pending = Some(length);
         state.unfinished = None;
+        state.progress.clear();
         state.marks.retain(|(at, _)| *at < length);
         state.settle()
     }
@@ -897,7 +911,7 @@ impl Journal {
         state.file.sync_data()
     }
 
-    /// Ends a turn that was stopped without losing what it did, so the model still knows it on the next turn: every step the turn finished stays, a reply whose tool calls have no results gives up its calls but keeps its text, and the reply that was being written when it stopped, `partial`, is kept as far as it got. The kept reply, or a reply of its own when the turn's prompt has none, ends with [`STOPPED_NOTE`]. Turns cut off whole are recorded as lost for `reason`. Returns the messages the history holds afterwards.
+    /// Ends a turn that was stopped without losing what it did, so the model still knows it on the next turn: every step the turn finished stays, and the reply that was being written when it stopped, `partial`, is kept as far as it got. A reply whose tool calls have no results keeps its calls, and each is given a result that says how it stood when the turn stopped, as [`Scribe::began`] and [`Scribe::ran`] noted it: finished, with its result; running, so it may have run in part; or not started, so nothing it would do happened. The kept reply, or a reply of its own after those results or when the turn's prompt has none, ends with [`STOPPED_NOTE`]. Turns cut off whole are recorded as lost for `reason`. Returns the messages the history holds afterwards.
     ///
     /// The history is read back from the file, which holds everything the turn wrote, since the turn's own copy is gone with its task.
     ///
@@ -905,20 +919,24 @@ impl Journal {
     ///
     /// Returns the error of the write or the sync, or of reading the file back.
     pub fn settle_stopped(&self, reason: &str, partial: &str) -> io::Result<Vec<Message>> {
-        self.lock().settle()?;
+        let progress = {
+            let mut state = self.lock();
+            state.settle()?;
+            std::mem::take(&mut state.progress)
+        };
         let mut history = Self::read(&self.path).map_err(io::Error::other)?.history;
-        let mut said = Vec::new();
-        while let Some(Message::Assistant(reply)) = history.last()
-            && !reply.tool_calls.is_empty()
-        {
-            said.push(reply.text.trim().to_owned());
-            history.pop();
-        }
-        said.reverse();
-        said.push(partial.trim().to_owned());
+        let closing = match history.last() {
+            Some(Message::Assistant(reply)) if !reply.tool_calls.is_empty() => {
+                Some(stopped_results(reply, &progress, reason == STOPPED))
+            }
+            _ => None,
+        };
+        let mut said = vec![partial.trim().to_owned()];
         said.retain(|text| !text.is_empty());
         self.cut_losing(history.len(), reason)?;
-        if said.is_empty() && !matches!(history.last(), Some(Message::User(_) | Message::Images(_)))
+        if closing.is_none()
+            && said.is_empty()
+            && !matches!(history.last(), Some(Message::User(_) | Message::Images(_)))
         {
             return Ok(history);
         }
@@ -928,6 +946,10 @@ impl Journal {
             ..omc_providers::Reply::default()
         });
         let mut state = self.lock();
+        if let Some(results) = closing {
+            write_record(&mut state.file, &Written::Message(&results))?;
+            history.push(results);
+        }
         write_record(&mut state.file, &Written::Message(&stopped))?;
         state.file.sync_data()?;
         history.push(stopped);
@@ -999,6 +1021,7 @@ impl Scribe {
         }
         state.settle()?;
         state.unfinished = None;
+        state.progress.clear();
         write_record(&mut state.file, &Written::Message(message))
     }
 
@@ -1035,6 +1058,7 @@ impl Scribe {
         }
         state.settle()?;
         state.unfinished = None;
+        state.progress.clear();
         write_record(&mut state.file, &Written::Cut(0))?;
         state.marks.clear();
         write_record(&mut state.file, &Written::Message(first))
@@ -1055,12 +1079,46 @@ impl Scribe {
         }
         state.settle()?;
         state.unfinished = None;
+        state.progress.clear();
         write_record(&mut state.file, &Written::Cut(keep))?;
         state.marks.retain(|(at, _)| *at < keep);
         for message in messages {
             write_record(&mut state.file, &Written::Message(message))?;
         }
         Ok(())
+    }
+
+    /// Notes that the tool call `call` of the reply the history ends with started running, so that a turn stopped while it runs can tell the model so; nothing is noted when the history was cut back since this scribe was made. Nothing is written to the file.
+    pub fn began(&self, call: &str) {
+        let Some(journal) = self.journal.upgrade() else {
+            return;
+        };
+        let mut state = journal.lock();
+        if state.epoch != self.epoch || state.progress.iter().any(|(id, _)| id == call) {
+            return;
+        }
+        state.progress.push((call.to_owned(), None));
+    }
+
+    /// Notes that a tool call of the reply the history ends with ended with `result`, so that a turn stopped before the rest of its batch ended can still give the model that result; nothing is noted when the history was cut back since this scribe was made. Nothing is written to the file.
+    pub fn ran(&self, result: &omc_providers::ToolResult) {
+        let Some(journal) = self.journal.upgrade() else {
+            return;
+        };
+        let mut state = journal.lock();
+        if state.epoch != self.epoch {
+            return;
+        }
+        match state
+            .progress
+            .iter_mut()
+            .find(|(id, _)| *id == result.call_id)
+        {
+            Some((_, ended)) => *ended = Some(result.clone()),
+            None => state
+                .progress
+                .push((result.call_id.clone(), Some(result.clone()))),
+        }
     }
 
     /// Syncs the file to disk, which is done when a turn ends.
@@ -1354,6 +1412,48 @@ fn answered_length(history: &[Message]) -> usize {
         .map_or(0, |index| index + 1)
 }
 
+/// The results that close the tool calls of `reply`, a reply whose turn was stopped before its batch ended, by the reader when `by_user` is set and by a failure otherwise: each says, from `progress`, whether its call finished, with its result, was running, or never started.
+fn stopped_results(
+    reply: &omc_providers::Reply,
+    progress: &[(String, Option<omc_providers::ToolResult>)],
+    by_user: bool,
+) -> Message {
+    let ended = if by_user {
+        "the user stopped the turn"
+    } else {
+        "the turn failed"
+    };
+    Message::ToolResults(
+        reply
+            .tool_calls
+            .iter()
+            .map(|call| {
+                let noted = progress.iter().find(|(id, _)| *id == call.id);
+                let (text, is_error, images) = match noted {
+                    Some((_, Some(result))) => (
+                        format!(
+                            "{}\n\n{}",
+                            FINISHED_CALL.replace("{ended}", ended),
+                            result.text
+                        ),
+                        result.is_error,
+                        result.images.clone(),
+                    ),
+                    Some((_, None)) => (RUNNING_CALL.replace("{ended}", ended), true, Vec::new()),
+                    None => (UNSTARTED_CALL.replace("{ended}", ended), true, Vec::new()),
+                };
+                omc_providers::ToolResult {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    text,
+                    is_error,
+                    images,
+                }
+            })
+            .collect(),
+    )
+}
+
 /// The failed results that close the tool calls of `last`, when it is a reply whose calls were left running, each saying [`INTERRUPTED_CALL`]; nothing otherwise.
 fn close_calls(last: Option<&Message>) -> Option<Message> {
     let Some(Message::Assistant(reply)) = last else {
@@ -1427,7 +1527,7 @@ mod tests {
         }
     }
 
-    /// A turn stopped after finishing a step keeps that step and loses only the call nothing answered, so the next open still has the work.
+    /// A turn stopped after finishing a step keeps that step, and the call nothing answered is kept with a result saying it never started, so the next open still has the work.
     #[test]
     fn a_stopped_turn_keeps_the_steps_it_finished() {
         let path = scratch("stopped.jsonl");
@@ -1468,11 +1568,139 @@ mod tests {
             ],
         );
         let kept = journal.settle_stopped(STOPPED, "").unwrap();
-        assert_eq!(kept.len(), 3);
+        assert_eq!(kept.len(), 6);
+        assert_eq!(kept[3], call("c2"));
+        assert!(matches!(
+            &kept[4],
+            Message::ToolResults(results)
+                if results.len() == 1 && results[0].call_id == "c2" && results[0].is_error && results[0].text.starts_with("Not run: the user stopped the turn")
+        ));
+        assert!(matches!(&kept[5], Message::Assistant(reply) if reply.text == STOPPED_NOTE));
         drop(journal);
         let (_, reopened) = Journal::open(&path, None).unwrap();
-        assert_eq!(reopened.len(), 3);
+        assert_eq!(reopened, kept);
         assert!(Journal::read(&path).unwrap().lost.is_empty());
+    }
+
+    /// A turn stopped in the middle of a batch tells the model, for each call of the batch, whether it finished, with its result, was running, or never started.
+    #[test]
+    fn a_stopped_batch_says_how_each_call_stood() {
+        let path = scratch("stopped-batch.jsonl");
+        let (journal, _) = Journal::open(&path, None).unwrap();
+        let calls: Vec<ToolCall> = ["done", "running", "waiting"]
+            .into_iter()
+            .map(|id| ToolCall {
+                id: id.into(),
+                name: "bash".into(),
+                arguments: json!({}),
+            })
+            .collect();
+        let reply = Message::Assistant(Reply {
+            text: "Editing and testing.".into(),
+            tool_calls: calls,
+            ..Reply::default()
+        });
+        let scribe = journal.scribe();
+        scribe.append(&Message::User("fix it".into())).unwrap();
+        scribe.append(&reply).unwrap();
+        scribe.began("done");
+        scribe.began("running");
+        scribe.ran(&ToolResult {
+            call_id: "done".into(),
+            name: "bash".into(),
+            text: "edited".into(),
+            is_error: false,
+            images: Vec::new(),
+        });
+        let kept = journal.settle_stopped(STOPPED, "").unwrap();
+        assert_eq!(kept.len(), 4);
+        assert_eq!(kept[1], reply);
+        let Message::ToolResults(results) = &kept[2] else {
+            panic!("the calls are not closed");
+        };
+        let ids: Vec<&str> = results
+            .iter()
+            .map(|result| result.call_id.as_str())
+            .collect();
+        assert_eq!(ids, ["done", "running", "waiting"]);
+        assert!(!results[0].is_error);
+        assert_eq!(
+            results[0].text,
+            "This call finished before the user stopped the turn. Its result:\n\nedited"
+        );
+        assert!(results[1].is_error);
+        assert!(
+            results[1]
+                .text
+                .starts_with("Interrupted: the user stopped the turn while this call was running"),
+            "{}",
+            results[1].text
+        );
+        assert!(results[2].is_error);
+        assert!(
+            results[2]
+                .text
+                .starts_with("Not run: the user stopped the turn before this call started"),
+            "{}",
+            results[2].text
+        );
+        assert!(matches!(&kept[3], Message::Assistant(reply) if reply.text == STOPPED_NOTE));
+        scribe.ran(&ToolResult {
+            call_id: "running".into(),
+            name: "bash".into(),
+            text: "late".into(),
+            is_error: false,
+            images: Vec::new(),
+        });
+        drop(scribe);
+        drop(journal);
+        let (_, reopened) = Journal::open(&path, None).unwrap();
+        assert_eq!(reopened, kept);
+    }
+
+    /// What a batch noted is forgotten once its results are appended, so a later stop does not take an earlier batch's calls for its own.
+    #[test]
+    fn noted_calls_are_forgotten_once_answered() {
+        let path = scratch("stopped-forgotten.jsonl");
+        let (journal, _) = Journal::open(&path, None).unwrap();
+        let call = |id: &str| ToolCall {
+            id: id.into(),
+            name: "bash".into(),
+            arguments: json!({}),
+        };
+        let scribe = journal.scribe();
+        scribe.append(&Message::User("go".into())).unwrap();
+        scribe
+            .append(&Message::Assistant(Reply {
+                tool_calls: vec![call("a")],
+                ..Reply::default()
+            }))
+            .unwrap();
+        scribe.began("a");
+        scribe
+            .append(&Message::ToolResults(vec![ToolResult {
+                call_id: "a".into(),
+                name: "bash".into(),
+                text: "ok".into(),
+                is_error: false,
+                images: Vec::new(),
+            }]))
+            .unwrap();
+        scribe
+            .append(&Message::Assistant(Reply {
+                tool_calls: vec![call("a")],
+                ..Reply::default()
+            }))
+            .unwrap();
+        let kept = journal.settle_stopped("the turn crashed", "").unwrap();
+        let Message::ToolResults(results) = &kept[4] else {
+            panic!("the call is not closed");
+        };
+        assert!(
+            results[0]
+                .text
+                .starts_with("Not run: the turn failed before")
+        );
     }
 
     /// A reply stopped while it was being written keeps its prompt and the text written so far, marked as stopped, so the model knows on the next turn what it was saying.

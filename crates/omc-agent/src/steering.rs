@@ -10,6 +10,11 @@ use crate::Scribe;
 pub trait Steering: Send + Sync {
     /// Takes the message that has waited longest, which becomes message number `at` of the history, with the images the reader attached to it, or nothing when none waits.
     fn next(&self, at: usize) -> Option<(String, Vec<Image>)>;
+
+    /// Whether the turn is to end once the batch of tool calls that just finished has its results in the history, without asking the model again; never, unless the implementation says otherwise.
+    fn halted(&self) -> bool {
+        false
+    }
 }
 
 /// Appends every message waiting in `steering`, when there is one, to `history` as the reader's, each followed by the images attached to it, each recorded with `scribe` as it is added; a journal that cannot be written to is reported on standard error.

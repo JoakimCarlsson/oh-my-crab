@@ -61,6 +61,8 @@ pub(crate) enum Ended {
     SignedOut(String),
     /// It failed for this reason.
     Failed(String),
+    /// It failed for this reason in a way that passes with time, such as a rate limit, and kept its prompt and the steps it finished: this is the conversation so far, which ends with them, unanswered.
+    Unanswered(String, Vec<Message>),
     /// It wrote this prompt to hand the conversation over to a new one.
     HandedOff(String),
     /// It panicked, for this reason, before it could settle the saved history.
@@ -584,7 +586,11 @@ impl Turn {
                     let text = error.to_string();
                     hooks.stop_failure(kind, &text, &text).await;
                 }
-                Ended::Failed(error.to_string())
+                if error.keeps_history() {
+                    Ended::Unanswered(error.to_string(), self.history)
+                } else {
+                    Ended::Failed(error.to_string())
+                }
             }
         }
     }
@@ -1554,7 +1560,10 @@ mod tests {
             let turn = turn_in(&dir, &shared, history);
             history = match turn.run_with(model.clone(), job).await {
                 Ended::Done(after) => after,
-                Ended::Failed(reason) | Ended::SignedOut(reason) | Ended::Crashed(reason) => {
+                Ended::Failed(reason)
+                | Ended::Unanswered(reason, _)
+                | Ended::SignedOut(reason)
+                | Ended::Crashed(reason) => {
                     panic!("turn failed: {reason}")
                 }
                 Ended::HandedOff(prompt) => panic!("turn handed over: {prompt}"),

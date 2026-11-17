@@ -27,6 +27,11 @@ model, runs the tool calls in the reply, sends the results back, and repeats
 until the model answers without calling a tool. The turn then ends with
 `Finished`: `null` when it went well, or the reason it failed. `Cancel` stops
 a turn, subagents included; the client then sees `"Halted"` and `Finished`.
+What the turn did stays in the conversation, so the model knows on the next
+turn where it was stopped: a reply cut off midway is kept as far as it got,
+and each tool call of a batch that was running is given a result saying
+whether it finished before the stop, with its result, was interrupted while it
+ran and may have run in part, or never started.
 
 ## History: saved and reopened by id
 

@@ -8,7 +8,13 @@ provider says how long to wait with `retry-after` or `retry-after-ms`, that wait
 is kept to, and a provider that asks for more than 60 seconds, however much
 more, is not waited for. Each wait shows as a running `retry` step, under an id
 no other wait of the process has, saying which attempt it is and why, and
-stopping the turn ends it. Sign-in problems, spent quotas, billing, missing
+stopping the turn ends it. When the attempts are used up, or the provider
+asks for a longer wait than is waited for, the turn fails with the reason, but
+its prompt and every step it finished stay in the conversation, unanswered,
+and stay saved; the turn is not recorded as lost. The reason the client is
+told ends by saying so: `/retry` sends the prompt again, a new prompt is sent
+after it so the model sees both, and a conversation reopened before either can
+go on with it through `Resume`. Sign-in problems, spent quotas, billing, missing
 credits and requests the provider will not take fail the turn at once, and so
 does a reply the model declined to give or the provider's content filter
 stopped.
@@ -52,7 +58,18 @@ the arguments of an `edit`, the model is sent a notice, once a turn, that
 nothing ran and that it should make a real call if it meant to. Any other code
 block, JSON included, is left alone.
 
-Both notices come after an answer that is already kept, in the history and in
+A reply without tool calls that ends by announcing work the agent is about to
+do, such as "Launching the fixers now" or "Let me check the callers", would
+end the turn with nothing done. When one of its last two sentences opens with
+the agent saying it acts now, the model is sent a notice, once a turn, that
+nothing ran and that it should make the call now or say plainly what blocks
+it. The check reads the words of the reply alone and leans toward letting the
+turn end: a reply that asks the user something, offers something ("I can ...
+if you want"), holds a condition or a negation, puts the work off till later,
+or whose last paragraph reports finished work is never followed up. A second
+announcement in the same turn ends it.
+
+These notices come after an answer that is already kept, in the history and in
 the saved conversation. The model's reply to a notice is kept as a reply of its
 own, and an empty one ends the turn; it is given to the model joined to the
 answer before it, since every provider wants a message from the reader between

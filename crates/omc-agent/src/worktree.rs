@@ -137,6 +137,13 @@ pub(crate) struct Snapshot {
     pub(crate) submodules: Vec<String>,
 }
 
+impl Snapshot {
+    /// Whether it is an untouched clone of a folder outside any git repository rather than a commit of one.
+    pub(crate) fn is_pristine(&self) -> bool {
+        matches!(self.base, Base::Pristine(_))
+    }
+}
+
 /// What holds the state a copy starts from, which its changes are taken against.
 #[derive(Clone)]
 enum Base {
@@ -325,6 +332,13 @@ fn ordinary(path: &Path) -> PathBuf {
         Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
         _ => path.to_path_buf(),
     }
+}
+
+/// Whether `directory` is inside a git working tree; `false` as well when git cannot be run.
+pub(crate) async fn in_repository(directory: &Path) -> bool {
+    git(directory, &["rev-parse", "--show-toplevel"])
+        .await
+        .is_ok_and(|top| !top.is_empty())
 }
 
 /// Takes the state of the main agent's working tree, as [`Isolation::directory`] says where it is, for copies to start from: inside a git repository, a commit on top of its head holding every file git does not ignore as it is on disk; outside one, unless [`Backend::Worktree`] is asked for, an untouched copy-on-write clone of the folder.

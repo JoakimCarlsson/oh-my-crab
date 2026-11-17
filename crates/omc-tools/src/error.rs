@@ -11,8 +11,10 @@ pub enum ToolError {
     /// The arguments did not match the tool's schema.
     #[error("invalid arguments: {0}")]
     InvalidArguments(String),
-    /// A path resolves outside the working directory.
-    #[error("path {0} is outside the working directory")]
+    /// A path resolves outside the working directory and the user's scratch directory.
+    #[error(
+        "path {0} is outside the working directory: file tools reach only the working directory and the scratch directory, `scratch` under the user's cache directory ($XDG_CACHE_HOME/scratch or ~/.cache/scratch)"
+    )]
     OutsidePath(String),
     /// A filesystem or process operation failed.
     #[error("{0}")]

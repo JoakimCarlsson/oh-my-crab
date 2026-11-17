@@ -148,6 +148,9 @@ pub struct Subagent {
     pub background: bool,
     /// How it stands.
     pub state: SubagentState,
+    /// What it has cost so far, its own requests and those of the subagents it started, across its follow-ups; left out before its first answered request, and by older senders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spent: Option<crate::SubagentSpend>,
 }
 
 /// How a subagent stands.
@@ -178,6 +181,7 @@ mod tests {
             category: category.map(str::to_owned),
             background: false,
             state: SubagentState::Running,
+            spent: None,
         }
     }
 
@@ -202,5 +206,31 @@ mod tests {
             serde_json::from_str::<Subagent>(old).unwrap(),
             subagent(None, None)
         );
+        assert!(line.get("spent").is_none());
+    }
+
+    /// A subagent's spend so far goes on the wire with its cost in millionths of a dollar and reads back as it was written; an unpriced one leaves the cost out.
+    #[test]
+    fn a_subagent_carries_its_spend() {
+        let mut sent = subagent(None, None);
+        sent.spent = Some(crate::SubagentSpend {
+            requests: 3,
+            input: 1200,
+            output: 300,
+            cache_read: 9000,
+            cache_write: 400,
+            cost: Some(42_500),
+        });
+        let line = serde_json::to_value(&sent).unwrap();
+        assert_eq!(line["spent"]["cost"], 42_500);
+        assert_eq!(line["spent"]["requests"], 3);
+        assert_eq!(serde_json::from_value::<Subagent>(line).unwrap(), sent);
+        sent.spent = Some(crate::SubagentSpend {
+            cost: None,
+            ..crate::SubagentSpend::default()
+        });
+        let line = serde_json::to_value(&sent).unwrap();
+        assert!(line["spent"].get("cost").is_none());
+        assert_eq!(serde_json::from_value::<Subagent>(line).unwrap(), sent);
     }
 }

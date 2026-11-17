@@ -211,14 +211,29 @@ async fn a_lasting_refusal_is_not_retried() {
     assert_eq!(model.requests().len(), 1);
 }
 
-/// A provider that stays overloaded fails the turn once the attempts are used up.
+/// A provider that stays overloaded fails the turn once the attempts are used up, and the prompt stays in the history, unanswered, rather than being dropped.
 #[tokio::test(start_paused = true)]
 async fn retries_are_limited() {
     let outcomes = (0..=MAX_RETRIES + 1).map(|_| overloaded()).collect();
     let model = Outcomes::new(outcomes);
-    let (ended, _, _) = turn(&model, &scratch("retry-limit")).await;
-    assert!(matches!(ended, Err(AgentError::Provider(_))));
+    let (ended, history, _) = turn(&model, &scratch("retry-limit")).await;
+    assert!(matches!(&ended, Err(error @ AgentError::Provider(_)) if error.keeps_history()));
+    assert_eq!(history, [Message::User("go".into())]);
     assert_eq!(model.requests().len(), MAX_RETRIES as usize + 1);
+}
+
+/// A rate limit whose wait is longer than is waited for fails the turn at once, keeping the prompt.
+#[tokio::test(start_paused = true)]
+async fn a_long_rate_limit_keeps_the_prompt() {
+    let model = Outcomes::new(vec![Err(failure(
+        "429 Too Many Requests",
+        "slow down",
+        Some(Duration::from_secs(3600)),
+    ))]);
+    let (ended, history, _) = turn(&model, &scratch("retry-long-limit")).await;
+    assert!(matches!(&ended, Err(error) if error.keeps_history()));
+    assert_eq!(history, [Message::User("go".into())]);
+    assert_eq!(model.requests().len(), 1);
 }
 
 /// A turn stopped while it waits to ask again does not ask again.
@@ -736,4 +751,44 @@ async fn an_auth_failure_does_not_fall_back() {
             .iter()
             .any(|event| matches!(event, AgentEvent::ModelFallback { .. }))
     );
+}
+
+/// A finished reply that announces work and makes no call is kept and followed up once with a notice to act now, which the history does not keep; a second announcement ends the turn, so the nudge can never loop.
+#[tokio::test]
+async fn an_announcement_without_a_call_is_nudged_once() {
+    let model = Outcomes::new(vec![
+        Ok(say("Found it.\n\nLaunching parallel fixers now.")),
+        Ok(say("Starting the next round.")),
+        Ok(say("never asked")),
+    ]);
+    let (ended, history, _) = turn(&model, &scratch("nudge-stall")).await;
+    ended.unwrap();
+    assert_eq!(
+        history,
+        [
+            Message::User("go".into()),
+            Message::Assistant(say("Found it.\n\nLaunching parallel fixers now.")),
+            Message::Assistant(say("Starting the next round.")),
+        ]
+    );
+    let requests = model.requests();
+    assert_eq!(requests.len(), 2);
+    let nudged = last_text(&requests[1]);
+    assert!(nudged.starts_with("<harness-notice>"), "{nudged}");
+    assert!(nudged.contains("made no tool call"), "{nudged}");
+}
+
+/// A final answer or a question to the user ends the turn without a nudge.
+#[tokio::test]
+async fn answers_and_questions_are_not_nudged() {
+    for text in [
+        "The parser now handles empty input; all tests pass.",
+        "Want me to also update the docs?",
+    ] {
+        let model = Outcomes::new(vec![Ok(say(text))]);
+        let (ended, history, _) = turn(&model, &scratch("nudge-stall-none")).await;
+        ended.unwrap();
+        assert_eq!(history.len(), 2, "{text}");
+        assert_eq!(model.requests().len(), 1, "{text}");
+    }
 }

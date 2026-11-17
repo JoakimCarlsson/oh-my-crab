@@ -51,6 +51,32 @@ pub(crate) const MEMORY: &str = "memory";
 /// The id of the setting that turns keeping the files before and after each turn on or off; it takes [`ON`] and [`OFF`].
 pub(crate) const SNAPSHOTS: &str = "snapshots";
 
+/// The setting naming the most US dollars one subagent run may spend.
+pub(crate) const SUBAGENT_BUDGET: &str = "subagent_budget";
+
+/// The amounts the subagent budget offers besides `off`, in US dollars.
+const BUDGETS: [&str; 5] = ["1", "2", "5", "10", "25"];
+
+/// The value of the subagent budget setting for `budget`: `off` for none, else the amount in US dollars.
+pub(crate) fn budget_value(budget: Option<f64>) -> String {
+    budget.map_or_else(|| OFF.to_owned(), |dollars| format!("{dollars}"))
+}
+
+/// The subagent budget `value` names: none for `off`, else an amount in US dollars above zero, written with or without a leading `$`; nothing when it names neither.
+pub(crate) fn parse_budget(value: &str) -> Option<Option<f64>> {
+    let value = value.trim();
+    if value == OFF {
+        return Some(None);
+    }
+    value
+        .strip_prefix('$')
+        .unwrap_or(value)
+        .parse::<f64>()
+        .ok()
+        .filter(|dollars| dollars.is_finite() && *dollars > 0.0)
+        .map(Some)
+}
+
 /// The value of the cache setting that stands for `retention`.
 pub(crate) fn retention_value(retention: Retention) -> &'static str {
     match retention {
@@ -118,6 +144,8 @@ pub(crate) struct Offer<'a> {
     pub(crate) checkpoints: bool,
     /// Whether orchestrator mode is on.
     pub(crate) orchestrator: bool,
+    /// The most US dollars one subagent run may spend; none for no limit.
+    pub(crate) subagent_budget: Option<f64>,
     /// Whether the files are kept before and after each turn.
     pub(crate) snapshots: bool,
     /// The prompt cache lifetime in use, when the provider offers a choice.
@@ -296,6 +324,25 @@ pub(crate) fn offered(offer: &Offer<'_>) -> Vec<Setting> {
             ),
         ],
     });
+    let current = budget_value(offer.subagent_budget);
+    let mut budgets = vec![pick(OFF, "Off", "Subagents may spend without limit")];
+    if !BUDGETS.contains(&current.as_str()) && current != OFF {
+        budgets.push(pick(&current, &format!("${current}"), ""));
+    }
+    budgets.extend(BUDGETS.iter().map(|amount| {
+        pick(
+            amount,
+            &format!("${amount}"),
+            "A subagent run that spends more is stopped after the step it is in and returns what it has",
+        )
+    }));
+    settings.push(Setting {
+        id: SUBAGENT_BUDGET.to_owned(),
+        category: SUBAGENT_BUDGET.to_owned(),
+        name: "Subagent budget".to_owned(),
+        current,
+        picks: budgets,
+    });
     settings.push(Setting {
         id: ORCHESTRATOR.to_owned(),
         category: ORCHESTRATOR.to_owned(),
@@ -366,6 +413,7 @@ mod tests {
             effort,
             checkpoints: false,
             orchestrator: false,
+            subagent_budget: None,
             snapshots: true,
             retention: None,
             warming: None,
@@ -394,6 +442,7 @@ mod tests {
                 "plan_model",
                 "plan_autosave",
                 "snapshots",
+                "subagent_budget",
                 "orchestrator",
                 "checkpoints"
             ]
@@ -422,7 +471,7 @@ mod tests {
     /// Effort is hidden when the model takes none, and otherwise falls back to medium.
     #[test]
     fn effort_follows_the_model() {
-        assert_eq!(offered(&offer(&[], &[], None)).len(), 7);
+        assert_eq!(offered(&offer(&[], &[], None)).len(), 8);
         let settings = offered(&offer(&[], &Effort::ALL, None));
         let effort = &settings[2];
         assert_eq!(
@@ -503,5 +552,32 @@ mod tests {
             assert_eq!(Mode::parse(mode.value()), Some(mode));
         }
         assert_eq!(Mode::parse("x"), None);
+    }
+
+    /// The subagent budget is off by default, offers its amounts, shows an amount set by hand among them, and reads `off`, amounts with or without `$`, and nothing else.
+    #[test]
+    fn the_subagent_budget_is_off_by_default() {
+        let models = [];
+        let mut offer = offer(&models, &[], None);
+        let find = |settings: Vec<Setting>| {
+            settings
+                .into_iter()
+                .find(|setting| setting.id == SUBAGENT_BUDGET)
+                .unwrap()
+        };
+        let off = find(offered(&offer));
+        assert_eq!(off.current, OFF);
+        assert_eq!(off.picks.len(), 6);
+        offer.subagent_budget = Some(2.5);
+        let set = find(offered(&offer));
+        assert_eq!(set.current, "2.5");
+        assert!(set.picks.iter().any(|pick| pick.value == "2.5"));
+        assert_eq!(parse_budget("off"), Some(None));
+        assert_eq!(parse_budget("$3"), Some(Some(3.0)));
+        assert_eq!(parse_budget("0.5"), Some(Some(0.5)));
+        assert_eq!(parse_budget("0"), None);
+        assert_eq!(parse_budget("-1"), None);
+        assert_eq!(parse_budget("lots"), None);
+        assert_eq!(budget_value(parse_budget("5").unwrap()), "5");
     }
 }

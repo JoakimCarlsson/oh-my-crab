@@ -85,7 +85,10 @@ held to it by its prompts, and crab does not run it.
   arguments and results. When a turn crab started made no tool calls, or the
   same calls with the same results as the turn crab started before it, the goal
   pauses with a note saying so. A prompt from the reader starts the judging
-  afresh.
+  afresh. A turn that only announces what the agent will do next, with no
+  call, is followed up inside the turn with a notice to act now, as any turn
+  is (see [When things go wrong](troubleshooting.md)), so a promise alone
+  neither ends the turn nor counts as progress.
 - **Budget.** The budget counts the input, output and cache writes of every
   request while the goal is active, subagents and summaries included; cache
   reads, and the requests that keep the cache warm between turns, are not
