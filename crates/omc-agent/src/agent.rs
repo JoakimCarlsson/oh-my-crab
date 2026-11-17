@@ -323,6 +323,42 @@ pub async fn run_turn_steered(
     for message in &history[start..] {
         record(scribe, message);
     }
+    carry_on(context, history, start, resets, events, scribe, steering).await
+}
+
+/// Goes on with a turn that was interrupted, as [`crate::Journal::resume`] put it back: `history` already holds the turn as far as it got, ending with a prompt or with tool results for the model to answer, and the turn runs on from there like [`run_turn_steered`] without a new prompt.
+///
+/// When the turn fails, `history` and the journal of `scribe` are cut back to what `history` held when it was resumed, so it can be resumed again.
+///
+/// # Errors
+///
+/// Same as [`run_turn`].
+pub async fn resume_turn(
+    context: &Context<'_>,
+    history: &mut Vec<Message>,
+    events: &(dyn Fn(AgentEvent) + Send + Sync),
+    scribe: Option<&Scribe>,
+    steering: Option<&dyn Steering>,
+) -> Result<(), AgentError> {
+    let start = history.len();
+    let resets = context.notebook.map_or(0, Notebook::resets);
+    carry_on(context, history, start, resets, events, scribe, steering).await
+}
+
+/// Drives a turn whose messages from `start` on are in `history` and saved already, until the model stops calling tools, then settles `history` and the journal of `scribe` as [`run_turn_steered`] describes; `resets` is how many times the notebook had started a fresh context window when the turn began.
+///
+/// # Errors
+///
+/// Same as [`run_turn`].
+async fn carry_on(
+    context: &Context<'_>,
+    history: &mut Vec<Message>,
+    start: usize,
+    resets: u64,
+    events: &(dyn Fn(AgentEvent) + Send + Sync),
+    scribe: Option<&Scribe>,
+    steering: Option<&dyn Steering>,
+) -> Result<(), AgentError> {
     let open = OpenCalls::new(events);
     let events: &(dyn Fn(AgentEvent) + Send + Sync) = &|event| open.see(event);
     let mut settled = None;

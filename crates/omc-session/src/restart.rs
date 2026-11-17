@@ -115,6 +115,35 @@ impl Session {
         }
     }
 
+    /// Goes on with the turn the harness stopped in the middle of when the conversation was last open: the steps it finished are put back, tool calls it left running are closed as interrupted, the client is told the turns with [`Event::Resumed`], and a turn runs on from there without a new prompt. Whatever stands in the way is told with [`Event::Failed`]: no open conversation, a turn running, or no stopped turn to go on with, which is so once anything else has changed the conversation.
+    pub(super) fn resume(&mut self) {
+        if self.open.is_none() {
+            return self.say(Event::Failed("the conversation is not open".to_owned()));
+        }
+        if self.running.is_some() {
+            return self.say(Event::Failed(
+                "a turn is running already; resume when it has finished".to_owned(),
+            ));
+        }
+        let resumed = match self.journal.as_ref().map(|journal| journal.resume()) {
+            Some(Ok(Some(added))) => added,
+            Some(Err(error)) => {
+                return self.say(Event::Failed(format!(
+                    "cannot save the conversation: {error}"
+                )));
+            }
+            Some(Ok(None)) | None => {
+                return self.say(Event::Failed(
+                    "the conversation has no interrupted turn to resume".to_owned(),
+                ));
+            }
+        };
+        self.history.extend(resumed);
+        self.shared.warmer.stop();
+        self.say_history();
+        self.start(Job::Resume, None);
+    }
+
     /// Takes the last reply back out of the conversation and answers the reader's last prompt again: the conversation is cut back to before that prompt, the client is told the turns left, and a turn starts with the prompt as the reader wrote it and under the id it was saved with, or as the model was told it when the conversation does not say.
     fn retry(&mut self) {
         let Some(at) = self

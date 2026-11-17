@@ -172,6 +172,21 @@ pub const STOPPED_NOTE: &str = "[The user stopped this reply here.]";
 /// The reason given for a turn that was still running when the conversation stopped.
 pub const INTERRUPTED: &str = "interrupted";
 
+/// The result a tool call is given when its turn is resumed after the harness stopped while the call ran, so that the model knows its outcome is unknown.
+pub const INTERRUPTED_CALL: &str = "The harness stopped before this call finished, so its result is lost. It may have run in part or in full: check what it did before running it again.";
+
+/// A turn the harness stopped in the middle of, as the history was opened: what it had done, which was cut back, kept so that [`Journal::resume`] can put it back and the turn can go on.
+struct Unfinished {
+    /// The length of the history once the turn was cut back, where `tail` goes back in.
+    base: usize,
+    /// The messages of the turn that were cut back, in order.
+    tail: Vec<Message>,
+    /// The marks of the turns among `tail`, at their positions in the history.
+    marks: Vec<Marked>,
+    /// The id of the first turn recorded as lost because it was interrupted, which is forgotten again when the turn is resumed.
+    forget: Option<String>,
+}
+
 impl Saved {
     /// The value saved under `key`, read as a `T`, or what `T` is by default when nothing readable is saved there.
     pub fn fact<T: serde::de::DeserializeOwned + Default>(&self, key: &str) -> T {
@@ -290,6 +305,8 @@ struct State {
     branches: Vec<Branch>,
     /// The index in `branches` of the branch the conversation is on.
     current: usize,
+    /// The turn the harness stopped in the middle of, while it can still be resumed: until anything else changes the history.
+    unfinished: Option<Unfinished>,
 }
 
 impl State {
@@ -492,11 +509,7 @@ impl Journal {
             }
         }
         let intended = history.len();
-        while matches!(history.last(), Some(Message::User(_) | Message::Images(_)))
-            || matches!(history.last(), Some(Message::Assistant(reply)) if !reply.tool_calls.is_empty())
-        {
-            history.pop();
-        }
+        let tail = history.split_off(answered_length(&history));
         let interrupted: Vec<Lost> = marks
             .iter()
             .filter(|(at, _)| *at >= history.len() && *at < intended)
@@ -529,6 +542,22 @@ impl Journal {
         if wrote {
             file.sync_data().map_err(io_error)?;
         }
+        let unfinished = (intended == saved && target.is_none())
+            .then(|| Unfinished {
+                base: history.len(),
+                tail,
+                marks: marks
+                    .iter()
+                    .filter(|(at, _)| *at >= history.len())
+                    .cloned()
+                    .collect(),
+                forget: interrupted.first().map(|turn| turn.mark.id.clone()),
+            })
+            .filter(|turn| {
+                !turn.tail.is_empty()
+                    || (matches!(history.last(), Some(Message::ToolResults(_)))
+                        && !lost.iter().any(|held| held.at == history.len()))
+            });
         lost.extend(interrupted);
         marks.retain(|(at, _)| *at < history.len());
         let mut branches: Vec<Branch> = lines.into_iter().map(|line| line.branch).collect();
@@ -553,6 +582,7 @@ impl Journal {
                 facts,
                 branches,
                 current,
+                unfinished,
             }),
         });
         Ok((journal, history))
@@ -789,6 +819,7 @@ impl Journal {
         state.settle()?;
         write_record(&mut state.file, &Written::Turn(mark))?;
         state.marks.push((at, mark.clone()));
+        state.unfinished = None;
         Ok(())
     }
 
@@ -833,6 +864,7 @@ impl Journal {
         let mut state = self.lock();
         state.epoch += 1;
         state.pending = Some(length);
+        state.unfinished = None;
         state.marks.retain(|(at, _)| *at < length);
         state.settle()
     }
@@ -902,6 +934,47 @@ impl Journal {
         Ok(history)
     }
 
+    /// Whether the history was opened in the middle of a turn the harness stopped, which [`Journal::resume`] can still put back to go on with.
+    pub fn unfinished(&self) -> bool {
+        self.lock().unfinished.is_some()
+    }
+
+    /// Puts back the turn the harness stopped in the middle of, so that it can go on where it was: the steps it finished, which opening the history cut back, are written again with their marks, the turns recorded as lost because they were interrupted are forgotten, and tool calls that were running when it stopped are given [`INTERRUPTED_CALL`] as their failed results. Returns the messages to add to the history as it was opened, which end with a prompt or with tool results for the model to answer; nothing when there is no such turn, or when the history changed since it was opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of the write or the sync; the turn can no longer be resumed then.
+    pub fn resume(&self) -> io::Result<Option<Vec<Message>>> {
+        let mut state = self.lock();
+        let Some(Unfinished {
+            base,
+            tail,
+            marks,
+            forget,
+        }) = state.unfinished.take()
+        else {
+            return Ok(None);
+        };
+        state.settle()?;
+        if let Some(id) = &forget {
+            write_record(&mut state.file, &Written::Forget(id))?;
+            if let Some(index) = state.lost.iter().position(|held| held.mark.id == *id) {
+                state.lost.truncate(index);
+            }
+        }
+        let mut added = tail;
+        added.extend(close_calls(added.last()));
+        for (offset, message) in added.iter().enumerate() {
+            for (at, mark) in marks.iter().filter(|(at, _)| *at == base + offset) {
+                write_record(&mut state.file, &Written::Turn(mark))?;
+                state.marks.push((*at, mark.clone()));
+            }
+            write_record(&mut state.file, &Written::Message(message))?;
+        }
+        state.file.sync_data()?;
+        Ok(Some(added))
+    }
+
     /// Takes the state, whatever a panicking writer left.
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state
@@ -925,6 +998,7 @@ impl Scribe {
             return Ok(());
         }
         state.settle()?;
+        state.unfinished = None;
         write_record(&mut state.file, &Written::Message(message))
     }
 
@@ -960,6 +1034,7 @@ impl Scribe {
             return Ok(());
         }
         state.settle()?;
+        state.unfinished = None;
         write_record(&mut state.file, &Written::Cut(0))?;
         state.marks.clear();
         write_record(&mut state.file, &Written::Message(first))
@@ -979,6 +1054,7 @@ impl Scribe {
             return Ok(());
         }
         state.settle()?;
+        state.unfinished = None;
         write_record(&mut state.file, &Written::Cut(keep))?;
         state.marks.retain(|(at, _)| *at < keep);
         for message in messages {
@@ -1263,6 +1339,40 @@ fn replay(path: &Path, bytes: &[u8], damage: Damage) -> Result<Replayed, Journal
         notes,
         changes,
         facts,
+    })
+}
+
+/// The length of `history` without the turn a crash left unanswered at its end: the prompts nothing answered and the replies whose tool calls have no results.
+fn answered_length(history: &[Message]) -> usize {
+    history
+        .iter()
+        .rposition(|message| match message {
+            Message::User(_) | Message::Images(_) => false,
+            Message::Assistant(reply) => reply.tool_calls.is_empty(),
+            _ => true,
+        })
+        .map_or(0, |index| index + 1)
+}
+
+/// The failed results that close the tool calls of `last`, when it is a reply whose calls were left running, each saying [`INTERRUPTED_CALL`]; nothing otherwise.
+fn close_calls(last: Option<&Message>) -> Option<Message> {
+    let Some(Message::Assistant(reply)) = last else {
+        return None;
+    };
+    (!reply.tool_calls.is_empty()).then(|| {
+        Message::ToolResults(
+            reply
+                .tool_calls
+                .iter()
+                .map(|call| omc_providers::ToolResult {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    text: INTERRUPTED_CALL.to_owned(),
+                    is_error: true,
+                    images: Vec::new(),
+                })
+                .collect(),
+        )
     })
 }
 
@@ -1778,6 +1888,84 @@ mod tests {
         assert_eq!(journal.lost()[0].reason, INTERRUPTED);
         drop(journal);
         assert_eq!(Journal::read(&path).unwrap().lost.len(), 1);
+    }
+
+    /// A turn a crash stopped while a tool call ran is set aside when the history is opened, and resuming puts its steps back with the call closed as interrupted, forgets it as lost, and saves all of it.
+    #[test]
+    fn an_interrupted_turn_can_be_resumed() {
+        let path = scratch("resumed.jsonl");
+        let (journal, _) = Journal::open(&path, None).unwrap();
+        append_all(&journal, &three_turns());
+        let at = three_turns().len();
+        let mark = Mark {
+            id: "4".into(),
+            text: "go".into(),
+            files: Vec::new(),
+        };
+        journal.mark(at, &mark).unwrap();
+        let call = Message::Assistant(Reply {
+            text: "running".into(),
+            tool_calls: vec![ToolCall {
+                id: "c".into(),
+                name: "bash".into(),
+                arguments: json!({}),
+            }],
+            ..Reply::default()
+        });
+        append_all(&journal, &[Message::User("go".into()), call.clone()]);
+        drop(journal);
+        let (journal, history) = Journal::open(&path, None).unwrap();
+        assert_eq!(history.len(), at);
+        assert!(journal.unfinished());
+        assert_eq!(journal.lost()[0].reason, INTERRUPTED);
+        let added = journal.resume().unwrap().unwrap();
+        assert_eq!(added.len(), 3);
+        assert_eq!(added[1], call);
+        assert!(matches!(
+            &added[2],
+            Message::ToolResults(results)
+                if results.len() == 1 && results[0].call_id == "c" && results[0].is_error && results[0].text == INTERRUPTED_CALL
+        ));
+        assert!(journal.lost().is_empty());
+        assert!(
+            journal
+                .marks()
+                .iter()
+                .any(|(held, kept)| *held == at && *kept == mark)
+        );
+        assert!(!journal.unfinished());
+        assert!(journal.resume().unwrap().is_none());
+        drop(journal);
+        let saved = Journal::read(&path).unwrap();
+        assert_eq!(saved.history.len(), at + 3);
+        assert!(saved.lost.is_empty());
+        let (journal, reopened) = Journal::open(&path, None).unwrap();
+        assert_eq!(reopened.len(), at + 3);
+        assert!(journal.unfinished());
+    }
+
+    /// A turn set aside when the history was opened can no longer be resumed once another turn starts.
+    #[test]
+    fn a_new_turn_drops_the_interrupted_one() {
+        let path = scratch("superseded.jsonl");
+        let (journal, _) = Journal::open(&path, None).unwrap();
+        append_all(&journal, &[Message::User("first".into())]);
+        drop(journal);
+        let (journal, history) = Journal::open(&path, None).unwrap();
+        assert!(history.is_empty());
+        assert!(journal.unfinished());
+        journal
+            .mark(
+                0,
+                &Mark {
+                    id: "2".into(),
+                    text: "second".into(),
+                    files: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(!journal.unfinished());
+        assert!(journal.resume().unwrap().is_none());
     }
 
     /// The files a tool call changed and the facts the harness saved come back when the file is read, a fact keeps only its latest value, and saving the same value again writes nothing.

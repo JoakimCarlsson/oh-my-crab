@@ -710,3 +710,72 @@ async fn orchestrator_mode_hands_work_to_categories() {
     let again = lead.seen.lock().unwrap()[3].clone();
     assert_eq!(again, off);
 }
+
+/// A conversation killed while a tool call ran comes back with the turn set aside; resuming puts the turn back, closes the call as interrupted and runs the turn on to its answer, which is saved, while resuming again finds nothing to resume.
+#[tokio::test]
+async fn resume_goes_on_with_a_turn_killed_midway() {
+    let model = Arc::new(Scripted::default());
+    let (mut session, mut events, mut finished) = opened("resume", model.clone());
+    session.handle(Command::Resume).await;
+    assert!(drain(&mut events).iter().any(
+        |event| matches!(event, Event::Failed(reason) if reason.contains("no interrupted turn"))
+    ));
+    let path = session
+        .open
+        .as_ref()
+        .unwrap()
+        .locations
+        .directory
+        .join("killed.jsonl");
+    {
+        let (journal, _) = Journal::open(&path, None).unwrap();
+        let mark = omc_agent::Mark {
+            id: "t1".into(),
+            text: "build it".into(),
+            files: Vec::new(),
+        };
+        journal.mark(0, &mark).unwrap();
+        let scribe = journal.scribe();
+        scribe.append(&Message::User("build it".into())).unwrap();
+        scribe
+            .append(&Message::Assistant(Reply {
+                tool_calls: vec![omc_providers::ToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({"command": "make"}),
+                }],
+                ..Reply::default()
+            }))
+            .unwrap();
+    }
+    let (journal, history) = Journal::open(&path, None).unwrap();
+    assert!(history.is_empty());
+    assert!(journal.unfinished());
+    session.journal = Some(journal);
+    session.history = history;
+    session.handle(Command::Resume).await;
+    assert!(
+        drain(&mut events)
+            .iter()
+            .any(|event| matches!(event, Event::Resumed(_)))
+    );
+    settle(&mut session, &mut finished).await;
+    assert_eq!(session.history.len(), 4);
+    assert!(matches!(
+        &session.history[2],
+        Message::ToolResults(results)
+            if results[0].call_id == "c1" && results[0].is_error && results[0].text == omc_agent::INTERRUPTED_CALL
+    ));
+    assert_eq!(reply_at(&session.history, 3), "answer 1");
+    let journal = session.journal.as_ref().unwrap();
+    assert!(journal.lost().is_empty());
+    assert_eq!(journal.marks()[0].1.id, "t1");
+    let saved = Journal::read(&path).unwrap();
+    assert_eq!(saved.history, session.history);
+    assert!(saved.lost.is_empty());
+    drain(&mut events);
+    session.handle(Command::Resume).await;
+    assert!(drain(&mut events).iter().any(
+        |event| matches!(event, Event::Failed(reason) if reason.contains("no interrupted turn"))
+    ));
+}

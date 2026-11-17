@@ -30,7 +30,8 @@ mod todos;
 mod worktree;
 
 pub use agent::{
-    AgentError, AgentEvent, Context, Live, compact, run_turn, run_turn_recorded, run_turn_steered,
+    AgentError, AgentEvent, Context, Live, compact, resume_turn, run_turn, run_turn_recorded,
+    run_turn_steered,
 };
 pub use approval::{ApprovalRequest, Approvals, Decision, Keeper, Place, Prompter, Standing};
 pub use aside::{answer_aside, write_handoff};
@@ -43,8 +44,8 @@ pub use hooks::{
     MAX_STOP_PER_TURN, Permit, Screened,
 };
 pub use journal::{
-    Branch, FIRST_BRANCH, INTERRUPTED, Journal, JournalError, Lost, Mark, Marked, STOPPED,
-    STOPPED_NOTE, Saved, Scribe,
+    Branch, FIRST_BRANCH, INTERRUPTED, INTERRUPTED_CALL, Journal, JournalError, Lost, Mark, Marked,
+    STOPPED, STOPPED_NOTE, Saved, Scribe,
 };
 pub use nesting::{DEFAULT_DEPTH, DEPTH_VARIABLE, MOST_DEPTH, Nesting, Throttle, max_depth};
 pub use picker::{Category, ModelPicker, Models, Picked};

@@ -822,6 +822,24 @@ prompt. The same as the prompt `/retry`.
 "Retry"
 ```
 
+### `Resume`
+
+Goes on with the turn that was running when crab last stopped, as after a
+crash or a kill. Opening a saved conversation sets such a turn aside and shows
+it as lost with the reason `interrupted`; `Resume` puts back the steps it
+finished, gives every tool call that was still running a failed result saying
+it was interrupted and may have run in part, sends `Resumed` with the turns,
+and runs the turn on from there without a new prompt. Its events follow as for
+a prompt, ending with `Finished`. The todo list and the goal come back with the
+conversation as they always do; subagents that ran in the background are not
+started again. Only possible right after `Open`, before anything else changes
+the conversation. Fails with `Failed` while a turn is running or when there is
+no interrupted turn.
+
+```json
+"Resume"
+```
+
 ### `Fresh`
 
 Starts the conversation afresh: every message is taken out of what the model
@@ -1315,10 +1333,13 @@ followed by `Finished` with `null`.
 
 The agent's plan, whole, as it stands now: a list of `PlanStep`, each with
 `text` (string) and `progress`, a `Progress`: `Pending`, `Doing` or `Done`. Each `Plan`
-replaces the one before.
+replaces the one before. A step may also carry `id` (string), the name other
+steps depend on it by; `depends_on` (list of strings), the ids or texts of the
+steps it waits on; and `blocked` (boolean), true while one of those is not
+`Done`. Each is left out when unset, empty or false.
 
 ```json
-{"Plan":[{"text":"Reproduce the failure","progress":"Done"},{"text":"Fix the fixture","progress":"Doing"},{"text":"Run the suite","progress":"Pending"}]}
+{"Plan":[{"text":"Reproduce the failure","progress":"Done"},{"text":"Fix the fixture","progress":"Doing"},{"text":"Run the suite","progress":"Pending","depends_on":["Fix the fixture"],"blocked":true}]}
 ```
 
 ### `Ask`

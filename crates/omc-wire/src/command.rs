@@ -162,6 +162,8 @@ pub enum Command {
     Close,
     /// Takes the last reply back out of the conversation and answers the reader's last prompt again: the conversation is cut back to before that prompt, the client is told the turns left with a [`crate::Event::Resumed`], and a turn starts with the prompt as the reader wrote it, under the id it was saved with. The same as the prompt `/retry`. Fails with a [`crate::Event::Failed`] while a turn is running or when the conversation has no prompt to answer again.
     Retry,
+    /// Goes on with the turn that was running when the harness last stopped, as after a crash or a kill: the steps the turn finished, which opening the conversation set aside and showed as interrupted, are put back, tool calls that were running are given failed results saying they were interrupted, the client is told the turns with a [`crate::Event::Resumed`], and the turn runs on from there without a new prompt, its events following as for a prompt. Only possible right after [`Command::Open`], before anything else changes the conversation. Fails with a [`crate::Event::Failed`] while a turn is running or when there is no interrupted turn.
+    Resume,
     /// Starts the conversation afresh: every message is taken out of what the model is given, the settings, the name, the goal and the notebook stay, and the client is told the turns left with a [`crate::Event::Resumed`]; a saved conversation keeps the turns, recorded as lost. The same as the prompt `/fresh`. Fails with a [`crate::Event::Failed`] while a turn is running.
     Fresh,
     /// Asks the model `question` on the side: it is shown the conversation as it stood when the last turn ended and answers with a [`crate::Event::Aside`], without tools, and neither the question nor the answer is added to the conversation. Allowed while a turn is running, which goes on undisturbed. The same as the prompt `/btw <question>`.
@@ -308,6 +310,7 @@ mod tests {
         let lines = [
             (r#""Retry""#, Command::Retry),
             (r#""Fresh""#, Command::Fresh),
+            (r#""Resume""#, Command::Resume),
             (
                 r#"{"Btw":{"question":"why?"}}"#,
                 Command::Btw {

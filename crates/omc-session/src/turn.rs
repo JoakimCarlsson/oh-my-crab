@@ -137,6 +137,8 @@ pub(crate) enum Job {
     Prompt(String, Vec<omc_providers::Image>),
     /// Summarize the older part of the conversation, giving particular attention to this when it is given.
     Compact(Option<String>),
+    /// Go on with the turn the harness stopped in the middle of, which the history already holds as far as it got.
+    Resume,
     /// Write the prompt that hands the conversation over to a new one, toward this goal when it is given.
     Handoff(Option<String>),
 }
@@ -540,6 +542,16 @@ impl Turn {
                     self.shared.lifecycle.settle(&starting);
                 }
                 result
+            }
+            Job::Resume => {
+                omc_agent::resume_turn(
+                    &context,
+                    &mut self.history,
+                    events.as_ref(),
+                    self.scribe.as_ref(),
+                    Some(self.shared.as_ref()),
+                )
+                .await
             }
             Job::Compact(focus) => {
                 compact(

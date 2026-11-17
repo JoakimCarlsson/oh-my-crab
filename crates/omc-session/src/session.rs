@@ -302,6 +302,7 @@ impl Session {
             Command::Undo { turn, paths } => self.undo(turn, &paths),
             Command::Retry => self.carry_out(restart::Asked::Retry, &[], false),
             Command::Fresh => self.carry_out(restart::Asked::Fresh, &[], false),
+            Command::Resume => self.resume(),
             Command::Btw { question } => {
                 let question = question.trim().to_owned();
                 self.carry_out(restart::Asked::Btw(question), &[], false);
