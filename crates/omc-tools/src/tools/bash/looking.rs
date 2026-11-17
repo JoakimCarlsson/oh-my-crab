@@ -140,9 +140,11 @@ const GIT_CONFIG_CHANGES: &[&str] = &[
 const HARMLESS_SINKS: &[&str] = &["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"];
 
 /// Folders the sandbox covers with private, empty scratch space when they exist.
+#[cfg(unix)]
 const SCRATCH: &[&str] = &["/tmp", "/var/tmp", "/run"];
 
 /// Folders under `/run` bound back into the sandbox read-only after it is covered, so that name lookups keep working.
+#[cfg(unix)]
 const KEPT_UNDER_RUN: &[&str] = &["/run/systemd/resolve", "/run/resolvconf"];
 
 /// The mode read-only commands run in on this machine: [`Mode::Sandboxed`] when `bwrap` is installed and can make a sandbox here, found out once and remembered, and [`Mode::Vetted`] otherwise.
@@ -177,6 +179,7 @@ fn sandbox_works() -> bool {
 }
 
 /// The arguments that have `bwrap` bind the whole filesystem read-only, give it fresh `/dev` and `/proc`, cover the [`SCRATCH`] folders and `/dev/shm` with private scratch space, keep the name lookup folders, bind `root` read-only again in case scratch space covered it, and start in `root`; the command to run follows them.
+#[cfg(unix)]
 fn sandbox_args(root: &Path) -> Vec<String> {
     let mut args: Vec<String> = ["--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"]
         .map(str::to_owned)
