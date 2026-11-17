@@ -4,8 +4,10 @@
 
 mod args;
 mod baseline;
+mod compare;
 mod report;
 mod run;
+mod stats;
 mod tally;
 mod task;
 
@@ -55,6 +57,10 @@ fn main() -> ExitCode {
 ///
 /// Fails when the tasks cannot be read, crab is measured and cannot list its tools or lacks one the model is to be given, or the output folder cannot be written.
 fn benchmark(options: &Options) -> Result<(), String> {
+    if let Some(saved) = &options.report {
+        let outcomes = compare::load(saved)?;
+        return summarise(options, &outcomes);
+    }
     let mut tasks = task::load(
         &options.tasks.clone().unwrap_or_else(bundled_tasks),
         &options.only,
@@ -102,8 +108,28 @@ fn benchmark(options: &Options) -> Result<(), String> {
     let written = serde_json::to_string_pretty(&outcomes).map_err(|error| error.to_string())?;
     std::fs::write(&results, written)
         .map_err(|error| format!("could not write {}: {error}", results.display()))?;
-    println!("{}", report::render(&outcomes));
     println!("Outcomes, transcripts and edited files: {}", out.display());
+    summarise(options, &outcomes)
+}
+
+/// Prints the report of `outcomes`: the tables by contender and task, how far the numbers can be trusted, what the runs cost when `options` give prices, and what changed since the benchmark `options` compare with.
+///
+/// # Errors
+///
+/// Fails when the earlier results cannot be read, or when they are compared, `options` ask for it, and a pass rate fell by more than chance.
+fn summarise(options: &Options, outcomes: &[Outcome]) -> Result<(), String> {
+    println!("{}", report::render(outcomes));
+    println!("{}", stats::render(outcomes));
+    if !options.prices.is_empty() {
+        println!("{}", stats::costs(outcomes, &options.prices));
+    }
+    if let Some(earlier) = &options.compare {
+        let (table, regressed) = compare::compare(&compare::load(earlier)?, outcomes);
+        println!("Since {}:\n\n{table}", earlier.display());
+        if regressed && options.fail_on_regression {
+            return Err("a pass rate fell by more than chance".to_owned());
+        }
+    }
     Ok(())
 }
 

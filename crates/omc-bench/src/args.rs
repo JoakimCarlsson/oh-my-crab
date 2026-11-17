@@ -3,8 +3,10 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::stats::Price;
+
 /// Usage text printed for `--help` and after a bad argument.
-pub(crate) const USAGE: &str = "usage: crab-bench <--model|--claude-code|--codex|--command> ... [options]\n\n  --model <provider[/model]>  measure crab with this model, as a provider id and optionally a model id\n  --claude-code <model>       measure Claude Code with this model, as a baseline\n  --codex <model>             measure the Codex CLI with this model, as a baseline\n  --command <name>=<command>  measure another program as a baseline: the command, split at spaces, with {prompt} standing for what the model is asked\n                              (repeat any of the four to compare several)\n  --runs <n>                  how many times each task is run for each contender (3)\n  --jobs <n>                  how many runs go on at once (4)\n  --task <name>               run only this task; repeat it for several\n  --tasks <folder>            the folder the tasks are read from (the bundled tasks)\n  --out <folder>              where the results, transcripts and edited files are written (build/bench/<time>)\n  --crab <program>            the crab to measure (the one beside crab-bench, else the one on PATH)\n  --timeout <seconds>         how long one run may take (300)\n  --tools <a,b,c>             the tools the model is given (read,grep,glob,edit)\n  --set <setting>=<value>     a conversation setting, such as effort=high; repeat it for several\n  --list                      print the tasks and stop";
+pub(crate) const USAGE: &str = "usage: crab-bench <--model|--claude-code|--codex|--command> ... [options]\n\n  --model <provider[/model]>  measure crab with this model, as a provider id and optionally a model id\n  --claude-code <model>       measure Claude Code with this model, as a baseline\n  --codex <model>             measure the Codex CLI with this model, as a baseline\n  --command <name>=<command>  measure another program as a baseline: the command, split at spaces, with {prompt} standing for what the model is asked\n                              (repeat any of the four to compare several)\n  --runs <n>                  how many times each task is run for each contender (3)\n  --jobs <n>                  how many runs go on at once (4)\n  --task <name>               run only this task; repeat it for several\n  --tasks <folder>            the folder the tasks are read from (the bundled tasks)\n  --out <folder>              where the results, transcripts and edited files are written (build/bench/<time>)\n  --crab <program>            the crab to measure (the one beside crab-bench, else the one on PATH)\n  --timeout <seconds>         how long one run may take (300)\n  --tools <a,b,c>             the tools the model is given (read,grep,glob,edit)\n  --set <setting>=<value>     a conversation setting, such as effort=high; repeat it for several\n  --list                      print the tasks and stop\n  --compare <results.json>    set the outcomes against an earlier benchmark's results file and show what changed\n  --fail-on-regression        end with a failure when --compare finds a pass rate that fell by more than chance\n  --price <contender>=<in>,<out>  dollars per million tokens sent and written, for the cost table; the contender as the report names it\n  --report <results.json>     run nothing: show the report of an earlier benchmark's results file";
 
 /// The tools the model is given unless `--tools` names others.
 const TOOLS: &[&str] = &["read", "grep", "glob", "edit"];
@@ -105,7 +107,7 @@ impl Contender {
 }
 
 /// Everything a benchmark run is told.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Options {
     /// What is measured, in the order it was named.
     pub(crate) contenders: Vec<Contender>,
@@ -129,6 +131,14 @@ pub(crate) struct Options {
     pub(crate) settings: Vec<(String, String)>,
     /// Whether to print the tasks and stop.
     pub(crate) list: bool,
+    /// An earlier benchmark's results file to set the outcomes against.
+    pub(crate) compare: Option<PathBuf>,
+    /// Whether a regression found by the comparison makes the benchmark fail.
+    pub(crate) fail_on_regression: bool,
+    /// The token prices of contenders, by the name the report gives them.
+    pub(crate) prices: Vec<(String, Price)>,
+    /// An earlier benchmark's results file to report on instead of running anything.
+    pub(crate) report: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -146,12 +156,16 @@ impl Default for Options {
             tools: TOOLS.iter().map(|&tool| tool.to_owned()).collect(),
             settings: Vec::new(),
             list: false,
+            compare: None,
+            fail_on_regression: false,
+            prices: Vec::new(),
+            report: None,
         }
     }
 }
 
 /// What the command line came to.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Asked {
     /// A benchmark run, or a listing of its tasks.
     Run(Box<Options>),
@@ -193,10 +207,14 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Asked
             }
             "--tools" => options.tools = listed(&value()?),
             "--set" => options.settings.push(setting(&value()?)?),
+            "--compare" => options.compare = Some(PathBuf::from(value()?)),
+            "--fail-on-regression" => options.fail_on_regression = true,
+            "--price" => options.prices.push(price(&value()?)?),
+            "--report" => options.report = Some(PathBuf::from(value()?)),
             other => return Err(format!("unknown option {other}")),
         }
     }
-    if options.contenders.is_empty() && !options.list {
+    if options.contenders.is_empty() && !options.list && options.report.is_none() {
         return Err(
             "name something to measure with --model, --claude-code, --codex or --command"
                 .to_owned(),
@@ -235,6 +253,22 @@ fn setting(text: &str) -> Result<(String, String), String> {
     match text.split_once('=') {
         Some((id, value)) if !id.is_empty() => Ok((id.to_owned(), value.to_owned())),
         _ => Err(format!("--set takes setting=value, not {text:?}")),
+    }
+}
+
+/// The contender and price `text` gives, written `contender=sent,written`; the contender is split off at the last `=`, since its name may hold one.
+///
+/// # Errors
+///
+/// Fails when `text` has no `=`, nothing before it, or a price that does not read.
+fn price(text: &str) -> Result<(String, Price), String> {
+    match text.rsplit_once('=') {
+        Some((contender, price)) if !contender.trim().is_empty() => {
+            Ok((contender.trim().to_owned(), Price::parse(price)?))
+        }
+        _ => Err(format!(
+            "--price takes contender=sent,written, not {text:?}"
+        )),
     }
 }
 
@@ -329,5 +363,41 @@ mod tests {
         assert!(read("--model claude --runs").is_err());
         assert!(read("--model claude --set effort").is_err());
         assert!(read("--model claude --what").is_err());
+        assert!(read("--model claude --price crab").is_err());
+        assert!(read("--model claude --price a=1").is_err());
+    }
+
+    /// Comparing, prices and reporting on saved results are read, and a report needs nothing to measure.
+    #[test]
+    fn comparison_and_prices_are_read() {
+        let Asked::Run(options) = parse(
+            [
+                "--model",
+                "claude",
+                "--compare",
+                "old.json",
+                "--fail-on-regression",
+                "--price",
+                "crab claude=3,15",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap() else {
+            panic!("expected a run");
+        };
+        assert_eq!(options.compare, Some(PathBuf::from("old.json")));
+        assert!(options.fail_on_regression);
+        assert_eq!(options.prices[0].0, "crab claude");
+        assert_eq!(
+            options.prices[0].1,
+            Price {
+                sent: 3.0,
+                written: 15.0
+            }
+        );
+        let Ok(Asked::Run(options)) = read("--report results.json") else {
+            panic!("expected a report");
+        };
+        assert_eq!(options.report, Some(PathBuf::from("results.json")));
     }
 }
