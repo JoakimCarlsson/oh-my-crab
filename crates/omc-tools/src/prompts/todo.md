@@ -5,3 +5,4 @@ Maintains the todo list the user sees. Each call REPLACES the whole list: send e
 Tasks are identified by their verbatim content. Keep wording stable between calls.
 Before work, list 3+ steps, requested task sets, or new instructions. MUST list EVERY user item separately (phased/numbered/bulleted/N); NEVER omit or remember leftovers.
 Statuses: `pending`, `in_progress` (at most one at a time), `completed`. Mark a task `completed` immediately when it is done and start the next one in the same call. Skip the list for trivial requests.
+Dependencies (optional): give a task an `id` and list in `depends_on` the ids or contents of the tasks it waits on. Cycles are refused; a task waiting on an unfinished one is shown as blocked and may not be `in_progress`.

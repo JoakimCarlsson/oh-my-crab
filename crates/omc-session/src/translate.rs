@@ -295,27 +295,47 @@ pub(crate) fn replay(
     turns
 }
 
-/// The plan a `todo` call's `arguments` lay out, when they lay one out.
+/// The plan a `todo` call's `arguments` lay out, when they lay one out, with steps waiting on unfinished steps marked blocked when their dependencies resolve.
 fn plan_of(arguments: &serde_json::Value) -> Option<Vec<omc_wire::PlanStep>> {
     let todos = arguments.get("todos")?.as_array()?;
-    Some(
-        todos
-            .iter()
-            .filter_map(|item| {
-                let text = item.get("content")?.as_str()?.trim();
-                (!text.is_empty()).then(|| omc_wire::PlanStep {
-                    text: text.to_owned(),
-                    progress: match item.get("status").and_then(|status| status.as_str()) {
-                        Some("in_progress" | "doing" | "active" | "started") => {
-                            omc_wire::Progress::Doing
-                        }
-                        Some("completed" | "done" | "complete") => omc_wire::Progress::Done,
-                        _ => omc_wire::Progress::Pending,
-                    },
-                })
+    let mut steps: Vec<omc_wire::PlanStep> = todos
+        .iter()
+        .filter_map(|item| {
+            let text = item.get("content")?.as_str()?.trim();
+            (!text.is_empty()).then(|| omc_wire::PlanStep {
+                text: text.to_owned(),
+                progress: match item.get("status").and_then(|status| status.as_str()) {
+                    Some("in_progress" | "doing" | "active" | "started") => {
+                        omc_wire::Progress::Doing
+                    }
+                    Some("completed" | "done" | "complete") => omc_wire::Progress::Done,
+                    _ => omc_wire::Progress::Pending,
+                },
+                id: item
+                    .get("id")
+                    .and_then(|id| id.as_str())
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned),
+                depends_on: item
+                    .get("depends_on")
+                    .and_then(|list| list.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|name| name.as_str())
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+                blocked: false,
             })
-            .collect(),
-    )
+        })
+        .collect();
+    if let Ok(graph) = omc_tools::dependencies::resolve(&omc_tools::dependencies::nodes_of(&steps))
+    {
+        omc_tools::dependencies::mark_blocked(&mut steps, &graph);
+    }
+    Some(steps)
 }
 
 /// The event that says what `event` says, given a context window of `window` tokens; nothing when it says nothing the client shows. Work nested under a subagent keeps the kind of the innermost subagent it names: the one that made the call, or the one a nested `task` call starts.

@@ -3,6 +3,7 @@
 mod checkpoint;
 mod coerce;
 mod deferral;
+pub mod dependencies;
 mod error;
 mod host;
 mod jobs;

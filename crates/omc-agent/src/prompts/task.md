@@ -8,6 +8,9 @@ Shared edits need one integration owner. Set interfaces in the task. Every task 
 # Batches
 One subagent: set `task` (with `agent`, `description`). Several independent slices: set `tasks`, a list of `{agent, task, description, output_schema, model}`, instead; up to {{most}} per call, {{parallel}} running at once. They run in parallel and the result labels each one's outcome; one failing does not stop the others. Prefer one call with `tasks` over many `task` calls. A call-level `agent`, `output_schema`, `isolated` or `model` applies to every item that omits it.
 
+# Dependencies
+When one item needs another's result, give the needed item an `id` and list it in the dependent item's `depends_on`. Each item starts as soon as every item it depends on completed, independent ones in parallel, and gets their results appended to its assignment. An item whose dependency failed is skipped, and so is everything after it. Cycles and unknown ids are refused before anything starts. An isolated item's worktree is made when the call starts, so it does not see what its dependencies changed until they are applied to your tree.
+
 # Structured output
 Set `output_schema` (a JSON Schema) when you need data back, not prose: findings to merge, lists to act on. The subagent must then hand its result to a `submit_result` tool; the value is checked against the schema and returned to you as JSON. A subagent that never submits a matching value fails.
 

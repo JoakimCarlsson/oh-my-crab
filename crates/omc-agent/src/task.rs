@@ -10,9 +10,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures_util::stream::FuturesUnordered;
 use futures_util::{StreamExt, stream};
 use omc_context::{AgentDefinition, render, subagent_assignment};
 use omc_providers::{ChatModel, Effort, Message};
+use omc_tools::dependencies::{Graph, Node, dependents, downstream, resolve};
 use omc_tools::schema::check_schema;
 use omc_tools::{Concurrency, Jobs, Registry, Tool, ToolError, ToolOutput, parse_args};
 use serde::Deserialize;
@@ -147,6 +149,12 @@ struct Item {
     model: Option<String>,
     /// The work category it is handed to, whose slot decides the model it asks.
     category: Option<String>,
+    /// The name other items of the call depend on it by.
+    #[serde(default)]
+    id: Option<String>,
+    /// The ids of the items of the call it waits on.
+    #[serde(default)]
+    depends_on: Vec<String>,
 }
 
 impl Args {
@@ -179,6 +187,8 @@ impl Args {
                 isolated,
                 model,
                 category,
+                id: None,
+                depends_on: Vec::new(),
             }]),
             (None, Some(list)) if list.is_empty() => invalid("`tasks` is empty".to_owned()),
             (None, Some(list)) if list.len() > MAX_TASKS => invalid(format!(
@@ -765,6 +775,147 @@ async fn conclude(
     (lane, outcome)
 }
 
+/// The dependencies between `items`, by their ids.
+///
+/// # Errors
+///
+/// Returns [`ToolError::InvalidArguments`] when two items share an id, an item depends on an id no item has or on itself, or the dependencies form a cycle.
+fn graph_of(items: &[Item]) -> Result<Graph, ToolError> {
+    let nodes: Vec<Node> = items
+        .iter()
+        .map(|item| Node {
+            names: item.id.iter().cloned().collect(),
+            depends_on: item.depends_on.clone(),
+        })
+        .collect();
+    resolve(&nodes).map_err(|reason| ToolError::InvalidArguments(format!("tasks: {reason}")))
+}
+
+/// The outcome of one subagent of a call run in dependency order, with its place in the call's list.
+type Placed = (usize, (Lane, Result<String, ToolError>));
+
+/// Runs `run`, at `position` of its call's list, as [`finish`] does, then applies what it changed as [`conclude`] does with `isolation`.
+async fn run_placed(
+    position: usize,
+    run: Run,
+    events: Arc<EventSink>,
+    nesting: Nesting,
+    isolation: Option<Arc<Isolation>>,
+) -> Placed {
+    let ended = finish(run, events.clone(), nesting).await;
+    (
+        position,
+        conclude(ended, isolation.as_deref(), events.as_ref()).await,
+    )
+}
+
+/// Ends `run` without running it, failed with `reason`: its step is closed, its end announced as failed, and its worktree, when it has one, removed through `isolation`.
+async fn skip(
+    mut run: Run,
+    reason: String,
+    events: &Arc<EventSink>,
+    isolation: Option<&Isolation>,
+) -> (Lane, Result<String, ToolError>) {
+    let lane = run.lane.clone();
+    let outcome = Err(ToolError::Failed(reason));
+    if let Some(event) = lane.closed(&outcome) {
+        events(event);
+    }
+    if let Some(mut enrolment) = run.enrolment.take() {
+        enrolment.leave();
+        enrolment.end(SubagentState::Failed);
+    }
+    let handback = match run.lease.take() {
+        Some(lease) => Some(lease.hand_back().await),
+        None => None,
+    };
+    conclude(
+        Ended {
+            lane,
+            outcome,
+            handback,
+        },
+        isolation,
+        events.as_ref(),
+    )
+    .await
+}
+
+/// Adds to the assignment of `run` the results of the subagents it depends on, at the positions `needs` of `outcomes`.
+fn brief(run: &mut Run, needs: &[usize], outcomes: &[Option<(Lane, Result<String, ToolError>)>]) {
+    let parts: Vec<String> = needs
+        .iter()
+        .filter_map(|&position| match outcomes.get(position)? {
+            Some((lane, Ok(text))) => Some(format!("## {}\n{text}", lane.label)),
+            _ => None,
+        })
+        .collect();
+    if !parts.is_empty() {
+        run.assignment = format!(
+            "{}\n\n# Results of the tasks this one depends on\n{}",
+            run.assignment,
+            parts.join("\n\n")
+        );
+    }
+}
+
+/// Runs `runs` in the order `graph` says: each starts as soon as every run it depends on completed, given their results, with independent ones running together, each taking a seat of `nesting`'s throttle; what one in a worktree of its own changed is applied as soon as it ends. A run that fails has every run depending on it, directly or not, skipped. Returns each run's lane and outcome in the order of `runs`.
+async fn run_ordered(
+    runs: Vec<Run>,
+    graph: Graph,
+    events: Arc<EventSink>,
+    nesting: Nesting,
+    isolation: Option<Arc<Isolation>>,
+) -> Vec<(Lane, Result<String, ToolError>)> {
+    let count = runs.len();
+    let reverse = dependents(&graph);
+    let mut remaining: Vec<usize> = graph.iter().map(Vec::len).collect();
+    let mut waiting: Vec<Option<Run>> = runs.into_iter().map(Some).collect();
+    let mut outcomes: Vec<Option<(Lane, Result<String, ToolError>)>> =
+        (0..count).map(|_| None).collect();
+    let mut running = FuturesUnordered::new();
+    let launch = |position: usize,
+                  waiting: &mut Vec<Option<Run>>,
+                  outcomes: &[Option<(Lane, Result<String, ToolError>)>]| {
+        let mut run = waiting[position].take()?;
+        brief(&mut run, &graph[position], outcomes);
+        Some(run_placed(
+            position,
+            run,
+            events.clone(),
+            nesting.clone(),
+            isolation.clone(),
+        ))
+    };
+    let ready: Vec<usize> = (0..count)
+        .filter(|&position| remaining[position] == 0)
+        .collect();
+    for position in ready {
+        running.extend(launch(position, &mut waiting, &outcomes));
+    }
+    while let Some((position, outcome)) = running.next().await {
+        let ok = outcome.1.is_ok();
+        let label = outcome.0.label.clone();
+        outcomes[position] = Some(outcome);
+        if ok {
+            for &next in &reverse[position] {
+                remaining[next] = remaining[next].saturating_sub(1);
+                if remaining[next] == 0 {
+                    running.extend(launch(next, &mut waiting, &outcomes));
+                }
+            }
+            continue;
+        }
+        for next in downstream(&graph, position) {
+            if let Some(run) = waiting[next].take() {
+                let reason = format!("skipped: it depends on `{label}`, which failed");
+                outcomes[next] = Some(skip(run, reason, &events, isolation.as_deref()).await);
+            }
+        }
+    }
+    outcomes.into_iter().flatten().collect()
+}
+
 /// A few words naming an assignment: its `description`, or the start of its `task`.
 fn headline(description: Option<&str>, task: &str) -> String {
     description
@@ -1236,6 +1387,8 @@ impl Task {
                     isolated: Some(false),
                     model,
                     category,
+                    id: None,
+                    depends_on: Vec::new(),
                 },
             )
             .await?;
@@ -1269,8 +1422,9 @@ impl Task {
     /// # Errors
     ///
     /// Returns [`ToolError::InvalidArguments`] for assignments that do not fit, and [`ToolError::Failed`] when an assignment cannot be prepared or a worktree cannot be made.
-    async fn fresh(&self, call: &str, args: Args) -> Result<Vec<Run>, ToolError> {
+    async fn fresh(&self, call: &str, args: Args) -> Result<(Vec<Run>, Graph), ToolError> {
         let items = args.items()?;
+        let graph = graph_of(&items)?;
         let several = items.len() > 1;
         let mut runs = Vec::with_capacity(items.len());
         for (index, item) in items.into_iter().enumerate() {
@@ -1288,7 +1442,7 @@ impl Task {
         for run in &mut runs {
             self.arm(run);
         }
-        Ok(runs)
+        Ok((runs, graph))
     }
 
     /// The finished subagent the call `call` with `args` sends a follow-up to, taken off the roster and ready to run again: it reports under this call, under an id of this call, with the approvals and the event sink of this tool, and keeps its conversation, its tools, its model and its system prompt.
@@ -1348,6 +1502,24 @@ impl Task {
                 .push(conclude(ended, self.settings.isolation.as_deref(), events.as_ref()).await);
         }
         outcomes
+    }
+
+    /// Starts `runs`, started by the call `call`, in the background as one job that runs them in the order `graph` says, as [`run_ordered`] does, and says which handle the job got.
+    fn start_ordered_in_background(&self, call: &str, runs: Vec<Run>, graph: Graph) -> ToolOutput {
+        let call = Some(call.to_owned()).filter(|call| !call.is_empty());
+        let count = runs.len();
+        let label = format!("{count} subagents with dependencies");
+        let events = self.settings.events.clone();
+        let nesting = self.settings.nesting.clone();
+        let isolation = self.settings.isolation.clone();
+        let handle = self.settings.jobs.spawn(label, call, async move {
+            combine(run_ordered(runs, graph, events, nesting, isolation).await)
+                .map(|output| output.text)
+                .map_err(|error| error.to_string())
+        });
+        ToolOutput::new(format!(
+            "Started {count} subagents in the background as {handle}; each starts once the items it depends on completed. Call `wait` once to get their combined result when all have ended."
+        ))
     }
 
     /// Starts `runs`, started by the call `call`, in the background, each once it took a seat of the shared throttle, and says which handle each got.
@@ -1515,7 +1687,7 @@ impl Tool for Task {
                 "output_schema": output_schema,
                 "tasks": {
                     "type": "array",
-                    "description": "Several independent assignments, run in parallel; give this instead of `task`. Call-level `agent`, `output_schema`, `isolated` and `model` apply to items that omit them.",
+                    "description": "Several assignments, run in parallel; give this instead of `task`. Call-level `agent`, `output_schema`, `isolated` and `model` apply to items that omit them. Items with `depends_on` start once the items they name completed.",
                     "maxItems": MAX_TASKS,
                     "items": {
                         "type": "object",
@@ -1525,7 +1697,9 @@ impl Tool for Task {
                             "description": description,
                             "output_schema": output_schema,
                             "isolated": isolated,
-                            "model": model
+                            "model": model,
+                            "id": { "type": "string", "description": "A short name other items of this call can depend on this one by." },
+                            "depends_on": { "type": "array", "items": { "type": "string" }, "description": "The ids of the items this one waits on: it starts once they all completed, with their results appended to its assignment, and is skipped when one of them fails." }
                         },
                         "required": ["task"]
                     }
@@ -1614,11 +1788,12 @@ impl Tool for Task {
                     .to_owned(),
             ));
         }
-        let mut runs = if args.resume.is_some() {
-            vec![self.resume(id, args)?]
+        let (mut runs, graph) = if args.resume.is_some() {
+            (vec![self.resume(id, args)?], Graph::new())
         } else {
             self.fresh(id, args).await?
         };
+        let ordered = graph.iter().any(|edges| !edges.is_empty());
         let several = runs.len() > 1;
         for run in &mut runs {
             (self.settings.events)(run.lane.opened());
@@ -1630,8 +1805,25 @@ impl Tool for Task {
                 (self.settings.events)(run.lane.worktree(lease.directory(), None));
             }
         }
+        if background && ordered {
+            return Ok(self.start_ordered_in_background(id, runs, graph));
+        }
         if background {
             return Ok(self.start_in_background(id, runs));
+        }
+        if ordered {
+            let settings = &self.settings;
+            let outcomes = settings
+                .nesting
+                .lending(run_ordered(
+                    runs,
+                    graph,
+                    settings.events.clone(),
+                    settings.nesting.clone(),
+                    settings.isolation.clone(),
+                ))
+                .await;
+            return combine(outcomes);
         }
         let mut outcomes = self.run_together(runs).await;
         if several {
@@ -1665,7 +1857,7 @@ mod tests {
     /// Builds a main registry with `read`, `grep`, `write` and a `task` tool over them that logs events into `log`.
     fn setup(
         name: &str,
-        model: Arc<Router>,
+        model: Arc<dyn ChatModel>,
         log: Arc<Mutex<Vec<AgentEvent>>>,
     ) -> (Registry, std::path::PathBuf) {
         let dir = scratch(name);
@@ -2045,5 +2237,207 @@ mod tests {
         let _ = handle.await;
         assert_eq!(dropped.load(Ordering::SeqCst), 2);
         assert_eq!(history.lock().unwrap().len(), 1);
+    }
+
+    /// The assignment a subagent was given, from what its model was asked.
+    fn assignment_of(seen: &crate::testkit::RequestSeen) -> String {
+        seen.last_user.clone().unwrap_or_default()
+    }
+
+    /// A model whose subagents answer `did <name>` for an assignment naming `<name>` on its last line, and fail by never handing back their structured result when the name starts with `fail`; `log` gets each assignment as it starts.
+    fn scripted(log: Arc<Mutex<Vec<String>>>) -> Arc<Router> {
+        Router::new(move |seen| {
+            let assignment = assignment_of(seen);
+            let name = assignment
+                .lines()
+                .find_map(|line| line.strip_prefix("job "))
+                .unwrap_or_default()
+                .to_owned();
+            if seen.messages == 1 {
+                log.lock().unwrap().push(assignment);
+            }
+            if name.starts_with("fail") {
+                say("no result")
+            } else {
+                say(&format!("did {name}"))
+            }
+        })
+    }
+
+    /// Runs `args` through the `task` tool of a fresh setup named `name` against `model`.
+    async fn run_task(
+        name: &str,
+        model: Arc<Router>,
+        args: Value,
+    ) -> Result<ToolOutput, ToolError> {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (registry, _) = setup(name, model, log);
+        let tool = registry.get("task").unwrap().clone();
+        tool.call_as("t1", args).await
+    }
+
+    /// The position in `log` of the assignment naming `name`.
+    fn started(log: &Mutex<Vec<String>>, name: &str) -> usize {
+        log.lock()
+            .unwrap()
+            .iter()
+            .position(|text| {
+                text.contains(&format!("job {name}\n")) || text.ends_with(&format!("job {name}"))
+            })
+            .unwrap_or_else(|| panic!("{name} never started"))
+    }
+
+    /// A dependent starts only after its dependencies completed, and is given their results.
+    #[tokio::test]
+    async fn dependent_tasks_run_in_order() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let output = run_task(
+            "task-deps-order",
+            scripted(log.clone()),
+            json!({"tasks": [
+                {"task": "job c", "id": "c", "depends_on": ["b"]},
+                {"task": "job b", "id": "b", "depends_on": ["a"]},
+                {"task": "job a", "id": "a"}
+            ]}),
+        )
+        .await
+        .unwrap();
+        assert!(output.text.starts_with("3 of 3 subagents completed."));
+        assert!(started(&log, "a") < started(&log, "b"));
+        assert!(started(&log, "b") < started(&log, "c"));
+        let assignments = log.lock().unwrap().clone();
+        let c = assignments
+            .iter()
+            .find(|text| text.contains("job c"))
+            .unwrap();
+        assert!(c.contains("Results of the tasks this one depends on"));
+        assert!(c.contains("did b"));
+        let first = output.text.find("did c").unwrap();
+        assert!(first < output.text.find("did b").unwrap());
+    }
+
+    /// A model whose subagents on `job a` and `job b` each wait until both have started, failing after a while when they never meet, as when they run one after the other.
+    struct Meeting {
+        /// How many of the two have started.
+        arrived: Mutex<usize>,
+        /// Woken when one arrives.
+        signal: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl ChatModel for Meeting {
+        /// Waits for the other of `job a` and `job b` before answering, then answers `done`.
+        async fn complete(
+            &self,
+            request: omc_providers::Request<'_>,
+            _sink: &mut dyn omc_providers::Sink,
+        ) -> Result<omc_providers::Reply, omc_providers::ProviderError> {
+            let first = request.messages.iter().find_map(|message| match message {
+                Message::User(text) => Some(text.clone()),
+                _ => None,
+            });
+            let gated = request.messages.len() == 1
+                && first.is_some_and(|text| text.contains("job a") || text.contains("job b"));
+            if gated {
+                *self.arrived.lock().unwrap() += 1;
+                self.signal.notify_waiters();
+                let met = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while *self.arrived.lock().unwrap() < 2 {
+                        let notified = self.signal.notified();
+                        if *self.arrived.lock().unwrap() >= 2 {
+                            break;
+                        }
+                        notified.await;
+                    }
+                })
+                .await;
+                if met.is_err() {
+                    return Ok(say("alone"));
+                }
+            }
+            Ok(say("done"))
+        }
+    }
+
+    /// Independent items of a batch with dependencies run at the same time, and their dependent after both.
+    #[tokio::test]
+    async fn independent_tasks_run_in_parallel() {
+        let model = Arc::new(Meeting {
+            arrived: Mutex::new(0),
+            signal: tokio::sync::Notify::new(),
+        });
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (registry, _) = setup("task-deps-parallel", model, log);
+        let output = registry
+            .get("task")
+            .unwrap()
+            .call_as(
+                "t1",
+                json!({"tasks": [
+                    {"task": "job a", "id": "a"},
+                    {"task": "job b", "id": "b"},
+                    {"task": "job c", "depends_on": ["a", "b"]}
+                ]}),
+            )
+            .await
+            .unwrap();
+        assert!(output.text.starts_with("3 of 3 subagents completed."));
+        assert!(!output.text.contains("alone"), "{}", output.text);
+    }
+
+    /// A failed dependency skips everything downstream of it, and leaves independent items be.
+    #[tokio::test]
+    async fn a_failed_dependency_skips_its_dependents() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let output = run_task(
+            "task-deps-failure",
+            scripted(log.clone()),
+            json!({"tasks": [
+                {"task": "job fail", "id": "f", "output_schema": {"type": "object"}},
+                {"task": "job b", "id": "b", "depends_on": ["f"]},
+                {"task": "job c", "depends_on": ["b"]},
+                {"task": "job d"}
+            ]}),
+        )
+        .await
+        .unwrap();
+        assert!(
+            output.text.starts_with("1 of 4 subagents completed."),
+            "{}",
+            output.text
+        );
+        assert_eq!(output.text.matches("skipped: it depends on").count(), 2);
+        let assignments = log.lock().unwrap().clone();
+        assert!(
+            !assignments
+                .iter()
+                .any(|text| text.contains("job b") || text.contains("job c"))
+        );
+    }
+
+    /// A cycle, or a dependency on an unknown id, is refused before any subagent starts.
+    #[tokio::test]
+    async fn dependency_cycles_are_refused() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let error = run_task(
+            "task-deps-cycle",
+            scripted(log.clone()),
+            json!({"tasks": [
+                {"task": "job a", "id": "a", "depends_on": ["b"]},
+                {"task": "job b", "id": "b", "depends_on": ["a"]}
+            ]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("cycle"), "{error}");
+        let unknown = run_task(
+            "task-deps-unknown",
+            scripted(log.clone()),
+            json!({"tasks": [{"task": "job a", "depends_on": ["ghost"]}]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(unknown.to_string().contains("ghost"));
+        assert!(log.lock().unwrap().is_empty());
     }
 }
