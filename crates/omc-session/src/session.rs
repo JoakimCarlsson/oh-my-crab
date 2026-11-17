@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use omc_agent::{Isolation, Journal};
 use omc_auth::{AuthError, LoginPrompt};
 use omc_context::{Discovered, Locations, discover, expand_skill};
@@ -371,7 +372,7 @@ impl Session {
 
     /// Opens the conversation: finds the provider, the tools, the skills and the agents, and says what can be set.
     ///
-    /// A turn of the conversation open before is cancelled first, and the prompts queued for it are dropped, so that nothing of it reaches the conversation opened now; its background runs are stopped, its debugging sessions disconnected, and its `SessionEnd` hooks run. Once open, the `SessionStart` hooks start, for a resumed conversation when it was saved, and their context is told to the model with the first prompt.
+    /// A turn of the conversation open before is cancelled first, and the prompts queued for it are dropped, so that nothing of it reaches the conversation opened now; its background runs and long-lived subagents are stopped, its debugging sessions disconnected, and its `SessionEnd` hooks run. Once open, the `SessionStart` hooks start, for a resumed conversation when it was saved, and their context is told to the model with the first prompt.
     async fn open(&mut self, opening: Opening) {
         let Opening {
             directory,
@@ -399,6 +400,7 @@ impl Session {
         let replaced = self.open.is_some();
         self.journal = None;
         self.shared.jobs.stop_all();
+        self.shared.crew.dismiss();
         self.shared.debuggers.close().await;
         if self.open.is_some() {
             let reason = if conversation.is_some() {
@@ -912,7 +914,7 @@ impl Session {
         };
         let ended = self.ended.clone();
         let task = tokio::spawn(async move {
-            let how = turn.run(job).await;
+            let how = guarded(turn.run(job)).await;
             let _ = ended.send((number, how));
         });
         self.running = Some((number, task.abort_handle()));
@@ -1076,7 +1078,7 @@ impl Session {
         self.shared.approvals.set_keeper(keeper);
     }
 
-    /// Takes in the end of turn `number`; a turn that was cancelled meanwhile is ignored.
+    /// Takes in the end of turn `number`; a turn that was cancelled meanwhile is ignored. A turn that crashed has its saved history settled as a stopped turn's is, since it never cut it back itself, then ends as a failed one does.
     ///
     /// A turn that answered is followed by a turn for the prompt that has waited longest for it, when one still waits; the others wait for that turn. When the turn failed or needs signing in again, the prompts waiting are dropped instead, and its last request, which a failed turn's history no longer ends with, is no longer kept warm. When no turn follows, crab starts waiting to tell the hooks it is idle.
     fn finish(&mut self, number: u64, how: Ended) {
@@ -1110,6 +1112,12 @@ impl Session {
                 self.shared.warmer.stop();
                 self.shared.checkpoint.clear();
                 self.keep_fresh_window();
+                self.say(Event::Finished(Some(reason)));
+                self.drop_queue();
+            }
+            Ended::Crashed(reason) => {
+                self.pause_goal(&format!("the turn failed: {reason}"));
+                self.forget_turn(&reason);
                 self.say(Event::Finished(Some(reason)));
                 self.drop_queue();
             }
@@ -1289,34 +1297,38 @@ impl Session {
 
     /// Stops the turn that is running, subagents included, declines what it waited on and drops the prompts queued for it, telling the client of each.
     ///
-    /// The turn's task owns everything it started, so aborting it ends them all; what it finished and the reply it was writing stay in the saved history, marked as stopped.
+    /// The turn's task owns everything it started, so aborting it ends them all; what it finished and the reply it was writing stay in the saved history, marked as stopped. Once a turn was stopped, crab starts waiting to tell the hooks it is idle.
     fn cancel(&mut self) {
         self.shared.questions.decline_all();
         if let Some((_, task)) = self.running.take() {
             task.abort();
             self.keep_after();
-            self.forget_turn();
+            self.forget_turn(omc_agent::STOPPED);
             self.pause_goal(goal::STOPPED);
             self.say(Event::Halted);
             self.say(Event::Finished(None));
+            self.wait_idle();
         }
         self.drop_queue();
     }
 
-    /// Ends whatever is running, for good, background runs and debugging sessions included.
+    /// Ends whatever is running, for good, background runs, long-lived subagents and debugging sessions included; a turn that was running is told to the client as halted and finished, as a cancelled one is.
     fn stop(&mut self) {
         self.shared.questions.decline_all();
         self.shared.jobs.stop_all();
+        self.shared.crew.dismiss();
         self.shared.debuggers.stop_all();
         if let Some((_, task)) = self.running.take() {
             task.abort();
             self.keep_after();
-            self.forget_turn();
+            self.forget_turn(omc_agent::STOPPED);
+            self.say(Event::Halted);
+            self.say(Event::Finished(None));
         }
     }
 
-    /// Settles the saved history after the turn was stopped, keeping every step the turn finished, the prompt and the reply as far as it was written, marked as stopped, and stops warming its last request, which the next one will not start with.
-    fn forget_turn(&mut self) {
+    /// Settles the saved history after the turn was stopped or crashed, keeping every step the turn finished, the prompt and the reply as far as it was written, marked as stopped, recording turns cut off whole as lost for `reason`, and stops warming its last request, which the next one will not start with.
+    fn forget_turn(&mut self, reason: &str) {
         self.shared.warmer.stop();
         self.shared.checkpoint.clear();
         self.keep_fresh_window();
@@ -1330,7 +1342,7 @@ impl Session {
         match self
             .journal
             .as_ref()
-            .map(|j| j.settle_stopped(omc_agent::STOPPED, &partial))
+            .map(|j| j.settle_stopped(reason, &partial))
         {
             Some(Ok(kept)) => self.history = kept,
             Some(Err(error)) => eprintln!("history not saved: {error}"),
@@ -1509,6 +1521,26 @@ const START_RESUME: &str = "resume";
 
 /// The kind of notification the hooks are told when crab has waited [`IDLE_AFTER`] for the reader after a turn.
 const IDLE: &str = "idle_prompt";
+
+/// What a turn crashed with, as the reason its end is told with.
+const CRASHED: &str = "the turn crashed";
+
+/// Runs `turn` to its end; a turn that panics ends as [`Ended::Crashed`] with [`CRASHED`] and what it panicked with, so that its end is still taken in and the client told.
+async fn guarded(turn: impl std::future::Future<Output = Ended>) -> Ended {
+    match std::panic::AssertUnwindSafe(turn).catch_unwind().await {
+        Ok(how) => how,
+        Err(panic) => {
+            let what = panic
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned());
+            Ended::Crashed(match what {
+                Some(what) => format!("{CRASHED}: {what}"),
+                None => CRASHED.to_owned(),
+            })
+        }
+    }
+}
 
 /// What a conversation for `locations` may use as its project's trust stands, with the reader's own hooks file `own` and the trust recorded in `store`, `vouched` when the reader trusted it for the conversation, leaving out what `disabled` names; what cannot be read is reported on standard error.
 fn assessed(
@@ -3014,6 +3046,89 @@ mod tests {
         jobs.spawn("forever".into(), None, std::future::pending());
         session.stop();
         assert!(jobs.wait().await.is_err());
+    }
+
+    /// A turn that panics ends as failed, saying it crashed and with what, instead of never ending.
+    #[tokio::test]
+    async fn a_turn_that_panics_ends_as_failed() {
+        let how = guarded(async { panic!("boom") }).await;
+        assert!(matches!(&how, Ended::Crashed(reason) if reason == "the turn crashed: boom"));
+        let how = guarded(async { Ended::Failed("fine".into()) }).await;
+        assert!(matches!(&how, Ended::Failed(reason) if reason == "fine"));
+    }
+
+    /// A turn that crashed after saving a reply with tool calls leaves the saved conversation settled as a stopped turn's, matching the history kept in memory, and the client is told it failed.
+    #[tokio::test]
+    async fn a_crashed_turn_settles_the_saved_conversation() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/crashed-turn");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.jsonl");
+        let (journal, _) = Journal::open(&path, None).unwrap();
+        let scribe = journal.scribe();
+        let before = vec![
+            Message::User("first".into()),
+            Message::Assistant(omc_providers::Reply {
+                text: "answer".into(),
+                ..omc_providers::Reply::default()
+            }),
+        ];
+        for message in &before {
+            scribe.append(message).unwrap();
+        }
+        scribe.append(&Message::User("go".into())).unwrap();
+        scribe
+            .append(&Message::Assistant(omc_providers::Reply {
+                text: "reading".into(),
+                tool_calls: vec![omc_providers::ToolCall {
+                    id: "t1".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": "a.txt" }),
+                }],
+                ..omc_providers::Reply::default()
+            }))
+            .unwrap();
+        let (out, mut events) = unbounded_channel();
+        let mut session = bare_session();
+        session.shared = Shared::new(out);
+        session.history = before;
+        session.journal = Some(journal);
+        let task = tokio::spawn(std::future::pending::<()>());
+        session.running = Some((1, task.abort_handle()));
+        session.finish(1, Ended::Crashed("the turn crashed: boom".into()));
+        let saved = Journal::read(&path).unwrap().history;
+        assert_eq!(saved, session.history);
+        assert!(saved.iter().all(|message| !matches!(
+            message,
+            Message::Assistant(reply) if !reply.tool_calls.is_empty()
+        )));
+        let told: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert_eq!(
+            told.last(),
+            Some(&Event::Finished(Some("the turn crashed: boom".into())))
+        );
+    }
+
+    /// Cancelling a running turn starts the wait to tell the hooks crab is idle.
+    #[tokio::test]
+    async fn cancelling_a_turn_waits_to_tell_it_is_idle() {
+        let mut session = bare_session();
+        let task = tokio::spawn(std::future::pending::<()>());
+        session.running = Some((1, task.abort_handle()));
+        session.cancel();
+        assert!(session.idle.is_some());
+    }
+
+    /// Stopping the session while a turn runs tells the client the turn halted and finished.
+    #[tokio::test]
+    async fn stopping_a_running_turn_tells_it_halted() {
+        let (mut session, mut events) = busy_session("stop-halts");
+        while events.try_recv().is_ok() {}
+        session.stop();
+        let told: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert!(told.contains(&Event::Halted));
+        assert_eq!(told.last(), Some(&Event::Finished(None)));
     }
 
     /// A session opened on an empty scratch folder named `name`, with no login and a turn that never ends running, and the events it sends.

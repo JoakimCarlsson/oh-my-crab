@@ -23,6 +23,7 @@ use crate::compaction;
 use crate::fallback::{Asked, Routing};
 use crate::hooks::{CompactTrigger, Compacting, Gate, Hooks, Permit, StopBound, with_note};
 use crate::loop_guard::LoopGuard;
+use crate::open_calls::OpenCalls;
 use crate::pruning;
 use crate::recall::{self, RECALL};
 use crate::recovery::{self, MAX_CUT_CALLS, MAX_RECOVERIES, Retry};
@@ -299,6 +300,8 @@ pub async fn run_turn_recorded(
 ///
 /// A message that is still waiting when the model answers without calling a tool is left in `steering` for the caller. When the turn fails, the messages put into it are cut back with it.
 ///
+/// A call announced through `events` that has not ended when the turn is dropped, as when the task running it is aborted, is ended there as failed with the text `stopped`, so that nothing is left shown as running.
+///
 /// # Errors
 ///
 /// Same as [`run_turn`].
@@ -320,6 +323,8 @@ pub async fn run_turn_steered(
     for message in &history[start..] {
         record(scribe, message);
     }
+    let open = OpenCalls::new(events);
+    let events: &(dyn Fn(AgentEvent) + Send + Sync) = &|event| open.see(event);
     let mut settled = None;
     let result = drive(context, history, events, scribe, steering, &mut settled).await;
     if let Some(checkpoint) = context.checkpoint {
@@ -793,6 +798,8 @@ fn follow_up(
 ///
 /// When the compaction fails, the journal records the turn that asked for it as lost for that reason, as it does for a failed turn, so a reopened conversation still shows it.
 ///
+/// When it is dropped before it ends, the compaction shown through `events` is ended there as failed with the text `stopped`.
+///
 /// # Errors
 ///
 /// Returns [`AgentError::Compaction`] when the history holds nothing old enough to summarize, or when the summary could not be made; the history is then left as it was.
@@ -803,6 +810,8 @@ pub async fn compact(
     events: &(dyn Fn(AgentEvent) + Send + Sync),
     scribe: Option<&Scribe>,
 ) -> Result<(), AgentError> {
+    let open = OpenCalls::new(events);
+    let events: &(dyn Fn(AgentEvent) + Send + Sync) = &|event| open.see(event);
     let live = context.refresh.map(|refresh| refresh());
     let system = live.as_ref().map_or(context.system, |live| &*live.system);
     let result = match compact_history(
@@ -1270,7 +1279,7 @@ impl Batch<'_> {
     /// A failing tool yields a result with `is_error` set.
     async fn run_call(&self, call: &ToolCall, ready: Ready<'_>) -> ToolResult {
         let caller = Nested::new(*self, call);
-        let done = perform(call, ready, self.hooks, &caller).await;
+        let done = perform(call, &call.id, ready, self.hooks, &caller).await;
         if let Some(reason) = done.halt {
             self.stop(reason);
         }
@@ -1362,9 +1371,10 @@ struct Performed {
     halt: Option<String>,
 }
 
-/// Runs `call`, admitted as `ready`, with `caller` for the tools it runs, and adds the note from the hooks that screened it and what `hooks` say after the call, whether it succeeded or failed, to its text, or replaces the text with what they give in its place.
+/// Runs `call`, admitted as `ready`, under the id `id` the client knows it by, with `caller` for the tools it runs, and adds the note from the hooks that screened it and what `hooks` say after the call, whether it succeeded or failed, to its text, or replaces the text with what they give in its place.
 async fn perform(
     call: &ToolCall,
+    id: &str,
     ready: Ready<'_>,
     hooks: Option<&dyn Hooks>,
     caller: &dyn Caller,
@@ -1377,7 +1387,7 @@ async fn perform(
     } = ready;
     let shown = hooks.map(|_| arguments.clone());
     let began = Instant::now();
-    let mut done = match tool.call_through(&call.id, arguments, caller).await {
+    let mut done = match tool.call_through(id, arguments, caller).await {
         Ok(output) => Performed {
             text: output.text,
             is_error: false,
@@ -1488,7 +1498,7 @@ impl Caller for Nested<'_> {
 
     /// Runs the tool `name` with `args` the way a call of the model runs: its arguments put right against the schema and shown to the hooks, the reader asked when it needs approval, the hooks shown its result; reported under the calling tool's call, numbered from one in the order they were made.
     ///
-    /// Calls that need approval or are exclusive are asked about and run one at a time, while shared calls that need no approval overlap; the reader is told which tool made them.
+    /// Calls that need approval or are exclusive are asked about and run one at a time, while shared calls that need no approval overlap; the reader is told which tool made them. The tool runs under the id the client knows the call by, the calling tool's id and the call's number joined by `:`, so that a background run it starts is tied to that call.
     async fn call(&self, name: &str, args: Value) -> Result<ToolOutput, String> {
         let number = self.made.fetch_add(1, AtomicOrdering::Relaxed) + 1;
         let call = ToolCall {
@@ -1514,7 +1524,8 @@ impl Caller for Nested<'_> {
             finish(&call, message.clone(), true, Vec::new(), &filed);
             return Err(message);
         }
-        let done = perform(&call, ready, self.batch.hooks, &NoCaller).await;
+        let known = format!("{}:{}", self.parent, call.id);
+        let done = perform(&call, &known, ready, self.batch.hooks, &NoCaller).await;
         finish(
             &call,
             done.text.clone(),
@@ -2169,6 +2180,73 @@ mod tests {
             Some(&journal.scribe()),
         )
         .await
+    }
+
+    /// A tool whose calls never end.
+    struct Stuck;
+
+    #[async_trait]
+    impl Tool for Stuck {
+        /// Returns `stuck`.
+        fn name(&self) -> &'static str {
+            "stuck"
+        }
+
+        /// Says what the tool does.
+        fn description(&self) -> &'static str {
+            "Never ends."
+        }
+
+        /// Takes nothing.
+        fn schema(&self) -> serde_json::Value {
+            json!({ "type": "object", "properties": {} })
+        }
+
+        /// Waits for ever.
+        async fn call(&self, _args: serde_json::Value) -> Result<ToolOutput, omc_tools::ToolError> {
+            std::future::pending().await
+        }
+    }
+
+    /// A turn dropped while a call runs, as a cancelled turn is, ends that call as stopped, once.
+    #[tokio::test]
+    async fn a_dropped_turn_ends_its_calls_as_stopped() {
+        let mut registry = Registry::new();
+        registry.register(Stuck);
+        let model = Scripted::new(vec![call_reply("t1", "stuck", json!({}))]);
+        let log = Mutex::new(Vec::new());
+        let events = |event: AgentEvent| log.lock().unwrap().push(event);
+        let mut history = Vec::new();
+        let approvals = deny_all();
+        let context = Context {
+            model: &model,
+            registry: &registry,
+            approvals: &approvals,
+            system: "",
+            effort: None,
+            refresh: None,
+            notebook: None,
+            window: None,
+            checkpoint: None,
+            hooks: None,
+            routing: None,
+        };
+        let turn = run_turn(&context, &mut history, "go".into(), &events);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), turn)
+                .await
+                .is_err()
+        );
+        let log = log.lock().unwrap();
+        let ends: Vec<&AgentEvent> = log
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::ToolDone { .. }))
+            .collect();
+        assert_eq!(ends.len(), 1);
+        assert!(matches!(
+            ends[0],
+            AgentEvent::ToolDone { id, is_error: true, text, .. } if id == "t1" && text == "stopped"
+        ));
     }
 
     /// A failed turn is cut back in the file, and a later open continues from the history before it with the earlier turn in the request.

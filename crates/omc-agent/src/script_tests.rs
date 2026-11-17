@@ -366,3 +366,57 @@ async fn subagents_script_with_their_own_tools() {
     });
     assert!(under_script, "{log:?}");
 }
+
+/// A tool that keeps the id of each call it runs for.
+#[derive(Default)]
+struct Ids {
+    /// The ids, in order.
+    seen: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl omc_tools::Tool for Ids {
+    /// Returns `ids`.
+    fn name(&self) -> &'static str {
+        "ids"
+    }
+
+    /// Says what the tool does.
+    fn description(&self) -> &'static str {
+        "Keeps the id it runs for."
+    }
+
+    /// Takes nothing.
+    fn schema(&self) -> Value {
+        json!({ "type": "object", "properties": {} })
+    }
+
+    /// Answers without keeping anything.
+    async fn call(&self, _args: Value) -> Result<omc_tools::ToolOutput, omc_tools::ToolError> {
+        Ok(omc_tools::ToolOutput::new("kept"))
+    }
+
+    /// Keeps `id` and answers.
+    async fn call_as(
+        &self,
+        id: &str,
+        _args: Value,
+    ) -> Result<omc_tools::ToolOutput, omc_tools::ToolError> {
+        self.seen.lock().unwrap().push(id.to_owned());
+        Ok(omc_tools::ToolOutput::new("kept"))
+    }
+}
+
+/// A tool a script calls runs under the id the client knows the call by, the script's id and the call's number joined by `:`, so that a background run it starts is tied to that call.
+#[tokio::test]
+async fn calls_run_under_the_id_the_client_knows() {
+    let dir = scratch("script-ids");
+    let ids = Arc::new(Ids::default());
+    let mut registry = Registry::builtin(&dir).unwrap();
+    registry.register_shared(ids.clone());
+    registry.register(Script::new(Spill::disabled()));
+    let model = scripter("await tools.ids({}); await tools.ids({}); return 1;");
+    let (history, _) = drive(&model, &registry.fitted(), &deny_all(), None).await;
+    assert!(!outcome(&history).1, "{:?}", outcome(&history));
+    assert_eq!(*ids.seen.lock().unwrap(), ["s1:1", "s1:2"]);
+}

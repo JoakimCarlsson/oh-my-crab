@@ -63,6 +63,8 @@ pub(crate) enum Ended {
     Failed(String),
     /// It wrote this prompt to hand the conversation over to a new one.
     HandedOff(String),
+    /// It panicked, for this reason, before it could settle the saved history.
+    Crashed(String),
 }
 
 /// The model a turn sends its requests to while plan mode is on, when the plan model setting names one other than the conversation's.
@@ -1539,7 +1541,9 @@ mod tests {
             let turn = turn_in(&dir, &shared, history);
             history = match turn.run_with(model.clone(), job).await {
                 Ended::Done(after) => after,
-                Ended::Failed(reason) | Ended::SignedOut(reason) => panic!("turn failed: {reason}"),
+                Ended::Failed(reason) | Ended::SignedOut(reason) | Ended::Crashed(reason) => {
+                    panic!("turn failed: {reason}")
+                }
                 Ended::HandedOff(prompt) => panic!("turn handed over: {prompt}"),
             };
         }

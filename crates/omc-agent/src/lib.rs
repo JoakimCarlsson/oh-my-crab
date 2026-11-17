@@ -13,6 +13,7 @@ mod hooks;
 mod journal;
 mod loop_guard;
 mod nesting;
+mod open_calls;
 pub mod permissions;
 mod picker;
 mod plans;

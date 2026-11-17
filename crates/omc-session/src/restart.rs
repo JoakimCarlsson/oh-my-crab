@@ -79,7 +79,7 @@ fn handoff_id() -> String {
 /// Why a model could not be had, as `ended` says it.
 fn reason_of(ended: Ended) -> String {
     match ended {
-        Ended::SignedOut(reason) | Ended::Failed(reason) => reason,
+        Ended::SignedOut(reason) | Ended::Failed(reason) | Ended::Crashed(reason) => reason,
         Ended::Done(_) | Ended::HandedOff(_) => "the model could not be reached".to_owned(),
     }
 }
@@ -159,7 +159,7 @@ impl Session {
         self.prompt(told, images, turn, text, files);
     }
 
-    /// Starts the conversation afresh: takes every message out of it, recording the turns of a saved conversation as lost for `reason`, stops warming its last request, starts the `SessionStart` hooks again and tells the client the turns left; the settings, the name, the goal and the notebook stay. Returns whether it did, telling the client why with [`Event::Failed`] when the saved conversation cannot be cut back.
+    /// Starts the conversation afresh: takes every message out of it, recording the turns of a saved conversation as lost for `reason`, stops its long-lived subagents, whose conversations belong to the one left behind, stops warming its last request, starts the `SessionStart` hooks again and tells the client the turns left; the settings, the name, the goal and the notebook stay. Returns whether it did, telling the client why with [`Event::Failed`] when the saved conversation cannot be cut back.
     fn start_afresh(&mut self, reason: &str) -> bool {
         if let Some(Err(error)) = self
             .journal
@@ -172,6 +172,7 @@ impl Session {
             return false;
         }
         self.history.clear();
+        self.shared.crew.dismiss();
         self.shared.warmer.stop();
         self.shared.checkpoint.clear();
         let model = self.shared.model().map(|(_, model)| model);

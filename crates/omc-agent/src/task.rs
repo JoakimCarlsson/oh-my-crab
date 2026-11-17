@@ -317,6 +317,18 @@ impl Lane {
         }
     }
 
+    /// The event ending the step of a subagent that is one of several as stopped, for a step dropped before it ended; nothing for a lone one.
+    fn dropped(&self) -> Option<AgentEvent> {
+        let place = self.place?;
+        Some(self.under_call(AgentEvent::ToolDone {
+            id: place.to_string(),
+            name: "task".to_owned(),
+            text: crate::open_calls::STOPPED_TEXT.to_owned(),
+            is_error: true,
+            changes: Vec::new(),
+        }))
+    }
+
     /// `event` filed under the call.
     fn under_call(&self, event: AgentEvent) -> AgentEvent {
         AgentEvent::Nested {
@@ -643,11 +655,32 @@ struct Ended {
     handback: Option<Handback>,
 }
 
+/// The step of a subagent that is one of several, while it runs: dropping it before it is closed, as when the turn or the background run it runs in is stopped, ends the step as stopped.
+struct OpenStep {
+    /// The lane of the subagent, until its step is closed.
+    lane: Option<Lane>,
+    /// Where the step is reported.
+    events: Arc<EventSink>,
+}
+
+impl Drop for OpenStep {
+    /// Ends the step as stopped when it was not closed.
+    fn drop(&mut self) {
+        if let Some(event) = self.lane.take().and_then(|lane| lane.dropped()) {
+            (self.events)(event);
+        }
+    }
+}
+
 /// Runs `run` once it took a seat of `nesting`'s throttle, which it holds until it ends, takes what it changed from its worktree when it has one, keeps it on the roster for follow-ups when it finished and is one that is kept, its result then naming its handle, reports the end of its step through `events` when it is one of several, announces its end, and says how it ended.
 ///
-/// A subagent the reader stops through the roster ends at once, with the subagents it started, as failed with a note saying the reader stopped it.
+/// A subagent the reader stops through the roster ends at once, with the subagents it started, as failed with a note saying the reader stopped it. When the future is dropped before the step of a subagent that is one of several was closed, the step is ended as stopped.
 async fn finish(mut run: Run, events: Arc<EventSink>, nesting: Nesting) -> Ended {
     let lane = run.lane.clone();
+    let mut step = OpenStep {
+        lane: Some(lane.clone()),
+        events: events.clone(),
+    };
     let lease = run.lease.take();
     let mut enrolment = run.enrolment.take();
     let seat = run.seat.clone();
@@ -688,6 +721,7 @@ async fn finish(mut run: Run, events: Arc<EventSink>, nesting: Nesting) -> Ended
         Some(lease) => Some(lease.hand_back().await),
         None => None,
     };
+    step.lane = None;
     if let Some(event) = lane.closed(&outcome) {
         events(event);
     }
