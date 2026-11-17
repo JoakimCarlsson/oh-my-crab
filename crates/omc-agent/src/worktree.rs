@@ -707,11 +707,11 @@ impl Lease {
         Ok((git_with(&self.tree, &patch, &[], None).await?, files))
     }
 
-    /// Removes the copy and its folder, and has git forget a worktree. A clone, which may hold many ignored files, is moved aside and git forgets it at once, and its files are deleted on a thread of its own, so that handing changes back does not wait for that.
+    /// Removes the copy and its folder, and has git forget a worktree. A clone, which may hold many ignored files, is moved aside at once, so its folder is gone when this returns, and its files are deleted on a thread of its own, so that handing changes back does not wait for that.
     async fn remove(&self) {
         let (top, tree, folder) = (self.top.clone(), self.tree.clone(), self.folder.clone());
         if matches!(self.base, Base::Pristine(_)) {
-            std::thread::spawn(move || std::fs::remove_dir_all(folder));
+            discard_aside(folder);
             return;
         }
         let _held = GIT_LOCK.lock().await;
@@ -736,6 +736,17 @@ impl Drop for Lease {
             std::thread::spawn(move || remove_now(&top, &tree, &folder));
         }
     }
+}
+
+/// Moves `folder` aside under a new name next to it, so its path is free at once, and deletes the moved folder on a thread of its own; when it cannot be moved, deletes it in place on that thread.
+fn discard_aside(folder: PathBuf) {
+    let aside = folder.with_file_name(format!("trash-{}", unique()));
+    let doomed = if std::fs::rename(&folder, &aside).is_ok() {
+        aside
+    } else {
+        folder
+    };
+    std::thread::spawn(move || std::fs::remove_dir_all(doomed));
 }
 
 /// Has git forget the cloned worktree at `tree`, made from the working tree at `top`, by moving its folder `folder` aside and pruning, then deletes the moved folder on a thread of its own; when it cannot be moved, removes it as [`remove_now`] does.
