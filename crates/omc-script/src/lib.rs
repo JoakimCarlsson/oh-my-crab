@@ -40,6 +40,7 @@ pub const WITHHELD: &[&str] = &[
     "rewind",
     "wait",
     "set_title",
+    "show",
     "goal",
     "submit_result",
     "recall",

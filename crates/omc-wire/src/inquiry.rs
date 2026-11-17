@@ -7,6 +7,9 @@ pub struct Alternative {
     pub label: String,
     /// What picking it means, when the agent says.
     pub description: String,
+    /// A self-contained HTML document, with inline CSS and nothing fetched from the network, that pictures the answer, when the agent drew one; a client may render it next to those of the other answers so the reader can compare them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mockup: Option<String>,
 }
 
 /// One question of a form, with the answers it offers.

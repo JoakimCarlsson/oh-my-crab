@@ -11,7 +11,7 @@ use omc_memory::Memories;
 use omc_providers::{ChatModel, Effort};
 use omc_tools::{
     Ask, Checkpoint, CheckpointTool, ContextNotes, Deferral, ExitPlanMode, Host, Jobs, MemoryEdit,
-    MemorySearch, NewContext, Notebook, Registry, Remember, Rewind, SetTitle, Todo, Wait,
+    MemorySearch, NewContext, Notebook, Registry, Remember, Rewind, SetTitle, Show, Todo, Wait,
 };
 
 /// Gives the plan the reader approved while it is being carried out, which the subagents started meanwhile are told of; nothing while there is none or a new plan is being made.
@@ -58,6 +58,8 @@ pub(crate) struct Inputs<'a> {
     pub(crate) checkpoint: Option<Arc<Checkpoint>>,
     /// Whether the conversation has no name yet, so that the agent is given the tool to name it.
     pub(crate) unnamed: bool,
+    /// Whether the client shows exhibits, so that the agent is given the tool to show them.
+    pub(crate) exhibits: bool,
     /// The background runs of the conversation.
     pub(crate) jobs: Arc<Jobs>,
     /// How subagents get git worktrees of their own, when they can.
@@ -133,6 +135,9 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
     registry.register_shared(inputs.goal.clone());
     if inputs.unnamed {
         registry.register(SetTitle::new(inputs.host.clone()));
+    }
+    if inputs.exhibits {
+        registry.register(Show::new(inputs.host.clone()));
     }
     if let Some(checkpoint) = &inputs.checkpoint {
         registry.register(CheckpointTool::new(checkpoint.clone()));
@@ -322,6 +327,7 @@ mod tests {
             checkpoint,
             jobs: shared.jobs.clone(),
             unnamed: true,
+            exhibits: true,
             isolation: None,
             memories,
             hooks: None,
@@ -421,6 +427,7 @@ mod tests {
                 "read",
                 "script",
                 "set_title",
+                "show",
                 "task",
                 "todo",
                 "wait",
@@ -451,6 +458,7 @@ mod tests {
                 "read",
                 "script",
                 "set_title",
+                "show",
                 "task",
                 "todo",
                 "wait",
@@ -458,6 +466,26 @@ mod tests {
                 "write"
             ]
         );
+    }
+
+    /// The agent has `show` in both modes when the client shows exhibits and in neither when it does not, and subagents never have it.
+    #[test]
+    fn show_is_given_only_to_a_client_that_shows_exhibits() {
+        let shows = |exhibits: bool, plan: bool| {
+            with_inputs(&[], None, None, |inputs| {
+                let mut inputs = inputs.clone();
+                inputs.exhibits = exhibits;
+                assemble(&inputs, plan).get("show").is_some()
+            })
+        };
+        for plan in [false, true] {
+            assert!(shows(true, plan));
+            assert!(!shows(false, plan));
+        }
+        let for_subagents = with_inputs(&[], None, None, |inputs| {
+            subagent_tools(&base_tools(inputs, false))
+        });
+        assert!(for_subagents.get("show").is_none());
     }
 
     /// The script tool of each mode can call that mode's tools, less the ones scripts never get: in plan mode only those that look; a denied tool is not offered to scripts, and a denied script is gone.

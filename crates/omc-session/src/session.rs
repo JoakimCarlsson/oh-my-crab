@@ -390,6 +390,7 @@ impl Session {
             defaults,
             languages,
             navigation,
+            exhibits,
         } = opening;
         let provider = provider.as_str();
         self.shared.set_home(home);
@@ -415,6 +416,7 @@ impl Session {
         self.shared
             .client_languages
             .set_navigation(languages && navigation);
+        self.shared.set_exhibits(exhibits);
         let saved = match &conversation {
             Some(id) => match load_history(id, history, keep, before.as_deref()) {
                 Ok(saved) => Some(saved),
@@ -3424,6 +3426,7 @@ mod tests {
                 before: None,
                 languages: false,
                 navigation: false,
+                exhibits: false,
             }))
             .await;
         assert!(session.running.is_none());

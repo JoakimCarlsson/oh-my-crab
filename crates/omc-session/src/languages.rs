@@ -405,11 +405,77 @@ fn client_cannot_navigate() -> LanguageError {
     )
 }
 
-/// The language servers the harness runs itself for the project in `directory`, when it was built with them.
+/// The environment variable that, set to `0`, `false`, `off` or `no`, keeps every conversation on language servers of its own instead of the user's shared daemon.
+#[cfg(all(feature = "lsp", unix))]
+const DAEMON_VARIABLE: &str = "OMC_LSP_DAEMON";
+
+/// The program that runs the language server daemon, once a program that can run it said so with [`share_language_servers`].
+static DAEMON_PROGRAM: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Has the conversations of this process share their language servers with the user's other conversations, through the language server daemon that running `program lsp-daemon` starts; the first call counts.
+///
+/// Only a program that can run the daemon calls this, as the `crab` binary does with its own path, so a program embedding the harness keeps servers of its own unless it asks. It changes nothing on a system without Unix sockets, in a build without language servers, or while the environment variable `OMC_LSP_DAEMON` is `0`.
+pub fn share_language_servers(program: PathBuf) {
+    let _ = DAEMON_PROGRAM.set(program);
+}
+
+/// Runs the user's language server daemon until no conversation has been connected to it for ten minutes; returns at once when one is running already.
+///
+/// # Errors
+///
+/// Fails when the daemon's socket cannot be made.
+#[cfg(all(feature = "lsp", unix))]
+pub async fn lsp_daemon() -> std::io::Result<()> {
+    omc_lsp::run_daemon().await
+}
+
+/// Refuses to run a language server daemon, which needs Unix sockets and a build with language servers.
+///
+/// # Errors
+///
+/// Always fails, saying this build has no daemon.
+#[cfg(not(all(feature = "lsp", unix)))]
+pub async fn lsp_daemon() -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "this build has no language server daemon",
+    ))
+}
+
+/// The language services of the user's daemon for the project in `directory`, when this process shares its servers and [`DAEMON_VARIABLE`] does not turn that off.
+#[cfg(all(feature = "lsp", unix))]
+fn shared_servers(directory: &Path, trusted: bool) -> Option<Arc<dyn LanguageService>> {
+    let program = DAEMON_PROGRAM.get()?;
+    let off = std::env::var(DAEMON_VARIABLE).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    });
+    if off {
+        return None;
+    }
+    Some(omc_lsp::DaemonLanguages::shared(
+        directory,
+        trusted,
+        program.clone(),
+    ))
+}
+
+/// No shared language services, on a system without Unix sockets.
+#[cfg(all(feature = "lsp", not(unix)))]
+fn shared_servers(_directory: &Path, _trusted: bool) -> Option<Arc<dyn LanguageService>> {
+    None
+}
+
+/// The language servers the harness runs itself for the project in `directory`, when it was built with them: those of the user's language server daemon, shared with every other conversation in the same root, when the process shares its servers (see [`share_language_servers`]), otherwise servers of the conversation's own.
 ///
 /// A language server loads the project, which for some languages runs the project's own build scripts. So the servers start only once the agent writes a file, which the person running it allowed, unless they trust the agent with everything (`trusted`): then the servers of the languages the project is written in start now, so that they are ready when the agent first writes a file.
 #[cfg(feature = "lsp")]
 pub(crate) fn own_servers(directory: &Path, trusted: bool) -> Option<Arc<dyn LanguageService>> {
+    if let Some(shared) = shared_servers(directory, trusted) {
+        return Some(shared);
+    }
     let servers = omc_lsp::Servers::new(directory);
     if trusted {
         servers.warm();

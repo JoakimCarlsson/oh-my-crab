@@ -118,6 +118,7 @@ None of the three exists with the `memory` setting off or `OMC_MEMORY=0`.
 | Tool             | What it does                                                                                  | Asks | Plan | Detail |
 | ---------------- | --------------------------------------------------------------------------------------------- | ---- | ---- | ------ |
 | `ask`            | Asks the reader a form of questions and waits for the answers                                 | no   | yes  | [`Inquire`](../wire-protocol.md#inquire) |
+| `show`           | *Sometimes.* Puts a Mermaid diagram or a self-contained HTML prototype in front of the reader and goes on without waiting; given only to a client that set `exhibits` in `Open` | no   | yes  | [`Show`](../wire-protocol.md#show) |
 | `todo`           | Keeps the todo list the reader sees, sent to the client as `Plan`                              | no   | yes  | [troubleshooting](../troubleshooting.md) |
 | `set_title`      | *Sometimes.* Names the conversation; given only while it has no name                          | no   | yes  | [history](../concepts.md#history-saved-and-reopened-by-id) |
 | `goal`           | Reads the goal, sets the one worked out after `/guided-goal`, or ends it as achieved; nothing else ends goal mode | no   | yes  | [goals](../goals.md) |
@@ -191,7 +192,7 @@ mode allows it.
 A client can deny any tool by name in `Open`; a denied tool is given to no
 one, subagents and scripts included.
 
-**Subagents** never get `exit_plan_mode`, `ask`, `todo`, `context_notes`,
+**Subagents** never get `exit_plan_mode`, `ask`, `show`, `todo`, `context_notes`,
 `new_context`, `checkpoint`, `rewind`, `wait`, the `agent_*` tools, `debug`, `set_title`, `goal`,
 `remember` or `memory_edit`: the tools that talk to the reader, steer the
 conversation, change memory, or hold state that belongs to the conversation.
@@ -202,7 +203,7 @@ kind whose definition lists tools gets only those. In plan mode subagents get
 only the tools plan mode allows. Subagents and scripts do get `lsp`; in plan
 mode it is the copy that refuses changes other than dry runs.
 
-**Scripts** never get `script` itself, `task`, the `agent_*` tools, `ask`, `exit_plan_mode`,
+**Scripts** never get `script` itself, `task`, the `agent_*` tools, `ask`, `show`, `exit_plan_mode`,
 `todo`, `context_notes`, `new_context`, `checkpoint`, `rewind`, `wait`,
 `set_title`, `goal`, `submit_result`, `recall`, `skill`, `remember`,
 `memory_edit` or `load_tools`. A subagent's script calls only that subagent's tools. See

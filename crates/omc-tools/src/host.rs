@@ -1,7 +1,7 @@
 //! What the tools that talk to the reader need from whoever runs them.
 
 use async_trait::async_trait;
-use omc_wire::{PlanStep, Question, Reply};
+use omc_wire::{Exhibit, PlanStep, Question, Reply};
 
 /// What the reader decided about a plan put to them, with what they wrote along with it, when they wrote anything.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,6 +34,9 @@ pub trait Host: Send + Sync {
 
     /// Puts `questions` to the reader and waits; nothing when the reader abandons the form or is gone.
     async fn inquire(&self, questions: Vec<Question>) -> Option<Vec<Reply>>;
+
+    /// Puts `exhibit`, a diagram or a prototype, in front of the reader and returns at once, without waiting for them to look.
+    fn show(&self, exhibit: Exhibit);
 
     /// Names the conversation `title` when it has no name yet; whether it was named, which it is not when a name was already there, since a name the reader gave or the agent gave first stays.
     fn name(&self, title: &str) -> bool;

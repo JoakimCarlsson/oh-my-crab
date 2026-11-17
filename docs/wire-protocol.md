@@ -76,7 +76,7 @@ out is refused as a bad command.
    trusted. When opening fails, crab sends `Failed` or `SignedOut` instead, and
    the client can send `Open` again.
 3. The client sends `Prompt`. Crab streams the turn as events: `Started`,
-   `Said`, `Thought`, `Tool`, `Used`, `Spent`, `Plan`, `Background`, and requests that
+   `Said`, `Thought`, `Tool`, `Used`, `Spent`, `Plan`, `Show`, `Background`, and requests that
    wait on the client (`Ask`, `Inquire`, `Language`). The turn ends with
    exactly one `Finished`, or with `SignedOut` when the account needs signing
    in again.
@@ -410,6 +410,7 @@ Opens the conversation; it must come before anything else. Carries an
 | `before`       | string                     | optional | A turn id: the conversation goes back to before that turn, on a new branch; the turns left behind stay saved. See [Branches](#branches). |
 | `languages`    | bool                       | default  | Whether the client answers `Language` requests; crab then starts no language servers of its own.                             |
 | `navigation`   | bool                       | default  | Whether the client, which set `languages`, also answers the questions about code of the `lsp` tool; see [`Language`](#language-1). Means nothing without `languages`. |
+| `exhibits`     | bool                       | default  | Whether the client shows the reader the exhibits of [`Show`](#show): the agent is then given the `show` tool. A client that leaves it out is never sent a `Show`. |
 
 The shortest valid `Open`:
 
@@ -420,7 +421,7 @@ The shortest valid `Open`:
 With every field:
 
 ```json
-{"Open":{"directory":"/home/me/project","home":null,"provider":"claude","model":"claude-sonnet-4-5","yolo":false,"tools":[{"name":"files","reach":{"Command":{"program":"mcp-files","args":["--root","."],"env":[["LOG","warn"]]}}},{"name":"issues","reach":{"Http":{"url":"https://example.com/mcp","headers":[["Authorization","Bearer x"]]}}}],"denied":["web_search"],"disabled":["AGENTS.md"],"conversation":"c-42","history":null,"keep":50,"defaults":[["effort","high"]],"before":null,"languages":true,"navigation":true}}
+{"Open":{"directory":"/home/me/project","home":null,"provider":"claude","model":"claude-sonnet-4-5","yolo":false,"tools":[{"name":"files","reach":{"Command":{"program":"mcp-files","args":["--root","."],"env":[["LOG","warn"]]}}},{"name":"issues","reach":{"Http":{"url":"https://example.com/mcp","headers":[["Authorization","Bearer x"]]}}}],"denied":["web_search"],"disabled":["AGENTS.md"],"conversation":"c-42","history":null,"keep":50,"defaults":[["effort","high"]],"before":null,"languages":true,"navigation":true,"exhibits":true}}
 ```
 
 #### `ToolServer` and `Reach`
@@ -1397,11 +1398,43 @@ A `Question`:
 | `multiple`     | bool                | Whether several alternatives may be picked.    |
 | `alternatives` | list of `Alternative` | The answers on offer.                        |
 
-An `Alternative` has `label` (string, what `Reply.picks` sends) and
-`description` (string, may be empty).
+An `Alternative` has `label` (string, what `Reply.picks` sends),
+`description` (string, may be empty) and `mockup` (string, left out when
+there is none): a self-contained HTML document, with inline CSS and nothing
+fetched from the network, that pictures the answer. A client may render the
+mockups of a question side by side so the reader can compare them, sandboxed
+and with the network denied, since the agent wrote them; a client that does
+not know the field ignores it and shows the labels alone.
 
 ```json
 {"Inquire":{"ticket":2,"questions":[{"header":"Database","text":"Which database should the service use?","multiple":false,"alternatives":[{"label":"Postgres","description":"The one production runs"},{"label":"SQLite","description":""}]}]}}
+{"Inquire":{"ticket":3,"questions":[{"header":"Layout","text":"Which layout should the settings page use?","multiple":false,"alternatives":[{"label":"Sidebar","description":"Sections listed on the left","mockup":"<!doctype html><style>nav{float:left;width:30%}</style><nav>General</nav><main>Options</main>"},{"label":"Tabs","description":"Sections across the top","mockup":"<!doctype html><style>nav{display:flex}</style><nav>General</nav><main>Options</main>"}]}]}}
+```
+
+### `Show`
+
+The agent's `show` tool put a visual in front of the reader. Nothing waits on
+it and there is no answer: the tool call ends at once and the turn goes on.
+Sent only to a client that set `exhibits` in `Open`, since the agent has the
+tool only then. Carries an `Exhibit`:
+
+| Field     | Type          | Meaning                                                              |
+| --------- | ------------- | -------------------------------------------------------------------- |
+| `id`      | string        | The id of the `show` tool call, as in the `Tool` events of that call. |
+| `title`   | string        | What the exhibit is called; one line, never empty.                   |
+| `kind`    | `ExhibitKind` | What `content` is.                                                   |
+| `content` | string        | The source to render, at most 256 KiB.                               |
+
+An `ExhibitKind` is `Diagram`, whose `content` is Mermaid source, or
+`Prototype`, whose `content` is a self-contained HTML document. The agent
+wrote the content, so render a prototype sandboxed and with the network
+denied; it is told to use inline styles and no external resources. An exhibit
+is not saved with the conversation as an event: a replayed history has the
+`show` call as a `Tool` event only.
+
+```json
+{"Show":{"id":"toolu_01","title":"Login flow","kind":"Diagram","content":"sequenceDiagram\n  Browser->>Server: POST /login\n  Server-->>Browser: 302 /home"}}
+{"Show":{"id":"toolu_02","title":"Sign-in card","kind":"Prototype","content":"<!doctype html><style>form{font:14px sans-serif}</style><form><input placeholder=\"Email\"><button>Sign in</button></form>"}}
 ```
 
 ### `Language`

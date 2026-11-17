@@ -32,7 +32,7 @@ Every text file is checked out with LF line endings on every system, as
 | `omc-memory`    | Memory across conversations.                                                      |
 | `omc-hooks`     | Hooks and project trust.                                                          |
 | `omc-mcp`       | Tool servers as tools of the agent: their files, resources and OAuth sign-ins.    |
-| `omc-lsp`       | Language servers crab starts itself.                                              |
+| `omc-lsp`       | Language servers crab starts itself, and the daemon that shares them between a user's conversations. |
 | `omc-dap`       | The `debug` tool and its debug adapters.                                          |
 | `omc-script`    | The `script` tool and its QuickJS sandbox.                                        |
 | `omc-bench`     | `crab-bench`, the [edit benchmark](benchmark.md); not part of a release.          |

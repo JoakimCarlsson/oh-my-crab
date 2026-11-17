@@ -18,6 +18,9 @@ struct Option_ {
     /// What it means.
     #[serde(default)]
     description: String,
+    /// A self-contained HTML document picturing the answer, when the choice is visual.
+    #[serde(default)]
+    mockup: Option<String>,
 }
 
 /// One question of an `ask` call.
@@ -77,6 +80,7 @@ impl From<Item> for Question {
                         option.label
                     },
                     description: option.description,
+                    mockup: option.mockup.filter(|mockup| !mockup.trim().is_empty()),
                 })
                 .collect(),
         }
@@ -125,7 +129,8 @@ impl Tool for Ask {
                                     "type": "object",
                                     "properties": {
                                         "label": { "type": "string" },
-                                        "description": { "type": "string" }
+                                        "description": { "type": "string" },
+                                        "mockup": { "type": "string", "description": "A small self-contained HTML document (inline CSS, no external resources) picturing this option, for visual choices." }
                                     },
                                     "required": ["label"]
                                 }
@@ -202,6 +207,34 @@ mod tests {
         let asked = host.asked.lock().unwrap();
         assert_eq!(asked[0][0].alternatives[0].label, "Tabs (Recommended)");
         assert_eq!(asked[0][0].alternatives[1].description, "four");
+        assert_eq!(asked[0][0].alternatives[1].mockup, None);
+    }
+
+    /// An option's mockup reaches the host as it was given, and an empty one is dropped.
+    #[tokio::test]
+    async fn mockups_are_passed_through() {
+        let host = Arc::new(RecordingHost::default());
+        let tool = Ask::new(host.clone());
+        tool.call(json!({"questions": [{
+            "id": "layout", "question": "Which layout?",
+            "options": [
+                {"label": "Sidebar", "mockup": "<!doctype html><nav>menu</nav>"},
+                {"label": "Tabs", "mockup": "  "}
+            ]
+        }]}))
+        .await
+        .unwrap();
+        let asked = host.asked.lock().unwrap();
+        assert_eq!(
+            asked[0][0].alternatives[0].mockup.as_deref(),
+            Some("<!doctype html><nav>menu</nav>")
+        );
+        assert_eq!(asked[0][0].alternatives[1].mockup, None);
+        let line = serde_json::to_string(&asked[0][0].alternatives).unwrap();
+        assert_eq!(
+            line,
+            r#"[{"label":"Sidebar","description":"","mockup":"<!doctype html><nav>menu</nav>"},{"label":"Tabs","description":""}]"#
+        );
     }
 
     /// An abandoned form is reported as cancelled.

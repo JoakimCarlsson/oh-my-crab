@@ -172,6 +172,7 @@ fn opening(exec: &Exec, folder: PathBuf) -> Opening {
         before: None,
         languages: false,
         navigation: false,
+        exhibits: false,
     }
 }
 

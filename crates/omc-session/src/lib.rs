@@ -35,6 +35,7 @@ mod turn;
 mod warmer;
 
 pub use hooks::{hooks, trust};
+pub use languages::{lsp_daemon, share_language_servers};
 pub use limits::render as render_limits;
 pub use listing::tools;
 pub use memory::memory;

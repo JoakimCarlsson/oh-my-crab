@@ -3,6 +3,7 @@
 ```text
 crab serve                      hold a conversation over standard input and output
 crab exec [options] [prompt]    run one prompt with nobody asked and print the answer
+crab lsp-daemon                 run the language server daemon the user's conversations share
 crab tools                      print the tools the agent can have, as a JSON list
 crab providers                  print the providers, as a JSON list of id, name and sign-in
 crab account <p> [folder]       print who provider <p> is signed in as, or nothing
@@ -42,6 +43,11 @@ one prints it as an error.
   list prices with subagents included, left out when no model's prices are
   known. It exits 1 when the turn fails. For scripts, CI and
   sandboxes: `crab exec --provider openrouter --model anthropic/claude-sonnet-4.5 --json "fix the failing test"`.
+- **`lsp-daemon`** runs the user's
+  [language server daemon](language-services.md#sharing-servers-between-conversations),
+  which `serve` and `exec` start themselves when it is not running, so it is
+  rarely run by hand. It prints nothing, exits at once when a daemon is
+  running already, and ends after ten minutes with no conversation connected.
 - **`limits [provider] [--json] [--folder <folder>]`** asks each signed-in
   provider that meters a subscription allowance how much of it the account has
   used, or only `provider`, and prints a bar, a share and the time to the reset

@@ -44,6 +44,6 @@ pub use tool::{
 pub use tools::{
     Ask, AstEdit, AstGrep, Bash, CheckpointTool, ContextNotes, Edit, Eval, ExitPlanMode, GitHub,
     Glob, Grep, LOAD_TOOLS, LoadTools, Lsp, MemoryEdit, MemorySearch, NewContext, Read, Remember,
-    Rewind, SetTitle, Skill, Todo, Wait, WebSearch, Write, attached_image, encoded_image,
+    Rewind, SetTitle, Show, Skill, Todo, Wait, WebSearch, Write, attached_image, encoded_image,
     one_line_summary, snapshot_tag,
 };

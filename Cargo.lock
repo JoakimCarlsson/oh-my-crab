@@ -1591,7 +1591,10 @@ name = "omc-lsp"
 version = "0.1.4"
 dependencies = [
  "async-trait",
+ "dirs",
  "omc-tools",
+ "omc-wire",
+ "serde",
  "serde_json",
  "tokio",
 ]

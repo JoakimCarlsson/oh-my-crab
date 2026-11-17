@@ -7,7 +7,7 @@ use omc_agent::Approvals;
 use omc_providers::Effort;
 use omc_providers::{Provider, Retention};
 use omc_tools::{Checkpoint, Host, Jobs, LanguageService, Languages, Notebook, PlanVerdict};
-use omc_wire::{Event, PlanStep, Question, Reply};
+use omc_wire::{Event, Exhibit, PlanStep, Question, Reply};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::bridge::Questions;
@@ -89,6 +89,8 @@ pub(crate) struct Shared {
     pub(crate) queue: Queue,
     /// The text of the reply being written, which the saved history does not hold until the reply is whole; kept so that a turn stopped midway keeps what it had said.
     pub(crate) streamed: Arc<Mutex<String>>,
+    /// Whether the client said, when it opened the conversation, that it shows exhibits, so that the agent is given the `show` tool.
+    exhibits: std::sync::atomic::AtomicBool,
     /// The conversation's name and the history it is saved in.
     naming: Mutex<Naming>,
     /// Where the conversation keeps its logins.
@@ -155,6 +157,7 @@ impl Shared {
             given_languages: given,
             queue: Queue::default(),
             streamed: Arc::default(),
+            exhibits: std::sync::atomic::AtomicBool::new(false),
             out,
             approvals: Arc::new(Approvals::new(questions.clone(), false)),
             questions,
@@ -360,6 +363,17 @@ impl Shared {
     /// Sends `event` to the client.
     pub(crate) fn say(&self, event: Event) {
         let _ = self.out.send(event);
+    }
+
+    /// Records whether the client of the conversation being opened shows exhibits.
+    pub(crate) fn set_exhibits(&self, exhibits: bool) {
+        self.exhibits
+            .store(exhibits, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the client shows exhibits, so that the agent is given the `show` tool.
+    pub(crate) fn exhibits(&self) -> bool {
+        self.exhibits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Records that the conversation is open with `provider`, `models` and `model`, in the mode `mode`; the system prompt, tools and workspace outline of a conversation opened before are forgotten and its cache is no longer kept warm.
@@ -669,6 +683,11 @@ impl Host for SessionHost {
         self.shared.questions.inquire(questions).await
     }
 
+    /// Sends the exhibit to the client, which nothing waits on.
+    fn show(&self, exhibit: Exhibit) {
+        self.shared.say(Event::Show(exhibit));
+    }
+
     /// Saves the plan and puts it to the client; when it is approved, it becomes the plan subagents are told of, plan mode ends and the settings are announced.
     async fn approve_plan(&self, plan: &str) -> PlanVerdict {
         self.shared.save_plan(plan);
@@ -953,5 +972,26 @@ mod tests {
         drop(journal);
         shared.attach(None);
         assert_eq!(shared.title(), None);
+    }
+
+    /// The client is taken to show no exhibits until an opening says it does, and an exhibit the host is given reaches the client as it is.
+    #[test]
+    fn exhibits_are_off_until_set_and_shown_as_events() {
+        let (out, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let shared = Shared::new(out);
+        assert!(!shared.exhibits());
+        shared.set_exhibits(true);
+        assert!(shared.exhibits());
+        let exhibit = Exhibit {
+            id: "call-1".to_owned(),
+            title: "Flow".to_owned(),
+            kind: omc_wire::ExhibitKind::Diagram,
+            content: "graph TD; A-->B".to_owned(),
+        };
+        SessionHost {
+            shared: shared.clone(),
+        }
+        .show(exhibit.clone());
+        assert_eq!(events.try_recv().ok(), Some(Event::Show(exhibit)));
     }
 }

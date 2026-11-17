@@ -419,6 +419,7 @@ impl Turn {
             checkpoint: checkpoint.clone(),
             jobs: self.shared.jobs.clone(),
             unnamed,
+            exhibits: self.shared.exhibits(),
             isolation: self.isolation.clone(),
             memories: memories.clone(),
             hooks: checks.clone(),

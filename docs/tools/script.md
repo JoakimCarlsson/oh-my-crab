@@ -40,7 +40,7 @@ as a child of the `script` call: its tool events carry the script call's id as
 `parent`, `script` as `agent`, and an id made of the script call's id and the
 call's number, as the work of a subagent is reported under its `task` call.
 
-Scripts never get `script` itself, `task`, `ask`, `exit_plan_mode`, `todo`,
+Scripts never get `script` itself, `task`, `ask`, `show`, `exit_plan_mode`, `todo`,
 `context_notes`, `new_context`, `checkpoint`, `rewind`, `wait`, `set_title`,
 `submit_result`, `recall`, `skill`, `remember`, `memory_edit` or `load_tools`: the tools that
 start subagents, talk to the reader, steer the conversation or only make sense

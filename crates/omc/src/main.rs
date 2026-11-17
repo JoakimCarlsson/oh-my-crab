@@ -3,11 +3,18 @@
 mod exec;
 
 /// Usage text printed for `--help` and after a bad argument.
-const USAGE: &str = "usage: crab <serve|exec|tools|providers|account|history|rename|import|fork|limits|memory|hooks|trust|permissions>\n\n  serve                    hold a conversation: read commands from standard input, write events to standard output\n  exec [--provider <id>] [--model <id>] [--folder <folder>] [--trust] [--json] [--timeout <seconds>] [prompt]  run one prompt, given as words or on standard input, with every tool allowed and nobody asked, and print the answer, or the outcome as JSON; exits 1 when the turn fails\n  tools                    print the tools the agent can have, as a JSON list of name and description\n  providers                print the providers a conversation can be opened with, as a JSON list of id, name and sign-in\n  account <provider> [folder]  print who <provider> is signed in as with the logins in [folder], or in crab's own folder, or nothing\n  limits [provider] [--json] [--folder <folder>]  print how much of its subscription allowance (the 5 hour and weekly windows and the like) each signed-in provider that meters one has used, or only <provider>'s, as text or as a JSON list of what each reported\n  history <id> [folder]    print the saved conversation <id> as JSON: its title, saved settings and turns, which works while it is open elsewhere\n  rename <id> <folder> <title>  name the saved conversation <id>, which fails while it is open elsewhere\n  import <id> <folder>          save the conversation a client kept, read as JSON from standard input, as the conversation <id>\n  fork <id> <copy> <folder> [turn]  copy the branch the saved conversation <id> is on, up to before [turn] or whole, to the new conversation <copy>\n  memory [folder]          print the memories a conversation in [folder], or in the current folder, starts with, as JSON: its project's, which every worktree of the repository shares, and the user's\n  hooks [folder]           print the hooks a conversation in [folder], or in the current folder, would find, whether each runs, and its project's trust, as JSON\n  trust <folder> [on|off]  print whether the project <folder> belongs to is trusted, as JSON, or record that it is (on) or is not (off), for every worktree of its repository\n  permissions [folder]     print the permission rules a conversation in [folder], or in the current folder, would use, with where each comes from and whether it is used, as JSON\n  permissions add <allow|ask|deny> <user|project> <rule> [folder]  add a rule to crab's permissions file, for every project (user) or for the project of [folder] (project)\n  permissions remove <rule> [folder]  take a rule out of crab's permissions file, the user's and the project's of [folder]";
+const USAGE: &str = "usage: crab <serve|exec|lsp-daemon|tools|providers|account|history|rename|import|fork|limits|memory|hooks|trust|permissions>\n\n  serve                    hold a conversation: read commands from standard input, write events to standard output\n  exec [--provider <id>] [--model <id>] [--folder <folder>] [--trust] [--json] [--timeout <seconds>] [prompt]  run one prompt, given as words or on standard input, with every tool allowed and nobody asked, and print the answer, or the outcome as JSON; exits 1 when the turn fails\n  lsp-daemon               run the language server daemon conversations of this user share, which serve and exec start themselves; ends after ten minutes with no conversation connected\n  tools                    print the tools the agent can have, as a JSON list of name and description\n  providers                print the providers a conversation can be opened with, as a JSON list of id, name and sign-in\n  account <provider> [folder]  print who <provider> is signed in as with the logins in [folder], or in crab's own folder, or nothing\n  limits [provider] [--json] [--folder <folder>]  print how much of its subscription allowance (the 5 hour and weekly windows and the like) each signed-in provider that meters one has used, or only <provider>'s, as text or as a JSON list of what each reported\n  history <id> [folder]    print the saved conversation <id> as JSON: its title, saved settings and turns, which works while it is open elsewhere\n  rename <id> <folder> <title>  name the saved conversation <id>, which fails while it is open elsewhere\n  import <id> <folder>          save the conversation a client kept, read as JSON from standard input, as the conversation <id>\n  fork <id> <copy> <folder> [turn]  copy the branch the saved conversation <id> is on, up to before [turn] or whole, to the new conversation <copy>\n  memory [folder]          print the memories a conversation in [folder], or in the current folder, starts with, as JSON: its project's, which every worktree of the repository shares, and the user's\n  hooks [folder]           print the hooks a conversation in [folder], or in the current folder, would find, whether each runs, and its project's trust, as JSON\n  trust <folder> [on|off]  print whether the project <folder> belongs to is trusted, as JSON, or record that it is (on) or is not (off), for every worktree of its repository\n  permissions [folder]     print the permission rules a conversation in [folder], or in the current folder, would use, with where each comes from and whether it is used, as JSON\n  permissions add <allow|ask|deny> <user|project> <rule> [folder]  add a rule to crab's permissions file, for every project (user) or for the project of [folder] (project)\n  permissions remove <rule> [folder]  take a rule out of crab's permissions file, the user's and the project's of [folder]";
+
+/// Has the conversations of this process share their language servers through the user's language server daemon, which this program runs as `crab lsp-daemon`; they keep servers of their own when the program's path cannot be told.
+fn share_language_servers() {
+    if let Ok(program) = std::env::current_exe() {
+        omc_session::share_language_servers(program);
+    }
+}
 
 /// Runs the conversation the command line asks for.
 ///
-/// `serve` refreshes the cached model catalog in the background, and ends the process as soon as the conversation is over, on [`omc_wire::Command::Close`] as on the end of standard input, without waiting for the thread that reads standard input to see its end.
+/// `serve` and `exec` share their language servers with the user's other conversations through the daemon `lsp-daemon` runs, which they start when it is not running. `serve` refreshes the cached model catalog in the background, and ends the process as soon as the conversation is over, on [`omc_wire::Command::Close`] as on the end of standard input, without waiting for the thread that reads standard input to see its end.
 ///
 /// # Errors
 ///
@@ -16,15 +23,21 @@ const USAGE: &str = "usage: crab <serve|exec|tools|providers|account|history|ren
 async fn main() -> anyhow::Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("serve") => {
+            share_language_servers();
             tokio::spawn(omc_providers::refresh_catalog());
             omc_session::serve(tokio::io::stdin(), tokio::io::stdout()).await?;
             std::process::exit(0)
         }
         Some("exec") => {
+            share_language_servers();
             tokio::spawn(omc_providers::refresh_catalog());
             let exec = exec::parse(std::env::args().skip(2))?;
             let succeeded = exec::run(exec).await?;
             std::process::exit(if succeeded { 0 } else { 1 })
+        }
+        Some("lsp-daemon") => {
+            omc_session::lsp_daemon().await?;
+            std::process::exit(0)
         }
         Some("tools") => {
             let tools = omc_session::tools().map_err(|reason| anyhow::anyhow!(reason))?;

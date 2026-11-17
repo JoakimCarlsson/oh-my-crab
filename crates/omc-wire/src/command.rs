@@ -52,6 +52,9 @@ pub struct Opening {
     /// Whether the client, which set `languages`, also answers the questions about code the `lsp` tool asks: definitions, references, hovers, symbols, the diagnostics of the whole project and renames, as the [`crate::LanguageAsk`] variants besides `Format` and `Diagnostics`. A client that leaves it out is never sent those, so a client written before they existed keeps working; the harness then refuses those questions itself. Means nothing without `languages`.
     #[serde(default)]
     pub navigation: bool,
+    /// Whether the client shows the reader the exhibits of [`crate::Event::Show`]: the agent is then given the `show` tool, and is not given it otherwise, so a client written before exhibits existed is never sent one.
+    #[serde(default)]
+    pub exhibits: bool,
 }
 
 /// One request from the client, answered by [`crate::Event`]s.
@@ -272,6 +275,7 @@ mod tests {
         assert_eq!(opening.conversation, None);
         assert_eq!(opening.history, None);
         assert_eq!(opening.keep, None);
+        assert!(!opening.exhibits);
     }
 
     /// A choice without a note, as a client written before notes sends it, still reads, and one with a note keeps it through a trip through a line.

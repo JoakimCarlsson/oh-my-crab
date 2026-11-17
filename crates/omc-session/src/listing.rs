@@ -79,6 +79,7 @@ pub fn tools() -> Result<Vec<ToolInfo>, String> {
         checkpoint: None,
         jobs: shared.jobs.clone(),
         unnamed: true,
+        exhibits: true,
         isolation: None,
         memories: (!omc_memory::disabled_by_environment())
             .then(|| omc_memory::Memories::open(&directory, None))
@@ -148,6 +149,7 @@ mod tests {
                 "read",
                 "script",
                 "set_title",
+                "show",
                 "skill",
                 "task",
                 "todo",

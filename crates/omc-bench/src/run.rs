@@ -213,6 +213,7 @@ fn opening(setup: &Setup, model: &Model, task: &Task, work: &Path) -> Opening {
         before: None,
         languages: true,
         navigation: false,
+        exhibits: false,
     }
 }
 

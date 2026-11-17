@@ -2,6 +2,7 @@
 
 use crate::branch::Branch;
 use crate::change::TurnChange;
+use crate::exhibit::Exhibit;
 use crate::goal::Goal;
 use crate::inquiry::Inquiry;
 use crate::language::LanguageRequest;
@@ -91,6 +92,8 @@ pub enum Event {
     Ask(Permission),
     /// The agent waits for the answers to this form of questions.
     Inquire(Inquiry),
+    /// The agent's `show` tool put this visual in front of the reader, which the turn does not wait on; sent only to a client that said, when it opened the conversation, that it shows exhibits.
+    Show(Exhibit),
     /// The harness asks the client's language services this, and waits for a [`crate::Command::Language`] answer under its ticket; sent only to a client that said, when it opened the conversation, that it answers them.
     Language(LanguageRequest),
     /// The turn ended, with the reason it failed where it did.

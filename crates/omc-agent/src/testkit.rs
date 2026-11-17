@@ -146,6 +146,9 @@ impl Host for Reader {
         self.replies.lock().unwrap().clone()
     }
 
+    /// Drops the exhibit, since the tests here never look at it.
+    fn show(&self, _exhibit: omc_wire::Exhibit) {}
+
     /// Takes any name, since the tests here never look at it.
     fn name(&self, _title: &str) -> bool {
         true

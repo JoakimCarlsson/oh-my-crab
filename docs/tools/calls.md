@@ -34,7 +34,7 @@ results come back in the model's order whatever order the calls ended in.
 | Class     | Tools |
 | --------- | ----- |
 | Shared    | `read` (files and the web), `grep`, `glob`, `ast_grep`, `web_search`, `lsp` except the actions that write files (rename, applying a code action, format, rename_file), `memory_search`, `skill`, `wait`, `mcp_resources`, `recall`, and `task` when every subagent it starts is of a kind that only looks (or in plan mode) |
-| Exclusive | `bash`, `edit`, `write`, `ast_edit`, `lsp` renames, `debug`, `script` outside plan mode, other `task` calls, tool-server tools, and the tools that steer the conversation or talk to the reader: `ask`, `todo`, `context_notes`, `new_context`, `checkpoint`, `rewind`, `remember`, `memory_edit`, `set_title`, `exit_plan_mode` |
+| Exclusive | `bash`, `edit`, `write`, `ast_edit`, `lsp` renames, `debug`, `script` outside plan mode, other `task` calls, tool-server tools, and the tools that steer the conversation or talk to the reader: `ask`, `show`, `todo`, `context_notes`, `new_context`, `checkpoint`, `rewind`, `remember`, `memory_edit`, `set_title`, `exit_plan_mode` |
 
 A tool-server tool is shared when its server marks it with the `readOnlyHint`
 annotation; the hint only lets its calls overlap, and it still asks first and

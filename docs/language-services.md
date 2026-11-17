@@ -33,6 +33,62 @@ one set of language servers runs:
 With none of these, `edit` and `write` behave as they would without language
 services.
 
+## Sharing servers between conversations
+
+Every `crab serve` and `crab exec` process holds one conversation, and a
+language server can take a long time and a lot of memory to load a project. So
+on Linux and macOS the servers `crab` starts itself do not belong to one
+conversation: they run in a daemon of the user, `crab lsp-daemon`, and every
+conversation of that user asks it. Ten conversations in one project then use
+one `rust-analyzer`, and a conversation opened in a project another one works
+in finds its servers loaded already.
+
+- **Starting.** The first conversation that needs a server starts the daemon,
+  detached from itself, and the conversations after it connect to the one
+  running. Only one daemon runs per user: it holds a lock file beside its
+  socket, and a socket file left behind by a daemon that died is replaced. The
+  socket is `daemon.sock` in `$XDG_RUNTIME_DIR/oh-my-crab/lsp`, or in
+  `<cache>/lsp` on a system without a runtime folder, a folder only the user
+  can read; `OMC_LSP_SOCKET` names another.
+- **Sharing.** Servers are shared by project root, the working folder of the
+  conversation, with symbolic links resolved. Conversations in `yolo` mode,
+  whose servers start when the conversation opens, share theirs among
+  themselves, apart from those of conversations whose servers wait for the
+  first write. An isolated subagent's worktree is a root of its own and gets
+  its own servers in the daemon. Restarting a server with the `lsp` tool
+  restarts it for every conversation sharing it.
+- **Stopping.** The servers of a root no conversation has asked about for ten
+  minutes are stopped, and started again when one asks. The daemon ends when
+  no conversation has been connected to it for ten minutes.
+- **Falling back.** A conversation that cannot reach the daemon, finds one
+  that speaks another version of the protocol (as after an upgrade, until the
+  old daemon ends), or gets no answer from it, starts servers of its own, as
+  it would without the daemon, and keeps them for the rest of its life. A
+  connection that drops is made again once before that.
+- **Turning it off.** `OMC_LSP_DAEMON=0` gives every conversation servers of
+  its own. A client that sets `languages`, and a program that embeds the
+  crates, never use the daemon: only the `crab` binary turns sharing on, with
+  `omc_session::share_language_servers`, since only it can start the daemon.
+
+The daemon reads files from disk, as a conversation's own servers do, and its
+servers run with the environment the daemon was started with: that of the
+first conversation that needed one, including its `PATH`.
+
+The conversation and the daemon exchange JSON lines. The conversation first
+sends `{"version": 1, "root": "/path", "trusted": false}` and the daemon
+answers `{"version": 1, "pid": 4242}`, hanging up when the versions differ.
+Then each request `{"id": 7, "ask": ...}` is answered by a response
+`{"id": 7, "answer": ...}`, in whatever order the answers are ready. An `ask`
+is `{"language": <LanguageAsk>}`, one of the questions a client's language
+services are asked in the [wire protocol](wire-protocol.md), or one of the
+daemon's own: `{"patience": {"paths": [...]}}`, `{"serves": {"path": ...}}`
+and `{"reformat": {"path": ...}}`. An `answer` is
+`{"language": <LanguageAnswer>}`, `{"patience": {"wait_ms": 20000}}`, or, for
+renames, file moves and code actions, the whole new text of each file changed:
+`{"rewritten": {"files": [{"path": ..., "text": ..., "edits": 2}]}}` and
+`{"applied": {"title": ..., "files": [...]}}`. The protocol is private to
+`crab` and changes with its version.
+
 ## The `lsp` tool
 
 The agent can also ask the language servers about code itself, with the `lsp`

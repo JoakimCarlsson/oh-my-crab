@@ -31,6 +31,7 @@ const WITHHELD: &[&str] = &[
     "task",
     "exit_plan_mode",
     "ask",
+    "show",
     "todo",
     "context_notes",
     "new_context",

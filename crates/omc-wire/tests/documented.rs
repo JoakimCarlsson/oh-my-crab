@@ -106,6 +106,7 @@ fn every_variant_of_the_carried_enums_is_named() {
         variants::<omc_wire::Merge>(),
         variants::<omc_wire::Verdict>(),
         variants::<omc_wire::Progress>(),
+        variants::<omc_wire::ExhibitKind>(),
         variants::<omc_wire::QueueState>(),
         variants::<omc_wire::Reach>(),
         variants::<omc_wire::Input>(),

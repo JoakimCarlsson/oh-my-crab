@@ -76,6 +76,10 @@ they run, questions that wait for an answer, and the end of each turn.
 A question carries a ticket, and its answer names that ticket. Approvals are
 `Ask` events answered with `Choose`, the `ask` tool's forms are `Inquire`
 answered with `Answer`, and project trust is `Trust` answered with `Trust`.
+An option of a form may carry a mockup, a small HTML document picturing it,
+for choices that are visual. The `show` tool, given only to a client that
+says in `Open` that it shows exhibits, puts a diagram or an HTML prototype in
+front of the reader as a `Show` event, which nothing waits on.
 See the [wire protocol](wire-protocol.md).
 
 ## Tool calls and approvals
