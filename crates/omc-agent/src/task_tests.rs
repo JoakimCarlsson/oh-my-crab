@@ -339,6 +339,7 @@ async fn a_definition_can_declare_the_schema() {
         prompt: "Count.".into(),
         output_schema: Some(counting()),
         isolated: false,
+        declared_read_only: false,
         model: None,
         path: None,
         origin: Origin::User,
@@ -438,6 +439,26 @@ fn only_looking_subagents_are_shared() {
         class(json!({"agent": "nobody", "task": "x"})),
         Concurrency::Exclusive
     );
+}
+
+/// The scout gets `bash` in its read-only mode, needing no approval, and nothing that writes; an agent that is not read-only gets the ordinary `bash`, which needs approval.
+#[test]
+fn the_scout_gets_a_read_only_bash() {
+    let (task, _) = simple("task-scout-bash", Router::new(|_| say("ok")));
+    let agents = builtin_agents();
+    let scout = agents.iter().find(|agent| agent.name == "scout").unwrap();
+    let looking = task.tools_for(scout);
+    let bash = looking.get("bash").expect("the scout has bash");
+    assert!(bash.read_only());
+    assert!(!bash.needs_approval());
+    assert!(bash.description().contains("Read-only mode"));
+    assert!(looking.get("edit").is_none());
+    let worker = agents.iter().find(|agent| agent.name == "task").unwrap();
+    let full = task.tools_for(worker);
+    let bash = full.get("bash").expect("a worker has bash");
+    assert!(!bash.read_only());
+    assert!(bash.needs_approval());
+    assert!(!bash.description().contains("Read-only mode"));
 }
 
 /// A model whose subagent requests take turns with each other, recording how many are under way at once.

@@ -159,6 +159,23 @@ A client that only knows `allow` and `reject` keeps working: they mean what
 they always meant, and any other allowing choice approves the plan as `allow`
 does.
 
+### Review
+
+With the `review` setting on, the default, each plan is reviewed before the
+reader sees it. The model of the `review` slot (see
+[Models and slots](models-and-slots.md)), else the conversation's, is asked
+once, without tools, with the reader's latest requests and the plan, and
+answers with a verdict: `pass`, or `revise` and a short list of concrete
+problems such as gaps, contradictions, unstated assumptions, missing
+verification or work beyond the request. On `revise` the `exit_plan_mode`
+call fails with that list, the reader is not asked, and the agent fixes the
+plan and submits it again; that next submission goes to the reader unreviewed,
+so a plan is sent back at most once in a row. An answer that cannot be read
+passes. When the review model cannot be used, or its request fails or takes
+over three minutes, the plan goes to the reader as if reviews were off. A
+review's cost counts toward the conversation's spend, and toward a goal's
+budget when it is the conversation's model that reviews.
+
 Every submitted plan is saved as markdown beside the conversation's history,
 in `<id>.plans/plan-<n>.md`, numbered in the order they were submitted, when
 the conversation is saved. With the `plan_autosave` setting on, it is also
@@ -243,8 +260,30 @@ handled like any other prompt. See
 
 `bash` with `background: true` starts a long command, such as a dev server or
 a long build, and returns a handle at once; `task` with `background: true`
-does the same for subagents. `wait` blocks until the next one ends and returns
-its result. The client sees a `Background` event when each starts and ends.
+does the same for subagents. The client sees a `Background` event when each
+starts and ends. The agent watches its runs with the `wait` tool, whose
+`action` picks what to do:
+
+| `action`         | Arguments                                   | What it does                                                                                                                                                                                                                                                   |
+| ---------------- | ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `wait` (default) | none                                        | Blocks until the next run ends and returns its handle, status and output; a run that ended earlier unreported is returned at once. Fails at once when nothing runs.                                                                                             |
+| `list`           | none                                        | Every run, running or ended (the last 32), with its handle, `command` or `subagent`, its status (`running`, `completed`, `failed`, `cancelled`) and how long it ran.                                                                                              |
+| `output`         | `id`; optional `lines`, `pattern`, `new`    | What the command `id` printed so far, both streams together: the last 50 lines, or the last `lines` (at most 500), and at most 16 000 bytes of their end. `pattern` keeps only lines matching a regular expression; `new` only what came since the last read of it. The latest 256 KiB are kept. A subagent shows its result once it ended. |
+| `cancel`         | `id`                                        | Stops the run: a command is killed with its whole process group, as on a timeout; a subagent is stopped as the reader's `StopSubagent` stops it. The result returns the end of the command's output; `wait` does not report the run again. Needs approval, like `bash`, and is refused in plan mode. |
+
+When runs end while no turn runs and they were not collected with `wait`,
+crab gathers the ends for half a second and then starts a turn of its own
+whose prompt names each run, its status, the first line of its output (a
+command's exit code) and its last 20 lines; those runs are no longer reported
+by `wait`. A run that ends during a turn is held: the agent can `wait` for it,
+and if the turn ends without that, the wake turn follows the turn, after any
+queued prompt and goal turn. Runs that were going when the reader sent
+`Cancel`, runs the agent cancelled, and runs that end while the
+`background_wake` setting is `off` wake nothing and are left to `wait`. A
+wake turn that starts no run of its own wakes nothing more except for runs
+still going. The client sees it start with
+[`Continued`](wire-protocol.md#continued), under a turn id starting with
+`wake-`.
 
 Background runs belong to the conversation, not to the turn: cancelling a
 turn leaves them running, and they are stopped when another conversation is

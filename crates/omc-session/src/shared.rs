@@ -105,6 +105,8 @@ pub(crate) struct Shared {
     pub(crate) warmer: Arc<Warmer>,
     /// The goal the agent works toward across turns, when the reader set one.
     pub(crate) goals: crate::goal::Goals,
+    /// Whether a second model reviews plans and goal completions, and where the plan stands in its round of review.
+    pub(crate) reviews: crate::review::Reviews,
     /// What the conversation cost so far.
     pub(crate) ledger: crate::spend::Ledger,
     /// Where the model slots are kept: the user's file, and the project's once a trusted project is open.
@@ -195,6 +197,7 @@ impl Shared {
             tree: Mutex::new(None),
             warmer: Arc::new(Warmer::default()),
             goals: crate::goal::Goals::default(),
+            reviews: crate::review::Reviews::default(),
             ledger: crate::spend::Ledger::default(),
             slot_files: Mutex::new(if cfg!(test) {
                 crate::slots::SlotFiles::default()
@@ -376,7 +379,7 @@ impl Shared {
         self.exhibits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Records that the conversation is open with `provider`, `models` and `model`, in the mode `mode`; the system prompt, tools and workspace outline of a conversation opened before are forgotten and its cache is no longer kept warm.
+    /// Records that the conversation is open with `provider`, `models` and `model`, in the mode `mode`; the system prompt, tools and workspace outline of a conversation opened before are forgotten and its cache is no longer kept warm, and background runs may wake the conversation again until a saved choice says otherwise.
     pub(crate) fn open(&self, provider: Provider, models: Vec<String>, model: String, mode: Mode) {
         *self.prefix.lock().unwrap_or_else(|held| held.into_inner()) = None;
         *self.tree.lock().unwrap_or_else(|held| held.into_inner()) = None;
@@ -392,6 +395,7 @@ impl Shared {
         });
         self.plans.set_approved(None);
         self.plans.set_autosave(false);
+        self.jobs.set_waking(true);
         self.approvals.set_yolo(mode == Mode::Yolo);
     }
 
@@ -410,8 +414,10 @@ impl Shared {
                 effort: state.effort,
                 checkpoints: state.checkpoints,
                 orchestrator: state.orchestrator,
+                review: self.reviews.enabled(),
                 subagent_budget: self.roster.budget(),
                 snapshots: state.snapshots,
+                background_wake: self.jobs.waking(),
                 retention: omc_providers::cache_ttl(provider, &state.model, Retention::Long)
                     .map(|_| state.retention),
                 warming: omc_providers::warmable(provider, &state.model, None)

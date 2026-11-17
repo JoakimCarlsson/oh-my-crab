@@ -184,6 +184,13 @@ pub trait Tool: Send + Sync {
         None
     }
 
+    /// A copy of the tool for agents marked read-only that runs only what cannot change anything, for a tool that is not [`Tool::read_only`] and whose read-only form is wider than the copy [`Tool::looking`] gives plan mode, such as `bash` running commands in a read-only sandbox; nothing for the rest.
+    ///
+    /// [`crate::Registry::confined`] keeps this copy, before the one [`Tool::looking`] gives.
+    fn confined(&self) -> Option<std::sync::Arc<dyn Tool>> {
+        None
+    }
+
     /// Runs the tool with `args`.
     ///
     /// # Errors

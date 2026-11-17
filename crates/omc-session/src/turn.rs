@@ -19,6 +19,7 @@ use crate::goal::{GoalTool, Metered};
 use crate::lifecycle::{context_of, start_notice};
 use crate::picker::SessionPicker;
 use crate::prefix::{Key, Planning, Prefix};
+use crate::review::{Reviewer, ReviewingHost};
 use crate::settings::Mode;
 use crate::shared::{SessionHost, Shared};
 use crate::slots;
@@ -282,6 +283,8 @@ impl Turn {
     /// The plan the history says the reader approved is the one subagents are told of while it is carried out.
     ///
     /// Every request of the turn is sent with the conversation's system prompt and tool list, made by its first turn, so that the provider's prompt cache keeps them: a prompt starts with notices of what changed since, among them the context the `SessionStart` hooks gave when the conversation opened or was last compacted, and the tools the mode on now lacks are refused when called. A compaction starts the `SessionStart` hooks again. The last request of the main loop is kept warm.
+    ///
+    /// Plans put forward and goal completions are reviewed by the `review` slot's model, else by the turn's model as a helper, when reviews are on.
     pub(crate) async fn run_planned(
         mut self,
         model: Arc<dyn ChatModel>,
@@ -301,6 +304,7 @@ impl Turn {
             })
         };
         let helper = priced(false);
+        let reviewing = helper.clone();
         let model = priced(true);
         let planner = planner.map(|planner| Planner {
             model: Arc::new(Metered {
@@ -351,8 +355,28 @@ impl Turn {
                 let _ = out.send(event);
             }
         });
-        let host: Arc<dyn Host> = Arc::new(SessionHost {
+        let reviewer = Arc::new(Reviewer {
             shared: self.shared.clone(),
+            picker: Some(Arc::new(SessionPicker {
+                shared: self.shared.clone(),
+                provider: self.provider,
+                effort,
+            })),
+            fallback: reviewing,
+            effort,
+            requests: crate::review::requests(
+                &self.history,
+                match &job {
+                    Job::Prompt(prompt, _) => Some(prompt.as_str()),
+                    _ => None,
+                },
+            ),
+        });
+        let host: Arc<dyn Host> = Arc::new(ReviewingHost {
+            inner: Arc::new(SessionHost {
+                shared: self.shared.clone(),
+            }),
+            reviewer: reviewer.clone(),
         });
         let checkpoint = self
             .shared
@@ -430,6 +454,7 @@ impl Turn {
             approved_plan,
             goal: Arc::new(GoalTool {
                 shared: self.shared.clone(),
+                reviewer: Some(reviewer),
             }),
         });
         let key = Key {

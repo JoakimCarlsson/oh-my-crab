@@ -43,4 +43,9 @@ pub trait Host: Send + Sync {
 
     /// Puts `plan` to the reader for approval and waits; what they decided, with plan mode ended when they approved.
     async fn approve_plan(&self, plan: &str) -> PlanVerdict;
+
+    /// Has `plan` reviewed before it is put to the reader; what the agent is told to fix when the review sends it back, else nothing, which is also what a host that does not review says.
+    async fn review_plan(&self, _plan: &str) -> Option<String> {
+        None
+    }
 }

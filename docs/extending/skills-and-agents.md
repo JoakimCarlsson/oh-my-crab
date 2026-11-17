@@ -197,6 +197,15 @@ Look for `unsafe` blocks in the files named and explain each.
   never get. A kind whose tools all only look (`read`, `grep`, `glob`,
   `ast_grep`, `web_search`, `skill`, `ask`, `todo`, `memory_search`) is marked
   read-only to the main agent.
+- `read_only`: `true`, `yes` or `on` declares the kind read-only whatever it
+  lists. It is marked read-only to the main agent and gets only the tools that
+  cannot change anything: those that only look, the copies of `lsp` and
+  `github` that only look, and `bash` in its read-only mode, which runs a
+  command only when it cannot change anything (see
+  [Subagents](../tools/subagents.md#read-only-agents-and-the-shell)). Tools
+  with no read-only form, such as `edit`, are left out. A kind that lists
+  `bash` without declaring itself read-only gets the ordinary `bash`. The
+  built-in `scout` declares itself read-only and lists `bash`.
 - `output_schema`: a JSON Schema object, written as JSON on the line. The
   subagent then hands its result to `submit_result` and the main agent gets
   checked JSON. A value that is not a JSON object is ignored.

@@ -80,7 +80,7 @@ fn record(history: &[Message]) -> String {
 /// # Errors
 ///
 /// Returns [`AgentError::Provider`] when the request fails, and [`AgentError::Empty`] when the reply has no text.
-async fn ask(
+pub(crate) async fn ask(
     model: &dyn ChatModel,
     effort: Option<Effort>,
     system: &str,

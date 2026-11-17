@@ -25,7 +25,9 @@ pub use checkpoint::Checkpoint;
 pub use deferral::{DEFAULT_DEFERRED, DEFERRED_VARIABLE, Deferral};
 pub use error::ToolError;
 pub use host::{Host, PlanVerdict};
-pub use jobs::{Finished, Jobs};
+pub use jobs::{
+    Feed, Finished, Jobs, Kind as JobKind, Launch, Listed, Look, Status as JobStatus, Stop,
+};
 pub use language::{
     DIAGNOSTICS_WAIT, Diagnostic, FORMAT_WAIT, LanguageService, Languages, Severity,
 };

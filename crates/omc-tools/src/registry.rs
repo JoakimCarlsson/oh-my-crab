@@ -198,6 +198,26 @@ impl Registry {
         }
     }
 
+    /// A registry for an agent marked read-only: the tools that never change anything, the read-only copies of the tools that have one for such agents, such as `bash` running only commands that cannot change anything, and the copies that only look of the rest that have one.
+    pub fn confined(&self) -> Self {
+        Self {
+            tools: self
+                .tools
+                .iter()
+                .filter_map(|(name, tool)| {
+                    if tool.read_only() {
+                        Some((*name, tool.clone()))
+                    } else {
+                        tool.confined()
+                            .or_else(|| tool.looking())
+                            .map(|copy| (*name, copy))
+                    }
+                })
+                .collect(),
+            deferred: self.deferred.clone(),
+        }
+    }
+
     /// The names of the registered tools, in name order.
     pub fn names(&self) -> Vec<String> {
         self.tools.keys().map(|name| (*name).to_owned()).collect()

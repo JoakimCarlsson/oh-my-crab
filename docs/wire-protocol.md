@@ -206,6 +206,8 @@ The settings crab offers today:
 | `plan_model`    | `plan_model`    | `same`, the provider's models, or any model as `model` or `provider/model` | always            |
 | `plan_autosave` | `plan_autosave` | `on`, `off`                               | always                                     |
 | `snapshots`     | `snapshots`     | `on`, `off`                               | always                                     |
+| `background_wake` | `background_wake` | `on`, `off`                           | always                                     |
+| `review`        | `review`        | `on`, `off`                               | always                                     |
 | `orchestrator`  | `orchestrator`  | `on`, `off`                               | always                                     |
 | `checkpoints`   | `checkpoints`   | `on`, `off`                               | always                                     |
 
@@ -340,8 +342,8 @@ conversation without an id keeps them under `unsaved-<process id>`.
   `.../<conversation>/backup`, are refused while a turn runs, and leave the
   conversation as it is. The model is told what happened with the next
   prompt.
-- A turn crab starts itself toward a goal is kept under the id its
-  `Continued` event carries.
+- A turn crab starts itself, toward a goal or to report background runs that
+  ended, is kept under the id its `Continued` event carries.
 - A turn without an id, a `/compact`, and a folder that is in no git
   repository keep nothing, and the three commands then answer `Failed`.
 - Every `Failed` these three commands answer with starts with `files:`, so a
@@ -1286,7 +1288,11 @@ ended. Carries a `Background`:
 | `call`    | string | optional | The id of the tool call that started it.          |
 
 Background runs belong to the conversation, not to a turn: they can report
-between turns, and they are stopped by `Open` and `Close`.
+between turns, and they are stopped by `Open` and `Close`. When runs the
+agent did not collect end while no turn runs, crab may start a turn of its own
+to report them, announced with [`Continued`](#continued) under a turn id
+starting with `wake-`; the `background_wake` setting turns that off, and runs
+that were going when the client sent `Cancel` never start one.
 
 ```json
 {"Background":{"id":"job-1","label":"npm run dev","running":true,"call":"toolu_05"}}
@@ -1809,18 +1815,21 @@ budget, and when a saved conversation that has one opens. See
 
 ### `Continued`
 
-Crab started a turn of its own toward the active goal, since the last turn
-ended with the goal still open. The turn's events follow as for a prompt the
-reader sent, and it ends with `Finished`. The prompt is saved as the turn's
-prompt, so a replayed history shows it as a turn the reader sent.
+Crab started a turn of its own: toward the active goal, since the last turn
+ended with the goal still open, or to tell the agent that background runs it
+started ended while no turn ran (see [`Background`](#background)). The turn's
+events follow as for a prompt the reader sent, and it ends with `Finished`.
+The prompt is saved as the turn's prompt, so a replayed history shows it as a
+turn the reader sent. The prefix of `turn` tells the two apart.
 
 | Field    | Type   | Presence | Meaning                                                                                                     |
 | -------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------- |
 | `prompt` | string | required | The prompt the turn started with.                                                                           |
-| `turn`   | string | required | The id crab saved the turn under: `goal-` and a number. Use it as the id of a turn the client prompted: with `before` in `Open`, and with `Changes`, `Restore` and `Undo`. |
+| `turn`   | string | required | The id crab saved the turn under: `goal-` and a number for a turn toward the goal, `wake-` and a number for one reporting background runs. Use it as the id of a turn the client prompted: with `before` in `Open`, and with `Changes`, `Restore` and `Undo`. |
 
 ```json
 {"Continued":{"prompt":"Keep working toward the goal.","turn":"goal-1794563890123456789"}}
+{"Continued":{"prompt":"<background-runs-ended>\nA background run you started has ended while you were waiting for the user. …\n\nbg-1 completed: cargo test\nexit code: 0\n…\n</background-runs-ended>","turn":"wake-1794563890123456789"}}
 ```
 
 ### `Changes`

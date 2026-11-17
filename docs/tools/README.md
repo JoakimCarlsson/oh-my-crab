@@ -66,7 +66,7 @@ starts on, outside any function or in a file that is not code is shown as
 | Tool   | What it does                                                                                       | Asks          | Plan | Detail             |
 | ------ | -------------------------------------------------------------------------------------------------- | ------------- | ---- | ------------------ |
 | `bash` | Runs a shell command in the working folder; condenses noisy output; `background: true` returns a handle at once | yes, per command | no   | [calls](calls.md)  |
-| `wait` | Blocks until the next background `bash` command or `task` subagent ends, and returns its result    | no            | yes  | [background runs](../concepts.md#background-runs) |
+| `wait` | Watches the background `bash` commands and `task` subagents: `wait` (the default) blocks until the next ends and returns its result, `list` lists them, `output` reads what a command printed so far, `cancel` stops one | `cancel` only | yes, but not `cancel` | [background runs](../concepts.md#background-runs) |
 | `eval` | Runs Python or JavaScript in a kernel that keeps its state between calls | yes, per language | no   | [eval](eval.md)    |
 
 ## Web
@@ -99,9 +99,14 @@ starts on, outside any function or in a file that is not code is shown as
 | `agent_wait`    | Blocks for the next reply of a long-lived subagent, with a timeout                               | no   | yes  | [long-lived subagents](subagents.md#long-lived-subagents) |
 | `agent_kill`    | Ends a long-lived subagent                                                                       | no   | yes  | [long-lived subagents](subagents.md#long-lived-subagents) |
 | `agent_list`    | Lists the long-lived subagents and how each stands                                               | no   | yes  | [long-lived subagents](subagents.md#long-lived-subagents) |
+| `crew_tasks`    | *Sometimes.* The task list the main agent and its long-lived subagents share: add, list, claim, done, release, assign | no   | yes  | [crews](subagents.md#crews) |
+| `crew_message`  | *Sometimes.* Sends a short message from one long-lived subagent to another, to all of them or to the main agent | no   | yes  | [crews](subagents.md#crews) |
+| `crew_members`  | *Sometimes.* Lists the crew to one of its long-lived subagents                                   | no   | yes  | [crews](subagents.md#crews) |
 | `submit_result` | *Sometimes.* Hands a subagent's typed result back, checked against the call's `output_schema` | no   | yes                        | [subagents](subagents.md) |
 
 `submit_result` is given only to a subagent asked for a typed result.
+`crew_message` and `crew_members` are given only to long-lived subagents, and
+`crew_tasks` to them and to the main agent once it has started one.
 
 ## Memory
 

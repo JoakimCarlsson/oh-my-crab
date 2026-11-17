@@ -16,7 +16,9 @@ use omc_context::{AgentDefinition, render, subagent_assignment};
 use omc_providers::{ChatModel, Effort, Message};
 use omc_tools::dependencies::{Graph, Node, dependents, downstream, resolve};
 use omc_tools::schema::check_schema;
-use omc_tools::{Concurrency, Jobs, Registry, Tool, ToolError, ToolOutput, parse_args};
+use omc_tools::{
+    Concurrency, JobKind, Jobs, Launch, Registry, Stop, Tool, ToolError, ToolOutput, parse_args,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -46,6 +48,9 @@ const WITHHELD: &[&str] = &[
     "agent_wait",
     "agent_kill",
     "agent_list",
+    "crew_message",
+    "crew_members",
+    "crew_tasks",
 ];
 
 /// The kind of subagent used when the call names none.
@@ -507,6 +512,8 @@ pub(crate) struct Run {
     meter: Arc<Meter>,
     /// The most US dollars its current run may spend before it is stopped after the step it is in; none for no limit.
     budget: Option<f64>,
+    /// Where the messages other members of its crew send it wait, when it is a long-lived subagent.
+    mailbox: Option<Arc<crate::mailbox::Mailbox>>,
 }
 
 /// What ends a subagent's run once it spent more than its budget: the run's meter, what the meter held when the run started, and the most US dollars the run may spend.
@@ -544,6 +551,26 @@ impl Steering for Budget {
     }
 }
 
+/// What a subagent's turn is steered by: its budget, which ends the turn once it is spent, and its mailbox, whose messages are put into the conversation at each step boundary.
+struct Steer<'a> {
+    /// The budget of the run, when it has one.
+    budget: Option<&'a Budget>,
+    /// The mailbox of the subagent, when it is a long-lived one.
+    mailbox: Option<&'a crate::mailbox::Mailbox>,
+}
+
+impl Steering for Steer<'_> {
+    /// Takes the message that waited longest in the mailbox, when there is one.
+    fn next(&self, at: usize) -> Option<(String, Vec<omc_providers::Image>)> {
+        self.mailbox.and_then(|mailbox| mailbox.next(at))
+    }
+
+    /// Ends the turn once the run spent more than its budget.
+    fn halted(&self) -> bool {
+        self.budget.is_some_and(Budget::passed)
+    }
+}
+
 /// The result of a subagent of the kind `kind` whose budget ended its run: what it said last, `said`, and a note that the budget stopped it and what `budget` saw it spend.
 fn budget_ended(kind: &str, said: &str, budget: &Budget) -> String {
     let said = if said.is_empty() {
@@ -559,7 +586,7 @@ fn budget_ended(kind: &str, said: &str, budget: &Budget) -> String {
 }
 
 impl Run {
-    /// Has the subagent work in the worktree `lease`, made from `snapshot`: its tools that touch files are replaced by ones built by `isolation` for the worktree, and its assignment says where it works.
+    /// Has the subagent work in the worktree `lease`, made from `snapshot`: its tools that touch files are replaced by ones built by `isolation` for the worktree, by their read-only copies where it held a read-only copy, leaving out those that have none, and its assignment says where it works.
     ///
     /// # Errors
     ///
@@ -573,8 +600,17 @@ impl Run {
         let directory = lease.directory();
         let own = (isolation.tools)(&directory)?;
         for tool in own.iter() {
-            if self.registry.get(tool.name()).is_some() {
-                self.registry.register_shared(tool.clone());
+            let Some(held) = self.registry.get(tool.name()) else {
+                continue;
+            };
+            let replacement = if held.read_only() && !tool.read_only() {
+                tool.confined().or_else(|| tool.looking())
+            } else {
+                Some(tool.clone())
+            };
+            match replacement {
+                Some(replacement) => self.registry.register_shared(replacement),
+                None => self.registry.remove(tool.name()),
             }
         }
         let shown = directory.display().to_string();
@@ -658,7 +694,12 @@ impl Run {
             start: self.meter.tally(),
             limit,
         });
-        let steering = budget.as_ref().map(|budget| budget as &dyn Steering);
+        let steer = Steer {
+            budget: budget.as_ref(),
+            mailbox: self.mailbox.as_deref(),
+        };
+        let steering =
+            (steer.budget.is_some() || steer.mailbox.is_some()).then_some(&steer as &dyn Steering);
         let context = Context {
             model: self.model.as_ref(),
             registry: &self.registry,
@@ -1209,18 +1250,20 @@ impl Task {
         })
     }
 
-    /// The tools `agent` gets: those of the registry the tool was given, less what is withheld, and only those the definition lists when it lists any; a tool that depends on what else the agent has, such as `script`, is fitted to them.
-    fn tools_for(&self, agent: &AgentDefinition) -> Registry {
-        self.settings
-            .registry
-            .filtered(|tool| {
-                !WITHHELD.contains(&tool.name())
-                    && agent
-                        .tools
-                        .as_ref()
-                        .is_none_or(|listed| listed.iter().any(|name| name == tool.name()))
-            })
-            .fitted()
+    /// The tools `agent` gets: those of the registry the tool was given, less what is withheld, and only those the definition lists when it lists any, each replaced by its read-only copy when the agent is read-only, which gives it `bash` in its read-only mode and leaves out what has no such copy; a tool that depends on what else the agent has, such as `script`, is fitted to them.
+    pub(crate) fn tools_for(&self, agent: &AgentDefinition) -> Registry {
+        let listed = self.settings.registry.filtered(|tool| {
+            !WITHHELD.contains(&tool.name())
+                && agent
+                    .tools
+                    .as_ref()
+                    .is_none_or(|listed| listed.iter().any(|name| name == tool.name()))
+        });
+        if agent.read_only() {
+            listed.confined().fitted()
+        } else {
+            listed.fitted()
+        }
     }
 
     /// Whether a subagent of the kind `agent` started by this tool gets a `task` tool of its own: it runs above the deepest level allowed, and its definition lists no tools or lists `task` or `agent` among them.
@@ -1406,6 +1449,7 @@ impl Task {
             enrolment: None,
             meter: Meter::below(self.settings.nesting.meter.clone()),
             budget: None,
+            mailbox: None,
         })
     }
 
@@ -1492,9 +1536,14 @@ impl Task {
         }
     }
 
-    /// Readies `run` to start, now that it is known where it works: it gets a `task` tool of its own when it may start subagents, as [`Task::equip`] tells, and then its system prompt is made for the tools it has, the folder it works in and the model it asks, followed by what its work category adds when it has one that does.
+    /// Readies `run` to start, now that it is known where it works: it gets a `task` tool of its own when it may start subagents, as [`Task::equip`] tells, and then its system prompt is made as [`Task::brief_on_tools`] tells.
     fn arm(&self, run: &mut Run) {
         self.equip(run);
+        self.brief_on_tools(run);
+    }
+
+    /// Makes the system prompt of `run` for the tools it has, the folder it works in and the model it asks, followed by what its work category adds when it has one that does.
+    fn brief_on_tools(&self, run: &mut Run) {
         let directory = run.lease.as_ref().map(Lease::directory);
         let system = (self.settings.prompt)(
             &run.definition,
@@ -1506,6 +1555,21 @@ impl Task {
             Some(addition) => format!("{system}\n\n{addition}"),
             None => system,
         };
+    }
+
+    /// Makes `run`, a long-lived subagent [`Task::enlist`] readied, a member of a crew: it gets `tools`, the tools members of a crew have, and takes the messages waiting in `mailbox` into its conversation at each step boundary of its turns; its system prompt is made again for the tools it now has.
+    pub(crate) fn join(
+        &self,
+        run: &mut Run,
+        tools: Vec<Arc<dyn Tool>>,
+        mailbox: Arc<crate::mailbox::Mailbox>,
+    ) {
+        for tool in tools {
+            run.registry.register_shared(tool);
+        }
+        run.registry = run.registry.fitted();
+        run.mailbox = Some(mailbox);
+        self.brief_on_tools(run);
     }
 
     /// A long-lived subagent of the kind `kind` (the default kind when `None`), started by the call `call` to do `task`, named by `description`, asking `model` when one is named or the model of the work category `category` when one is: ready to run, working in the main agent's folder, with its tools and system prompt.
@@ -1651,15 +1715,17 @@ impl Task {
         outcomes
     }
 
-    /// Starts `runs`, started by the call `call`, in the background as one job that runs them in the order `graph` says, as [`run_ordered`] does, and says which handle the job got.
+    /// Starts `runs`, started by the call `call`, in the background as one job that runs them in the order `graph` says, as [`run_ordered`] does, and says which handle the job got; cancelling the job stops its subagents through the roster.
     fn start_ordered_in_background(&self, call: &str, runs: Vec<Run>, graph: Graph) -> ToolOutput {
         let call = Some(call.to_owned()).filter(|call| !call.is_empty());
         let count = runs.len();
         let label = format!("{count} subagents with dependencies");
+        let stop = self.stopper(runs.iter().map(|run| run.id.clone()).collect());
         let events = self.settings.events.clone();
         let nesting = self.settings.nesting.clone();
         let isolation = self.settings.isolation.clone();
-        let handle = self.settings.jobs.spawn(label, call, async move {
+        let launch = Launch::new(label, call, JobKind::Subagent).stopped_by(stop);
+        let handle = self.settings.jobs.spawn_with(launch, async move {
             combine(run_ordered(runs, graph, events, nesting, isolation).await)
                 .map(|output| output.text)
                 .map_err(|error| error.to_string())
@@ -1669,7 +1735,13 @@ impl Task {
         ))
     }
 
-    /// Starts `runs`, started by the call `call`, in the background, each once it took a seat of the shared throttle, and says which handle each got.
+    /// What stops the subagents `ids` through the roster, saying whether it stopped any, for cancelling the background job that runs them.
+    fn stopper(&self, ids: Vec<String>) -> Stop {
+        let roster = self.settings.nesting.roster.clone();
+        Arc::new(move || ids.iter().filter(|id| roster.stop(id)).count() > 0)
+    }
+
+    /// Starts `runs`, started by the call `call`, in the background, each once it took a seat of the shared throttle, and says which handle each got; cancelling one stops its subagent through the roster.
     fn start_in_background(&self, call: &str, runs: Vec<Run>) -> ToolOutput {
         let call = Some(call.to_owned()).filter(|call| !call.is_empty());
         let started: Vec<(String, Lane)> = runs
@@ -1679,16 +1751,15 @@ impl Task {
                 let events = self.settings.events.clone();
                 let isolation = self.settings.isolation.clone();
                 let nesting = self.settings.nesting.clone();
-                let handle =
-                    self.settings
-                        .jobs
-                        .spawn(lane.label.clone(), call.clone(), async move {
-                            let ended = finish(run, events.clone(), nesting).await;
-                            conclude(ended, isolation.as_deref(), events.as_ref())
-                                .await
-                                .1
-                                .map_err(|error| error.to_string())
-                        });
+                let launch = Launch::new(lane.label.clone(), call.clone(), JobKind::Subagent)
+                    .stopped_by(self.stopper(vec![run.id.clone()]));
+                let handle = self.settings.jobs.spawn_with(launch, async move {
+                    let ended = finish(run, events.clone(), nesting).await;
+                    conclude(ended, isolation.as_deref(), events.as_ref())
+                        .await
+                        .1
+                        .map_err(|error| error.to_string())
+                });
                 (handle, lane)
             })
             .collect();
@@ -2174,7 +2245,7 @@ mod tests {
         };
         assert_eq!(
             tools_of("SUB:scout"),
-            vec!["ast_grep", "glob", "grep", "read"]
+            vec!["ast_grep", "bash", "glob", "grep", "read"]
         );
         assert_eq!(
             tools_of("SUB:task"),

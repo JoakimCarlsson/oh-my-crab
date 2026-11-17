@@ -2,7 +2,7 @@ Runs subagents on self-contained assignments and returns their final messages as
 
 # Delegation
 Use most specific agent. Prefer one agent to investigate + edit. Omit `agent` only for the default (`task`); NEVER specify it.
-Shared edits need one integration owner. Set interfaces in the task. Every task MUST skip build/lint/tests/formatters mid-flight; run once afterward.
+Shared edits need one integration owner. Set interfaces in the task. Every subagent costs a full context of its own: delegate only work worth that. Check the agent has the tools and reach the task needs; a read-only agent cannot run commands unless its description says so. A subagent alone in a tree (the only writer, or isolated) SHOULD build and run the tests for what it changed before reporting; writers sharing one working tree at the same time skip builds, and you run them once afterward.
 {{nesting}}
 
 # Batches

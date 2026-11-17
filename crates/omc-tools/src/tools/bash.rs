@@ -4,6 +4,7 @@
 
 mod condense;
 mod intercept;
+mod looking;
 mod shell;
 
 use std::process::{ExitStatus, Stdio};
@@ -18,7 +19,7 @@ use tokio::process::Command;
 
 use super::capture::Capture;
 use crate::tool::parse_args;
-use crate::{Jobs, Sandbox, Subject, Tool, ToolError, ToolOutput};
+use crate::{Feed, JobKind, Jobs, Launch, Sandbox, Subject, Tool, ToolError, ToolOutput};
 pub(super) use condense::Condenser;
 use condense::{Rules, rules_for};
 use intercept::Verdict;
@@ -60,6 +61,8 @@ pub struct Bash {
     condense: bool,
     /// Whether plain shell uses that a dedicated tool does better are turned away.
     intercept: bool,
+    /// How commands are kept from changing anything, when this is the read-only copy for agents marked read-only.
+    looking: Option<looking::Mode>,
     /// What the model is told it does.
     description: String,
 }
@@ -74,6 +77,7 @@ impl Bash {
             jobs: None,
             condense: switched_on(CONDENSE_ENV),
             intercept: switched_on(INTERCEPT_ENV),
+            looking: None,
             description: String::new(),
         }
         .described()
@@ -83,6 +87,15 @@ impl Bash {
     pub fn with_jobs(sandbox: Sandbox, jobs: Arc<Jobs>) -> Self {
         Self {
             jobs: Some(jobs),
+            ..Self::new(sandbox)
+        }
+        .described()
+    }
+
+    /// Creates the read-only copy for agents marked read-only, running commands in the root of `sandbox` in the foreground only, with the same defaults as [`Bash::new`]: inside a sandbox where the filesystem is read-only when `bwrap` can make one here, and otherwise only commands made of programs that only look.
+    pub fn looking_only(sandbox: Sandbox) -> Self {
+        Self {
+            looking: Some(looking::mode()),
             ..Self::new(sandbox)
         }
         .described()
@@ -101,9 +114,22 @@ impl Bash {
     }
 
     /// The tool with its description matching what it does.
+    /// The tool with its description matching what it does; the read-only copy says which read-only mode it is in instead of saying commands are approved.
     fn described(mut self) -> Self {
+        let base = match self.looking {
+            Some(_) => DESCRIPTION.replace(" The user is asked to approve each command.", ""),
+            None => DESCRIPTION.to_owned(),
+        };
         let notes = [
-            (true, DESCRIPTION),
+            (true, base.as_str()),
+            (
+                self.looking == Some(looking::Mode::Sandboxed),
+                looking::SANDBOXED_NOTE,
+            ),
+            (
+                self.looking == Some(looking::Mode::Vetted),
+                looking::VETTED_NOTE,
+            ),
             (self.intercept, INTERCEPT_NOTE),
             (self.condense, CONDENSE_NOTE),
             (self.jobs.is_some(), BACKGROUND_NOTE),
@@ -117,12 +143,23 @@ impl Bash {
         self
     }
 
+    /// The process that runs `command`: inside the read-only sandbox for the copy in sandboxed read-only mode, and in a plain shell otherwise.
+    fn command(&self, command: &str) -> Command {
+        match self.looking {
+            Some(looking::Mode::Sandboxed) => looking::sandboxed(command, self.sandbox.root()),
+            _ => shell(command),
+        }
+    }
+
     /// Decides whether `command` may run, returning any tip to add to its result.
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Failed`], naming the tool and arguments to use instead, when the command is turned away.
+    /// Returns [`ToolError::Failed`], naming the tool and arguments to use instead, when the command is turned away, and saying the shell is read-only, what was refused and why, when the copy in vetted read-only mode finds the command could change something.
     fn screen(&self, command: &str) -> Result<Option<String>, ToolError> {
+        if self.looking == Some(looking::Mode::Vetted) {
+            looking::vet(command).map_err(ToolError::Failed)?;
+        }
         if !self.intercept {
             return Ok(None);
         }
@@ -192,9 +229,14 @@ impl Tool for Bash {
         schema
     }
 
-    /// Commands can do anything, so they need approval.
+    /// The read-only copy only looks: in sandboxed mode nothing a command does can change the filesystem, and in vetted mode a command that could is refused before it runs.
+    fn read_only(&self) -> bool {
+        self.looking.is_some()
+    }
+
+    /// Commands can do anything, so they need approval; the read-only copy's cannot change anything, so they need none.
     fn needs_approval(&self) -> bool {
-        true
+        self.looking.is_none()
     }
 
     /// Shows the command line.
@@ -218,14 +260,30 @@ impl Tool for Bash {
         })
     }
 
+    /// The read-only copy for agents marked read-only, with the same output handling, when this is not already that copy.
+    fn confined(&self) -> Option<Arc<dyn Tool>> {
+        self.looking.is_none().then(|| {
+            Arc::new(
+                Bash::looking_only(self.sandbox.clone())
+                    .condensing(self.condense)
+                    .intercepting(self.intercept),
+            ) as Arc<dyn Tool>
+        })
+    }
+
     /// Runs the call without an id, which only loses the link from a background run to the call that started it.
     async fn call(&self, args: Value) -> Result<ToolOutput, ToolError> {
         self.call_as("", args).await
     }
 
-    /// Runs the command, killing its whole process group on timeout, or starts it in the background under the call `id`; turns it away first when a dedicated tool does the job.
+    /// Runs the command, killing its whole process group on timeout, or starts it in the background under the call `id`; turns it away first when a dedicated tool does the job, and in the read-only copy when it asks for a background run or, in vetted mode, could change something.
     async fn call_as(&self, id: &str, args: Value) -> Result<ToolOutput, ToolError> {
         let args: Args = parse_args(args)?;
+        if self.looking.is_some() && args.background {
+            return Err(ToolError::Failed(
+                "the shell is read-only for this agent: background runs are not allowed".to_owned(),
+            ));
+        }
         let tip = self.screen(&args.command)?;
         let rules = self.rules(&args.command);
         if !args.background {
@@ -233,9 +291,9 @@ impl Tool for Bash {
                 .timeout
                 .unwrap_or(DEFAULT_TIMEOUT_SECS)
                 .clamp(1, MAX_TIMEOUT_SECS);
-            let mut output = run(
+            let mut output = run_process(
+                self.command(&args.command),
                 &self.sandbox,
-                &args.command,
                 Some(Duration::from_secs(seconds)),
                 rules,
             )
@@ -260,18 +318,24 @@ impl Tool for Bash {
             .chars()
             .take(120)
             .collect();
+        let feed = Feed::new();
         let work = {
             let command = command.clone();
+            let feed = feed.clone();
             async move {
-                run(&sandbox, &command, timeout, rules)
+                run(&sandbox, &command, timeout, rules, feed)
                     .await
                     .map(|output| output.text)
                     .map_err(|error| error.to_string())
             }
         };
-        let handle = jobs.spawn(label, Some(id.to_owned()).filter(|id| !id.is_empty()), work);
+        let call = Some(id.to_owned()).filter(|id| !id.is_empty());
+        let handle = jobs.spawn_with(
+            Launch::new(label, call, JobKind::Command).fed_by(feed),
+            work,
+        );
         Ok(ToolOutput::new(format!(
-            "Started in the background as {handle}. Call `wait` to get its result when it ends."
+            "Started in the background as {handle}. Call `wait` to get its result when it ends; `wait` with `action` `output` shows what it printed so far, and `cancel` stops it."
         )))
     }
 }
@@ -295,7 +359,22 @@ impl Drop for GroupGuard {
     }
 }
 
-/// Runs `command` in the root of `sandbox`, waiting at most `limit` when there is one, and condensing its output with `rules` when there are any.
+/// Runs `command` in a plain shell in the root of `sandbox`, as [`run_process`] runs a process, writing what it prints to `feed` too.
+///
+/// # Errors
+///
+/// Same as [`run_process`].
+async fn run(
+    sandbox: &Sandbox,
+    command: &str,
+    limit: Option<Duration>,
+    rules: Option<Rules>,
+    feed: Feed,
+) -> Result<ToolOutput, ToolError> {
+    run_process_fed(shell(command), sandbox, limit, rules, Some(feed)).await
+}
+
+/// Runs `process`, a shell running a command, in the root of `sandbox`, waiting at most `limit` when there is one, and condensing its output with `rules` when there are any.
 ///
 /// An output stream too long to show, or one condensing left something out of, is saved whole in the sandbox's spill folder, and the report names the file. The command is killed, with its process group, when the returned future is dropped.
 ///
@@ -303,13 +382,28 @@ impl Drop for GroupGuard {
 ///
 /// Returns [`ToolError::Io`] when the shell cannot start and
 /// [`ToolError::Failed`], carrying the partial output, on timeout.
-async fn run(
+async fn run_process(
+    process: Command,
     sandbox: &Sandbox,
-    command: &str,
     limit: Option<Duration>,
     rules: Option<Rules>,
 ) -> Result<ToolOutput, ToolError> {
-    let mut child = shell(command)
+    run_process_fed(process, sandbox, limit, rules, None).await
+}
+
+/// Runs `process` as [`run_process`] does, writing what it prints, both streams as they come, to `feed` too when there is one, so that it can be read while the process runs.
+///
+/// # Errors
+///
+/// Same as [`run_process`].
+async fn run_process_fed(
+    mut process: Command,
+    sandbox: &Sandbox,
+    limit: Option<Duration>,
+    rules: Option<Rules>,
+    feed: Option<Feed>,
+) -> Result<ToolOutput, ToolError> {
+    let mut child = process
         .current_dir(sandbox.root())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -329,8 +423,8 @@ async fn run(
     let stdout = fresh("stdout");
     let stderr = fresh("stderr");
     let readers = [
-        tokio::spawn(capture(child.stdout.take(), stdout.clone())),
-        tokio::spawn(capture(child.stderr.take(), stderr.clone())),
+        tokio::spawn(capture(child.stdout.take(), stdout.clone(), feed.clone())),
+        tokio::spawn(capture(child.stderr.take(), stderr.clone(), feed)),
     ];
     let waited = match limit {
         Some(limit) => tokio::time::timeout(limit, child.wait()).await.ok(),
@@ -360,8 +454,12 @@ async fn run(
     }
 }
 
-/// Reads `source` to the end into `into`.
-async fn capture<R: AsyncRead + Unpin>(source: Option<R>, into: Arc<Mutex<Capture>>) {
+/// Reads `source` to the end into `into`, and into `feed` too when there is one.
+async fn capture<R: AsyncRead + Unpin>(
+    source: Option<R>,
+    into: Arc<Mutex<Capture>>,
+    feed: Option<Feed>,
+) {
     let Some(mut source) = source else { return };
     let mut chunk = [0u8; 8192];
     while let Ok(read) = source.read(&mut chunk).await {
@@ -369,6 +467,9 @@ async fn capture<R: AsyncRead + Unpin>(source: Option<R>, into: Arc<Mutex<Captur
             break;
         }
         into.lock().unwrap().push(&chunk[..read]);
+        if let Some(feed) = &feed {
+            feed.push(&chunk[..read]);
+        }
     }
 }
 
@@ -592,6 +693,35 @@ mod tests {
         assert!(!marker.exists());
     }
 
+    /// What a background command printed can be read while it runs, and cancelling it kills it along with the processes it started, without `wait` reporting it.
+    #[tokio::test]
+    async fn a_background_command_can_be_read_and_cancelled() {
+        let dir = scratch("bash-bg-cancel");
+        let marker = dir.join("alive");
+        let jobs = Arc::new(Jobs::new(|_| {}));
+        let tool = Bash::with_jobs(Sandbox::new(&dir).unwrap(), jobs.clone());
+        tool.call(json!({
+            "command": "(sleep 2; touch alive) & echo ready; echo oops >&2; sleep 30",
+            "background": true
+        }))
+        .await
+        .unwrap();
+        let look = crate::Look::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = String::new();
+        while !seen.contains("oops") && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            seen = jobs.output("bg-1", &look).unwrap();
+        }
+        assert!(seen.starts_with("bg-1 command running "));
+        assert!(seen.contains("ready"));
+        let said = jobs.cancel("bg-1").unwrap();
+        assert!(said.contains("Killed with the processes it started"));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!marker.exists());
+        assert!(jobs.wait().await.is_err());
+    }
+
     /// Writes an executable `cargo` into `dir` that prints build progress to stderr and a result to stdout, as the real one does.
     fn fake_cargo(dir: &std::path::Path) {
         use std::os::unix::fs::PermissionsExt;
@@ -672,5 +802,93 @@ mod tests {
             .unwrap();
         assert!(started.elapsed() < Duration::from_secs(4));
         assert!(out.text.contains("done"));
+    }
+
+    /// The read-only copy only looks, needs no approval, cannot start background runs and says which read-only mode it is in; the ordinary tool is unchanged.
+    #[tokio::test]
+    async fn the_read_only_copy_only_looks() {
+        let (plain, _dir) = tool("bash-read-only-copy");
+        assert!(!plain.read_only());
+        assert!(plain.needs_approval());
+        let copy = plain.confined().unwrap();
+        assert!(copy.read_only());
+        assert!(!copy.needs_approval());
+        assert!(copy.confined().is_none());
+        assert!(copy.description().contains("Read-only mode"));
+        assert!(!copy.description().contains("approve each command"));
+        assert!(copy.schema()["properties"]["background"].is_null());
+        let refused = copy
+            .call(json!({ "command": "true", "background": true }))
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("read-only"));
+        let out = copy.call(json!({ "command": "echo hi" })).await.unwrap();
+        assert!(out.text.contains("hi"));
+    }
+
+    /// In vetted read-only mode a command that could change something is refused before it runs.
+    #[tokio::test]
+    async fn vetted_mode_refuses_before_running() {
+        let (sandbox, dir) = sandbox("bash-read-only-vetted");
+        let copy = Bash {
+            looking: Some(looking::Mode::Vetted),
+            ..Bash::new(sandbox)
+        }
+        .described();
+        assert!(
+            copy.description()
+                .contains("only commands that cannot change anything run")
+        );
+        let refused = copy
+            .call(json!({ "command": "echo hi > made.txt" }))
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("read-only"));
+        assert!(!dir.join("made.txt").exists());
+        let out = copy
+            .call(json!({ "command": "echo hi | wc -c" }))
+            .await
+            .unwrap();
+        assert!(out.text.contains('3'));
+    }
+
+    /// In sandboxed read-only mode writes fail, even through programs off any list, while reads outside the working directory succeed and `/tmp` is usable scratch space; skipped where `bwrap` cannot make a sandbox.
+    #[tokio::test]
+    async fn sandboxed_mode_reads_anywhere_and_writes_nowhere() {
+        if looking::mode() != looking::Mode::Sandboxed {
+            return;
+        }
+        let (sandbox, dir) = sandbox("bash-read-only-sandboxed");
+        let outside = scratch("bash-read-only-sandboxed-outside");
+        std::fs::write(outside.join("data.txt"), "outside data\n").unwrap();
+        let copy = Bash::looking_only(sandbox);
+        assert!(copy.description().contains("sandbox"));
+        let read = copy
+            .call(json!({ "command": format!("cat {}", outside.join("data.txt").display()) }))
+            .await
+            .unwrap();
+        assert!(read.text.contains("outside data"), "{}", read.text);
+        let wrote = copy
+            .call(json!({ "command": "touch made.txt; python3 -c \"open('made2.txt', 'w')\"; echo hi > made3.txt" }))
+            .await
+            .unwrap();
+        assert!(!wrote.text.contains("exit code: 0"), "{}", wrote.text);
+        for name in ["made.txt", "made2.txt", "made3.txt"] {
+            assert!(!dir.join(name).exists(), "{name}");
+        }
+        let removed = copy
+            .call(json!({ "command": format!("rm {}", outside.join("data.txt").display()) }))
+            .await
+            .unwrap();
+        assert!(outside.join("data.txt").exists(), "{}", removed.text);
+        let scratch_space = copy
+            .call(json!({ "command": "echo kept > /tmp/scratch && cat /tmp/scratch" }))
+            .await
+            .unwrap();
+        assert!(
+            scratch_space.text.contains("kept"),
+            "{}",
+            scratch_space.text
+        );
     }
 }

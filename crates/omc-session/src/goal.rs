@@ -10,6 +10,7 @@ use omc_tools::{Tool, ToolError, ToolOutput};
 use omc_wire::{Goal, GoalState};
 use serde_json::{Value, json};
 
+use crate::review::Reviewer;
 use crate::shared::Shared;
 
 /// The fact a conversation's goal is saved under.
@@ -69,6 +70,8 @@ struct Held {
     last: Option<u64>,
     /// Whether the reader asked the agent to set the goal with them, so that the agent may create it.
     interviewing: bool,
+    /// What the reviewer objected to when it refused the agent's first completion of the goal; once set, the next completion is not reviewed.
+    objections: Option<String>,
 }
 
 /// The goal of a conversation, shared by its commands, its turns and the `goal` tool.
@@ -282,7 +285,22 @@ impl Goals {
         })
     }
 
-    /// Ends the goal as achieved, with the agent's `summary`.
+    /// The goal, when crab works toward it and no review refused its completion yet, so that a completion of it is reviewed.
+    pub(crate) fn unreviewed(&self) -> Option<Goal> {
+        self.with(|held| {
+            held.goal
+                .clone()
+                .filter(|goal| matches!(goal.state, GoalState::Active | GoalState::BudgetLimited))
+                .filter(|_| held.objections.is_none())
+        })
+    }
+
+    /// Notes that the reviewer refused the goal's completion for `problems`, so that the next completion is accepted and carries them.
+    pub(crate) fn object(&self, problems: &[String]) {
+        self.with(|held| held.objections = Some(problems.join("; ")));
+    }
+
+    /// Ends the goal as achieved, with the agent's `summary`, followed by what the reviewer objected to when it refused an earlier completion.
     ///
     /// # Errors
     ///
@@ -297,7 +315,12 @@ impl Goals {
                 ));
             }
             goal.state = GoalState::Complete;
-            goal.note = Some(summary.to_owned());
+            goal.note = Some(match &held.objections {
+                Some(objections) => {
+                    format!("{summary}\n\nA reviewer refused an earlier completion: {objections}")
+                }
+                None => summary.to_owned(),
+            });
             let goal = goal.clone();
             held.continuing = false;
             held.last = None;
@@ -602,6 +625,8 @@ impl ChatModel for Metered {
 pub(crate) struct GoalTool {
     /// The conversation whose goal it is.
     pub(crate) shared: Arc<Shared>,
+    /// What reviews a completion before it is accepted, when the turn has one.
+    pub(crate) reviewer: Option<Arc<Reviewer>>,
 }
 
 /// What the `goal` tool says it does.
@@ -647,11 +672,11 @@ impl Tool for GoalTool {
         }
     }
 
-    /// Reads the goal, or ends it as achieved and tells the client.
+    /// Reads the goal, or ends it as achieved and tells the client. The first completion of a goal is reviewed when there is a reviewer; a refusal keeps the goal open, and the next completion is accepted with the reviewer's objections in its note.
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Failed`] when there is no goal, it is not being worked toward, the operation is unknown, or `complete` comes without a summary.
+    /// Returns [`ToolError::Failed`] when there is no goal, it is not being worked toward, the operation is unknown, `complete` comes without a summary, or the reviewer refused the completion.
     async fn call(&self, args: Value) -> Result<ToolOutput, ToolError> {
         let goals = &self.shared.goals;
         match args["op"].as_str() {
@@ -687,6 +712,12 @@ impl Tool for GoalTool {
                                 .to_owned(),
                         )
                     })?;
+                if let (Some(reviewer), Some(goal)) = (&self.reviewer, goals.unreviewed())
+                    && let Some(problems) = reviewer.completion(&goal.objective, summary).await
+                {
+                    goals.object(&problems);
+                    return Err(ToolError::Failed(omc_agent::completion_refused(&problems)));
+                }
                 let goal = goals.complete(summary).map_err(ToolError::Failed)?;
                 self.shared.announce_goal(&goal);
                 Ok(ToolOutput::new(format!(

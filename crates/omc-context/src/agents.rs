@@ -35,6 +35,8 @@ pub struct AgentDefinition {
     pub output_schema: Option<serde_json::Value>,
     /// Whether it works in a git worktree of its own unless a call says otherwise, its changes handed back to the main agent's working tree as a patch when it ends.
     pub isolated: bool,
+    /// Whether the definition declares itself read-only with `read_only: true`, so that it gets only the tools that cannot change anything, `bash` among them in its read-only mode, whatever it lists.
+    pub declared_read_only: bool,
     /// The model it asks, as the definition names it: an alias such as `haiku`, `sonnet` or `opus`, a model id, a provider and a model id as `provider/model`, or `@name` for the model of the slot `name`; `inherit` for the model of the agent that starts it; nothing for the model of the `subagent` slot, which is the model of the agent that starts it unless set.
     pub model: Option<String>,
     /// Where the definition is, or nothing for a built-in one.
@@ -44,14 +46,15 @@ pub struct AgentDefinition {
 }
 
 impl AgentDefinition {
-    /// Whether the definition lists tools and all of them only look.
+    /// Whether the agent is read-only: the definition declares itself so, or it lists tools and all of them only look.
     pub fn read_only(&self) -> bool {
-        self.tools.as_ref().is_some_and(|tools| {
-            !tools.is_empty()
-                && tools
-                    .iter()
-                    .all(|tool| READ_ONLY_TOOLS.contains(&tool.as_str()))
-        })
+        self.declared_read_only
+            || self.tools.as_ref().is_some_and(|tools| {
+                !tools.is_empty()
+                    && tools
+                        .iter()
+                        .all(|tool| READ_ONLY_TOOLS.contains(&tool.as_str()))
+            })
     }
 }
 
@@ -150,6 +153,7 @@ fn from_markdown(
         prompt,
         output_schema: schema_of(parsed.get("output_schema")),
         isolated: flag(parsed.get("isolated")),
+        declared_read_only: flag(parsed.get("read_only")),
         model: model_of(parsed.get("model")),
         path,
         origin,
@@ -201,6 +205,7 @@ fn from_toml(
         tools: None,
         output_schema: schema_of(get("output_schema").as_deref()),
         isolated: flag(get("isolated").as_deref()),
+        declared_read_only: flag(get("read_only").as_deref()),
         model: model_of(get("model").as_deref()),
         prompt,
         path: Some(path.to_path_buf()),
@@ -223,6 +228,41 @@ mod tests {
         assert!(!agents[0].read_only());
         assert!(agents[1].read_only());
         assert!(!agents[2].read_only());
+    }
+
+    /// The scout declares itself read-only and lists `bash`, which it gets in its read-only mode.
+    #[test]
+    fn the_scout_has_a_read_only_shell() {
+        let scout = builtin_agents().remove(1);
+        assert!(scout.declared_read_only);
+        assert!(
+            scout
+                .tools
+                .as_ref()
+                .is_some_and(|tools| tools.iter().any(|tool| tool == "bash"))
+        );
+    }
+
+    /// A definition that declares itself read-only is read-only whatever it lists, and one that lists `bash` without declaring it is not.
+    #[test]
+    fn declared_read_only() {
+        let declared = from_markdown(
+            "---\nname: looker\nread_only: true\ntools: read, bash\n---\nLook.",
+            "looker",
+            None,
+            Origin::BuiltIn,
+        )
+        .unwrap();
+        assert!(declared.read_only());
+        let plain = from_markdown(
+            "---\nname: doer\ntools: read, bash\n---\nDo.",
+            "doer",
+            None,
+            Origin::BuiltIn,
+        )
+        .unwrap();
+        assert!(!plain.declared_read_only);
+        assert!(!plain.read_only());
     }
 
     /// Markdown and TOML definitions are found, and a project one shadows a built-in.

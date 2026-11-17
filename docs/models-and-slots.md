@@ -13,7 +13,7 @@ the model it asks, with backups for when that model keeps failing.
 | `fast`     | Compaction summaries, questions on the side (`/btw`) and the prompt `/handoff` writes.                              |
 | `plan`     | Turns in plan mode, unless the `plan_model` setting names another model.                                            |
 | `subagent` | Subagents started by `task` and `agent_spawn` whose call and kind name no model.                                     |
-| `review`   | Reserved for reviews, such as judging a goal; crab asks no model for one yet.                                       |
+| `review`   | Reviews: a plan before the reader sees it, and a goal's completion before it ends, while the `review` setting is on. |
 | `vision`   | Reserved for describing images to a model that cannot read them; crab does not do that yet.                          |
 
 A slot holds an assignment for each provider, such as `claude` or `codex`,

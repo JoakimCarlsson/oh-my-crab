@@ -40,7 +40,7 @@ pub(crate) const PLAN: &str = "plan";
 /// The slot of subagents whose kind names no model.
 pub(crate) const SUBAGENT: &str = "subagent";
 
-/// The slot of reviews, such as judging a goal; reserved until crab asks a model for one.
+/// The slot of reviews: a plan before the reader sees it, and a goal's completion before it ends.
 pub(crate) const REVIEW: &str = "review";
 
 /// The slot of describing images for a model that cannot read them; reserved until crab does.

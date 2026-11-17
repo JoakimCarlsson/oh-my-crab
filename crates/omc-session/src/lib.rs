@@ -21,6 +21,7 @@ mod prefix;
 mod prompt;
 mod providers;
 mod queue;
+mod review;
 mod rules;
 mod serve;
 mod session;
@@ -32,6 +33,7 @@ mod spend;
 mod toolset;
 mod translate;
 mod turn;
+mod wake;
 mod warmer;
 
 pub use hooks::{hooks, trust};

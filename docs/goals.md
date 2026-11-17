@@ -80,7 +80,15 @@ held to it by its prompts, and crab does not run it.
 - **Complete.** Only the agent ends the goal as achieved, by calling the
   [`goal`](tools/README.md#conversation-control) tool with `complete` and a
   summary of its evidence. The goal becomes `Complete` with the summary as its
-  note, and no further turn starts.
+  note, and no further turn starts. With the `review` setting on, the
+  default, the first `complete` of a goal is judged first by the `review`
+  slot's model, else the conversation's, in one request without tools that
+  carries the objective and the summary. When it rejects the completion, the
+  call fails with its reasons and the agent goes on working; the next
+  `complete` of that goal is accepted without a review, and its note ends
+  with the reasons the reviewer gave. A review that cannot be asked, fails,
+  takes over three minutes or answers with nothing readable accepts the
+  completion.
 - **No progress.** crab digests the tool calls each turn made, with their
   arguments and results. When a turn crab started made no tool calls, or the
   same calls with the same results as the turn crab started before it, the goal
@@ -105,4 +113,5 @@ The main agent has the `goal` tool in every conversation, so that the tool
 list never changes when a goal is set. `status` reads the objective, its state
 and its budget; `create` sets the goal worked out after `/guided-goal`, and is
 refused otherwise; `complete` with `summary` ends it as achieved, and is refused
-when no goal is being worked toward. Subagents and scripts do not get it.
+when no goal is being worked toward, and once when a review rejects it (see
+[How it ends](#how-it-ends)). Subagents and scripts do not get it.

@@ -1,6 +1,6 @@
-//! The few TOML keys an agent definition uses: top-level strings, single or triple quoted.
+//! The few TOML keys an agent definition uses: top-level strings, single or triple quoted, and the bare booleans `true` and `false`.
 
-/// The top-level string keys of `text`, in order; anything else is skipped.
+/// The top-level string and boolean keys of `text`, in order, booleans as `true` or `false`; anything else is skipped.
 pub(crate) fn strings(text: &str) -> Vec<(String, String)> {
     let mut found = Vec::new();
     let mut lines = text.lines();
@@ -39,6 +39,8 @@ pub(crate) fn strings(text: &str) -> Vec<(String, String)> {
         } else if let Some(quoted) = value.strip_prefix('\'') {
             let end = quoted.rfind('\'').unwrap_or(quoted.len());
             found.push((key.trim().to_owned(), quoted[..end].to_owned()));
+        } else if matches!(value, "true" | "false") {
+            found.push((key.trim().to_owned(), value.to_owned()));
         }
     }
     found
@@ -58,6 +60,14 @@ mod tests {
         assert_eq!(found[0], ("name".into(), "rev".into()));
         assert_eq!(found[1], ("description".into(), "checks".into()));
         assert_eq!(found[2].1, "Line one\nLine two");
+        let flags = strings("read_only = true\nisolated = false\ncount = 3\n");
+        assert_eq!(
+            flags,
+            vec![
+                ("read_only".into(), "true".into()),
+                ("isolated".into(), "false".into())
+            ]
+        );
         assert_eq!(found.len(), 3);
     }
 }

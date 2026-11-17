@@ -128,11 +128,11 @@ pub enum Event {
     Trust(TrustRequest),
     /// The conversation's goal was set, or how it stands changed; sent when the conversation opens too, when it has one.
     Goal(Goal),
-    /// The harness started a turn of its own toward the goal, since the last turn ended with the goal open; the turn's events follow as for a prompt the reader sent.
+    /// The harness started a turn of its own: toward the goal, since the last turn ended with the goal open, or to tell the agent that background runs ended while no turn ran; the turn's events follow as for a prompt the reader sent.
     Continued {
         /// The prompt the turn started with.
         prompt: String,
-        /// The id the harness saved the turn under, by which the client goes back to before it and asks about its files, as with the id of a turn it prompted itself.
+        /// The id the harness saved the turn under, by which the client goes back to before it and asks about its files, as with the id of a turn it prompted itself; it starts with `goal-` for a turn toward the goal and `wake-` for one reporting background runs.
         turn: String,
     },
     /// What a turn changed in the files, in answer to a [`crate::Command::Changes`].

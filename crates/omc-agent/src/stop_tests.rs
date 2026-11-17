@@ -189,6 +189,43 @@ async fn stopping_a_background_subagent_leaves_the_others_running() {
     jobs.stop_all();
 }
 
+/// Cancelling a background subagent's run stops the subagent through the roster, leaves `wait` nothing to report for it, and leaves the other run going.
+#[tokio::test]
+async fn cancelling_a_background_run_stops_its_subagent() {
+    let roster = Arc::new(Roster::default());
+    let jobs = Arc::new(Jobs::new(|_| {}));
+    let model = Arc::new(Hanging {
+        router: Router::new(|_| say("done")),
+    });
+    let (task, log) = tool("cancel-background", model, roster.clone(), jobs.clone());
+    task.call_as(
+        "t1",
+        json!({"background": true, "tasks": [{"task": "hang one"}, {"task": "hang two"}]}),
+    )
+    .await
+    .unwrap();
+    running(&roster, "t1/1").await;
+    let said = jobs.cancel("bg-1").unwrap();
+    assert!(said.starts_with("bg-1 subagent cancelled "));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while roster.running("t1/1") && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!roster.running("t1/1"));
+    assert!(roster.running("t1/2"));
+    assert_eq!(
+        states(&log, "t1/1"),
+        [SubagentState::Running, SubagentState::Stopped]
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), jobs.wait())
+            .await
+            .is_err()
+    );
+    jobs.stop_all();
+}
+
 /// Stopping a subagent that started subagents of its own ends them too, each announced under an id holding its parent's.
 #[tokio::test]
 async fn stopping_a_subagent_stops_its_children() {

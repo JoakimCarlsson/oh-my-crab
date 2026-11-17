@@ -102,11 +102,14 @@ impl Tool for ExitPlanMode {
             .to_owned()
     }
 
-    /// Waits for the reader's verdict and tells the agent what it was: an approved plan is echoed back to be carried out, or opens a fresh context window that starts from it; a plan not approved yet or rejected is an error that says what the reader wrote.
+    /// Has the plan reviewed first, sending it back to the agent with what to fix when the review asks for that; otherwise waits for the reader's verdict and tells the agent what it was: an approved plan is echoed back to be carried out, or opens a fresh context window that starts from it; a plan not approved yet or rejected is an error that says what the reader wrote.
     async fn call(&self, args: Value) -> Result<ToolOutput, ToolError> {
         let args: Args = parse_args(args)?;
         if args.plan.trim().is_empty() {
             return Err(ToolError::InvalidArguments("the plan is empty".to_owned()));
+        }
+        if let Some(returned) = self.host.review_plan(&args.plan).await {
+            return Err(ToolError::Failed(returned));
         }
         match self.host.approve_plan(&args.plan).await {
             PlanVerdict::Approved { fresh, note } => Ok(ToolOutput::new(self.approved(

@@ -90,6 +90,7 @@ fn quick(model: &str) -> AgentDefinition {
         prompt: "Answer.".into(),
         output_schema: None,
         isolated: false,
+        declared_read_only: false,
         model: Some(model.into()),
         path: None,
         origin: Origin::Project,

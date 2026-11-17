@@ -17,6 +17,40 @@ definition can give an `output_schema`: the subagent then hands its result to
 `submit_result`, which checks it against the schema, and the main agent gets
 the checked JSON instead of prose.
 
+## Read-only agents and the shell
+
+A kind marked read-only, such as the built-in `scout`, gets `bash` in a
+read-only mode when it lists `bash` and declares itself read-only (see
+[agent definitions](../extending/skills-and-agents.md)). Its commands can read
+anywhere the user can, outside the working directory too, which `read`, `grep`
+and `glob` cannot, but cannot change anything:
+
+- Where `bwrap` (bubblewrap) is installed and can make a sandbox, which crab
+  tries once and remembers, every command runs inside a mount namespace in
+  which the whole file system is bound read-only. `/tmp`, `/var/tmp`,
+  `/dev/shm` and `/run` are private scratch space thrown away when the command
+  ends (the name lookup folders under `/run` are kept), the network is left as
+  it is and the command starts in the working directory. Any program may run
+  there: `python3`, `jq`, `awk`, `git log`, `cargo metadata`.
+- Elsewhere (no `bwrap`, or not Linux) a command line is checked before it
+  runs: it may only chain and pipe programs that only look (`ls`, `cat`,
+  `head`, `tail`, `wc`, `sort`, `uniq`, `cut`, `tr`, `grep`, `rg`, `find`, `jq`,
+  `stat`, `file`, `du`, `df`, `date`, `echo`, `printf`, `pwd`, `env`, `which`,
+  `realpath`, `basename`, `dirname` and a few more) and `git` subcommands that
+  only look (`status`, `log`, `diff`, `show`, `blame`, `rev-parse`,
+  `branch --list` and the like), without the options that write or run another
+  program (`find -delete` or `-exec`, `sort -o`, `rg --pre`, `git -c`,
+  `git diff --output`). Output redirection to a file, command substitution,
+  variable assignments, subshells and control flow are refused, and so is
+  everything else, with a message saying the shell is read-only, what was
+  refused and why.
+
+In both modes background runs are refused, timeouts and output limits are as
+for the ordinary `bash`, and commands need no approval. The tool's description
+tells the model which mode it is in. In the sandbox a program can still reach
+the network, and through it services that change things; the sandbox only
+keeps the file system as it is.
+
 ## Follow-ups
 
 A subagent that finished is kept in memory with its whole conversation, and
@@ -183,9 +217,9 @@ around, such as a tester the agent hands every change to, the main agent has
 five more tools:
 
 - `agent_spawn` starts a subagent of any kind under a `name` of its choosing
-  (letters, digits, `-` and `_`, at most 40) with a first `prompt`, and
-  returns at once. `agent`, `model`, `category` and `description` work as for
-  `task`.
+  (letters, digits, `-` and `_`, at most 40; not `lead` or `all`) with a
+  first `prompt`, and returns at once. `agent`, `model`, `category` and
+  `description` work as for `task`.
 - `agent_send` sends a live one a follow-up `message`, which it answers
   knowing its whole conversation, after any message it is still on. It
   returns at once and says how many replies the subagent owes.
@@ -203,14 +237,56 @@ once. Each works in the main agent's folder, never in a worktree of its own,
 and kinds whose definition asks for a structured result cannot be spawned.
 Each turn of theirs takes a seat as any subagent does (see
 [Nesting](#nesting)), and their work is reported under the `agent_spawn` or
-`agent_send` call that gave them the message. Subagents never get these tools.
-In plan mode spawned subagents only get tools that look, and `agent_send`
-refuses one that can change files.
+`agent_send` call that gave them the message, or under their own
+`agent_spawn` call for a message from a crewmate (see [Crews](#crews)).
+Subagents never get these tools. In plan mode spawned subagents only get
+tools that look, and `agent_send` refuses one that can change files.
 
 They are announced with the same `Subagent` events as other subagents, with
 `background` set: `Running` when spawned, `Stopped` when killed or stopped by
 the reader with `StopSubagent`, which also ends a long-lived subagent. No new
 events or commands were needed.
+
+### Crews
+
+The long-lived subagents of a conversation are its crew, and the main agent
+is their lead. Each member gets three tools no other agent gets; `task`
+subagents, the subagents members start, and conversations without a crew
+never see them:
+
+- `crew_message` sends a short `message` (at most 4000 characters) `to`
+  another member by name, to every other live member with `all`, or to the
+  lead with `lead`. A member that is working gets it at its next step
+  boundary, after the batch of tool calls it is in, as a `<crew-message
+  from="…">` notice saying who sent it; one that is idle gets it as its next
+  message and starts on it, as with `agent_send`, and the lead is owed its
+  reply, which `agent_wait` gives. Several messages waiting for an idle member
+  come as one. A message to the lead is queued among the sender's replies, so
+  the lead reads it with `agent_wait` on the sender and `agent_list` counts it;
+  it starts no turn of the lead's. A message to a member there is none of, to
+  one that was stopped, or to the sender itself is refused, and a member may
+  send 20 messages per run of its work, from the message it was given to its
+  reply; past that the tool says so. Messages never start subagents.
+- `crew_members` lists the crew: the lead, then each member's name, kind,
+  whether `working`, `idle` or `stopped`, and what it was started to do.
+- `crew_tasks` is the task list the crew shares with the lead. Its `action`
+  is `add` (a `title`, an optional `detail`, and `after`, the ids of tasks it
+  waits on, which must exist), `list`, `claim` (an `id`), `done` (an `id` and
+  a one-line `result`) or `release` (an `id`). Tasks are numbered `t1`, `t2`
+  and so on. A claim is atomic: a task one member holds cannot be claimed by
+  another, and a task cannot be claimed until every task it waits on is done.
+  Only the holder marks a task done or releases it.
+
+The lead gets `crew_tasks` too, from the turn after it started its first
+member, with `assign` (an `id` and `to`, a member's name, taking the task
+from whoever held it) instead of `claim`; it may mark any task done or
+release it. A member that is killed gives up the tasks it held. The list is
+kept apart from the conversation's todo list, which the main agent alone
+rewrites whole for the reader to follow, while this one is changed a task at
+a time by several agents at once. It holds at most 200 tasks, lives in the
+`crab` process with the crew, and is emptied when the crew is dismissed, as
+when the conversation ends. These are ordinary tool calls in the clients'
+view: no new events or commands were added.
 
 ## Stopping one subagent
 

@@ -89,6 +89,7 @@ pub fn tools() -> Result<Vec<ToolInfo>, String> {
         approved_plan: Arc::new(|| None),
         goal: Arc::new(crate::goal::GoalTool {
             shared: shared.clone(),
+            reviewer: None,
         }),
     });
     let mut listed: Vec<ToolInfo> = Vec::new();

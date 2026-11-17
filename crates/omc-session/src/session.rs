@@ -25,12 +25,14 @@ use crate::lifecycle::IDLE_AFTER;
 use crate::permissions::{self, FileKeeper, PermissionsFile};
 use crate::prompt::compose;
 use crate::settings::{
-    CACHE, CHECKPOINTS, EFFORT, MEMORY, MODE, MODEL, Mode, OFF, ON, ORCHESTRATOR, PLAN_AUTOSAVE,
-    PLAN_MODEL, SNAPSHOTS, SUBAGENT_BUDGET, WARMING, parse_budget, parse_retention,
+    BACKGROUND_WAKE, CACHE, CHECKPOINTS, EFFORT, MEMORY, MODE, MODEL, Mode, OFF, ON, ORCHESTRATOR,
+    PLAN_AUTOSAVE, PLAN_MODEL, REVIEW, SNAPSHOTS, SUBAGENT_BUDGET, WARMING, parse_budget,
+    parse_retention,
 };
 use crate::shared::Shared;
 use crate::snapshots::{End, Snapshots};
 use crate::turn::{Ended, Job, Turn};
+use crate::wake;
 
 #[path = "restart.rs"]
 mod restart;
@@ -162,7 +164,7 @@ pub async fn run(commands: UnboundedReceiver<Command>, out: UnboundedSender<Even
 
 /// Runs a conversation like [`run`], with what `options` gives it.
 ///
-/// When the conversation ends, its debugging sessions are disconnected cleanly first, and then everything still running is stopped.
+/// When the conversation ends, its debugging sessions are disconnected cleanly first, and then everything still running is stopped. Background runs that end are gathered for [`crate::wake::GATHER`] and then reported in a turn of crab's own, as [`Session::wake`] says.
 pub async fn run_with(
     mut commands: UnboundedReceiver<Command>,
     out: UnboundedSender<Event>,
@@ -184,6 +186,8 @@ pub async fn run_with(
         turn_id: None,
         put_back: None,
     };
+    let jobs = session.shared.jobs.clone();
+    let mut gathering: Option<tokio::time::Instant> = None;
     let reason = loop {
         tokio::select! {
             command = commands.recv() => match command {
@@ -193,6 +197,13 @@ pub async fn run_with(
                 Some(command) => session.handle(command).await,
             },
             Some((number, how)) = finished.recv() => session.finish(number, how),
+            () = jobs.ended() => {
+                gathering.get_or_insert_with(|| tokio::time::Instant::now() + wake::GATHER);
+            }
+            () = tokio::time::sleep_until(gathering.unwrap_or_else(tokio::time::Instant::now)), if gathering.is_some() => {
+                gathering = None;
+                session.wake();
+            }
         }
     };
     session.calm();
@@ -1086,7 +1097,7 @@ impl Session {
 
     /// Takes in the end of turn `number`; a turn that was cancelled meanwhile is ignored. A turn that crashed has its saved history settled as a stopped turn's is, since it never cut it back itself, then ends as a failed one does. A turn that failed in a way that passes with time keeps its prompt in the conversation, unanswered, and the client is told so after the reason, with [`KEPT_PROMPT`].
     ///
-    /// A turn that answered is followed by a turn for the prompt that has waited longest for it, when one still waits; the others wait for that turn. When the turn failed or needs signing in again, the prompts waiting are dropped instead, and its last request, which a failed turn's history no longer ends with, is no longer kept warm. When no turn follows, crab starts waiting to tell the hooks it is idle.
+    /// A turn that answered is followed by a turn for the prompt that has waited longest for it, when one still waits; the others wait for that turn. With none waiting and no turn toward the goal, background runs that ended unreported while it ran are reported in a turn of crab's own, as [`Self::wake`] says. When the turn failed or needs signing in again, the prompts waiting are dropped instead, and its last request, which a failed turn's history no longer ends with, is no longer kept warm. When no turn follows, crab starts waiting to tell the hooks it is idle.
     fn finish(&mut self, number: u64, how: Ended) {
         if self.running.as_ref().map(|(running, _)| *running) != Some(number) {
             return;
@@ -1101,6 +1112,9 @@ impl Session {
                 self.follow_up();
                 if self.running.is_none() {
                     self.pursue(progress);
+                }
+                if self.running.is_none() {
+                    self.wake();
                 }
             }
             Ended::HandedOff(prompt) => self.hand_over(prompt),
@@ -1173,6 +1187,31 @@ impl Session {
         if self.running.is_none() {
             self.pause_goal("the turn toward it could not start");
         }
+    }
+
+    /// Starts a turn of crab's own telling the agent which background runs ended unreported, how, and the end of their output, when no turn runs, the conversation is open with a model, and the setting lets runs wake it; the runs it tells of are no longer reported by `wait`. Runs the reader stopped with `Cancel`, runs collected with `wait` and runs that ended while waking was off are not told of.
+    ///
+    /// The client sees the turn start with [`Event::Continued`] under an id starting with [`wake::TURN_PREFIX`], and its events follow as for a prompt it sent.
+    fn wake(&mut self) {
+        if self.running.is_some() || self.open.is_none() || self.shared.model().is_none() {
+            return;
+        }
+        let ended = self.shared.jobs.take_wakes();
+        if ended.is_empty() {
+            return;
+        }
+        let prompt = wake::notice(&ended);
+        let id = wake::turn_id();
+        self.say(Event::Continued {
+            prompt: prompt.clone(),
+            turn: id.clone(),
+        });
+        let mark = omc_agent::Mark {
+            id,
+            text: prompt.clone(),
+            files: Vec::new(),
+        };
+        self.start(Job::Prompt(prompt, Vec::new()), Some(mark));
     }
 
     /// Carries out the `/goal` command the client sent as `text` under the turn id `turn` with `files`, which `asked` reads as: shows, sets, pauses, resumes, clears or gives a budget to the goal, telling the client how it stands with a `Goal` event, and starts a turn toward it, under the reader's turn id, when it was set or resumed.
@@ -1311,9 +1350,10 @@ impl Session {
 
     /// Stops the turn that is running, subagents included, declines what it waited on and drops the prompts queued for it, telling the client of each.
     ///
-    /// The turn's task owns everything it started, so aborting it ends them all; what it finished and the reply it was writing stay in the saved history, marked as stopped. Once a turn was stopped, crab starts waiting to tell the hooks it is idle.
+    /// The turn's task owns everything it started, so aborting it ends them all; what it finished and the reply it was writing stay in the saved history, marked as stopped. Background runs go on, but none started so far wakes the conversation when it ends; `wait` still reports them. Once a turn was stopped, crab starts waiting to tell the hooks it is idle.
     fn cancel(&mut self) {
         self.shared.questions.decline_all();
+        self.shared.jobs.silence();
         if let Some((_, task)) = self.running.take() {
             task.abort();
             self.keep_after();
@@ -1466,6 +1506,13 @@ impl Session {
                 }
                 _ => false,
             },
+            REVIEW => match value {
+                ON | OFF => {
+                    self.shared.reviews.set_enabled(value == ON);
+                    true
+                }
+                _ => false,
+            },
             CACHE => parse_retention(value).is_some_and(|retention| {
                 self.shared.set_retention(retention);
                 true
@@ -1487,6 +1534,13 @@ impl Session {
             SNAPSHOTS => match value {
                 ON | OFF => {
                     self.shared.set_snapshots(value == ON);
+                    true
+                }
+                _ => false,
+            },
+            BACKGROUND_WAKE => match value {
+                ON | OFF => {
+                    self.shared.jobs.set_waking(value == ON);
                     true
                 }
                 _ => false,
@@ -3412,6 +3466,78 @@ mod tests {
                 Event::Finished(Some("/goal: no goal is set".into()))
             ]
         );
+        session.stop();
+    }
+
+    /// The prompts of the turns crab started so far because background runs ended, as told with `Continued` under a wake id.
+    fn wake_events(events: &mut UnboundedReceiver<Event>) -> Vec<String> {
+        std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                Event::Continued { prompt, turn } if turn.starts_with(wake::TURN_PREFIX) => {
+                    Some(prompt)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A background run that ends while a turn runs is held until the turn ends, then reported in one turn of crab's own, once; it is no longer reported by `wait`.
+    #[tokio::test]
+    async fn a_run_that_ends_wakes_the_conversation_once_it_is_idle() {
+        let (mut session, mut events) = busy_session("wake-once");
+        let jobs = session.shared.jobs.clone();
+        jobs.spawn("first".into(), None, async { Ok("one".to_owned()) });
+        jobs.spawn("second".into(), None, async { Ok("two".to_owned()) });
+        tokio::time::timeout(Duration::from_secs(1), jobs.ended())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        session.wake();
+        assert!(wake_events(&mut events).is_empty());
+        session.finish(1, Ended::Done(Vec::new()));
+        let woken = wake_events(&mut events);
+        assert_eq!(woken.len(), 1);
+        assert!(woken[0].contains("bg-1 completed: first\none"));
+        assert!(woken[0].contains("bg-2 completed: second\ntwo"));
+        assert_eq!(session.running.as_ref().map(|(number, _)| *number), Some(2));
+        assert!(jobs.wait().await.is_err());
+        session.finish(2, Ended::Done(Vec::new()));
+        session.wake();
+        assert!(wake_events(&mut events).is_empty());
+        assert!(session.running.is_none());
+        session.stop();
+    }
+
+    /// Runs going when the reader cancels the conversation's work, and runs that end while the setting is off, wake nothing and are left to `wait`.
+    #[tokio::test]
+    async fn cancelled_or_switched_off_runs_do_not_wake() {
+        let (mut session, mut events) = busy_session("wake-never");
+        let jobs = session.shared.jobs.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        jobs.spawn("slow".into(), None, async move {
+            let _ = rx.await;
+            Ok("late".to_owned())
+        });
+        session.cancel();
+        tx.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        session.wake();
+        assert!(wake_events(&mut events).is_empty());
+        assert!(session.running.is_none());
+        assert_eq!(jobs.wait().await.unwrap().text, "late");
+
+        session
+            .handle(Command::Set {
+                setting: "background_wake".into(),
+                value: "off".into(),
+            })
+            .await;
+        jobs.spawn("quick".into(), None, async { Ok("x".to_owned()) });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        session.wake();
+        assert!(wake_events(&mut events).is_empty());
+        assert!(session.running.is_none());
+        assert_eq!(jobs.wait().await.unwrap().text, "x");
         session.stop();
     }
 

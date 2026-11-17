@@ -33,6 +33,9 @@ pub(crate) const OFF: &str = "off";
 /// The id of the setting that turns orchestrator mode, in which the agent hands work to subagents by work category, on or off; it takes [`ON`] and [`OFF`].
 pub(crate) const ORCHESTRATOR: &str = "orchestrator";
 
+/// The id of the setting that turns reviews by the `review` slot's model, of plans and of goal completions, on or off; it takes [`ON`] and [`OFF`].
+pub(crate) const REVIEW: &str = "review";
+
 /// The id of the setting that picks how long the provider keeps the prompt cache.
 pub(crate) const CACHE: &str = "cache";
 
@@ -50,6 +53,9 @@ pub(crate) const MEMORY: &str = "memory";
 
 /// The id of the setting that turns keeping the files before and after each turn on or off; it takes [`ON`] and [`OFF`].
 pub(crate) const SNAPSHOTS: &str = "snapshots";
+
+/// The id of the setting that turns starting a turn when background runs end while the conversation waits on or off; it takes [`ON`] and [`OFF`].
+pub(crate) const BACKGROUND_WAKE: &str = "background_wake";
 
 /// The setting naming the most US dollars one subagent run may spend.
 pub(crate) const SUBAGENT_BUDGET: &str = "subagent_budget";
@@ -144,10 +150,14 @@ pub(crate) struct Offer<'a> {
     pub(crate) checkpoints: bool,
     /// Whether orchestrator mode is on.
     pub(crate) orchestrator: bool,
+    /// Whether a second model reviews plans and goal completions.
+    pub(crate) review: bool,
     /// The most US dollars one subagent run may spend; none for no limit.
     pub(crate) subagent_budget: Option<f64>,
     /// Whether the files are kept before and after each turn.
     pub(crate) snapshots: bool,
+    /// Whether background runs that end while the conversation waits start a turn that reports them.
+    pub(crate) background_wake: bool,
     /// The prompt cache lifetime in use, when the provider offers a choice.
     pub(crate) retention: Option<Retention>,
     /// Whether the prompt cache is kept warm, when the provider can be warmed.
@@ -324,6 +334,24 @@ pub(crate) fn offered(offer: &Offer<'_>) -> Vec<Setting> {
             ),
         ],
     });
+    settings.push(Setting {
+        id: BACKGROUND_WAKE.to_owned(),
+        category: BACKGROUND_WAKE.to_owned(),
+        name: "Wake on background runs".to_owned(),
+        current: if offer.background_wake { ON } else { OFF }.to_owned(),
+        picks: vec![
+            pick(
+                ON,
+                "On",
+                "When background commands or subagents end while the agent waits for you, a turn starts by itself to tell the agent how they went",
+            ),
+            pick(
+                OFF,
+                "Off",
+                "Runs that end wait until the agent asks for them in a turn you start",
+            ),
+        ],
+    });
     let current = budget_value(offer.subagent_budget);
     let mut budgets = vec![pick(OFF, "Off", "Subagents may spend without limit")];
     if !BUDGETS.contains(&current.as_str()) && current != OFF {
@@ -342,6 +370,20 @@ pub(crate) fn offered(offer: &Offer<'_>) -> Vec<Setting> {
         name: "Subagent budget".to_owned(),
         current,
         picks: budgets,
+    });
+    settings.push(Setting {
+        id: REVIEW.to_owned(),
+        category: REVIEW.to_owned(),
+        name: "Review".to_owned(),
+        current: if offer.review { ON } else { OFF }.to_owned(),
+        picks: vec![
+            pick(
+                ON,
+                "On",
+                "A second model, the review slot's, checks each plan before you see it and each goal before it ends, sending it back once when it finds problems",
+            ),
+            pick(OFF, "Off", "Plans and goal completions are not reviewed"),
+        ],
     });
     settings.push(Setting {
         id: ORCHESTRATOR.to_owned(),
@@ -413,8 +455,10 @@ mod tests {
             effort,
             checkpoints: false,
             orchestrator: false,
+            review: true,
             subagent_budget: None,
             snapshots: true,
+            background_wake: true,
             retention: None,
             warming: None,
             memory: None,
@@ -442,7 +486,9 @@ mod tests {
                 "plan_model",
                 "plan_autosave",
                 "snapshots",
+                "background_wake",
                 "subagent_budget",
+                "review",
                 "orchestrator",
                 "checkpoints"
             ]
@@ -471,7 +517,7 @@ mod tests {
     /// Effort is hidden when the model takes none, and otherwise falls back to medium.
     #[test]
     fn effort_follows_the_model() {
-        assert_eq!(offered(&offer(&[], &[], None)).len(), 8);
+        assert_eq!(offered(&offer(&[], &[], None)).len(), 10);
         let settings = offered(&offer(&[], &Effort::ALL, None));
         let effort = &settings[2];
         assert_eq!(
@@ -545,6 +591,20 @@ mod tests {
         assert_eq!(find(offered(&offer)).1, ON);
     }
 
+    /// Reviews are offered just before orchestrator mode and show how they stand.
+    #[test]
+    fn review_is_offered_before_orchestrator_mode() {
+        let models = [];
+        let mut offer = offer(&models, &[], None);
+        let find = |settings: Vec<Setting>| {
+            let at = settings.len() - 3;
+            (settings[at].id.clone(), settings[at].current.clone())
+        };
+        assert_eq!(find(offered(&offer)), (REVIEW.to_owned(), ON.to_owned()));
+        offer.review = false;
+        assert_eq!(find(offered(&offer)).1, OFF);
+    }
+
     /// Modes round-trip through their values.
     #[test]
     fn modes_parse() {
@@ -579,5 +639,22 @@ mod tests {
         assert_eq!(parse_budget("-1"), None);
         assert_eq!(parse_budget("lots"), None);
         assert_eq!(budget_value(parse_budget("5").unwrap()), "5");
+    }
+
+    /// Waking on background runs is offered right after the file snapshots, on by default, and shows when it was turned off.
+    #[test]
+    fn background_wake_is_on_by_default() {
+        let models = [];
+        let mut offer = offer(&models, &[], None);
+        let find = |settings: Vec<Setting>| {
+            let at = settings
+                .iter()
+                .position(|setting| setting.id == BACKGROUND_WAKE)
+                .unwrap();
+            (settings[at - 1].id.clone(), settings[at].current.clone())
+        };
+        assert_eq!(find(offered(&offer)), (SNAPSHOTS.to_owned(), ON.to_owned()));
+        offer.background_wake = false;
+        assert_eq!(find(offered(&offer)).1, OFF);
     }
 }

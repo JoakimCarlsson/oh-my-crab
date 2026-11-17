@@ -155,6 +155,12 @@ Every tool call is put to the rules, in this order:
    file an edit touches, the whole folder an `ast_edit` works through.
 6. Otherwise the reader is asked.
 
+The `bash` of a read-only subagent, such as the `scout`, does not ask: it runs
+a command only inside a read-only sandbox or after checking that the command
+only looks, and refuses the rest (see
+[Subagents](../tools/subagents.md#read-only-agents-and-the-shell)). Deny and
+ask rules still apply to it. The `bash` of every other agent asks as before.
+
 ## "Always allow"
 
 The question about a call offers "Allow once", "Always allow" with the rules

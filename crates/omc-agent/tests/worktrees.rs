@@ -451,6 +451,7 @@ async fn isolation_outside_a_repository_falls_back() {
         prompt: "Fix.".into(),
         output_schema: None,
         isolated: true,
+        declared_read_only: false,
         model: None,
         path: None,
         origin: Origin::User,
