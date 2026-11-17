@@ -422,7 +422,7 @@ impl Journal {
             notes,
             changes,
             facts,
-        } = replay(path, &bytes[..complete])?;
+        } = replay(path, &bytes[..complete], Damage::Refused)?;
         let switched = match branch {
             Some(id) if id != lines[current].branch.id => {
                 current = lines
@@ -637,11 +637,11 @@ impl Journal {
         file.sync_data().map_err(failed)
     }
 
-    /// Reads the history in the file at `path` without opening it for writing or locking it, so that a conversation that is open elsewhere can be read; an incomplete last line is left out.
+    /// Reads the history in the file at `path` without opening it for writing or locking it, so that a conversation that is open elsewhere can be read; an incomplete last line is left out, and so is whatever a damaged file holds that cannot be read, such as a line a full disk cut short, so that the rest of the conversation can still be shown.
     ///
     /// # Errors
     ///
-    /// Returns [`JournalError::Io`] when the file cannot be read, and [`JournalError::Corrupt`] when a line is not a record.
+    /// Returns [`JournalError::Io`] when the file cannot be read.
     pub fn read(path: &Path) -> Result<Saved, JournalError> {
         let bytes = std::fs::read(path).map_err(|source| JournalError::Io {
             path: path.to_path_buf(),
@@ -651,7 +651,7 @@ impl Journal {
             .iter()
             .rposition(|&byte| byte == b'\n')
             .map_or(0, |end| end + 1);
-        replay(path, &bytes[..complete]).map(Replayed::into_saved)
+        replay(path, &bytes[..complete], Damage::Skipped).map(Replayed::into_saved)
     }
 
     /// Names the conversation saved at `path` `title`, which works on a conversation nobody has open; a turn that was left unanswered is cut back, as it is whenever the history is opened.
@@ -1076,10 +1076,27 @@ fn open_private(path: &Path) -> io::Result<File> {
 }
 
 /// Writes `record` as one line with a single write, which is flushed as the file is not buffered.
+///
+/// # Errors
+///
+/// Returns the error of the write. Whatever part of the line reached the file is then taken out again, as far as the file system allows, so that the next record does not end up on the same line as half of this one.
 fn write_record(file: &mut File, record: &Written<'_>) -> io::Result<()> {
     let mut line = serde_json::to_vec(record).map_err(io::Error::other)?;
     line.push(b'\n');
-    file.write_all(&line)
+    let start = file.stream_position()?;
+    file.write_all(&line).inspect_err(|_| {
+        let _ = file.set_len(start);
+        let _ = file.seek(SeekFrom::Start(start));
+    })
+}
+
+/// What replaying a history file does with a record it cannot take: a line that is not a record, a cut-back past the end, a branch made twice or a switch to a branch that was never made.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Damage {
+    /// The replay fails, so that a damaged history is never written to.
+    Refused,
+    /// The record is left out and the replay goes on, so that the rest can be read.
+    Skipped,
 }
 
 /// What replaying a history file gives: every branch with its messages, the one the conversation is on, and what the conversation holds besides.
@@ -1142,8 +1159,9 @@ impl Replayed {
 ///
 /// # Errors
 ///
-/// Returns [`JournalError::Corrupt`] for a line that is not a record, a cut-back past the start or past the end, or a switch to a branch that was never made.
-fn replay(path: &Path, bytes: &[u8]) -> Result<Replayed, JournalError> {
+/// Returns [`JournalError::Corrupt`] for a line that is not a record, a cut-back past the start or past the end, a branch made twice, or a switch to a branch that was never made, unless `damage` says to leave such records out.
+fn replay(path: &Path, bytes: &[u8], damage: Damage) -> Result<Replayed, JournalError> {
+    let skipping = damage == Damage::Skipped;
     let mut lines = vec![Line::first()];
     let mut current = 0;
     let mut notes = String::new();
@@ -1159,7 +1177,11 @@ fn replay(path: &Path, bytes: &[u8]) -> Result<Replayed, JournalError> {
             line: index + 1,
             reason,
         };
-        let record = serde_json::from_slice(line).map_err(|error| corrupt(error.to_string()))?;
+        let record = match serde_json::from_slice(line) {
+            Ok(record) => record,
+            Err(_) if skipping => continue,
+            Err(error) => return Err(corrupt(error.to_string())),
+        };
         let on = &mut lines[current];
         match record {
             Record::Turn(mark) => {
@@ -1200,6 +1222,7 @@ fn replay(path: &Path, bytes: &[u8]) -> Result<Replayed, JournalError> {
                 on.branch.lost.retain(|held| held.at <= length);
                 waiting = None;
             }
+            Record::Cut(_) if skipping => {}
             Record::Cut(length) => {
                 return Err(corrupt(format!(
                     "cut back to {length} of {} messages",
@@ -1211,19 +1234,23 @@ fn replay(path: &Path, bytes: &[u8]) -> Result<Replayed, JournalError> {
                 waiting = None;
             }
             Record::Branch(forked) => {
-                let made = on.branched(&forked);
                 if lines.iter().any(|line| line.branch.id == forked.id) {
+                    if skipping {
+                        continue;
+                    }
                     return Err(corrupt(format!("branch {} is made twice", forked.id)));
                 }
+                let made = lines[current].branched(&forked);
                 lines.push(made);
                 current = lines.len() - 1;
                 waiting = None;
             }
             Record::Switch(id) => {
-                current = lines
-                    .iter()
-                    .position(|line| line.branch.id == id)
-                    .ok_or_else(|| corrupt(format!("no branch has the id {id}")))?;
+                match lines.iter().position(|line| line.branch.id == id) {
+                    Some(found) => current = found,
+                    None if skipping => continue,
+                    None => return Err(corrupt(format!("no branch has the id {id}"))),
+                }
                 waiting = None;
             }
         }
@@ -1506,6 +1533,26 @@ mod tests {
         std::fs::write(&path, [0xff, 0xfe, b'\n']).unwrap();
         assert!(Journal::open(&path, None).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), [0xff, 0xfe, b'\n']);
+    }
+
+    /// A history with a line a failed write cut short, the next record on the same line, still reads, without that line, and still refuses to open for writing.
+    #[test]
+    fn a_damaged_line_is_left_out_when_reading() {
+        let path = scratch("torn.jsonl");
+        std::fs::write(
+            &path,
+            "{\"message\":{\"User\":\"q1\"}}\n{\"message\":{\"Assistant\":{\"te{\"message\":{\"User\":\"lost\"}}\n{\"cut\":9}\n{\"message\":{\"User\":\"q2\"}}\n",
+        )
+        .unwrap();
+        let saved = Journal::read(&path).unwrap();
+        assert_eq!(
+            saved.history,
+            [Message::User("q1".into()), Message::User("q2".into())]
+        );
+        assert!(matches!(
+            Journal::open(&path, None),
+            Err(JournalError::Corrupt { line: 2, .. })
+        ));
     }
 
     /// A path that cannot be read as a file is an error.
