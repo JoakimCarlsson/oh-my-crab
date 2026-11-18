@@ -23,8 +23,8 @@ const URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 /// Model list endpoint of the Codex backend.
 const MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
 
-/// Client version the model list is filtered for.
-const CLIENT_VERSION: &str = "0.159.0";
+/// Codex compatibility version used for model discovery and request headers.
+const CLIENT_VERSION: &str = "0.200.0";
 
 /// Claim of the access token that holds the ChatGPT account details.
 const JWT_CLAIM: &str = "https://api.openai.com/auth";
@@ -120,7 +120,7 @@ fn authorized(
 ///
 /// Returns [`ProviderError`] on network failure or a non-success status.
 async fn list_codex_models(credentials: &Credentials) -> Result<Vec<String>, ProviderError> {
-    let url = format!("{MODELS_URL}?client_version={CLIENT_VERSION}");
+    let url = Host::Codex.models_url();
     let request = reqwest::Client::new().get(url);
     let response = authorized(request, credentials, "").send().await?;
     if !response.status().is_success() {
@@ -948,6 +948,24 @@ mod tests {
         assert_eq!(sent("gpt-5.5", Effort::Max), "xhigh");
         assert_eq!(sent("gpt-6-sol", Effort::Max), "max");
         assert_eq!(sent("gpt-5.1-codex-mini", Effort::Low), "medium");
+    }
+
+    /// Discovery requests advertise the compatibility version that exposes GPT-6.2 models.
+    #[test]
+    fn codex_discovery_uses_current_compatibility_version() {
+        assert_eq!(
+            Host::Codex.models_url(),
+            "https://chatgpt.com/backend-api/codex/models?client_version=0.200.0"
+        );
+        let credentials: Credentials = serde_json::from_value(json!({
+            "access": "tok", "refresh": "r", "expires_at_ms": 0,
+        }))
+        .unwrap();
+        assert!(
+            headers(&credentials, "")
+                .iter()
+                .any(|(name, value)| { name == "version" && value == "0.200.0" })
+        );
     }
 
     /// Headers carry the routing hint, account and session ids.
