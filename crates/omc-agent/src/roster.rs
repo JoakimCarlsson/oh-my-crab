@@ -38,6 +38,8 @@ pub(crate) enum Fate {
     Stopped,
     /// A follow-up to it runs now.
     Busy,
+    /// The conversation it belonged to was closed or opened anew.
+    Released,
 }
 
 impl Fate {
@@ -63,6 +65,7 @@ impl Fate {
             Self::Failed => "it failed, which ends a subagent for good".to_owned(),
             Self::Stopped => "it was stopped before it finished, which ends a subagent for good".to_owned(),
             Self::Busy => "a follow-up to it runs now; wait for that one to end".to_owned(),
+            Self::Released => "the conversation it belonged to was closed or opened anew, which lets every kept subagent go".to_owned(),
         }
     }
 }
@@ -244,6 +247,19 @@ impl Roster {
         drop(inner);
         drop(gone);
         kept
+    }
+
+    /// Lets every finished subagent kept for follow-ups go, remembering why, as a conversation that ends or is opened anew does.
+    ///
+    /// A kept subagent holds its model and tools, which may hold the conversation itself; letting them go breaks that cycle, so the conversation and what it holds open, such as its saved history, are let go too.
+    pub fn release(&self) {
+        let mut inner = self.lock();
+        let gone: Vec<(String, Retired)> = inner.retired.drain().collect();
+        for (handle, _) in &gone {
+            inner.fates.insert(handle.clone(), Fate::Released);
+        }
+        drop(inner);
+        drop(gone);
     }
 
     /// A handle no subagent of the conversation has yet, for a subagent to be kept under once it finished.

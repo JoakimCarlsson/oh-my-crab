@@ -234,3 +234,23 @@ async fn unknown_handles_say_why() {
         "{unknown}"
     );
 }
+
+/// Releasing the roster, as a conversation that ends does, lets every kept subagent go with the model it held, and a follow-up to one says why it went.
+#[tokio::test]
+async fn releasing_lets_kept_subagents_and_their_models_go() {
+    let roster = Arc::new(Roster::default());
+    let model = counting();
+    let (task, _) = tool("follow-up-release", model.clone(), roster.clone());
+    let alone = Arc::strong_count(&model);
+    task.call_as("t1", json!({"task": "a"})).await.unwrap();
+    assert_eq!(roster.kept(), 1);
+    assert!(Arc::strong_count(&model) > alone);
+    roster.release();
+    assert_eq!(roster.kept(), 0);
+    assert_eq!(Arc::strong_count(&model), alone);
+    let released = task
+        .call_as("t2", json!({"continue": "sub-1", "task": "more"}))
+        .await
+        .unwrap_err();
+    assert!(released.to_string().contains("opened anew"), "{released}");
+}

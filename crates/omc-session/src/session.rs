@@ -206,12 +206,7 @@ pub async fn run_with(
             }
         }
     };
-    session.calm();
-    session.shared.debuggers.close().await;
-    session.stop();
-    if session.open.is_some() {
-        session.shared.lifecycle.end(reason).await;
-    }
+    session.end(reason).await;
 }
 
 /// What every failure of the [`Command::Changes`], [`Command::Restore`] and [`Command::Undo`] commands starts with, so that a client can tell it from a failure of the conversation.
@@ -415,8 +410,10 @@ impl Session {
         self.cancel();
         let replaced = self.open.is_some();
         self.journal = None;
+        self.shared.attach(None);
         self.shared.jobs.stop_all();
         self.shared.crew.dismiss();
+        self.shared.roster.release();
         self.shared.debuggers.close().await;
         if self.open.is_some() {
             let reason = if conversation.is_some() {
@@ -1366,11 +1363,26 @@ impl Session {
         self.drop_queue();
     }
 
-    /// Ends whatever is running, for good, background runs, long-lived subagents and debugging sessions included; a turn that was running is told to the client as halted and finished, as a cancelled one is.
+    /// Ends the conversation for `reason`, as `SessionEnd` hooks are told it: disconnects its debugging sessions cleanly, stops everything still running, runs the hooks, and lets its saved history go.
+    ///
+    /// The history is let go here rather than when the conversation's shared state is dropped, since something the conversation started may still hold that state; the history's lock must not outlive the conversation, or opening it again in this process finds it open elsewhere.
+    async fn end(&mut self, reason: &str) {
+        self.calm();
+        self.shared.debuggers.close().await;
+        self.stop();
+        if self.open.is_some() {
+            self.shared.lifecycle.end(reason).await;
+        }
+        self.journal = None;
+        self.shared.attach(None);
+    }
+
+    /// Ends whatever is running, for good, background runs, long-lived subagents and debugging sessions included, and lets the finished subagents kept for follow-ups go; a turn that was running is told to the client as halted and finished, as a cancelled one is.
     fn stop(&mut self) {
         self.shared.questions.decline_all();
         self.shared.jobs.stop_all();
         self.shared.crew.dismiss();
+        self.shared.roster.release();
         self.shared.debuggers.stop_all();
         if let Some((_, task)) = self.running.take() {
             task.abort();
@@ -3118,6 +3130,25 @@ mod tests {
         jobs.spawn("forever".into(), None, std::future::pending());
         session.stop();
         assert!(jobs.wait().await.is_err());
+    }
+
+    /// Ending a conversation lets its saved history go even while something still holds the conversation's shared state, so the same process can open the conversation again at once instead of finding it open elsewhere.
+    #[tokio::test]
+    async fn ending_lets_the_history_go_while_the_state_is_still_held() {
+        let folder = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/tests/omc-session/end-releases");
+        let _ = std::fs::remove_dir_all(&folder);
+        let mut session = bare_session();
+        let (journal, _) = load_history("held", Some(folder.clone()), None, None).unwrap();
+        session.journal = Some(journal);
+        session.shared.attach(session.journal.clone());
+        let still_held = session.shared.clone();
+        assert!(load_history("held", Some(folder.clone()), None, None).is_err());
+        session.end(END_EXIT).await;
+        assert!(still_held.journal().is_none());
+        assert!(load_history("held", Some(folder.clone()), None, None).is_ok());
+        drop(still_held);
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     /// A turn that panics ends as failed, saying it crashed and with what, instead of never ending.
