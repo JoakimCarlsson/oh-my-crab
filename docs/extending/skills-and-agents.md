@@ -238,12 +238,16 @@ Two files change the main agent's system prompt itself. Crab looks for each in
 project is trusted, then in `<config>`; the first one found that is not empty
 or only whitespace is used, cut at 64 KiB.
 
-- `SYSTEM.md` replaces crab's built-in instructions: its role, its engineering
-  and tool policy, its workflow and delivery rules. What crab builds for the
-  conversation still follows it: the skills, the tool inventory, the request
-  to name an unnamed conversation, the workstation, the outline of the working
-  directory, the instruction files and, in plan mode, its rules. The text is
-  used as written; nothing in it is filled in.
+- `SYSTEM.md` is a changed copy of crab's built-in instructions: its role, its
+  engineering and tool policy, its workflow and delivery rules. Start it from
+  crab's own text (`SYSTEM_TEMPLATE` in `omc-context`; a client that writes
+  the file for you puts it there) and edit it. It is filled in like crab's own:
+  `{{name}}` and `{{#if name}}…{{else}}…{{/if}}` follow the tools the agent
+  has. What crab builds for the conversation is never dropped: the skills and
+  tool inventory (`{{runtime}}`), the request to name an unnamed conversation
+  (`{{unnamed}}`), the project part (`{{project}}`), `APPEND_SYSTEM.md`
+  (`{{append}}`), orchestrator mode (`{{orchestrator}}`) and plan mode
+  (`{{plan}}`) go where their tag is, or at the end when the file leaves it out.
 - `APPEND_SYSTEM.md` is added after the project part, built-in instructions
   or `SYSTEM.md` alike, before the rules of plan mode.
 

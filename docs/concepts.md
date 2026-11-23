@@ -318,7 +318,7 @@ builds the system prompt and the tool list once per conversation, when its
 first turn starts, and sends them unchanged after that. They are rebuilt only
 when the model changes or the `checkpoints`, `orchestrator` or `memory`
 setting is turned on or off. The system prompt holds crab's instructions (or the user's or the
-project's `SYSTEM.md` in their place, and any `APPEND_SYSTEM.md` after them;
+project's changed copy of them in `SYSTEM.md`, and any `APPEND_SYSTEM.md` after them;
 see [the system prompt](extending/skills-and-agents.md#the-system-prompt)),
 the instruction files that always apply (`AGENTS.md`, `CLAUDE.md` and the
 like; those for some files only arrive with

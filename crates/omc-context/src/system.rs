@@ -4,11 +4,21 @@ use crate::instructions::blocks;
 use crate::template::render;
 use crate::{Discovered, Environment, environment_reminder};
 
-/// The main agent's prompt.
-const SYSTEM: &str = include_str!("prompts/system.md");
+/// The main agent's prompt, crab's built-in instructions, which a [`crate::SYSTEM_FILE`] starts as a copy of to change them.
+pub const SYSTEM_TEMPLATE: &str = include_str!("prompts/system.md");
 
-/// The main agent's prompt when a [`crate::SYSTEM_FILE`] replaces crab's built-in instructions.
-const REPLACED: &str = include_str!("prompts/system_replaced.md");
+/// The parts of the main agent's prompt crab always adds, each with the tag that places it, put at the end of a [`crate::SYSTEM_FILE`] that leaves its tag out.
+const KEPT: [(&str, &str); 6] = [
+    (
+        "{{orchestrator}}",
+        "{{#if has_task}}{{#if orchestrator}}# Delegation\n{{orchestrator}}{{/if}}{{/if}}",
+    ),
+    ("{{runtime}}", "{{runtime}}"),
+    ("{{unnamed}}", "{{unnamed}}"),
+    ("{{project}}", "{{project}}"),
+    ("{{append}}", "{{append}}"),
+    ("{{plan}}", "{{plan}}"),
+];
 
 /// The skills and the tool inventory, part of the main agent's prompt whether or not its instructions are replaced.
 const RUNTIME: &str = include_str!("prompts/runtime.md");
@@ -51,7 +61,7 @@ pub struct PromptInput<'a> {
 ///
 /// With orchestrator mode on and the `task` tool among the tools, the prompt tells the agent to lead and hand work to subagents by work category, also after a [`crate::SYSTEM_FILE`]; with it off the prompt is what it is without the mode.
 ///
-/// A [`crate::SYSTEM_FILE`] that was found takes the place of crab's built-in instructions, ahead of the skills, the tool inventory, the project and the rules of plan mode, which stay; an [`crate::APPEND_SYSTEM_FILE`] goes after the project, before the rules of plan mode. It holds nothing that changes from day to day, so that the provider's prompt cache keeps it; the date and the branch go to the agent in [`crate::environment_reminder`] instead.
+/// A [`crate::SYSTEM_FILE`] that was found is a changed copy of [`SYSTEM_TEMPLATE`] and is rendered in its place; the skills, the tool inventory, the project, the [`crate::APPEND_SYSTEM_FILE`] and the rules of plan mode are added at its end when it leaves their tags out, so it changes crab's instructions but never drops them. It holds nothing that changes from day to day, so that the provider's prompt cache keeps it; the date and the branch go to the agent in [`crate::environment_reminder`] instead.
 pub fn build_prompt(input: PromptInput<'_>) -> String {
     let flags = flags(input.tools);
     let project = project(&input);
@@ -72,11 +82,6 @@ pub fn build_prompt(input: PromptInput<'_>) -> String {
         ""
     };
     let append = appended(input.discovered);
-    let base = input
-        .discovered
-        .system
-        .as_ref()
-        .map(|file| file.content.trim());
     vars.extend([
         ("runtime", runtime.as_str()),
         ("unnamed", unnamed),
@@ -84,9 +89,23 @@ pub fn build_prompt(input: PromptInput<'_>) -> String {
         ("project", project.as_str()),
         ("append", append),
         ("plan", plan.as_str()),
-        ("base", base.unwrap_or_default()),
     ]);
-    render(if base.is_some() { REPLACED } else { SYSTEM }, &vars)
+    match input.discovered.system.as_ref() {
+        Some(file) => render(&completed(&file.content), &vars),
+        None => render(SYSTEM_TEMPLATE, &vars),
+    }
+}
+
+/// `template`, a [`crate::SYSTEM_FILE`], with every part in [`KEPT`] whose tag it leaves out added at its end.
+fn completed(template: &str) -> String {
+    let mut whole = template.trim().to_owned();
+    for (tag, part) in KEPT {
+        if !whole.contains(tag) {
+            whole.push_str("\n\n");
+            whole.push_str(part);
+        }
+    }
+    whole
 }
 
 /// The text of the [`crate::APPEND_SYSTEM_FILE`] found, trimmed, or nothing.
@@ -449,7 +468,7 @@ mod tests {
         assert!(!own(false).contains("# Delegation"));
     }
 
-    /// A `SYSTEM.md` replaces crab's built-in instructions but keeps the skills, the tools, the project and plan mode; an `APPEND_SYSTEM.md` follows the project in the main prompt and the environment in a subagent's, which never takes the `SYSTEM.md`.
+    /// A `SYSTEM.md` is rendered in place of crab's built-in instructions, with the skills, the tools, the project and plan mode added when it leaves them out; an `APPEND_SYSTEM.md` follows the project in the main prompt and the environment in a subagent's, which never takes the `SYSTEM.md`.
     #[test]
     fn system_files_shape_the_prompt() {
         let base = scratch("system-files");
@@ -462,7 +481,7 @@ mod tests {
         put(
             &base,
             "repo/.oh-my-crab/SYSTEM.md",
-            "You are a {{pirate}}.\n",
+            "You are a {{pirate}}.\n{{#if has_task}}You may delegate.{{/if}}\n",
         );
         put(
             &base,
@@ -491,7 +510,7 @@ mod tests {
             tree: "",
         };
         let prompt = build_prompt(input);
-        assert!(prompt.starts_with("You are a {{pirate}}.\n"));
+        assert!(prompt.starts_with("You are a .\nYou may delegate.\n"));
         assert!(!prompt.contains("crab's trusted coding assistant"));
         assert!(!prompt.contains("# Delegation"));
         assert!(prompt.contains("- pdf: Reads PDFs"));
@@ -520,5 +539,41 @@ mod tests {
             subagent.find(&environment_reminder(&environment)).unwrap()
                 < subagent.find("Answer in French.").unwrap()
         );
+    }
+
+    /// A `SYSTEM.md` that is an unchanged copy of the built-in instructions gives the built-in prompt.
+    #[test]
+    fn a_copy_of_the_template_changes_nothing() {
+        let base = scratch("system-copy");
+        put(&base, ".oh-my-crab/SYSTEM.md", SYSTEM_TEMPLATE);
+        let locations = Locations {
+            directory: base.clone(),
+            root: None,
+            home: None,
+            claude: None,
+            codex: None,
+            crab: None,
+            project: true,
+        };
+        let copied = discover(&locations, &[]);
+        let environment = Environment::detect(&locations, "m");
+        let tools: Vec<String> = ["read", "task"].map(String::from).to_vec();
+        let input = PromptInput {
+            environment: &environment,
+            discovered: &copied,
+            tools: &tools,
+            plan: true,
+            unnamed: true,
+            orchestrator: true,
+            tree: "",
+        };
+        let builtin = build_prompt(PromptInput {
+            discovered: &Discovered {
+                system: None,
+                ..copied.clone()
+            },
+            ..input
+        });
+        assert_eq!(build_prompt(input), builtin);
     }
 }

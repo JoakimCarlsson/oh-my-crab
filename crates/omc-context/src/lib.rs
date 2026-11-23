@@ -39,6 +39,6 @@ pub use place::{agent_places, instruction_places, skill_places};
 pub use plugins::plugin_folders;
 pub use scope::{CONFIG_DIR_VARIABLE, Locations, PROJECT_FOLDER, crab_folder};
 pub use skills::Skill;
-pub use system::{PromptInput, build_prompt, build_subagent_prompt};
+pub use system::{PromptInput, SYSTEM_TEMPLATE, build_prompt, build_subagent_prompt};
 pub use template::render;
 pub use tree::workspace_tree;
