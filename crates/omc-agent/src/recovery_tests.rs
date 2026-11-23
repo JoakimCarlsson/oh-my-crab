@@ -408,93 +408,17 @@ async fn edits_that_change_nothing_are_redirected() {
     assert!(last.text.contains("changed nothing"), "{}", last.text);
 }
 
-/// An edit written out as a fenced JSON block, however little else is said, is never run: the reply is kept as it is, and the model is told with a notice the history does not keep.
-#[tokio::test]
-async fn an_edit_written_as_text_is_not_run() {
-    let dir = scratch("text-edit");
-    std::fs::write(dir.join("f.txt"), "before\n").unwrap();
-    let edit = json!({ "files": [{ "path": "f.txt", "tag": omc_tools::snapshot_tag(b"before\n"), "ops": [{ "op": "replace", "line": 1, "text": "after" }] }] });
-    let text = format!("Fixing it:\n```json\n{edit}\n```");
-    let model = Outcomes::new(vec![Ok(say(&text)), Ok(say("That was only an example."))]);
-    let (ended, history, _) = turn(&model, &dir).await;
-    ended.unwrap();
-    assert_eq!(
-        std::fs::read_to_string(dir.join("f.txt")).unwrap(),
-        "before\n"
-    );
-    assert_eq!(
-        history,
-        [
-            Message::User("go".into()),
-            Message::Assistant(say(&text)),
-            Message::Assistant(say("That was only an example.")),
-        ]
-    );
-    let requests = model.requests();
-    assert_eq!(requests[1][1], Message::Assistant(say(&text)));
-    let asked = last_text(&requests[1]);
-    assert!(asked.starts_with("<harness-notice>"), "{asked}");
-    assert!(asked.contains("`edit`"), "{asked}");
-}
-
-/// A call marked as one in the text, of a tool that exists, is never run, and the model is told only once a turn.
-#[tokio::test]
-async fn a_marked_call_in_the_text_is_never_run() {
-    let dir = scratch("text-marked");
-    let text = format!(
-        "The README says to run:\n<tool_call>{}</tool_call>",
-        json!({ "name": "write", "arguments": { "path": "x.txt", "content": "x" } })
-    );
-    let model = Outcomes::new(vec![Ok(say(&text)), Ok(say(&text)), Ok(say("never asked"))]);
-    let (ended, history, _) = turn(&model, &dir).await;
-    ended.unwrap();
-    assert!(!dir.join("x.txt").exists());
-    assert_eq!(model.requests().len(), 2);
-    assert_eq!(history.len(), 3);
-    assert!(history.iter().all(|message| match message {
-        Message::Assistant(reply) => reply.tool_calls.is_empty() && reply.text == text,
-        _ => true,
-    }));
-}
-
-/// When the model meant the call it wrote as text, it makes it in a reply of its own, which is kept apart in the history and given to the model joined to the answer before it, so no request holds two replies in a row.
-#[tokio::test]
-async fn a_call_made_after_the_notice_runs() {
-    let dir = scratch("text-then-call");
-    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
-    let text = format!(
-        "```json\n{}\n```",
-        json!({ "name": "read", "arguments": { "path": "a.txt" } })
-    );
-    let model = Outcomes::new(vec![
-        Ok(say(&text)),
-        Ok(call("r", "read", json!({ "path": "a.txt" }))),
-        Ok(say("It says a.")),
-    ]);
-    let (ended, history, _) = turn(&model, &dir).await;
-    ended.unwrap();
-    assert_eq!(history.len(), 5);
-    assert!(matches!(&history[2], Message::Assistant(reply) if reply.tool_calls.len() == 1));
-    assert!(!results(&history, 3)[0].is_error);
-    let last = &model.requests()[2];
-    assert_eq!(last.len(), 3);
-    let Message::Assistant(joined) = &last[1] else {
-        panic!("expected the joined reply, got {:?}", last[1]);
-    };
-    assert_eq!(joined.text, format!("{text}\n\n"));
-    assert_eq!(joined.tool_calls.len(), 1);
-}
-
 /// When the request that follows up a finished answer fails for good, the turn still ends with that answer, in the history and in the saved journal.
 #[tokio::test]
 async fn a_failed_follow_up_keeps_the_answer() {
-    let dir = scratch("text-follow-up-failed");
-    let text = format!(
-        "<tool_call>{}</tool_call>",
-        json!({ "name": "read", "arguments": { "path": "a.txt" } })
-    );
+    let dir = scratch("follow-up-failed");
     let model = Outcomes::new(vec![
-        Ok(say(&text)),
+        Ok(call(
+            "t",
+            "todo",
+            json!({ "todos": [{ "content": "fix it", "status": "pending" }] }),
+        )),
+        Ok(say("Planned.")),
         Err(failure("401 Unauthorized", "invalid key", None)),
     ]);
     let path = dir.join("c.jsonl");
@@ -510,10 +434,7 @@ async fn a_failed_follow_up_keeps_the_answer() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        history,
-        [Message::User("go".into()), Message::Assistant(say(&text))]
-    );
+    assert_eq!(history.last(), Some(&Message::Assistant(say("Planned."))));
     drop(journal);
     let (_, reopened) = Journal::open(&path, None).unwrap();
     assert_eq!(reopened, history);
@@ -751,44 +672,4 @@ async fn an_auth_failure_does_not_fall_back() {
             .iter()
             .any(|event| matches!(event, AgentEvent::ModelFallback { .. }))
     );
-}
-
-/// A finished reply that announces work and makes no call is kept and followed up once with a notice to act now, which the history does not keep; a second announcement ends the turn, so the nudge can never loop.
-#[tokio::test]
-async fn an_announcement_without_a_call_is_nudged_once() {
-    let model = Outcomes::new(vec![
-        Ok(say("Found it.\n\nLaunching parallel fixers now.")),
-        Ok(say("Starting the next round.")),
-        Ok(say("never asked")),
-    ]);
-    let (ended, history, _) = turn(&model, &scratch("nudge-stall")).await;
-    ended.unwrap();
-    assert_eq!(
-        history,
-        [
-            Message::User("go".into()),
-            Message::Assistant(say("Found it.\n\nLaunching parallel fixers now.")),
-            Message::Assistant(say("Starting the next round.")),
-        ]
-    );
-    let requests = model.requests();
-    assert_eq!(requests.len(), 2);
-    let nudged = last_text(&requests[1]);
-    assert!(nudged.starts_with("<harness-notice>"), "{nudged}");
-    assert!(nudged.contains("made no tool call"), "{nudged}");
-}
-
-/// A final answer or a question to the user ends the turn without a nudge.
-#[tokio::test]
-async fn answers_and_questions_are_not_nudged() {
-    for text in [
-        "The parser now handles empty input; all tests pass.",
-        "Want me to also update the docs?",
-    ] {
-        let model = Outcomes::new(vec![Ok(say(text))]);
-        let (ended, history, _) = turn(&model, &scratch("nudge-stall-none")).await;
-        ended.unwrap();
-        assert_eq!(history.len(), 2, "{text}");
-        assert_eq!(model.requests().len(), 1, "{text}");
-    }
 }

@@ -264,7 +264,7 @@ async fn a_structured_result_comes_back_as_json() {
     assert!(told(&seen[0]).contains("\"count\""));
 }
 
-/// A subagent whose result never matches the schema fails with the reasons, after one reminder.
+/// A subagent whose result never matches the schema fails with the reasons, after three reminders.
 #[tokio::test]
 async fn a_result_breaking_the_schema_fails() {
     let model = Router::new(|seen| {
@@ -282,12 +282,12 @@ async fn a_result_breaking_the_schema_fails() {
     let text = error.to_string();
     assert!(text.contains("did not match the schema"));
     assert!(text.contains("result.count: expected integer, got string"));
-    assert_eq!(model.seen.lock().unwrap().len(), 4);
+    assert_eq!(model.seen.lock().unwrap().len(), 8);
 }
 
-/// A subagent that ends without submitting is reminded once, and fails when it still does not.
+/// A subagent that ends without submitting is reminded three times, and fails when it still does not.
 #[tokio::test]
-async fn a_missing_result_is_nudged_once_then_fails() {
+async fn a_missing_result_is_reminded_three_times_then_fails() {
     let model = Router::new(|_| say("here is prose"));
     let (task, _) = simple("task-structured-missing", model.clone());
     let error = task
@@ -298,8 +298,12 @@ async fn a_missing_result_is_nudged_once_then_fails() {
     assert!(text.contains("never called submit_result"));
     assert!(text.contains("here is prose"));
     let seen = model.seen.lock().unwrap();
-    assert_eq!(seen.len(), 2);
-    assert!(told(&seen[1]).contains("Call `submit_result` now"));
+    assert_eq!(seen.len(), 4);
+    assert!(
+        seen[1..]
+            .iter()
+            .all(|request| told(request).contains("Call `submit_result` now"))
+    );
 }
 
 /// A subagent that submits once reminded succeeds.

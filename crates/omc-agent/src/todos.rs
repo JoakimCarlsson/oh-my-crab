@@ -20,6 +20,9 @@ pub(crate) const CHANGES: u32 = 12;
 /// How many reminders are given between two changes of the list.
 pub(crate) const MAX_REMINDERS: u32 = 2;
 
+/// How many times a turn is held up for ending with open items.
+pub(crate) const MAX_FINISHES: u32 = 3;
+
 /// Added to a batch of results when the list has gone stale.
 const REMINDER: &str = include_str!("prompts/todo_reminder.md");
 
@@ -51,8 +54,10 @@ pub(crate) struct TodoTracker {
     worked: bool,
     /// Whether a `todo` call succeeded in this turn.
     listed: bool,
-    /// Whether the model was already told not to end the turn with open items.
-    nudged: bool,
+    /// How many times the model was told in this turn not to end it with open items.
+    finishes: u32,
+    /// Whether the model was told not to end the turn with open items and has made no tool call since.
+    awaiting: bool,
 }
 
 impl TodoTracker {
@@ -76,6 +81,9 @@ impl TodoTracker {
         changed: &[(String, Vec<FileChange>)],
         text: &str,
     ) -> Option<String> {
+        if !calls.is_empty() {
+            self.awaiting = false;
+        }
         for call in calls {
             let succeeded = results
                 .iter()
@@ -106,16 +114,18 @@ impl TodoTracker {
         Some(fill(REMINDER, &self.open).replace("{changes}", &changes.to_string()))
     }
 
-    /// The notice to send along when the turn is about to end with `reply`: once a turn, when the list still has open items, it was written or files were changed in this turn, and `reply` does not ask the user a question. A list left over from an earlier turn does not hold up a turn that only answered a question.
+    /// The notice to send along when the turn is about to end with `reply`: when the list still has open items, it was written or files were changed in this turn, and `reply` does not ask the user a question; at most [`MAX_FINISHES`] times a turn, and never twice without a tool call between, so a model that answers a notice with words alone ends the turn. A list left over from an earlier turn does not hold up a turn that only answered a question.
     pub(crate) fn finishing(&mut self, reply: &Reply) -> Option<String> {
-        if self.nudged
+        if self.awaiting
+            || self.finishes >= MAX_FINISHES
             || !(self.worked || self.listed)
             || self.open.is_empty()
             || asks_question(&reply.text)
         {
             return None;
         }
-        self.nudged = true;
+        self.finishes += 1;
+        self.awaiting = true;
         Some(fill(FINISH, &self.open))
     }
 }

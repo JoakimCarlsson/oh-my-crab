@@ -71,6 +71,9 @@ const STRUCTURED: &str = include_str!("prompts/structured.md");
 /// What a subagent asked for a structured result is told when it ends without handing one back.
 const NUDGE: &str = include_str!("prompts/submit_nudge.md");
 
+/// How many times a subagent that ended without submitting its result is reminded to submit it before it fails.
+const SUBMIT_REMINDERS: u32 = 3;
+
 /// What an isolated subagent is told about the worktree it works in.
 const ISOLATED: &str = include_str!("prompts/isolated.md");
 
@@ -668,7 +671,7 @@ impl Run {
         }
     }
 
-    /// Runs the subagent to the end of a turn, going on from its conversation so far, and returns what it said last, or the result it handed back when it was asked for one; one that ends without handing back a result is reminded once.
+    /// Runs the subagent to the end of a turn, going on from its conversation so far, and returns what it said last, or the result it handed back when it was asked for one; one that ends without handing back a result is reminded up to [`SUBMIT_REMINDERS`] times.
     ///
     /// # Errors
     ///
@@ -738,20 +741,22 @@ impl Run {
                 reply
             });
         };
-        if let Some(result) = wanted.accepted() {
-            return Ok(result);
+        for _ in 0..SUBMIT_REMINDERS {
+            if let Some(result) = wanted.accepted() {
+                return Ok(result);
+            }
+            run_turn_steered(
+                &context,
+                &mut self.history,
+                NUDGE.trim().to_owned(),
+                Vec::new(),
+                &report,
+                None,
+                steering,
+            )
+            .await
+            .map_err(|error| failed(&kind, &error))?;
         }
-        run_turn_steered(
-            &context,
-            &mut self.history,
-            NUDGE.trim().to_owned(),
-            Vec::new(),
-            &report,
-            None,
-            steering,
-        )
-        .await
-        .map_err(|error| failed(&kind, &error))?;
         wanted
             .accepted()
             .ok_or_else(|| wanted.missing(&kind, &self.history))

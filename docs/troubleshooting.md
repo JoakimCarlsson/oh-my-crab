@@ -44,30 +44,11 @@ most twice before the list changes again. A call counts when the files it
 reports changing really changed, or when it is a successful `write`; a shell
 command that only looks, such as `ls` or a test run, does not. When a turn
 that wrote the list or changed files is about to end with open items, the
-model is sent a notice, once a turn, to finish them or update the list; a list
-left over from an earlier turn does not hold up a turn that only answered a
+model is sent a notice to finish them or update the list, up to three times a
+turn; a reply to a notice that makes no tool call ends the turn. A list left
+over from an earlier turn does not hold up a turn that only answered a
 question. Neither happens when the model's reply ends by asking the user a
 question.
-
-Nothing in the text of a reply is ever run, so a call the model quotes from a
-file or from what the user pasted cannot turn into a real one. When a reply
-without tool calls holds what looks like a call written out as text, a block
-marked as a call, such as `<tool_call>{"name": "read", "arguments":
-{...}}</tool_call>`, or a fenced JSON block that is a call of a known tool or
-the arguments of an `edit`, the model is sent a notice, once a turn, that
-nothing ran and that it should make a real call if it meant to. Any other code
-block, JSON included, is left alone.
-
-A reply without tool calls that ends by announcing work the agent is about to
-do, such as "Launching the fixers now" or "Let me check the callers", would
-end the turn with nothing done. When one of its last two sentences opens with
-the agent saying it acts now, the model is sent a notice, once a turn, that
-nothing ran and that it should make the call now or say plainly what blocks
-it. The check reads the words of the reply alone and leans toward letting the
-turn end: a reply that asks the user something, offers something ("I can ...
-if you want"), holds a condition or a negation, puts the work off till later,
-or whose last paragraph reports finished work is never followed up. A second
-announcement in the same turn ends it.
 
 These notices come after an answer that is already kept, in the history and in
 the saved conversation. The model's reply to a notice is kept as a reply of its

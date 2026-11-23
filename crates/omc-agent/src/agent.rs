@@ -28,9 +28,7 @@ use crate::pruning;
 use crate::recall::{self, RECALL};
 use crate::recovery::{self, MAX_CUT_CALLS, MAX_RECOVERIES, Retry};
 use crate::shake;
-use crate::stall;
 use crate::steering::{self, Steering};
-use crate::text_calls;
 use crate::todos::TodoTracker;
 use crate::{ApprovalRequest, Approvals, Scribe, Standing};
 
@@ -554,11 +552,7 @@ fn append_notice(results: &mut [ToolResult], notice: &str) {
 ///
 /// The batches of calls are watched for circles: the same calls made again and again, or edits that change nothing, earn a notice to the model at the end of the batch's results.
 ///
-/// The model's todo list is watched too: when it still has open items after [`crate::todos::CHANGES`] calls that changed files since it last changed, a reminder listing them is added to the batch's results, at most [`crate::todos::MAX_REMINDERS`] times between changes; and a turn that wrote the list or changed files and is about to end with open items is followed up once with a notice to finish them or update the list. Neither happens when the model's reply ends by asking the user a question.
-///
-/// A reply without tool calls whose text holds a call written out as text is never run; it is followed up once a turn with a notice telling the model to make the call if it meant to.
-///
-/// A finished reply without tool calls whose last sentences announce work the agent is about to do, such as "Launching the fixers now", is followed up once a turn with a notice telling the model to do it now or say what blocks it; a reply that asks the user something, offers something or reports finished work is not.
+/// The model's todo list is watched too: when it still has open items after [`crate::todos::CHANGES`] calls that changed files since it last changed, a reminder listing them is added to the batch's results, at most [`crate::todos::MAX_REMINDERS`] times between changes; and a turn that wrote the list or changed files and is about to end with open items is followed up with a notice to finish them or update the list, at most [`crate::todos::MAX_FINISHES`] times and never twice without a tool call between. Neither happens when the model's reply ends by asking the user a question.
 ///
 /// A follow-up keeps the finished answer in the history and sends its notice with the next request only; the model's next reply is kept as a reply of its own, and an empty one ends the turn.
 ///
@@ -584,8 +578,6 @@ async fn drive(
     let mut retries = 0;
     let mut recoveries = 0;
     let mut cut_calls = 0;
-    let mut written_noticed = false;
-    let mut stall_noticed = false;
     let mut following_up = false;
     let mut notice: Option<Cow<'static, str>> = None;
     let mut cut: Option<Reply> = None;
@@ -703,12 +695,10 @@ async fn drive(
             return Err(AgentError::OutputLimit);
         }
         let follow_up = if calls.is_empty() {
-            match follow_up(
-                &reply,
-                registry,
-                (&mut written_noticed, &mut stall_noticed),
-                &mut todos,
-            ) {
+            match (reply.stop == Stop::Finished)
+                .then(|| todos.finishing(&reply))
+                .flatten()
+            {
                 Some(notice) => Some(notice),
                 None if reply.stop != Stop::Length => stops.next(context.hooks, &said).await,
                 None => None,
@@ -836,29 +826,6 @@ async fn drive(
             *settled = None;
         }
     }
-}
-
-/// The notice to follow up `answer`, a reply without tool calls that would end the turn, with: that it wrote a call of a tool in `registry` out as text, when it did and the model was not yet told so this turn; otherwise that it announced work it is about to do and made no call, when the model was not yet told so this turn; otherwise, for a finished answer, that the list `todos` tracks still has open items, once a turn. `noticed` keeps whether the model was told of a written call and of an announcement this turn, so that neither notice is sent twice and a model that keeps announcing cannot keep the turn going. Nothing when the turn is to end.
-fn follow_up(
-    answer: &Reply,
-    registry: &Registry,
-    noticed: (&mut bool, &mut bool),
-    todos: &mut TodoTracker,
-) -> Option<String> {
-    let (written_noticed, stall_noticed) = noticed;
-    if !*written_noticed
-        && let Some(written) = text_calls::notice(answer, &|name| registry.get(name).is_some())
-    {
-        *written_noticed = true;
-        return Some(written);
-    }
-    if !*stall_noticed && let Some(stalled) = stall::notice(answer) {
-        *stall_noticed = true;
-        return Some(stalled.to_owned());
-    }
-    (answer.stop == Stop::Finished)
-        .then(|| todos.finishing(answer))
-        .flatten()
 }
 
 /// Compacts `history` now, as the reader asked: summarizes all but the most recent messages, giving particular attention to `focus` when there is one, and records the compaction with `scribe`, which is synced when it is done.

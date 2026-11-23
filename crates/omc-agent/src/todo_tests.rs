@@ -144,7 +144,7 @@ async fn a_stale_list_earns_a_reminder() {
     );
 }
 
-/// A turn about to end with open items after changing files is nudged once, with a notice only the model sees after the answer, which is kept as it is; the reply to the notice is kept as a reply of its own.
+/// A turn about to end with open items after changing files is nudged, with a notice only the model sees after the answer, which is kept as it is; the reply to the notice is kept as a reply of its own, and ends the turn when it makes no tool call.
 #[tokio::test]
 async fn ending_with_open_items_is_nudged_once() {
     let dir = scratch("todo-finish");

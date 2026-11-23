@@ -26,11 +26,9 @@ mod recovery;
 mod review;
 mod roster;
 mod shake;
-mod stall;
 mod steering;
 mod submit;
 mod task;
-mod text_calls;
 mod todos;
 mod worktree;
 
