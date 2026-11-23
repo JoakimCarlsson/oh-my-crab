@@ -109,6 +109,11 @@ pub enum Command {
         /// The id of the subagent.
         id: String,
     },
+    /// Stops the background run `id`, as a [`crate::Event::Background`] named it: a command is killed with the processes it started, a subagent is stopped. The turn, if one runs, goes on, and the run's end is not reported to the agent. Fails with a [`crate::Event::Failed`] when no run with that id is running.
+    StopBackground {
+        /// The id of the run.
+        id: String,
+    },
     /// Gives the setting `setting` the value `value`.
     Set {
         /// The setting.

@@ -588,6 +588,22 @@ leaves the turn as it is.
 {"StopSubagent":{"id":"toolu_07/2"}}
 ```
 
+### `StopBackground`
+
+Stops one background run, named by the `id` a `Background` event gave it: a
+command is killed with the processes it started, a subagent is stopped. The
+turn, if one runs, carries on, and the run's end is not reported to the agent.
+Crab sends a `Background` event with `running` false once it has ended. An id
+that names no running run is answered with `Failed`.
+
+| Field | Type   | Presence | Meaning            |
+| ----- | ------ | -------- | ------------------ |
+| `id`  | string | required | The id of the run. |
+
+```json
+{"StopBackground":{"id":"bg-1"}}
+```
+
 ### `Set`
 
 Gives a setting a value. See [Settings round-trips](#settings-round-trips).

@@ -296,6 +296,11 @@ impl Session {
                     self.say(Event::Failed(format!("no subagent {id} is running")));
                 }
             }
+            Command::StopBackground { id } => {
+                if let Err(error) = self.shared.jobs.cancel(&id) {
+                    self.say(Event::Failed(error.to_string()));
+                }
+            }
             Command::Set { setting, value } => self.set(&setting, &value).await,
             Command::Login { provider } => self.login(&provider),
             Command::Language { ticket, answer } => {
@@ -3130,6 +3135,30 @@ mod tests {
         jobs.spawn("forever".into(), None, std::future::pending());
         session.stop();
         assert!(jobs.wait().await.is_err());
+    }
+
+    /// Stopping a background run kills it and tells the client it ended; stopping one that is not running is refused with a `Failed` event.
+    #[tokio::test]
+    async fn stopping_a_background_run_kills_it() {
+        let (mut session, mut events) = busy_session("stop-background");
+        let jobs = session.shared.jobs.clone();
+        let id = jobs.spawn("forever".into(), None, std::future::pending());
+        while events.try_recv().is_ok() {}
+        session
+            .handle(Command::StopBackground { id: id.clone() })
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let told: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert!(
+            told.iter().any(
+                |event| matches!(event, Event::Background(run) if run.id == id && !run.running)
+            )
+        );
+        session
+            .handle(Command::StopBackground { id: "bg-99".into() })
+            .await;
+        let told: Vec<Event> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert!(matches!(told.as_slice(), [Event::Failed(_)]));
     }
 
     /// Ending a conversation lets its saved history go even while something still holds the conversation's shared state, so the same process can open the conversation again at once instead of finding it open elsewhere.
