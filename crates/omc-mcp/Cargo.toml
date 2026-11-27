@@ -12,13 +12,26 @@ async-trait = "0.1.92"
 dirs = "7.0.0"
 futures-util = "0.3.34"
 oauth2 = "5.0.0"
-omc-tools = { version = "0.1.7", path = "../omc-tools" }
-omc-wire = { version = "0.1.7", path = "../omc-wire" }
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "form", "rustls", "stream"] }
+omc-tools = { version = "0.1.8", path = "../omc-tools" }
+omc-wire = { version = "0.1.8", path = "../omc-wire" }
+reqwest = { version = "0.13.5", default-features = false, features = [
+  "json",
+  "form",
+  "rustls",
+  "stream",
+] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["rt", "macros", "sync", "io-util", "process", "time", "net"] }
+tokio = { version = "1.54.1", features = [
+  "rt",
+  "macros",
+  "sync",
+  "io-util",
+  "process",
+  "time",
+  "net",
+] }
 url = "2.5.8"
 
 [dev-dependencies]
