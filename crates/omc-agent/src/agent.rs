@@ -18,6 +18,7 @@ use omc_tools::{
 use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::{RwLockReadGuard, RwLockWriteGuard};
+use tracing::Instrument;
 
 use crate::compaction;
 use crate::fallback::{Asked, Routing};
@@ -428,7 +429,15 @@ async fn carry_on(
     let open = OpenCalls::new(events);
     let events: &(dyn Fn(AgentEvent) + Send + Sync) = &|event| open.see(event);
     let mut settled = None;
-    let result = drive(context, history, events, scribe, steering, &mut settled).await;
+    let span = tracing::info_span!(
+        "invoke_agent",
+        otel.name = "invoke_agent crab",
+        gen_ai.operation.name = "invoke_agent",
+        gen_ai.agent.name = "crab",
+    );
+    let result = drive(context, history, events, scribe, steering, &mut settled)
+        .instrument(span)
+        .await;
     if let Some(checkpoint) = context.checkpoint {
         checkpoint.clear();
     }
@@ -1412,7 +1421,20 @@ impl Batch<'_> {
     /// A failing tool yields a result with `is_error` set.
     async fn run_call(&self, call: &ToolCall, ready: Ready<'_>) -> ToolResult {
         let caller = Nested::new(*self, call);
-        let done = perform(call, &call.id, ready, self.hooks, &caller).await;
+        let span = tracing::info_span!(
+            "execute_tool",
+            otel.name = format!("execute_tool {}", call.name),
+            gen_ai.operation.name = "execute_tool",
+            gen_ai.tool.name = %call.name,
+            gen_ai.tool.call.id = %call.id,
+            "error.type" = tracing::field::Empty,
+        );
+        let done = perform(call, &call.id, ready, self.hooks, &caller)
+            .instrument(span.clone())
+            .await;
+        if done.is_error {
+            span.record("error.type", "tool_error");
+        }
         if let Some(reason) = done.halt {
             self.stop(reason);
         }

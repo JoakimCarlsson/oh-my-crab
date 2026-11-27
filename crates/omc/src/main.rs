@@ -1,9 +1,10 @@
 //! The `crab` binary: the harness, served to another program over standard input and output.
 
+mod diagnostics;
 mod exec;
 
 /// Usage text printed for `--help` and after a bad argument.
-const USAGE: &str = "usage: crab <serve|exec|lsp-daemon|tools|providers|account|history|rename|import|fork|limits|memory|hooks|trust|permissions>\n\n  serve                    hold a conversation: read commands from standard input, write events to standard output\n  exec [--provider <id>] [--model <id>] [--folder <folder>] [--trust] [--json] [--timeout <seconds>] [prompt]  run one prompt, given as words or on standard input, with every tool allowed and nobody asked, and print the answer, or the outcome as JSON; exits 1 when the turn fails\n  lsp-daemon               run the language server daemon conversations of this user share, which serve and exec start themselves; ends after ten minutes with no conversation connected\n  tools                    print the tools the agent can have, as a JSON list of name and description\n  providers                print the providers a conversation can be opened with, as a JSON list of id, name and sign-in\n  account <provider> [folder]  print who <provider> is signed in as with the logins in [folder], or in crab's own folder, or nothing\n  limits [provider] [--json] [--folder <folder>]  print how much of its subscription allowance (the 5 hour and weekly windows and the like) each signed-in provider that meters one has used, or only <provider>'s, as text or as a JSON list of what each reported\n  history <id> [folder]    print the saved conversation <id> as JSON: its title, saved settings and turns, which works while it is open elsewhere\n  rename <id> <folder> <title>  name the saved conversation <id>, which fails while it is open elsewhere\n  import <id> <folder>          save the conversation a client kept, read as JSON from standard input, as the conversation <id>\n  fork <id> <copy> <folder> [turn]  copy the branch the saved conversation <id> is on, up to before [turn] or whole, to the new conversation <copy>\n  memory [folder]          print the memories a conversation in [folder], or in the current folder, starts with, as JSON: its project's, which every worktree of the repository shares, and the user's\n  hooks [folder]           print the hooks a conversation in [folder], or in the current folder, would find, whether each runs, and its project's trust, as JSON\n  trust <folder> [on|off]  print whether the project <folder> belongs to is trusted, as JSON, or record that it is (on) or is not (off), for every worktree of its repository\n  permissions [folder]     print the permission rules a conversation in [folder], or in the current folder, would use, with where each comes from and whether it is used, as JSON\n  permissions add <allow|ask|deny> <user|project> <rule> [folder]  add a rule to crab's permissions file, for every project (user) or for the project of [folder] (project)\n  permissions remove <rule> [folder]  take a rule out of crab's permissions file, the user's and the project's of [folder]";
+const USAGE: &str = "usage: crab <serve|exec|lsp-daemon|tools|providers|account|history|rename|import|fork|limits|memory|hooks|trust|permissions|bug-report>\n\n  serve                    hold a conversation: read commands from standard input, write events to standard output\n  exec [--provider <id>] [--model <id>] [--folder <folder>] [--trust] [--json] [--timeout <seconds>] [prompt]  run one prompt, given as words or on standard input, with every tool allowed and nobody asked, and print the answer, or the outcome as JSON; exits 1 when the turn fails\n  lsp-daemon               run the language server daemon conversations of this user share, which serve and exec start themselves; ends after ten minutes with no conversation connected\n  tools                    print the tools the agent can have, as a JSON list of name and description\n  providers                print the providers a conversation can be opened with, as a JSON list of id, name and sign-in\n  account <provider> [folder]  print who <provider> is signed in as with the logins in [folder], or in crab's own folder, or nothing\n  limits [provider] [--json] [--folder <folder>]  print how much of its subscription allowance (the 5 hour and weekly windows and the like) each signed-in provider that meters one has used, or only <provider>'s, as text or as a JSON list of what each reported\n  history <id> [folder]    print the saved conversation <id> as JSON: its title, saved settings and turns, which works while it is open elsewhere\n  rename <id> <folder> <title>  name the saved conversation <id>, which fails while it is open elsewhere\n  import <id> <folder>          save the conversation a client kept, read as JSON from standard input, as the conversation <id>\n  fork <id> <copy> <folder> [turn]  copy the branch the saved conversation <id> is on, up to before [turn] or whole, to the new conversation <copy>\n  memory [folder]          print the memories a conversation in [folder], or in the current folder, starts with, as JSON: its project's, which every worktree of the repository shares, and the user's\n  hooks [folder]           print the hooks a conversation in [folder], or in the current folder, would find, whether each runs, and its project's trust, as JSON\n  trust <folder> [on|off]  print whether the project <folder> belongs to is trusted, as JSON, or record that it is (on) or is not (off), for every worktree of its repository\n  permissions [folder]     print the permission rules a conversation in [folder], or in the current folder, would use, with where each comes from and whether it is used, as JSON\n  permissions add <allow|ask|deny> <user|project> <rule> [folder]  add a rule to crab's permissions file, for every project (user) or for the project of [folder] (project)\n  permissions remove <rule> [folder]  take a rule out of crab's permissions file, the user's and the project's of [folder]\n  bug-report [--note <text>] [folder]  write a zip to send with a bug report, holding this build's version, the operating system and crab's last crashes, into [folder] or the current folder, and print its path\n\nWith the otlp feature built in, serve and exec send traces and metrics to the OpenTelemetry collector the OTEL_EXPORTER_OTLP_ENDPOINT variables name.";
 
 /// Has the conversations of this process share their language servers through the user's language server daemon, which this program runs as `crab lsp-daemon`; they keep servers of their own when the program's path cannot be told.
 fn share_language_servers() {
@@ -16,23 +17,38 @@ fn share_language_servers() {
 ///
 /// `serve` and `exec` share their language servers with the user's other conversations through the daemon `lsp-daemon` runs, which they start when it is not running. `serve` refreshes the cached model catalog in the background, and ends the process as soon as the conversation is over, on [`omc_wire::Command::Close`] as on the end of standard input, without waiting for the thread that reads standard input to see its end.
 ///
+/// Every panic is recorded in crab's crash log. `serve` and `exec` say on standard error when crab crashed since the user was last told, and send telemetry while they run when it is asked for, flushing it before the process ends.
+///
 /// # Errors
 ///
 /// Fails when the streams cannot be read or written.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
+    diagnostics::record_crashes();
     match std::env::args().nth(1).as_deref() {
         Some("serve") => {
+            diagnostics::tell_of_crash();
+            let telemetry = diagnostics::start_telemetry();
             share_language_servers();
             tokio::spawn(omc_providers::refresh_catalog());
-            omc_session::serve(tokio::io::stdin(), tokio::io::stdout()).await?;
+            let served = omc_session::serve(tokio::io::stdin(), tokio::io::stdout()).await;
+            if let Some(telemetry) = telemetry {
+                telemetry.shutdown();
+            }
+            served?;
             std::process::exit(0)
         }
         Some("exec") => {
+            diagnostics::tell_of_crash();
+            let telemetry = diagnostics::start_telemetry();
             share_language_servers();
             tokio::spawn(omc_providers::refresh_catalog());
             let exec = exec::parse(std::env::args().skip(2))?;
-            let succeeded = exec::run(exec).await?;
+            let succeeded = exec::run(exec).await;
+            if let Some(telemetry) = telemetry {
+                telemetry.shutdown();
+            }
+            let succeeded = succeeded?;
             std::process::exit(if succeeded { 0 } else { 1 })
         }
         Some("lsp-daemon") => {
@@ -222,6 +238,11 @@ async fn main() -> anyhow::Result<()> {
             }
             .map_err(|reason| anyhow::anyhow!(reason))?;
             println!("{}", serde_json::to_string(&listed)?);
+            Ok(())
+        }
+        Some("bug-report") => {
+            let path = diagnostics::bug_report(std::env::args().skip(2))?;
+            println!("{}", path.display());
             Ok(())
         }
         Some("-h" | "--help") => {

@@ -312,7 +312,7 @@ impl Recorder {
 
 #[async_trait]
 impl ChatModel for Recorder {
-    /// Sends `request` and, once it is answered, keeps it warm; the earlier request is no longer warmed from the moment this one is sent, since this one reads its entries anyway.
+    /// Sends `request`, measured as [`crate::measure::chat`] describes, and, once it is answered, keeps it warm; the earlier request is no longer warmed from the moment this one is sent, since this one reads its entries anyway.
     async fn complete(
         &self,
         request: Request<'_>,
@@ -320,7 +320,12 @@ impl ChatModel for Recorder {
     ) -> Result<Reply, ProviderError> {
         self.shared.warmer.stop();
         let started = Instant::now();
-        let reply = self.inner.complete(request, sink).await?;
+        let reply = crate::measure::chat(
+            self.provider,
+            &self.model,
+            self.inner.complete(request, sink),
+        )
+        .await?;
         let prompt_tokens = reply.tokens.map_or(0, |tokens| tokens.context());
         self.keep(&request, started, prompt_tokens);
         Ok(reply)

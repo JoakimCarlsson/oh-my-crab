@@ -65,3 +65,34 @@ own, and an empty one ends the turn; it is given to the model joined to the
 answer before it, since every provider wants a message from the reader between
 two replies. When the request that follows a notice fails, the turn ends with
 the answer it already had instead of being undone.
+
+## Crashes and bug reports
+
+Every panic of a crab process is recorded in `crashes.json` in crab's data
+folder (`~/.local/share/oh-my-crab` on Linux), which keeps the last five, with
+the message, where it happened and the call stack. The next `crab serve` or
+`crab exec` says on standard error that crab crashed, once per crash and only
+for a crash of the last seven days.
+
+`crab bug-report [--note <text>] [folder]` writes
+`crab-bug-report-<time>.zip` into `folder`, or the current folder, and prints
+its path. It holds `report.json`, with crab's version, the operating system,
+the architecture and the note, and `crashes.json`, the crash log, when there
+is one. Nothing else is read, and nothing is sent anywhere: attach the zip to
+the report yourself.
+
+## Telemetry
+
+A crab built with the `otlp` feature (`cargo install --path crates/omc
+--features otlp`) sends traces and metrics over OTLP, HTTP with protobuf, while
+`serve` or `exec` runs, when `OTEL_EXPORTER_OTLP_ENDPOINT`, or its `_TRACES_`
+or `_METRICS_` form, is set, and `OTEL_SDK_DISABLED` is not `true`. The other
+standard `OTEL_*` variables, such as `OTEL_EXPORTER_OTLP_HEADERS`, apply.
+Without an endpoint, nothing is started. A build without the feature says on
+standard error that it cannot send.
+
+Each turn is an `invoke_agent` span, with a `chat <model>` span for every
+model request, carrying the provider, the model and the tokens, and an
+`execute_tool <name>` span for every tool call. The metrics are
+`gen_ai.client.token.usage`, by token type, provider and model, and
+`gen_ai.client.operation.duration`, in seconds.

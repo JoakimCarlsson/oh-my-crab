@@ -13,6 +13,7 @@ mod languages;
 mod lifecycle;
 mod limits;
 mod listing;
+mod measure;
 mod memory;
 mod permissions;
 mod picker;
