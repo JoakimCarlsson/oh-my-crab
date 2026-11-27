@@ -69,6 +69,10 @@ starts `crab`. A switch that is off when set to `0` is also off with `false`,
 | `OMC_SEARXNG_URL`    | The SearXNG instance `web_search` asks, when `SEARXNG_URL` is not set.                                      | unset                         | [Reading the web and GitHub](tools/web-and-github.md)      |
 | `OMC_MODELS_REFRESH` | Set to `0` to stop `crab serve` from downloading the model catalog into `<cache>/models.json` once a day; the bundled snapshot and any copy already cached are still used. | on                            | [Model catalog](providers/supported.md#model-catalog)      |
 | `OMC_MODELS_URL`     | Where the model catalog is downloaded from, in the models.dev format.                                       | `https://models.dev/api.json` | [Model catalog](providers/supported.md#model-catalog)      |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Where a crab built with the `otlp` feature sends traces and metrics over OTLP; without it, or its `_TRACES_` or `_METRICS_` form, nothing is sent. | unset | [Telemetry](troubleshooting.md#telemetry) |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Where traces go, instead of `OTEL_EXPORTER_OTLP_ENDPOINT`. | unset | [Telemetry](troubleshooting.md#telemetry) |
+| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Where metrics go, instead of `OTEL_EXPORTER_OTLP_ENDPOINT`. | unset | [Telemetry](troubleshooting.md#telemetry) |
+| `OTEL_SDK_DISABLED` | Set to `true` to send nothing even when an endpoint is set. | unset | [Telemetry](troubleshooting.md#telemetry) |
 
 An empty `OMC_CONFIG_DIR`, `OMC_PROVIDERS_FILE`, `OMC_HOOKS_FILE`, `OMC_TRUST_FILE`,
 `OMC_PERMISSIONS_FILE`, `OMC_MEMORY_DIR`, `OMC_DEBUGGERS_FILE`, `OMC_MCP_FILE`,
