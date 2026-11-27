@@ -41,6 +41,26 @@ call, so a stale tag is reported as such. Each kind of read is kept apart when o
 left out: an outline is only made out of date by another bare read of the same
 path, never by a read of a range, and a read of a range never by an outline.
 
+A section that leaves the tag out, or cites a tag that was never one of this
+file's, is not refused when the file is exactly as it was when the model last
+got its plain tag: crab keeps the plain tags each `read`, `edit` and `write` of
+the conversation gave for a file, and uses the latest when it still matches the
+file, as the model could have copied it. A tag of an earlier state of the file
+the model saw is still stale, and a file the model was never given a tag for,
+or one that changed since, still needs the right tag.
+
+### Changing part of a line
+
+`{"op": "substitute", "line": 12, "find": "\"output\":128000", "text": "\"output\":129024"}`
+swaps the exact text `find` for `text` within that line and keeps the rest of
+the line byte for byte, so a long line is not retyped. `find` must occur in the
+line exactly once, unless `"all": true` asks for every occurrence in the line
+to be replaced, as in a rename; otherwise the call is refused, saying what the
+line holds or how often `find` occurs in it, and nothing is written. A `find`
+that starts and ends with a letter, digit or `_` matches only whole words, so
+`ToolResult` does not match inside `ToolResults`, unless it occurs nowhere as
+a whole word in the line.
+
 ### Merge conflicts
 
 When the lines `read` returns include a merge conflict marker (`<<<<<<<`,

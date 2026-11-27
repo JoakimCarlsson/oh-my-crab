@@ -14,9 +14,12 @@ pub const DEFERRED_VARIABLE: &str = "OMC_DEFERRED_TOOLS";
 
 /// The built-in tools hidden until looked up when [`DEFERRED_VARIABLE`] does not say: ones most turns never call, or whose description is long for how rarely they are used.
 pub const DEFAULT_DEFERRED: &[&str] = &[
+    "agent_*",
     "ast_edit",
     "ast_grep",
     "debug",
+    "eval",
+    "github",
     "mcp_resources",
     "memory_edit",
 ];

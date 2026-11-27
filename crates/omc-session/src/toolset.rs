@@ -169,6 +169,7 @@ fn assemble(inputs: &Inputs<'_>, plan: bool) -> Registry {
                     environment: own.as_ref().unwrap_or(&environment),
                     discovered: &discovered,
                     tools,
+                    hidden: &[],
                     plan: false,
                     unnamed: false,
                     orchestrator: false,

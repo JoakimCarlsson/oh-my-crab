@@ -80,7 +80,7 @@ pub fn plan_mode_notice(on: bool, tools: &[String]) -> String {
     if !on {
         return render(PLAN_OFF, &[]);
     }
-    let listed = inventory(tools);
+    let listed = inventory(tools, &[]);
     let rules = plan_rules(tools);
     render(
         PLAN_ON,

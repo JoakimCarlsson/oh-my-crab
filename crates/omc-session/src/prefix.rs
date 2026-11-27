@@ -105,10 +105,12 @@ impl Prefix {
             names.push(LOAD_TOOLS.to_owned());
             names.sort();
         }
+        let hidden: Vec<String> = deferred.iter().map(|name| (*name).to_owned()).collect();
         let system = build_prompt(PromptInput {
             environment,
             discovered: &discovered,
             tools: &names,
+            hidden: &hidden,
             plan: false,
             unnamed,
             orchestrator: key.orchestrator,

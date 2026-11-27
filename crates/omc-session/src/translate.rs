@@ -218,7 +218,10 @@ pub(crate) fn replay(
                     turn.events.push(Event::Started(omc_wire::Part::Thinking));
                     turn.events.push(Event::Thought(reply.thinking.clone()));
                 }
-                if !reply.text.is_empty() {
+                if !reply.text.trim().is_empty() && !reply.tool_calls.is_empty() {
+                    turn.events.push(Event::Started(omc_wire::Part::Thinking));
+                    turn.events.push(Event::Thought(reply.text.clone()));
+                } else if !reply.text.is_empty() {
                     turn.events.push(Event::Started(omc_wire::Part::Text));
                     turn.events.push(Event::Said(reply.text.clone()));
                 }

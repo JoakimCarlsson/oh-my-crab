@@ -45,8 +45,10 @@ pub struct PromptInput<'a> {
     pub environment: &'a Environment,
     /// The instruction files and skills found.
     pub discovered: &'a Discovered,
-    /// The names of the tools the agent has.
+    /// The names of the tools the agent has, hidden ones among them.
     pub tools: &'a [String],
+    /// The names among `tools` that are hidden until the agent loads them with `load_tools`.
+    pub hidden: &'a [String],
     /// Whether plan mode is on.
     pub plan: bool,
     /// Whether the conversation has no name yet, which the prompt then asks the agent to give it.
@@ -71,7 +73,7 @@ pub fn build_prompt(input: PromptInput<'_>) -> String {
     } else {
         String::new()
     };
-    let tools = inventory(input.tools);
+    let tools = inventory(input.tools, input.hidden);
     let mut vars = flags_ref(&flags);
     vars.extend([("skills", skills.as_str()), ("tools", tools.as_str())]);
     let runtime = render(RUNTIME, &vars);
@@ -128,7 +130,7 @@ pub fn build_subagent_prompt(input: PromptInput<'_>, role: &str) -> String {
     } else {
         String::new()
     };
-    let tools = inventory(input.tools);
+    let tools = inventory(input.tools, input.hidden);
     let mut vars = flags_ref(&flags);
     vars.extend([
         ("agent", role),
@@ -184,11 +186,17 @@ pub(crate) fn plan_rules(tools: &[String]) -> String {
     render(PLAN, &flags_ref(&flags(tools)))
 }
 
-/// The list of tools, one to a line.
-pub(crate) fn inventory(tools: &[String]) -> String {
+/// The list of tools, one to a line, with the `hidden` ones marked as needing `load_tools` first.
+pub(crate) fn inventory(tools: &[String], hidden: &[String]) -> String {
     tools
         .iter()
-        .map(|tool| format!("- `{tool}`"))
+        .map(|tool| {
+            if hidden.contains(tool) {
+                format!("- `{tool}` (hidden: `load_tools` it first)")
+            } else {
+                format!("- `{tool}`")
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -225,6 +233,16 @@ fn project(input: &PromptInput<'_>) -> String {
 /// Tests for the system prompt.
 mod tests {
     use super::*;
+
+    /// The inventory marks hidden tools as needing `load_tools` first and lists the others plainly.
+    #[test]
+    fn inventory_marks_hidden_tools() {
+        let tools = ["eval".to_owned(), "read".to_owned()];
+        assert_eq!(
+            inventory(&tools, &tools[..1]),
+            "- `eval` (hidden: `load_tools` it first)\n- `read`"
+        );
+    }
     use crate::testutil::{put, scratch};
     use crate::{Locations, discover};
 
@@ -257,6 +275,7 @@ mod tests {
             environment: &environment,
             discovered: &discovered,
             tools: &tools,
+            hidden: &[],
             plan: false,
             unnamed: false,
             orchestrator: false,
@@ -301,6 +320,7 @@ mod tests {
             environment: &environment,
             discovered: &discovered,
             tools: &tools,
+            hidden: &[],
             plan: true,
             unnamed: false,
             orchestrator: false,
@@ -332,6 +352,7 @@ mod tests {
                 environment: &environment,
                 discovered: &discovered,
                 tools: &[],
+                hidden: &[],
                 plan: false,
                 unnamed: false,
                 orchestrator: false,
@@ -368,6 +389,7 @@ mod tests {
             environment: &environment,
             discovered: &discovered,
             tools: &[],
+            hidden: &[],
             plan: false,
             unnamed: false,
             orchestrator: false,
@@ -400,6 +422,7 @@ mod tests {
             environment: &environment,
             discovered: &discovered,
             tools: &tools,
+            hidden: &[],
             plan: false,
             unnamed,
             orchestrator: false,
@@ -430,6 +453,7 @@ mod tests {
             environment: &environment,
             discovered: &discovered,
             tools,
+            hidden: &[],
             plan: false,
             unnamed: false,
             orchestrator,
@@ -504,6 +528,7 @@ mod tests {
             environment: &environment,
             discovered: &discovered,
             tools: &tools,
+            hidden: &[],
             plan: true,
             unnamed: true,
             orchestrator: false,
@@ -562,6 +587,7 @@ mod tests {
             environment: &environment,
             discovered: &copied,
             tools: &tools,
+            hidden: &[],
             plan: true,
             unnamed: true,
             orchestrator: true,

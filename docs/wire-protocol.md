@@ -110,9 +110,7 @@ lines are shortened):
 {"Choose":{"ticket":1,"option":"allow"}}
 {"Tool":{"id":"toolu_01TuYTkx2rQq1MVbexcwgAye","title":null,"kind":null,"state":"Done","target":null,"diff":{"path":"calc.py","old":"def add(a, b):\n    return a - b\n","new":"def add(a, b):\n    return a + b\n"},"output":"calc.py: tag D960\n     1\tdef add(a, b):\n     2\t    return a + b","parent":null,"agent":null,"worktree":null}}
 {"Started":"Text"}
-{"Said":"Fixed `"}
-{"Said":"add"}
-{"Said":"` in `calc.py`: it returned `a - b`, and now returns `a + b`."}
+{"Said":"Fixed `add` in `calc.py`: it returned `a - b`, and now returns `a + b`."}
 {"Used":{"used":23141,"size":1000000}}
 {"Finished":null}
 "Close"
@@ -1202,17 +1200,20 @@ A new block of the agent's reply starts, of the `Part` given: `Thinking` or
 
 ### `Said`
 
-The next chunk of the agent's reply text, to append to the current `Text`
-block.
+The agent's reply text, to append to the current `Text` block. Text is held
+until the model's reply ends and then sent whole: text written in a reply that
+also calls tools is working notes, and is sent as a `Thinking` block of
+`Thought` instead, so `Said` carries only answers.
 
 ```json
-{"Said":"` in `calc.py`"}
+{"Said":"Fixed `add` in `calc.py`."}
 ```
 
 ### `Thought`
 
 The next chunk of the agent's thinking, to append to the current `Thinking`
-block.
+block, streamed as it comes; also the text of a reply that calls tools, sent
+whole once that reply ends.
 
 ```json
 {"Thought":"Look at the fixture first."}

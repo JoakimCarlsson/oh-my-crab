@@ -1,6 +1,8 @@
 //! Confinement of tool paths to the working directory and the user's scratch directory.
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::{Spill, ToolError};
 
@@ -13,6 +15,8 @@ pub struct Sandbox {
     scratch: Option<PathBuf>,
     /// Where output too long to show is saved.
     spill: Spill,
+    /// The whole-file tags the model was shown for each file, oldest first, shared by every copy of the sandbox, so that an edit that leaves the tag out of a file the model has seen as it now is, or cites a tag that was never this file's, can use the latest.
+    shown: Arc<Mutex<HashMap<PathBuf, Vec<String>>>>,
 }
 
 /// The user's scratch directory: `scratch` under the user's cache directory, which is `$XDG_CACHE_HOME` or `~/.cache` on Linux; none when the user has no cache directory.
@@ -31,7 +35,31 @@ impl Sandbox {
             root: root.as_ref().canonicalize()?,
             scratch: scratch_dir().and_then(|dir| canonicalize_existing(&dir)),
             spill: Spill::default(),
+            shown: Arc::default(),
         })
+    }
+
+    /// Notes that the model was shown `tag`, the whole-file tag of `path` as it was then.
+    pub(crate) fn note_shown(&self, path: &Path, tag: &str) {
+        let mut shown = self.shown.lock().unwrap_or_else(PoisonError::into_inner);
+        let tags = shown.entry(path.to_path_buf()).or_default();
+        tags.retain(|seen| seen != tag);
+        tags.push(tag.to_owned());
+    }
+
+    /// The tag an edit of `path` that cites `cited`, possibly nothing, is taken to mean, given `current`, the whole-file tag of the file now: the latest tag the model was shown for the file when that is the file as it now is, and `cited` names no earlier state of the file the model saw, as with a tag left out or copied from another file; otherwise `cited` as it is.
+    pub(crate) fn meant_tag<'a>(&self, path: &Path, cited: &'a str, current: &'a str) -> &'a str {
+        let shown = self.shown.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(tags) = shown.get(path) else {
+            return cited;
+        };
+        let latest_is_current = tags.last().is_some_and(|latest| latest == current);
+        let names_earlier = tags.iter().any(|seen| seen.eq_ignore_ascii_case(cited));
+        if latest_is_current && !names_earlier {
+            current
+        } else {
+            cited
+        }
     }
 
     /// The sandbox letting tools reach `scratch` besides the working directory, instead of the user's scratch directory; none lets them reach only the working directory.

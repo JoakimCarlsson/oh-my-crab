@@ -3491,7 +3491,10 @@ mod tests {
         session.finish(3, Ended::Done(second.clone()));
         assert_eq!(goal_events(&mut events), vec![("continued".into(), None)]);
         let third = tested(&second, "1 failed");
-        session.finish(4, Ended::Done(third));
+        session.finish(4, Ended::Done(third.clone()));
+        assert_eq!(goal_events(&mut events), vec![("continued".into(), None)]);
+        let fourth = tested(&third, "1 failed");
+        session.finish(5, Ended::Done(fourth));
         assert_eq!(
             goal_events(&mut events),
             vec![("Paused".into(), Some(goal::NO_PROGRESS.to_owned()))]

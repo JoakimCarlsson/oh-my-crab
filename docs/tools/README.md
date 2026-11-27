@@ -126,7 +126,7 @@ None of the three exists with the `memory` setting off or `OMC_MEMORY=0`.
 | `show`           | *Sometimes.* Puts a Mermaid diagram or a self-contained HTML prototype in front of the reader and goes on without waiting; given only to a client that set `exhibits` in `Open` | no   | yes  | [`Show`](../wire-protocol.md#show) |
 | `todo`           | Keeps the todo list the reader sees, sent to the client as `Plan`                              | no   | yes  | [troubleshooting](../troubleshooting.md) |
 | `set_title`      | *Sometimes.* Names the conversation; given only while it has no name                          | no   | yes  | [history](../concepts.md#history-saved-and-reopened-by-id) |
-| `goal`           | Reads the goal, sets the one worked out after `/guided-goal`, or ends it as achieved; nothing else ends goal mode | no   | yes  | [goals](../goals.md) |
+| `goal`           | Reads the goal, sets the one worked out after `/guided-goal`, pauses it when blocked on the reader, or ends it as achieved; nothing else ends goal mode | no   | yes  | [goals](../goals.md) |
 | `exit_plan_mode` | Hands the plan to the reader for approval and ends plan mode when approved, in the same context or a fresh one; saves every plan; refused outside it | no   | only | [plans](../concepts.md#plans) |
 | `skill`          | Loads a skill's instructions; listed even when there are no skills                             | no   | yes  | [skills](../extending/skills-and-agents.md#skills) |
 | `load_tools`     | *Sometimes.* Hands over the description and parameters of hidden tools so they can be called   | no   | yes  | [hidden tools](#hidden-tools) |
@@ -149,7 +149,9 @@ names it wants, it returns their whole descriptions and parameter schemas.
 The model then calls them by name like any other tool. Their calls are checked
 against the schema, put to the permission rules, asked about, shown to the
 hooks and scheduled exactly as calls of listed tools are; a call made without
-loading the tool first runs too, as long as its arguments fit.
+loading the tool first runs too, as long as its arguments fit. The system
+prompt's tool list names hidden tools too, each marked as needing `load_tools`
+first.
 
 Hiding never changes the tool list in the middle of a conversation, so it
 keeps the [prompt cache](../long-conversations.md#prompt-cache): the hidden
@@ -161,9 +163,12 @@ By default these are hidden:
 
 | Tool            | Why                                                        |
 | --------------- | ---------------------------------------------------------- |
+| `agent_*`       | Long-lived subagents are rare; `task` covers most delegation |
 | `ast_edit`      | Rewrites by syntax tree are rare; `edit` covers most edits |
 | `ast_grep`      | Searches by syntax tree are rare; `grep` covers most       |
 | `debug`         | Driving a debugger is rare, and its description is long    |
+| `eval`          | A kept Python or JavaScript kernel is rare; `bash` runs one-off scripts |
+| `github`        | `read` covers pull requests, issues and files; actions and searches are rare |
 | `mcp_resources` | Tool-server resources are seldom needed                    |
 | `memory_edit`   | Correcting a memory is rare                                |
 

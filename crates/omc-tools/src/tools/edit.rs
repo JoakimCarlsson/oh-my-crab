@@ -78,6 +78,8 @@ enum Kind {
     Delete,
     /// Replace a merge conflict block with one of its sides or the text.
     Resolve,
+    /// Replace the one occurrence of `find` in the line with the text, leaving the rest of the line as it is.
+    Substitute,
 }
 
 /// One operation of a section, as the model sends it.
@@ -89,12 +91,17 @@ struct Op {
     line: Option<usize>,
     /// The last line of the range, for `replace` and `delete`.
     end: Option<usize>,
-    /// The new lines, for `replace`, `insert_before` and `insert_after`, or what a `resolve` puts in place of the block.
+    /// The new lines, for `replace`, `insert_before` and `insert_after`, or what a `resolve` puts in place of the block; for `substitute`, what takes the place of `find`.
     text: Option<String>,
+    /// For `substitute`: the exact text in the line to replace, which must occur in it once.
+    find: Option<String>,
     /// The number of the merge conflict a `resolve` replaces.
     conflict: Option<usize>,
     /// The side of the conflict a `resolve` keeps.
     take: Option<Take>,
+    /// For `substitute`: replace every occurrence of `find` in the line rather than requiring exactly one.
+    #[serde(default)]
+    all: bool,
 }
 
 /// What an operation does to lines, once a `resolve` has been turned into the lines it replaces.
@@ -159,7 +166,9 @@ impl Tool for Edit {
          nothing is written; read the file again. A call either applies to every file or to \
          none. A successful edit returns the new tag and a preview of the changed lines, so you \
          can edit again without reading. An insert at line 0 puts text at the top of a file and \
-         needs no tag, so a line can be added to the top of files that were never read. The \
+         needs no tag, so a line can be added to the top of files that were never read. To \
+         change part of a long line, substitute swaps the exact text `find`, which must occur \
+         once in that line unless `all` is true, for `text`, so the rest of the line is not retyped. The \
          user is asked to approve each edit.\n\
          Merge conflicts: the resolve operation replaces the whole block of conflict N, \
          markers included, with one side or with your text; N is the number read lists the \
@@ -189,10 +198,12 @@ impl Tool for Edit {
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "op": { "type": "string", "enum": ["replace", "insert_before", "insert_after", "delete", "resolve"] },
+                                        "op": { "type": "string", "enum": ["replace", "insert_before", "insert_after", "delete", "substitute", "resolve"] },
                                         "line": { "type": "integer", "minimum": 0, "description": "The line to act on; the first line of a range. Required except for resolve. An insert at line 0, before or after, puts the text at the top of the file." },
                                         "end": { "type": "integer", "minimum": 1, "description": "Last line of the range, for replace and delete. Defaults to line." },
-                                        "text": { "type": "string", "description": "The new lines, separated by newlines, without line numbers; each newline at the end adds a blank line. Required for replace and the inserts; an empty string is one blank line, so use delete to remove lines. For resolve, the lines that replace the conflict block, instead of take." },
+                                        "text": { "type": "string", "description": "The new lines, separated by newlines, without line numbers; each newline at the end adds a blank line. Required for replace and the inserts; an empty string is one blank line, so use delete to remove lines. For substitute, what replaces find within the line. For resolve, the lines that replace the conflict block, instead of take." },
+                                        "find": { "type": "string", "description": "For substitute: the exact text within the line to replace; it must occur in that line exactly once, unless all is true." },
+                                        "all": { "type": "boolean", "description": "For substitute: replace every occurrence of find in the line, as in a rename." },
                                         "conflict": { "type": "integer", "minimum": 1, "description": "For resolve: the number of the merge conflict, as read lists them." },
                                         "take": { "type": "string", "enum": ["ours", "theirs", "base", "both"], "description": "For resolve: the side of the conflict to keep; both is ours then theirs." }
                                     },
@@ -263,7 +274,7 @@ impl Tool for Edit {
         for (item, file) in pending.iter_mut().zip(&written) {
             item.new.clone_from(&file.text);
         }
-        Ok(report(&pending, &written, &diagnostics))
+        Ok(report(&self.sandbox, &pending, &written, &diagnostics))
     }
 }
 
@@ -364,8 +375,13 @@ fn apply(sandbox: &Sandbox, args: Args) -> Result<Vec<Pending>, ToolError> {
     Ok(pending)
 }
 
-/// The result of an edit that wrote `pending`, whose files are now as `written` says, with the `diagnostics` block after the files when there is one: each file's tag and a preview of the region it changed, noting the files the language service formatted.
-fn report(pending: &[Pending], written: &[Written], diagnostics: &str) -> ToolOutput {
+/// The result of an edit that wrote `pending`, whose files are now as `written` says, with the `diagnostics` block after the files when there is one: each file's tag and a preview of the region it changed, noting the files the language service formatted. The new whole-file tags are noted in `sandbox` as shown to the model.
+fn report(
+    sandbox: &Sandbox,
+    pending: &[Pending],
+    written: &[Written],
+    diagnostics: &str,
+) -> ToolOutput {
     let mut report = Vec::new();
     let mut changes = Vec::new();
     for (item, file) in pending.iter().zip(written) {
@@ -381,7 +397,9 @@ fn report(pending: &[Pending], written: &[Written], diagnostics: &str) -> ToolOu
                  read a folded range to edit inside it)",
             )
         } else {
-            (tag(item.new.as_bytes()), "")
+            let next = tag(item.new.as_bytes());
+            sandbox.note_shown(&item.path, &next);
+            (next, "")
         };
         report.push(format!(
             "{}: tag {next}{note}{formatted}\n{}",
@@ -434,12 +452,18 @@ fn prepare(sandbox: &Sandbox, path: PathBuf, section: &Section) -> Result<Pendin
         section.generated,
         "\"generated\": true in this file's section",
     )?;
-    let cited = section.tag.trim();
+    let plain = tag(&bytes);
+    let written = section.tag.trim();
+    let cited = if is_outline_tag(written) {
+        written
+    } else {
+        sandbox.meant_tag(&path, written, &plain)
+    };
     let outlined = is_outline_tag(cited);
     let current = if outlined {
         outline_tag(&bytes)
     } else {
-        tag(&bytes)
+        plain.clone()
     };
     if cited.is_empty() && !only_tops(&section.ops) {
         return Err(ToolError::InvalidArguments(format!(
@@ -549,6 +573,7 @@ fn place(old: &str, ops: &[Op]) -> Result<Vec<Placed>, String> {
                 Kind::InsertAfter => Action::InsertAfter,
                 Kind::Delete => Action::Delete,
                 Kind::Resolve => return resolve(op, number, &conflicts, &lines),
+                Kind::Substitute => return substitute(op, number, &lines),
             };
             let line = op
                 .line
@@ -561,6 +586,77 @@ fn place(old: &str, ops: &[Op]) -> Result<Vec<Placed>, String> {
             })
         })
         .collect()
+}
+
+/// Turns the `substitute` operation `op`, number `number`, into the replace of its line, among `lines`, with the line's one occurrence of `find` swapped for `text`.
+///
+/// # Errors
+///
+/// Returns a message when the line, `find` or `text` is missing, the line is outside the file, or `find` does not occur in the line exactly once.
+fn substitute(op: &Op, number: usize, lines: &[&str]) -> Result<Placed, String> {
+    let line = op
+        .line
+        .ok_or_else(|| format!("operation {number} needs line"))?;
+    let find = op
+        .find
+        .as_deref()
+        .filter(|find| !find.is_empty())
+        .ok_or_else(|| format!("operation {number}: substitute needs find"))?;
+    let text = op
+        .text
+        .as_deref()
+        .ok_or_else(|| format!("operation {number} needs text"))?;
+    let current = line
+        .checked_sub(1)
+        .and_then(|index| lines.get(index))
+        .ok_or_else(|| format!("operation {number}: line {line} is outside the file"))?;
+    let starts = occurrences(current, find);
+    let chosen = match starts.len() {
+        0 => {
+            return Err(format!(
+                "operation {number}: line {line} does not contain {find:?}; it is {current:?}"
+            ));
+        }
+        1 => &starts[..],
+        _ if op.all => &starts[..],
+        count => {
+            return Err(format!(
+                "operation {number}: {find:?} occurs {count} times in line {line}; give a longer find that occurs once, or all: true to replace every one"
+            ));
+        }
+    };
+    let mut swapped = String::with_capacity(current.len() + text.len());
+    let mut from = 0;
+    for &start in chosen {
+        swapped.push_str(&current[from..start]);
+        swapped.push_str(text);
+        from = start + find.len();
+    }
+    swapped.push_str(&current[from..]);
+    Ok(Placed {
+        action: Action::Replace,
+        line,
+        end: None,
+        text: Some(swapped),
+    })
+}
+
+/// Where `find` starts in `line`. A `find` that starts and ends with a word character counts only where it stands as a whole word, so that `Item` is not found inside `Items`, unless it occurs nowhere as a whole word; then every occurrence counts.
+fn occurrences(line: &str, find: &str) -> Vec<usize> {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let all: Vec<usize> = line.match_indices(find).map(|(start, _)| start).collect();
+    let wordy = find.starts_with(word) && find.ends_with(word);
+    if !wordy {
+        return all;
+    }
+    let whole: Vec<usize> = all
+        .iter()
+        .copied()
+        .filter(|&start| {
+            !line[..start].ends_with(word) && !line[start + find.len()..].starts_with(word)
+        })
+        .collect();
+    if whole.is_empty() { all } else { whole }
 }
 
 /// Turns the `resolve` operation `op`, number `number`, into the replace or
@@ -945,12 +1041,13 @@ mod tests {
         }
     }
 
-    /// A section of inserts at line 0 needs no tag, also for a file that was never read, while any other operation without a tag is refused and writes nothing.
+    /// A section of inserts at line 0 needs no tag, also for a file that was never read, while any other operation without a tag on a file the model was never shown is refused and writes nothing.
     #[tokio::test]
     async fn inserts_at_the_top_need_no_tag() {
         let (tool, dir) = tool("edit-top-untagged");
         put(&dir, "a.txt", "a\n");
         put(&dir, "b.txt", "b\n");
+        put(&dir, "c.txt", "c\n");
         let args = json!({ "files": [
             { "path": "a.txt", "ops": [{ "op": "insert_before", "line": 0, "text": "top" }] },
             { "path": "b.txt", "ops": [{ "op": "insert_after", "line": 0, "text": "top" }] }
@@ -961,12 +1058,62 @@ mod tests {
         assert_eq!(get(&dir, "b.txt"), "top\nb\n");
         let refused = tool
             .call(json!({ "files": [
-                { "path": "a.txt", "ops": [{ "op": "insert_after", "line": 1, "text": "x" }] }
+                { "path": "c.txt", "ops": [{ "op": "insert_after", "line": 1, "text": "x" }] }
             ]}))
             .await
             .unwrap_err();
         assert!(refused.to_string().contains("needs the tag"));
-        assert_eq!(get(&dir, "a.txt"), "top\na\n");
+        assert_eq!(get(&dir, "c.txt"), "c\n");
+    }
+
+    /// A substitute swaps the one occurrence of its find in the line and keeps the rest of the line; a find that is missing or occurs twice is refused and writes nothing.
+    #[tokio::test]
+    async fn substitute_swaps_text_within_a_line() {
+        let (tool, dir) = tool("edit-substitute");
+        let t = put(
+            &dir,
+            "f.json",
+            "{\"a\": {\"output\": 128, \"cost\": {\"output\": 5}},\n\"b\": 1}\n",
+        );
+        let swap = |find: &str| json!([{ "op": "substitute", "line": 1, "find": find, "text": "\"output\": 256, \"cost\"" }]);
+        let twice = tool
+            .call(call(
+                "f.json",
+                &t,
+                json!([{ "op": "substitute", "line": 1, "find": "\"output\"", "text": "x" }]),
+            ))
+            .await;
+        assert!(matches!(twice, Err(ToolError::Failed(m)) if m.contains("occurs 2 times")));
+        let t2 = put(&dir, "g.txt", "Foo(Foo)\nFoo\n");
+        tool.call(call(
+            "g.txt",
+            &t2,
+            json!([{ "op": "substitute", "line": 1, "find": "Foo", "text": "Bar", "all": true }]),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(get(&dir, "g.txt"), "Bar(Bar)\nFoo\n");
+        let t3 = put(&dir, "h.rs", "Message::ToolResults(vec![ToolResult {\n");
+        tool.call(call(
+            "h.rs",
+            &t3,
+            json!([{ "op": "substitute", "line": 1, "find": "ToolResult", "text": "ToolOutcome" }]),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            get(&dir, "h.rs"),
+            "Message::ToolResults(vec![ToolOutcome {\n"
+        );
+        let missing = tool.call(call("f.json", &t, swap("nope"))).await;
+        assert!(matches!(missing, Err(ToolError::Failed(m)) if m.contains("does not contain")));
+        tool.call(call("f.json", &t, swap("\"output\": 128, \"cost\"")))
+            .await
+            .unwrap();
+        assert_eq!(
+            get(&dir, "f.json"),
+            "{\"a\": {\"output\": 256, \"cost\": {\"output\": 5}},\n\"b\": 1}\n"
+        );
     }
 
     /// Deleting a line and a range removes exactly those lines, with line numbers from the original file.
@@ -1064,6 +1211,41 @@ mod tests {
             .await;
         assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
         assert_eq!(get(&dir, "f.txt"), "a\n");
+    }
+
+    /// A section that leaves the tag out of a file the model read, or cites a tag that was never this file's, uses the tag it was last shown while the file is still as it was then; a tag of an earlier state of the file the model saw is stale, and once the file changes on disk the left-out tag is rejected again.
+    #[tokio::test]
+    async fn a_left_out_tag_of_a_file_read_as_it_is_is_used() {
+        let dir = scratch("edit-shown-tag");
+        let sandbox = Sandbox::new(&dir).unwrap();
+        let tool = Edit::new(sandbox.clone());
+        let first = put(&dir, "f.txt", "a\nb\n");
+        crate::tools::Read::new(sandbox)
+            .call(json!({ "path": "f.txt" }))
+            .await
+            .unwrap();
+        let untagged = |line: u64, text: &str| json!({ "files": [{ "path": "f.txt", "ops": [{ "op": "replace", "line": line, "text": text }] }] });
+        tool.call(untagged(1, "A")).await.unwrap();
+        tool.call(call(
+            "f.txt",
+            "FFFF",
+            json!([{ "op": "replace", "line": 2, "text": "B" }]),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(get(&dir, "f.txt"), "A\nB\n");
+        let stale = tool
+            .call(call(
+                "f.txt",
+                &first,
+                json!([{ "op": "replace", "line": 1, "text": "x" }]),
+            ))
+            .await;
+        assert!(matches!(stale, Err(ToolError::Failed(m)) if m.contains("has changed")));
+        std::fs::write(dir.join("f.txt"), "changed\n").unwrap();
+        let result = tool.call(untagged(1, "x")).await;
+        assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+        assert_eq!(get(&dir, "f.txt"), "changed\n");
     }
 
     /// When one of several files fails, none of them changes.

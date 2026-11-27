@@ -1,4 +1,4 @@
-//! A goal the agent keeps working toward across turns: the reader sets it with `/goal`, a reminder of it opens every turn, and after each turn that ends with it open crab starts the next one itself, until the agent says it is done, two turns in a row make no progress, or its token budget runs out.
+//! A goal the agent keeps working toward across turns: the reader sets it with `/goal`, a reminder of it opens every turn, and after each turn that ends with it open crab starts the next one itself, until the agent says it is done, two turns crab started in a row make no progress, or its token budget runs out.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -25,8 +25,14 @@ pub(crate) const GUIDED_COMMAND: &str = "guided-goal";
 /// The name of the tool the agent ends the goal with.
 pub(crate) const GOAL_TOOL: &str = "goal";
 
-/// Why a goal paused when two turns crab started in a row did the same thing, or nothing.
-pub(crate) const NO_PROGRESS: &str = "no progress: the last turn made no tool calls, or the same calls with the same results as the turn before it";
+/// Why a goal paused when two turns crab started in a row each did the same as the turn before them, or nothing.
+pub(crate) const NO_PROGRESS: &str = "no progress: two turns in a row made no tool calls, or repeated the same calls with the same results";
+
+/// How many turns crab started in a row may make no progress before the goal pauses.
+const MAX_STALLS: u8 = 2;
+
+/// What opens the prompt of the turn crab starts after a turn that made no progress.
+const STALLED: &str = "<harness-notice>\nYour last turn made no tool calls, or repeated the calls of the turn before it, and the goal is not complete. Stopping to report, summarize or ask whether to go on does not end goal mode. Make the next tool call the objective needs now. Only when you are truly blocked on something only the reader can give, call `goal` with `block` and a `reason` naming it.\n</harness-notice>";
 
 /// Why a goal paused when the reader stopped a turn.
 pub(crate) const STOPPED: &str = "the reader stopped the turn";
@@ -68,6 +74,8 @@ struct Held {
     continuing: bool,
     /// What the tool calls of the last turn crab started came to, when it made any.
     last: Option<u64>,
+    /// How many turns crab started in a row made no tool calls, or the same calls with the same results as the turn before.
+    stalls: u8,
     /// Whether the reader asked the agent to set the goal with them, so that the agent may create it.
     interviewing: bool,
     /// What the reviewer objected to when it refused the agent's first completion of the goal; once set, the next completion is not reviewed.
@@ -133,6 +141,7 @@ impl Goals {
             held.interviewing = true;
             held.continuing = false;
             held.last = None;
+            held.stalls = 0;
             let goal = held
                 .goal
                 .as_mut()
@@ -206,6 +215,7 @@ impl Goals {
             held.wrap_up = WrapUp::NotDue;
             held.continuing = false;
             held.last = None;
+            held.stalls = 0;
             Ok(goal)
         })
     }
@@ -324,6 +334,7 @@ impl Goals {
             let goal = goal.clone();
             held.continuing = false;
             held.last = None;
+            held.stalls = 0;
             Ok(goal)
         })
     }
@@ -333,12 +344,13 @@ impl Goals {
         self.with(|held| {
             held.continuing = false;
             held.last = None;
+            held.stalls = 0;
         });
     }
 
     /// What crab does after a turn whose tool calls and results came to `digest`, `None` when it made none, ended with no prompt of the reader's waiting.
     ///
-    /// While the goal is active crab starts another turn, unless the turn was one crab started and made no tool calls, or the same calls with the same results as the turn crab started before it: then the goal pauses. Once the budget is used up, a turn is started to tell the agent to wrap up when it was not told during the turn, and then nothing more.
+    /// While the goal is active crab starts another turn. A turn crab started that made no tool calls, or the same calls with the same results as the turn crab started before it, is a stall: the next turn's prompt says so, and the goal pauses once [`MAX_STALLS`] turns in a row stalled. Once the budget is used up, a turn is started to tell the agent to wrap up when it was not told during the turn, and then nothing more.
     pub(crate) fn after_turn(&self, digest: Option<u64>) -> Next {
         self.with(|held| {
             let Some(goal) = held.goal.as_mut() else {
@@ -352,16 +364,25 @@ impl Goals {
                 }
                 GoalState::Active => {
                     let stalled = held.continuing && (digest.is_none() || digest == held.last);
-                    if stalled {
+                    held.stalls = if stalled { held.stalls + 1 } else { 0 };
+                    if held.stalls >= MAX_STALLS {
                         goal.state = GoalState::Paused;
                         goal.note = Some(NO_PROGRESS.to_owned());
                         held.continuing = false;
                         held.last = None;
+                        held.stalls = 0;
                         return Next::Halt(goal.clone());
                     }
-                    held.last = if held.continuing { digest } else { None };
+                    if !stalled {
+                        held.last = if held.continuing { digest } else { None };
+                    }
                     held.continuing = true;
-                    Next::Continue(continuation(goal))
+                    let prompt = continuation(goal);
+                    Next::Continue(if stalled {
+                        format!("{STALLED}\n\n{prompt}")
+                    } else {
+                        prompt
+                    })
                 }
                 _ => {
                     held.continuing = false;
@@ -408,7 +429,7 @@ pub(crate) fn described(goal: &Goal) -> String {
 /// The reminder of `goal` a turn's prompt starts with.
 fn reminder(goal: &Goal) -> String {
     format!(
-        "<goal>\nGoal mode is on. The objective: {}\n{}. Keep working until the objective is fully achieved, never a smaller version of it. Once you have checked with real evidence that it is achieved, call the `goal` tool with `complete` and a summary of that evidence; nothing else ends goal mode.\n</goal>",
+        "<goal>\nGoal mode is on. The objective: {}\n{}. Keep working until the whole objective is achieved: never redefine success as a smaller, easier or already-done part of it, and treat a part you have no current evidence for as not done. Do not end a turn to report progress or to ask whether to go on: keep making tool calls; the conversation is compacted as it fills, so context is never a reason to stop. Once you have checked with real evidence, as wide as the claim, that it is achieved, call the `goal` tool with `complete` and a summary of that evidence. When the next step needs something only the reader can give, call `goal` with `block` and a `reason` instead of asking or waiting.\n</goal>",
         goal.objective,
         usage(goal)
     )
@@ -437,14 +458,14 @@ pub(crate) fn interview(idea: &str) -> String {
 /// The prompt crab starts the first turn toward `objective` with.
 pub(crate) fn opening(objective: &str) -> String {
     format!(
-        "Work toward this goal until it is fully achieved: {objective}\n\nStart by saying what done means for it and how you will check it, then work. When it is achieved and you have checked it, call the `goal` tool with `complete` and a summary of the evidence."
+        "Work toward this goal until it is fully achieved: {objective}\n\nWork through every step without stopping to report. When it is achieved and you have checked it, call the `goal` tool with `complete` and a summary of the evidence."
     )
 }
 
 /// The prompt of a turn crab starts itself to keep working toward `goal`.
 pub(crate) fn continuation(goal: &Goal) -> String {
     format!(
-        "Keep working toward the goal: {}\n\nBefore anything else, audit where it stands:\n1. Say what done means for the objective, concretely.\n2. Check the current state against it with real evidence: run the tests, builds or commands that show it, rather than trusting what earlier turns said.\n3. List what is still missing or failing.\n4. When nothing is missing and you checked it in this turn, call `goal` with `complete` and a summary of the evidence.\n5. Otherwise take the next concrete step and carry it out; do not stop to ask whether to go on.\n6. When you are blocked on something only the reader can give, say exactly what and end the turn without calling tools; goal mode then pauses.\n\n{}.",
+        "Keep working toward the goal: {}\n\nBefore anything else, audit where it stands, in your thinking rather than in text:\n1. Work out what done means for the objective, concretely.\n2. Check the current state against it with real evidence: run the tests, builds or commands that show it, rather than trusting what earlier turns said.\n3. Note what is still missing or failing.\n4. When nothing is missing and you checked it in this turn, call `goal` with `complete` and a summary of the evidence.\n5. Otherwise take the next concrete step and carry it out, then the one after it; do not stop to report or to ask whether to go on.\n6. Only when you are blocked on something only the reader can give, call `goal` with `block` and a `reason` naming exactly what.\n\n{}.",
         goal.objective,
         usage(goal)
     )
@@ -630,7 +651,7 @@ pub(crate) struct GoalTool {
 }
 
 /// What the `goal` tool says it does.
-const GOAL_DESCRIPTION: &str = "Read, create or end the goal the reader set with /goal. While goal mode is on, crab keeps starting turns toward the goal; only `complete` ends it.\n- `status`: the objective, how it stands and how much of its token budget is used.\n- `create` with `objective`, and `budget` when the reader gave one: sets the goal you worked out with the reader; only after they asked for it with /guided-goal.\n- `complete` with `summary`: the objective is fully achieved and you checked it with real evidence in this conversation, such as tests or builds you ran; the summary gives that evidence. Never call it to stop early, for a smaller version of the objective, or because the budget ran out.";
+const GOAL_DESCRIPTION: &str = "Read, create, pause or end the goal the reader set with /goal. While goal mode is on, crab keeps starting turns toward the goal; only `complete` ends it.\n- `status`: the objective, how it stands and how much of its token budget is used.\n- `create` with `objective`, and `budget` when the reader gave one: sets the goal you worked out with the reader; only after they asked for it with /guided-goal.\n- `block` with `reason`: pauses goal mode because the next step needs something only the reader can give, such as a secret, an account, a decision or hardware; `reason` names exactly what. Never call it for something you can find, build or work around yourself.\n- `complete` with `summary`: the objective is fully achieved and you checked it with real evidence in this conversation, such as tests or builds you ran; the summary gives that evidence. Never call it to stop early, for a smaller version of the objective, or because the budget ran out.";
 
 #[async_trait]
 impl Tool for GoalTool {
@@ -644,14 +665,15 @@ impl Tool for GoalTool {
         GOAL_DESCRIPTION
     }
 
-    /// The tool takes an operation and, to complete the goal, a summary.
+    /// The tool takes an operation and what that operation needs.
     fn schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "op": { "type": "string", "enum": ["status", "create", "complete"] },
+                "op": { "type": "string", "enum": ["status", "create", "block", "complete"] },
                 "objective": { "type": "string", "description": "For `create`: the goal, laid out with Objective, Success criteria, Verification, Boundaries and Stop conditions." },
                 "budget": { "type": "integer", "description": "For `create`: the most tokens the goal may use, when the reader gave a budget." },
+                "reason": { "type": "string", "description": "For `block`: exactly what only the reader can give." },
                 "summary": { "type": "string", "description": "For `complete`: what was achieved and the evidence that it was." },
             },
             "required": ["op"],
@@ -667,16 +689,17 @@ impl Tool for GoalTool {
     fn describe(&self, args: &Value) -> String {
         match args["op"].as_str() {
             Some("complete") => "complete the goal".to_owned(),
+            Some("block") => "pause the goal: blocked".to_owned(),
             Some("create") => "set the goal".to_owned(),
             _ => "read the goal".to_owned(),
         }
     }
 
-    /// Reads the goal, or ends it as achieved and tells the client. The first completion of a goal is reviewed when there is a reviewer; a refusal keeps the goal open, and the next completion is accepted with the reviewer's objections in its note.
+    /// Reads the goal, pauses it when the agent is blocked on the reader, or ends it as achieved, telling the client of a change. The first completion of a goal is reviewed when there is a reviewer; a refusal keeps the goal open, and the next completion is accepted with the reviewer's objections in its note.
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Failed`] when there is no goal, it is not being worked toward, the operation is unknown, `complete` comes without a summary, or the reviewer refused the completion.
+    /// Returns [`ToolError::Failed`] when there is no goal, it is not being worked toward, the operation is unknown, `block` comes without a reason, `complete` comes without a summary, or the reviewer refused the completion.
     async fn call(&self, args: Value) -> Result<ToolOutput, ToolError> {
         let goals = &self.shared.goals;
         match args["op"].as_str() {
@@ -701,6 +724,25 @@ impl Tool for GoalTool {
                     usage(&goal)
                 )))
             }
+            Some("block") => {
+                let reason = args["reason"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|reason| !reason.is_empty())
+                    .ok_or_else(|| {
+                        ToolError::Failed(
+                            "`block` needs a `reason` naming what only the reader can give"
+                                .to_owned(),
+                        )
+                    })?;
+                let goal = goals.pause(&format!("blocked: {reason}")).ok_or_else(|| {
+                    ToolError::Failed("no goal is being worked toward".to_owned())
+                })?;
+                self.shared.announce_goal(&goal);
+                Ok(ToolOutput::new(
+                    "Goal mode is paused until the reader resumes it with /goal resume. End this turn now with one line to the reader naming exactly what you need from them.",
+                ))
+            }
             Some("complete") => {
                 let summary = args["summary"]
                     .as_str()
@@ -721,12 +763,12 @@ impl Tool for GoalTool {
                 let goal = goals.complete(summary).map_err(ToolError::Failed)?;
                 self.shared.announce_goal(&goal);
                 Ok(ToolOutput::new(format!(
-                    "The goal is complete and goal mode is off. {}. Finish this turn by telling the reader what was achieved.",
+                    "The goal is complete and goal mode is off. {}. Finish this turn with at most two lines to the reader: that it is done and the evidence. Plain text: no bold, headings or bullet lists, no change-by-change recap.",
                     usage(&goal)
                 )))
             }
             other => Err(ToolError::Failed(format!(
-                "`op` is status, create or complete, not {}",
+                "`op` is status, create, block or complete, not {}",
                 other.unwrap_or("missing")
             ))),
         }

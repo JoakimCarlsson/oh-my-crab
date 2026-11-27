@@ -105,7 +105,7 @@ fn finds_what_a_turn_added() {
     assert_eq!(added(5, &after).len(), 3);
 }
 
-/// While the goal is active crab goes on after every turn, and pauses once two turns it started in a row did the same, or nothing; the reader speaking judges the next turns afresh.
+/// While the goal is active crab goes on after every turn, and pauses once two turns it started in a row each did the same as the turn before them, or nothing; the turn after a first stall is told so, and the reader speaking judges the next turns afresh.
 #[test]
 fn goes_on_until_two_turns_make_no_progress() {
     let goals = Goals::default();
@@ -113,14 +113,21 @@ fn goes_on_until_two_turns_make_no_progress() {
     assert!(matches!(goals.after_turn(Some(1)), Next::Continue(_)));
     assert!(matches!(goals.after_turn(Some(2)), Next::Continue(_)));
     assert!(matches!(goals.after_turn(Some(3)), Next::Continue(_)));
+    let Next::Continue(nudged) = goals.after_turn(Some(3)) else {
+        panic!("one repeated turn should be told, not stopped");
+    };
+    assert!(nudged.starts_with("<harness-notice>"));
     let Next::Halt(goal) = goals.after_turn(Some(3)) else {
-        panic!("the same calls twice should stop it");
+        panic!("the same calls three times should stop it");
     };
     assert_eq!(goal.state, GoalState::Paused);
     assert_eq!(goal.note.as_deref(), Some(NO_PROGRESS));
     assert_eq!(goals.after_turn(Some(4)), Next::Rest);
 
     goals.resume().unwrap();
+    assert!(matches!(goals.after_turn(None), Next::Continue(_)));
+    assert!(matches!(goals.after_turn(None), Next::Continue(_)));
+    assert!(matches!(goals.after_turn(Some(7)), Next::Continue(_)));
     assert!(matches!(goals.after_turn(None), Next::Continue(_)));
     assert!(matches!(goals.after_turn(None), Next::Halt(_)));
 

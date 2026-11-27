@@ -869,7 +869,7 @@ mod tests {
             .unwrap();
         assert!(read.text.contains("outside data"), "{}", read.text);
         let wrote = copy
-            .call(json!({ "command": "touch made.txt; python3 -c \"open('made2.txt', 'w')\"; echo hi > made3.txt" }))
+            .call(json!({ "command": "touch made.txt; python3 -c \"open('made2.txt', 'w')\"; date > made3.txt" }))
             .await
             .unwrap();
         assert!(!wrote.text.contains("exit code: 0"), "{}", wrote.text);

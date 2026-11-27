@@ -123,6 +123,8 @@ impl Tool for Write {
         .await
         .map_err(|e| ToolError::Failed(e.to_string()))??;
         let diagnostics = settle(&self.languages, std::slice::from_mut(&mut file)).await;
+        self.sandbox
+            .note_shown(&file.path, &tag(file.text.as_bytes()));
         if file.formatted {
             text.push_str(&format!(
                 "; formatted by the language server to {} bytes, tag {}",

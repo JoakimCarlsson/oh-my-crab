@@ -249,8 +249,16 @@ impl Tool for Read {
         let sandbox = self.sandbox.clone();
         tokio::task::spawn_blocking(move || {
             let (path, label, note) = lookalike::redirect(&sandbox, path, label)?;
-            read_path(&path, &label, &selector, outline)
-                .map(|output| lookalike::noted(output, note))
+            let output = read_path(&path, &label, &selector, outline)?;
+            if let Some(shown) = output
+                .text
+                .strip_prefix("[tag ")
+                .and_then(|rest| rest.split(']').next())
+                .filter(|shown| !crate::tools::snapshot::is_outline_tag(shown))
+            {
+                sandbox.note_shown(&path, shown);
+            }
+            Ok(lookalike::noted(output, note))
         })
         .await
         .map_err(|e| ToolError::Failed(e.to_string()))?

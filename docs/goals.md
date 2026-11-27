@@ -69,8 +69,8 @@ held to it by its prompts, and crab does not run it.
   the next turn itself and tells the client with a
   [`Continued`](wire-protocol.md#continued) event carrying the prompt and the id of the turn. That
   prompt asks the agent to audit where the objective stands with real
-  evidence, list what is missing, take the next step, and end the turn without
-  calling tools when only the reader can unblock it. The prompt is saved as the
+  evidence, list what is missing, take the next step, and call `goal` with
+  `block` when only the reader can unblock it. The prompt is saved as the
   turn's, so the conversation reads back as turns like any other.
 - A prompt the reader sends while a turn runs waits for it and starts the next
   turn instead, as any queued prompt does; crab goes on after that turn.
@@ -90,13 +90,16 @@ held to it by its prompts, and crab does not run it.
   takes over three minutes or answers with nothing readable accepts the
   completion.
 - **No progress.** crab digests the tool calls each turn made, with their
-  arguments and results. When a turn crab started made no tool calls, or the
-  same calls with the same results as the turn crab started before it, the goal
+  arguments and results. A turn crab started that made no tool calls, or the
+  same calls with the same results as the turn crab started before it, is a
+  stall: the next turn's prompt opens with a notice telling the agent so and to
+  make the next call now. When two turns crab started stall in a row, the goal
   pauses with a note saying so. A prompt from the reader starts the judging
-  afresh. A turn that only announces what the agent will do next, with no
-  call, is followed up inside the turn with a notice to act now, as any turn
-  is (see [When things go wrong](troubleshooting.md)), so a promise alone
-  neither ends the turn nor counts as progress.
+  afresh.
+- **Blocked.** When the next step needs something only the reader can give,
+  such as a secret or a decision, the agent calls `goal` with `block` and a
+  `reason`. The goal pauses at once with `blocked: <reason>` as its note, and
+  no further turn starts until `/goal resume`.
 - **Budget.** The budget counts the input, output and cache writes of every
   request while the goal is active, subagents and summaries included; cache
   reads, and the requests that keep the cache warm between turns, are not
@@ -112,6 +115,7 @@ held to it by its prompts, and crab does not run it.
 The main agent has the `goal` tool in every conversation, so that the tool
 list never changes when a goal is set. `status` reads the objective, its state
 and its budget; `create` sets the goal worked out after `/guided-goal`, and is
-refused otherwise; `complete` with `summary` ends it as achieved, and is refused
+refused otherwise; `block` with `reason` pauses it (see
+[How it ends](#how-it-ends)); `complete` with `summary` ends it as achieved, and is refused
 when no goal is being worked toward, and once when a review rejects it (see
 [How it ends](#how-it-ends)). Subagents and scripts do not get it.

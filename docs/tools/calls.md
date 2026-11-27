@@ -87,9 +87,19 @@ delimiter quoted, or no `$`, backtick or backslash in the body) is not run; the
 result names the call that does the same (`read` with `path:1-` or a line
 range, or `write`). Every word must be literal, every path inside the working
 directory, every file text rather than binary, and every option one the tool
-reproduces. Everything else runs: searches with `grep` or `rg`, `find`,
-`ls -R` and `sed -i` (the dedicated tools skip ignored and binary files, match
-only files, or replace exact text, so their results differ), appending with
-`>>`, other options, pipelines, lists and commands sent to the background with
-`&`. Such a command runs with a one-line tip naming the tool when it starts a
-pipeline. Set `OMC_BASH_INTERCEPT=0` to run every command.
+reproduces.
+
+A whole command line is also turned away, wherever the command stands in it,
+when any command edits a file inside the working directory through the shell:
+`sed -i` or `perl -i` on such a file, also through `xargs` or `find -exec`
+(only files outside the working directory are let through), `echo` or `printf` writing or appending
+to one, a `cat` or `tee` fed by a here-document or here-string writing to one,
+and `python`, `node`, `ruby`, `perl` and similar interpreters running inline
+code (`-c`, `-e` or fed on standard input) that writes files. The result points
+to `edit`, `ast_edit` or `write`. Programs that generate a file, such as
+`cargo run > out.txt`, still run.
+
+Everything else runs: searches with `grep` or `rg`, `find`, `ls -R`, other
+options, pipelines, lists and commands sent to the background with `&`. Such a
+command runs with a one-line tip naming the tool when it starts a pipeline.
+Set `OMC_BASH_INTERCEPT=0` to run every command.

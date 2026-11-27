@@ -1,6 +1,10 @@
 //! Steering the model from shell commands to the dedicated tool that does the same job better.
 //!
-//! A command is turned away only when a dedicated tool gives exactly the same result: `cat`, `less` or `more` of a few text files, `head` or `tail` of a number of lines of one text file, and `echo`, `printf` or a `cat` here-document whose text the shell does not expand, written over one file. Every word must be literal, every path must lie inside the working directory, every option must be one the dedicated tool reproduces, and the line must be that one command alone, with no control operator and not sent to the background. Anything else runs. Searches with `grep` or `rg`, `find` by name, `ls -R`, `sed -i` and appending to a file run too, since the dedicated tools differ from them in what they see or do, and such a command, like a command that would be turned away when it stands inside a pipeline or a list, runs with a one-line tip naming the tool.
+//! A command is turned away when a dedicated tool gives exactly the same result: `cat`, `less` or `more` of a few text files, `head` or `tail` of a number of lines of one text file, and `echo`, `printf` or a `cat` here-document whose text the shell does not expand, written over one file. Every word must be literal, every path must lie inside the working directory, every option must be one the dedicated tool reproduces, and the line must be that one command alone, with no control operator and not sent to the background.
+//!
+//! A whole line is also turned away when any command in it edits a file inside the working directory through the shell, wherever it stands: `sed -i` or `perl -i` on such a file, `echo`, `printf` or a `cat` or `tee` fed by a here-document writing or appending to one, and `python`, `node`, `ruby`, `perl` and the like running inline code that writes files. Such edits skip the snapshot checks of `edit` and show no change, so they are sent to `edit`, `ast_edit` or `write`.
+//!
+//! Anything else runs. Searches with `grep` or `rg`, `find` by name and `ls -R` run too, since the dedicated tools differ from them in what they see, and such a command, like a command that would be turned away when it stands inside a pipeline or a list, runs with a one-line tip naming the tool.
 
 use std::io::Read as _;
 
@@ -24,15 +28,25 @@ const GREP_TIP: &str = "[tip: the `grep` tool searches file contents too, skippi
 /// The tip for finding or listing files by name.
 const GLOB_TIP: &str = "[tip: the `glob` tool finds files by name, skipping ignored files and listing the newest first]";
 
-/// The tip for editing a file in place.
-const SED_TIP: &str = "[tip: for a targeted change, the `edit` tool checks the lines against a `read` snapshot and shows the change]";
+/// Programs that run code given inline, with `-c` or `-e` or fed on standard input.
+const INTERPRETERS: &[&str] = &[
+    "python", "python2", "python3", "pypy", "pypy3", "node", "nodejs", "bun", "deno", "ruby",
+    "perl", "php", "lua",
+];
 
-/// The tip for appending to a file that exists.
-const APPEND_TIP: &str = "[tip: to add to an existing file, `edit` with `insert_after` on its last line shows the change]";
-
-/// The tip for appending to a file that does not exist yet.
-const CREATE_TIP: &str =
-    "[tip: the `write` tool creates a file from its whole text, with no shell quoting in the way]";
+/// Calls whose presence in inline code means it writes a file, beside `open(` together with `.write(`.
+const WRITE_CALLS: &[&str] = &[
+    ".write_text(",
+    ".write_bytes(",
+    "writeFileSync(",
+    "writeFile(",
+    "appendFileSync(",
+    "File.write(",
+    "file_put_contents(",
+    "Bun.write(",
+    "Deno.writeTextFile(",
+    "fileinput.input(",
+];
 
 /// What to do with a command line.
 #[derive(Debug, PartialEq, Eq)]
@@ -66,6 +80,17 @@ pub(super) fn check(command: &str, sandbox: &Sandbox) -> Verdict {
             redirection.reason, redirection.advice
         ));
     }
+    let paths = Paths(sandbox);
+    if let Some(how) = line
+        .pipelines
+        .iter()
+        .flat_map(|pipeline| &pipeline.stages)
+        .find_map(|simple| scripted_edit(simple, &paths))
+    {
+        return Verdict::Refuse(format!(
+            "Not run, nothing on this line ran: it edits a file in the working directory through the shell ({how}), which skips the snapshot checks and shows no change. Use `edit` for changes to an existing file (read it first for its tag), `ast_edit` for the same change at many sites, and `write` for a new file or a whole rewrite. A program that generates a file may still write it, such as `cargo run > out.txt`."
+        ));
+    }
     if line.unusual {
         return Verdict::Run;
     }
@@ -74,6 +99,108 @@ pub(super) fn check(command: &str, sandbox: &Sandbox) -> Verdict {
         .filter_map(|pipeline| pipeline.stages.first())
         .find_map(|first| tip(first, sandbox))
         .map_or(Verdict::Run, Verdict::Hint)
+}
+
+/// The in-place editor, `sed` or `perl`, that `words` run on files inside the working directory, as the program or as the command of a wrapper such as `xargs` or `find -exec`; nothing when there is none, or when it is given only files outside the working directory.
+fn in_place_editor<'a>(words: &'a [Word], paths: &Paths) -> Option<&'a str> {
+    words.iter().enumerate().find_map(|(at, word)| {
+        let editor = program_name(word);
+        let operands: Vec<&Word> = words[at + 1..]
+            .iter()
+            .take_while(|word| !matches!(word.text.as_str(), ";" | "+" | "{}"))
+            .collect();
+        let options: Vec<&str> = operands.iter().map(|word| word.text.as_str()).collect();
+        let in_place = match editor {
+            "sed" => edits_in_place(&options),
+            "perl" => options
+                .iter()
+                .any(|word| short_options(word).is_some_and(|letters| letters.contains('i'))),
+            _ => false,
+        };
+        if !in_place {
+            return None;
+        }
+        let inside_file = operands.iter().any(|word| {
+            paths
+                .inside(&word.text)
+                .is_some_and(|resolved| resolved.is_file() || (!word.literal && !resolved.is_dir()))
+        });
+        let outside = operands.iter().any(|word| {
+            let pathlike = word.text.starts_with(['/', '~']) || word.text.starts_with("..");
+            pathlike && paths.inside(&word.text).is_none()
+        });
+        (inside_file || !outside).then_some(editor)
+    })
+}
+
+/// How `simple` edits a file inside the working directory through the shell, in a few words, when it does: an in-place `sed` or `perl`, also run by `xargs` or `find -exec`, text written into a file by `echo`, `printf` or a here-document, or inline interpreter code that writes files.
+fn scripted_edit(simple: &Simple, paths: &Paths) -> Option<String> {
+    if let Some(editor) = in_place_editor(simple.invocation(), paths) {
+        return Some(format!("`{editor} -i`"));
+    }
+    let (program, words) = simple.invocation().split_first()?;
+    let arguments: Vec<&str> = words.iter().map(|word| word.text.as_str()).collect();
+    let program = program_name(program);
+    let here_doc = simple
+        .redirects
+        .iter()
+        .any(|redirect| redirect.is_here_doc() || redirect.operator.ends_with("<<<"));
+    let writes_text = match program {
+        "echo" | "printf" => true,
+        "cat" => here_doc && arguments.iter().all(|word| word.starts_with('-')),
+        "tee" => here_doc,
+        _ => false,
+    };
+    let into_file = simple.redirects.iter().any(|redirect| {
+        redirect.writes_stdout()
+            && redirect
+                .target
+                .as_ref()
+                .is_some_and(|target| paths.file_inside(&target.text))
+    });
+    let tee_file = program == "tee"
+        && arguments
+            .iter()
+            .any(|word| !word.starts_with('-') && paths.file_inside(word));
+    if writes_text && (into_file || tee_file) {
+        return Some(format!("`{program}` writing into a file"));
+    }
+    let interpreter = program.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    if INTERPRETERS.contains(&program) || INTERPRETERS.contains(&interpreter) {
+        let inline = arguments
+            .iter()
+            .zip(arguments.iter().skip(1))
+            .filter(|(flag, _)| matches!(**flag, "-c" | "-e" | "-E" | "--eval" | "-r"))
+            .map(|(_, code)| *code);
+        let fed = simple
+            .redirects
+            .iter()
+            .filter(|redirect| !redirect.writes_stdout())
+            .filter_map(|redirect| {
+                redirect.body.as_deref().or_else(|| {
+                    redirect
+                        .operator
+                        .ends_with("<<<")
+                        .then(|| redirect.target.as_ref().map(|target| target.text.as_str()))
+                        .flatten()
+                })
+            });
+        if inline.chain(fed).any(writes_files) {
+            return Some(format!("inline `{program}` code that writes files"));
+        }
+    }
+    None
+}
+
+/// The letters of `word` when it is a cluster of short options, such as `-pi`, and not a long option.
+fn short_options(word: &str) -> Option<&str> {
+    word.strip_prefix('-').filter(|rest| !rest.starts_with('-'))
+}
+
+/// Whether inline `code` writes files: it calls one of [`WRITE_CALLS`], or opens a file and writes to it.
+fn writes_files(code: &str) -> bool {
+    WRITE_CALLS.iter().any(|call| code.contains(call))
+        || (code.contains("open(") && code.contains(".write("))
 }
 
 /// The one command `line` consists of, when it is a single plain command with no control operator and is not sent to the background.
@@ -105,8 +232,6 @@ fn tip(simple: &Simple, sandbox: &Sandbox) -> Option<String> {
         "grep" | "egrep" | "fgrep" | "rg" if !reads_stdin_redirect(simple) => GREP_TIP,
         "find" if finds_by_name(&arguments) => GLOB_TIP,
         "ls" if lists_recursively(&arguments) => GLOB_TIP,
-        "sed" if edits_in_place(&arguments) => SED_TIP,
-        "echo" | "printf" | "cat" => appended(simple, &Paths(sandbox))?,
         _ => return None,
     };
     Some(tip.to_owned())
@@ -137,28 +262,11 @@ fn lists_recursively(arguments: &[&str]) -> bool {
     })
 }
 
-/// Whether a `sed` with `arguments` edits its files in place.
+/// Whether a `sed` with `arguments` edits its files in place: `-i`, a cluster of short options holding it such as `-Ei`, or `--in-place`.
 fn edits_in_place(arguments: &[&str]) -> bool {
-    arguments
-        .iter()
-        .any(|word| word.starts_with("-i") || word.starts_with("--in-place"))
-}
-
-/// The tip for `simple` appending its output to one file inside the working directory: `edit` when the file exists, `write` when it does not.
-fn appended(simple: &Simple, paths: &Paths) -> Option<&'static str> {
-    let output = simple
-        .redirects
-        .iter()
-        .find(|redirect| redirect.writes_stdout() && redirect.appends())?;
-    let target = output.target.as_ref().filter(|target| target.literal)?;
-    let resolved = paths.inside(&target.text)?;
-    if target.text.starts_with("/dev/") || resolved.is_dir() {
-        return None;
-    }
-    Some(if resolved.is_file() {
-        APPEND_TIP
-    } else {
-        CREATE_TIP
+    arguments.iter().any(|word| {
+        word.starts_with("--in-place")
+            || short_options(word).is_some_and(|options| options.contains('i'))
     })
 }
 
@@ -215,6 +323,11 @@ impl Paths<'_> {
         (!path.starts_with('-'))
             .then(|| self.0.resolve(path).ok())
             .flatten()
+    }
+
+    /// Whether `path` names a file, existing or not, inside the working directory: not a directory and not a device under `/dev/`.
+    fn file_inside(&self, path: &str) -> bool {
+        !path.starts_with("/dev/") && self.inside(path).is_some_and(|resolved| !resolved.is_dir())
     }
 }
 
@@ -472,26 +585,28 @@ mod tests {
             "echo hi",
             "echo hi > /dev/null",
             "echo hi > ../outside.txt",
-            "echo $HOME > notes.txt",
             "echo hi 2> err.txt",
             "sudo cat notes.txt",
             "cat notes.txt > copy.txt",
             "cat < notes.txt",
             "cat > new.txt",
-            "cat > new.txt <<EOF\n$HOME\nEOF",
-            "cat > new.txt <<EOF\n`date`\nEOF",
-            "cat > new.txt <<EOF\na\\tb\nEOF",
-            "cat > new.txt <<< hello",
             "grep x < notes.txt",
             "wc -l notes.txt | sort",
             "cargo test | grep -rn x src",
             "git status",
+            "sed -i s/a/b/ ../outside.txt",
+            "sed 's/a/b/' notes.txt",
+            "perl -ne 'print' notes.txt",
+            "python -c 'print(open(\"notes.txt\").read())'",
+            "python3 -m unittest",
+            "cargo run > out.txt",
+            "cargo test 2>&1 | tee build.log",
         ] {
             assert_eq!(check(command, &sandbox), Verdict::Run, "`{command}`");
         }
     }
 
-    /// Searches, finds, recursive listings, in-place edits and appends run, with a tip naming the tool that does a similar job.
+    /// Searches, finds and recursive listings run, with a tip naming the tool that does a similar job.
     #[test]
     fn runs_near_equivalents_with_a_tip() {
         let sandbox = sandbox("intercept-near");
@@ -504,12 +619,48 @@ mod tests {
             ("find src -name main.rs", "`glob`"),
             ("ls -R docs", "`glob`"),
             ("ls -laR", "`glob`"),
-            ("sed -i 's/main/start/' src/main.rs", "`edit`"),
-            ("echo more >> notes.txt", "`insert_after`"),
-            ("echo first >> new.txt", "`write`"),
         ] {
             let tip = hinted(&sandbox, command);
             assert!(tip.contains(tool), "`{command}`: {tip}");
+        }
+    }
+
+    /// A line in which any command edits a file in the working directory through the shell is turned away whole, wherever that command stands.
+    #[test]
+    fn refuses_scripted_edits_anywhere_on_the_line() {
+        let sandbox = sandbox("intercept-scripted");
+        for (command, how) in [
+            ("sed -i 's/main/start/' src/main.rs", "`sed -i`"),
+            ("sed -Ei 's/a/b/' src/*.rs && git diff", "`sed -i`"),
+            (
+                "grep -rl get_total src | xargs sed -i 's/get_total/compute_total/g'",
+                "`sed -i`",
+            ),
+            ("find . -name '*.rs' -exec sed -i 's/a/b/' {} +", "`sed -i`"),
+            ("sed -i 's/\\bx\\b/y/g' notes.txt", "`sed -i`"),
+            ("perl -pi -e 's/a/b/' notes.txt", "`perl -i`"),
+            ("echo more >> notes.txt", "`echo` writing"),
+            ("echo $HOME > notes.txt", "`echo` writing"),
+            ("touch a; cat > new.txt <<'EOF'\nx\nEOF", "`cat` writing"),
+            ("cat > new.txt <<EOF\n$HOME\nEOF", "`cat` writing"),
+            ("cat > new.txt <<< hello", "`cat` writing"),
+            ("tee notes.txt <<'EOF'\nx\nEOF", "`tee` writing"),
+            (
+                "python3 - <<'EOF'\nimport pathlib\np = pathlib.Path('notes.txt')\np.write_text(p.read_text().replace('a', 'b'))\nEOF",
+                "inline `python3`",
+            ),
+            (
+                "python -c \"f = open('notes.txt', 'w'); f.write('x')\"",
+                "inline `python`",
+            ),
+            (
+                "node -e \"require('fs').writeFileSync('a.js', 'x')\"",
+                "inline `node`",
+            ),
+        ] {
+            let message = refused(&sandbox, command);
+            assert!(message.contains(how), "`{command}`: {message}");
+            assert!(message.contains("`edit`"), "{message}");
         }
     }
 

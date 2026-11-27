@@ -542,6 +542,7 @@ impl Turn {
                 told.extend(added);
                 told.extend(extended);
                 told.extend(self.shared.goals.reminder());
+                told.push(TURN_RULES.to_owned());
                 told.push(prompt);
                 let steering: Option<&dyn omc_agent::Steering> = if self
                     .hooks
@@ -749,6 +750,9 @@ pub(crate) async fn connect(
 /// How a conversation started, as `SessionStart` hooks are told it, when it was just compacted.
 const START_COMPACT: &str = "compact";
 
+/// The rules models break most, restated right before every prompt of the reader's, where they weigh most, since the system prompt sits far back in a long conversation.
+const TURN_RULES: &str = "<system-reminder>\nA question gets an answer only: change nothing. An order gets done in full in this turn and checked before you stop, unless plan mode is on. Edit files only with `edit`, `write` or `ast_edit`, never through `bash` (no `sed -i`, heredocs or inline scripts that write files). Open your reply with a tool call, not text, and write nothing between tool calls: no narration, fragments or notes to yourself. Final reply after an order: one paragraph of at most two lines, plain text, saying what was done and how it was checked. Leave out which rules or instructions you followed, findings outside the request, a recap of each change and offers.\n</system-reminder>";
+
 /// Whether `event` says the main agent's conversation was compacted.
 fn compacted(event: &omc_agent::AgentEvent) -> bool {
     matches!(
@@ -774,6 +778,11 @@ async fn digest(memories: Arc<omc_memory::Memories>, prompt: String) -> String {
 /// Tests for running a turn through the session's tools and modes.
 mod tests {
     use std::sync::Mutex;
+
+    /// What the model is sent for a reader's `prompt` that comes with no notice: the turn rules, then the prompt.
+    fn ruled(prompt: &str) -> String {
+        format!("{}\n\n{prompt}", super::TURN_RULES)
+    }
 
     use async_trait::async_trait;
     use omc_providers::{ProviderError, Reply, Request, Sink, ToolCall};
@@ -1110,7 +1119,7 @@ mod tests {
             prompts[1].contains("Today's date: 2026-11-06.")
                 && prompts[1].contains("Plan mode is now on")
         );
-        assert_eq!(prompts[2], "three");
+        assert_eq!(prompts[2], ruled("three"));
         assert!(
             prompts[3].starts_with("<plan-mode>\nPlan mode is now off")
                 && prompts[3].ends_with("four")
@@ -1169,7 +1178,7 @@ mod tests {
             panic!("turn failed");
         };
         let seen = model.seen.lock().unwrap();
-        assert_eq!(seen[0].prompt.as_deref(), Some("second"));
+        assert_eq!(seen[0].prompt.as_deref(), Some(ruled("second").as_str()));
         let third = seen[1].prompt.as_deref().unwrap();
         assert!(third.starts_with("<environment>") && third.ends_with("third"));
     }
@@ -1525,9 +1534,10 @@ mod tests {
         };
         let prompt = model.seen.lock().unwrap()[0].prompt.clone().unwrap();
         assert!(
-            prompt.contains(
-                "<user-prompt-submit-hook>\nthe build is red\n</user-prompt-submit-hook>\n\nhello"
-            ),
+            prompt.contains(&format!(
+                "<user-prompt-submit-hook>\nthe build is red\n</user-prompt-submit-hook>\n\n{}",
+                ruled("hello")
+            )),
             "{prompt}"
         );
     }
@@ -1616,7 +1626,7 @@ mod tests {
             "{}",
             prompts[0]
         );
-        assert_eq!(prompts[1], "two");
+        assert_eq!(prompts[1], ruled("two"));
         assert!(
             prompts[2].contains("<session-start-hook>\nstarted by compact\n</session-start-hook>")
                 && prompts[2].ends_with("three"),
@@ -2045,7 +2055,7 @@ mod tests {
                 ),
                 3 => calling(
                     "edit",
-                    json!({ "files": [{ "path": "f.txt", "tag": "0000", "ops": ops }] }),
+                    json!({ "files": [{ "path": "f.txt", "tag": omc_tools::snapshot_tag(b"a\nb\nc\n"), "ops": ops }] }),
                 ),
                 _ => Reply {
                     text: "done".into(),
@@ -2438,7 +2448,7 @@ mod tests {
             first.contains("<memory>") && first.contains("Integration tests need Docker running.")
         );
         assert!(first.ends_with("how do I run the integration tests"));
-        assert_eq!(seen[2].prompt.as_deref(), Some("next"));
+        assert_eq!(seen[2].prompt.as_deref(), Some(ruled("next").as_str()));
         let saved = memories.all().unwrap();
         assert_eq!(saved.len(), 2);
         assert_eq!(saved[1].text, "Release builds need the `ci` feature.");
