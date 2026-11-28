@@ -13,9 +13,9 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
-omc-diagnostics = { version = "0.1.8", path = "../omc-diagnostics" }
+omc-diagnostics = { version = "0.1.9", path = "../omc-diagnostics" }
 omc-providers.workspace = true
-omc-session = { version = "0.1.8", path = "../omc-session" }
+omc-session = { version = "0.1.9", path = "../omc-session" }
 omc-wire.workspace = true
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
