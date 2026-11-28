@@ -79,7 +79,9 @@ impl Tool for SetTitle {
             return Err(ToolError::InvalidArguments("the title is empty".to_owned()));
         }
         if self.host.name(&title) {
-            Ok(ToolOutput::new(format!("Named the conversation: {title}")))
+            Ok(ToolOutput::new(format!(
+                "Named the conversation: {title}. Do not call `set_title` again in this conversation, also when the task changes."
+            )))
         } else {
             Ok(ToolOutput::new(
                 "The conversation already has a name, which stays.",

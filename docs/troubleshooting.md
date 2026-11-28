@@ -39,12 +39,7 @@ after six such edits it is told to stop and explain to the user.
 
 When a reply writes text beside its tool calls, a notice telling the model to
 make its calls without text and keep its words for the final answer is added
-to the results of that step, at most twice a turn. That text reaches the
-client as thinking, not as the answer.
-
-After a turn that changed files, a final answer of more than two lines with
-text is not shown: the model is asked once, with a notice, to write it again
-as one paragraph of at most two lines, and that answer is shown and kept.
+to the results of that step, at most twice a turn.
 
 The todo list the model keeps with `todo` is watched as well. When it still
 has items pending or in progress after 12 calls that changed files since it

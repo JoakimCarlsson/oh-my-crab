@@ -51,9 +51,10 @@ to the result; see [language services](../language-services.md).
 
 A `grep` result of 20 matches or fewer says which function each match in a
 code file is in, as `path:line in name:text`, so that matches that look alike
-can be told apart without reading the file. A match on the line a function
-starts on, outside any function or in a file that is not code is shown as
-`path:line:text`.
+can be told apart without reading the file. A match in a JSON or YAML file
+names the key it stands under the same way, such as `models.json:918 in zai:`.
+A match on the line a function starts on, outside any function or key, or in
+any other file is shown as `path:line:text`.
 
 ## Code intelligence
 

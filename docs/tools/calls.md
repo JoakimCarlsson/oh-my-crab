@@ -6,7 +6,8 @@ number or boolean sent as a string, a single value where a list is wanted, an
 object or list sent as JSON text, and `null` for an optional argument.
 Arguments that are one item of the list a tool requires become that list: an
 `edit` call that sends one file's `path`, `tag` and `ops` without the `files`
-list around them means that one file. When the arguments still do not fit, the
+list around them means that one file, and one that sends `ops` beside a
+`files` list of one section without its own `ops` means that section's. When the arguments still do not fit, the
 call is turned away with every place that is wrong and what was expected
 there.
 

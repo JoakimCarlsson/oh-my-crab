@@ -170,56 +170,21 @@ pub struct Context<'a> {
     pub routing: Option<&'a Routing>,
 }
 
-/// Passes the chunks of a reply on as events: thinking as it streams, text once the reply has ended, so that text written beside tool calls reaches the client as thinking rather than as the answer.
+/// Passes the chunks of a reply on as events as they stream in.
 struct Chunks<'a> {
     /// Where the events go.
     events: &'a (dyn Fn(AgentEvent) + Send + Sync),
-    /// The text of the reply so far, held until it is known whether the reply calls tools.
-    held: String,
-}
-
-impl<'a> Chunks<'a> {
-    /// Chunks that send their events to `events`.
-    fn new(events: &'a (dyn Fn(AgentEvent) + Send + Sync)) -> Self {
-        Self {
-            events,
-            held: String::new(),
-        }
-    }
-
-    /// Drops the text held, so that a reply asked again is not shown twice.
-    fn discard(&mut self) {
-        self.held.clear();
-    }
-
-    /// Passes on the text held, once the reply ended: as thinking when it `calls` tools, since such text is working notes, and as the answer otherwise.
-    fn settle(&mut self, calls: bool) {
-        if self.held.trim().is_empty() {
-            self.held.clear();
-            return;
-        }
-        let text = std::mem::take(&mut self.held);
-        if calls {
-            (self.events)(AgentEvent::Started(Part::Thinking));
-            (self.events)(AgentEvent::Thought(text));
-        } else {
-            (self.events)(AgentEvent::Started(Part::Text));
-            (self.events)(AgentEvent::Delta(text));
-        }
-    }
 }
 
 impl Sink for Chunks<'_> {
-    /// Reports that a block of thinking starts; a block of text is reported when the reply settles.
+    /// Reports that a new block of the reply starts.
     fn start(&mut self, part: Part) {
-        if part == Part::Thinking {
-            (self.events)(AgentEvent::Started(part));
-        }
+        (self.events)(AgentEvent::Started(part));
     }
 
-    /// Holds text until the reply settles.
+    /// Reports text as it streams in.
     fn text(&mut self, chunk: &str) {
-        self.held.push_str(chunk);
+        (self.events)(AgentEvent::Delta(chunk.to_owned()));
     }
 
     /// Reports thinking as it streams in.
@@ -234,20 +199,8 @@ const MAX_NARRATION_NOTICES: u8 = 2;
 /// Added to a batch of tool results when the reply that made the calls also wrote text.
 const NARRATION_NOTICE: &str = "<harness-notice>\nYou wrote text beside your tool calls. The user sees every call already: make the next calls with no text at all, and write only the final answer once the work is done.\n</harness-notice>";
 
-/// Most lines with text a final answer may have after a turn that changed files before it is asked for again, shorter.
-const MAX_ANSWER_LINES: usize = 2;
-
-/// How many lines of `text` hold something other than blanks.
-fn answer_lines(text: &str) -> usize {
-    text.lines().filter(|line| !line.trim().is_empty()).count()
-}
-
-/// The notice that asks again for a final answer of `lines` lines, which was not shown, at most [`MAX_ANSWER_LINES`] long.
-fn long_answer_notice(lines: usize) -> String {
-    format!(
-        "<harness-notice>\nYour final answer ran to {lines} lines and was not shown. Write it again as one paragraph of at most {MAX_ANSWER_LINES} lines, plain text: what was done and how it was checked. Leave out which rules you followed, findings outside the request and a recap of each change.\n</harness-notice>"
-    )
-}
+/// Added to the results of a batch that only updated the todo list when the reply that made it also wrote text, which may have been the answer.
+const ANSWERED_NOTICE: &str = "<harness-notice>\nThe text you wrote beside this todo update is already shown to the user. If it was your final answer, end the turn now with an empty reply; do not write it again. If work is left, carry on with it.\n</harness-notice>";
 
 /// The share of the context window, in percent, at which the agent is reminded to save its notes.
 const REMINDER_PERCENT: u64 = 80;
@@ -619,7 +572,7 @@ fn append_notice(results: &mut [ToolResult], notice: &str) {
 ///
 /// The model's todo list is watched too: when it still has open items after [`crate::todos::CHANGES`] calls that changed files since it last changed, a reminder listing them is added to the batch's results, at most [`crate::todos::MAX_REMINDERS`] times between changes; and a turn that wrote the list or changed files and is about to end with open items is followed up with a notice to finish them or update the list, at most [`crate::todos::MAX_FINISHES`] times and never twice without a tool call between. Neither happens when the model's reply ends by asking the user a question.
 ///
-/// A follow-up keeps the finished answer in the history and sends its notice with the next request only; the model's next reply is kept as a reply of its own, and an empty one ends the turn.
+/// A follow-up keeps the finished answer in the history and sends its notice with the next request only; the model's next reply is kept as a reply of its own, and an empty one ends the turn, also after replies that only update the todo list, so that the answer need not be written twice.
 ///
 /// When the provider refuses a request while the history holds images, the
 /// images are taken out, with a note left in their place, and the request is
@@ -637,8 +590,7 @@ async fn drive(
     let mut saved = context.notebook.map_or(0, Notebook::revision);
     let mut reminded = false;
     let mut narration_notices: u8 = 0;
-    let mut changed_files = false;
-    let mut shortened = false;
+
     let mut first = true;
     let mut stripped = false;
     let mut overflowed = false;
@@ -677,7 +629,7 @@ async fn drive(
         if recall::offered(history) && registry.get(RECALL).is_none() {
             specs.push(recall::spec());
         }
-        let mut chunks = Chunks::new(events);
+        let mut chunks = Chunks { events };
         let answered = {
             let messages = request_messages(history, cut.as_ref(), notice.as_deref());
             if let Some(hooks) = context.hooks {
@@ -692,12 +644,7 @@ async fn drive(
             asked.model().complete(request, &mut chunks).await
         };
         let reply = match answered {
-            Ok(reply) => {
-                if !reply.tool_calls.is_empty() {
-                    chunks.settle(true);
-                }
-                reply
-            }
+            Ok(reply) => reply,
             Err(error) if !overflowed && error.is_context_overflow() => {
                 overflowed = true;
                 match make_room(context, history, system, true, events, scribe).await {
@@ -740,9 +687,13 @@ async fn drive(
         };
         let reply = named(reply, registry);
         notice = None;
-        if std::mem::take(&mut following_up) && is_empty(&reply) && reply.stop != Stop::Length {
+        let followed = std::mem::take(&mut following_up);
+        if followed && is_empty(&reply) && reply.stop != Stop::Length {
             return Ok(());
         }
+        following_up = followed
+            && !reply.tool_calls.is_empty()
+            && reply.tool_calls.iter().all(|call| call.name == "todo");
         if recoveries < MAX_RECOVERIES
             && let Some(next) = stopped_short(&reply)
         {
@@ -751,27 +702,13 @@ async fn drive(
             if !is_empty(&reply) {
                 cut = Some(reply);
             }
-            chunks.settle(false);
+
             continue;
         }
         if first && is_empty(&reply) {
             return Err(AgentError::Empty);
         }
         first = false;
-        if reply.tool_calls.is_empty() {
-            let lines = answer_lines(&reply.text);
-            if changed_files
-                && !shortened
-                && reply.stop == Stop::Finished
-                && lines > MAX_ANSWER_LINES
-            {
-                shortened = true;
-                chunks.discard();
-                notice = Some(Cow::Owned(long_answer_notice(lines)));
-                continue;
-            }
-            chunks.settle(false);
-        }
         let nearly_full = reply
             .tokens
             .zip(context.window)
@@ -866,14 +803,7 @@ async fn drive(
         let changed = changed
             .into_inner()
             .unwrap_or_else(|held| held.into_inner());
-        changed_files |= !changed.is_empty()
-            || results.iter().any(|result| {
-                !result.is_error
-                    && matches!(
-                        result.name.as_str(),
-                        "edit" | "write" | "ast_edit" | "script"
-                    )
-            });
+
         for (call, files) in &changed {
             if let Some(Err(error)) = scribe.map(|scribe| scribe.changes(call, files)) {
                 eprintln!("history not saved: {error}");
@@ -885,7 +815,10 @@ async fn drive(
         if let Some(reminder) = todos.observe(&calls, &results, &changed, &said) {
             append_notice(&mut results, &reminder);
         }
-        if !said.trim().is_empty() && narration_notices < MAX_NARRATION_NOTICES {
+        if !said.trim().is_empty() && calls.iter().all(|call| call.name == "todo") {
+            append_notice(&mut results, ANSWERED_NOTICE);
+            following_up = true;
+        } else if !said.trim().is_empty() && narration_notices < MAX_NARRATION_NOTICES {
             narration_notices += 1;
             append_notice(&mut results, NARRATION_NOTICE);
         }
@@ -1765,32 +1698,23 @@ mod tests {
     use super::*;
     use crate::{Decision, Journal, Prompter};
 
-    /// Thinking is passed on as it streams; text is held until the reply ends, then passed on as the answer, or as thinking when the reply also calls tools.
+    /// The start of each block is passed on as an event before its chunks, and text streams as it comes.
     #[test]
-    fn text_beside_calls_is_passed_on_as_thinking() {
+    fn block_starts_are_reported() {
         let seen = Mutex::new(Vec::new());
         let events = |event: AgentEvent| seen.lock().unwrap().push(event);
-        let mut chunks = Chunks::new(&events);
+        let mut chunks = Chunks { events: &events };
         chunks.start(Part::Thinking);
         chunks.thinking("hm");
         chunks.start(Part::Text);
-        chunks.text("h");
-        chunks.text("i");
-        assert_eq!(seen.lock().unwrap().len(), 2);
-        chunks.settle(false);
-        chunks.start(Part::Text);
-        chunks.text("reading");
-        chunks.settle(true);
-        chunks.settle(false);
+        chunks.text("hi");
         assert_eq!(
             *seen.lock().unwrap(),
             [
                 AgentEvent::Started(Part::Thinking),
                 AgentEvent::Thought("hm".into()),
                 AgentEvent::Started(Part::Text),
-                AgentEvent::Delta("hi".into()),
-                AgentEvent::Started(Part::Thinking),
-                AgentEvent::Thought("reading".into()),
+                AgentEvent::Delta("hi".into())
             ]
         );
     }
@@ -1948,13 +1872,12 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(log[2], AgentEvent::Started(Part::Text));
-        assert_eq!(log[3], AgentEvent::Delta("it says hello".into()));
+        assert_eq!(log[2], AgentEvent::Delta("it says hello".into()));
     }
 
-    /// Text written beside a tool call reaches the client as thinking, and the model is told, in that call's results, to call tools without text.
+    /// Text written beside a tool call streams as usual, and the model is told, in that call's results, to call tools without text.
     #[tokio::test]
-    async fn text_beside_calls_is_thinking_and_earns_a_notice() {
+    async fn text_beside_calls_earns_a_notice() {
         let dir = scratch("loop-narrate");
         std::fs::write(dir.join("hello.txt"), "hello from disk\n").unwrap();
         let registry = Registry::builtin(&dir).unwrap();
@@ -1999,58 +1922,8 @@ mod tests {
                 .contains("You wrote text beside your tool calls")
         );
         let log = log.lock().unwrap();
-        assert!(log.contains(&AgentEvent::Thought("Reading the file.".into())));
-        assert!(!log.contains(&AgentEvent::Delta("Reading the file.".into())));
+        assert!(log.contains(&AgentEvent::Delta("Reading the file.".into())));
         assert!(log.contains(&AgentEvent::Delta("it says hello".into())));
-    }
-
-    /// After a turn that changed files, a final answer longer than two lines is not shown: the model is asked once for a shorter one, which is.
-    #[tokio::test]
-    async fn a_long_final_answer_is_asked_again_shorter() {
-        let dir = scratch("loop-long-answer");
-        let registry = Registry::builtin(&dir).unwrap();
-        let long = "Wrote it.\n\nI followed your rules.\n\nAlso a side note.";
-        let model = Scripted::new(vec![
-            call_reply("t1", "write", json!({ "path": "a.txt", "content": "x\n" })),
-            Reply {
-                text: long.into(),
-                ..Reply::default()
-            },
-            Reply {
-                text: "Wrote a.txt.".into(),
-                ..Reply::default()
-            },
-        ]);
-        let log = Mutex::new(Vec::new());
-        let events = |event: AgentEvent| log.lock().unwrap().push(event);
-        let mut history = Vec::new();
-        run_turn(
-            &Context {
-                model: &model,
-                registry: &registry,
-                approvals: &Approvals::new(Arc::new(DenyAll), true),
-                system: "",
-                effort: None,
-                refresh: None,
-                notebook: None,
-                window: None,
-                checkpoint: None,
-                hooks: None,
-                routing: None,
-            },
-            &mut history,
-            "write a.txt".into(),
-            &events,
-        )
-        .await
-        .unwrap();
-        assert!(dir.join("a.txt").exists());
-        let log = log.lock().unwrap();
-        assert!(!log.contains(&AgentEvent::Delta(long.into())));
-        assert!(log.contains(&AgentEvent::Delta("Wrote a.txt.".into())));
-        assert!(
-            matches!(history.last(), Some(Message::Assistant(reply)) if reply.text == "Wrote a.txt.")
-        );
     }
 
     /// Runs one turn of `model` on the built-in tools in `dir` with `history`.

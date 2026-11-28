@@ -209,6 +209,8 @@ mod tests {
             tokens: 0,
             written: 0,
             seconds: 0.0,
+            reply_lines: 0,
+            refused_shell: 0,
         }
     }
 

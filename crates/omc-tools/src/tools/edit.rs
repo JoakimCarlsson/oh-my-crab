@@ -185,7 +185,7 @@ impl Tool for Edit {
                 "files": {
                     "type": "array",
                     "minItems": 1,
-                    "description": "One section per file.",
+                    "description": "One section per file, each holding its own path, tag and ops: [{\"path\": \"src/a.rs\", \"tag\": \"1A2B\", \"ops\": [{\"op\": \"replace\", \"line\": 3, \"text\": \"...\"}]}].",
                     "items": {
                         "type": "object",
                         "properties": {

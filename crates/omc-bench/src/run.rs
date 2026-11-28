@@ -75,6 +75,12 @@ pub(crate) struct Outcome {
     pub(crate) written: u64,
     /// How long the run took, in seconds.
     pub(crate) seconds: f64,
+    /// The lines with text of the final reply, the text after the last tool call.
+    #[serde(default)]
+    pub(crate) reply_lines: usize,
+    /// How many `bash` calls crab turned away, as edits or reads a dedicated tool does.
+    #[serde(default)]
+    pub(crate) refused_shell: u32,
 }
 
 /// Runs `task` with `contender` in a fresh copy of its files under `folder`, where the transcript is kept too, as run `number`.
@@ -113,6 +119,17 @@ pub(crate) fn run(
     {
         differing.push(CHECK_FAILED.to_owned());
     }
+    let reply_lines = tally
+        .reply()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    if let Some(limit) = task.reply
+        && (reply_lines == 0 || reply_lines > limit || formatted(tally.reply()))
+    {
+        differing.push(REPLY_BROKEN.to_owned());
+    }
+    let refused_shell = tally.refused_shell();
     let (context, requests, tokens) = (tally.context(), tally.requests(), tally.sent());
     let written = tally.written();
     let tools = tally.into_tools();
@@ -137,7 +154,21 @@ pub(crate) fn run(
         tokens,
         written,
         seconds: started.elapsed().as_secs_f64(),
+        reply_lines,
+        refused_shell,
     }
+}
+
+/// What a run that broke its task's reply limit is said to differ in.
+const REPLY_BROKEN: &str = "(the final reply broke the reply limit)";
+
+/// Whether `reply` uses markdown formatting: bold, a heading or a bullet list.
+fn formatted(reply: &str) -> bool {
+    reply.contains("**")
+        || reply.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with('#') || line.starts_with("- ") || line.starts_with("* ")
+        })
 }
 
 /// Makes `work` a fresh copy of the files `task` starts from, committed in a git repository of its own, so that the project the harness sees ends there and starts clean.

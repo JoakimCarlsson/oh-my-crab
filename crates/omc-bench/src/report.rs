@@ -33,6 +33,10 @@ struct Sum {
     written: u64,
     /// How long the runs took together, in seconds.
     seconds: f64,
+    /// The lines with text of the final replies, added up.
+    reply_lines: usize,
+    /// How many `bash` calls crab turned away.
+    refused_shell: u32,
 }
 
 impl Sum {
@@ -53,6 +57,8 @@ impl Sum {
             sum.tokens += outcome.tokens;
             sum.written += outcome.written;
             sum.seconds += outcome.seconds;
+            sum.reply_lines += outcome.reply_lines;
+            sum.refused_shell += outcome.refused_shell;
         }
         sum
     }
@@ -97,16 +103,16 @@ fn contenders(outcomes: &[Outcome]) -> Vec<&str> {
     contenders
 }
 
-/// The table of `outcomes` by contender: how many runs passed, were exact and passed cleanly, what a run took in requests, tool calls, tokens sent, tokens written and time, how many edit calls failed, and how many runs ended badly.
+/// The table of `outcomes` by contender: how many runs passed, were exact and passed cleanly, what a run took in requests, tool calls, tokens sent, tokens written and time, how many edit calls failed, how many runs ended badly, how long the final replies were and how many shell calls crab turned away.
 fn by_contender(outcomes: &[Outcome]) -> String {
     let mut table = String::from(
-        "| contender | runs | passed | exact | clean | requests / run | tool calls / run | failed edit calls | tokens sent / run | tokens written / run | seconds / run | errors |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+        "| contender | runs | passed | exact | clean | requests / run | tool calls / run | failed edit calls | tokens sent / run | tokens written / run | seconds / run | errors | reply lines / run | refused shell calls |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for contender in contenders(outcomes) {
         let sum = Sum::of(outcomes.iter().filter(|outcome| outcome.model == contender));
         let _ = writeln!(
             table,
-            "| {contender} | {} | {} | {} | {} | {} | {:.1} | {} | {} | {:.0} | {:.0} | {} |",
+            "| {contender} | {} | {} | {} | {} | {} | {:.1} | {} | {} | {:.0} | {:.0} | {} | {:.1} | {} |",
             sum.runs,
             share(sum.passed, sum.runs),
             share(sum.exact, sum.runs),
@@ -118,6 +124,8 @@ fn by_contender(outcomes: &[Outcome]) -> String {
             sum.each(sum.written as f64),
             sum.each(sum.seconds),
             sum.errors,
+            sum.each(sum.reply_lines as f64),
+            sum.refused_shell,
         );
     }
     table
@@ -217,6 +225,8 @@ mod tests {
             tokens: 2500,
             written: 300,
             seconds: 10.0,
+            reply_lines: 1,
+            refused_shell: 0,
         }
     }
 
@@ -232,11 +242,11 @@ mod tests {
         let rows: Vec<&str> = report.lines().collect();
         assert_eq!(
             rows[2],
-            "| b | 2 | 100% | 100% | 50% | 4.0 | 3.0 | 25% | 2.5k | 300 | 10 | 0 |"
+            "| b | 2 | 100% | 100% | 50% | 4.0 | 3.0 | 25% | 2.5k | 300 | 10 | 0 | 1.0 | 0 |"
         );
         assert_eq!(
             rows[3],
-            "| a | 1 | 0% | 0% | 0% | 4.0 | 3.0 | 100% | 2.5k | 300 | 10 | 0 |"
+            "| a | 1 | 0% | 0% | 0% | 4.0 | 3.0 | 100% | 2.5k | 300 | 10 | 0 | 1.0 | 0 |"
         );
         assert!(report.contains("| task | b | a |"));
         assert!(

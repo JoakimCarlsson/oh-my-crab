@@ -139,6 +139,8 @@ The report has one row for each harness and model:
 | `tokens written / run` | The tokens the model wrote, reasoning included.                        |
 | `seconds / run`     | How long a run took.                                                      |
 | `errors`            | Runs that ended badly: the turn failed, timed out or the harness stopped. |
+| `reply lines / run` | The lines with text of the final reply, what the model said after its last tool call. |
+| `refused shell calls` | The `bash` calls crab turned away as edits or reads a dedicated tool does, added up. |
 
 `tokens sent` counts what each request carried, cached or not, so it shows how
 much a harness makes the model read. `tokens written` is what the model wrote
@@ -311,6 +313,66 @@ What the runs showed:
 Three runs a cell show the large differences and not the small ones. Run the
 command above to measure again after a change.
 
+### Claude 5.5 models, 27 November 2026
+
+Measured on Linux with crab at the commit that added the reply, no-change and
+shell-call scoring (after 0.1.7), signed in to one Claude account. Every task
+was run twice for each row, with the default effort and tools. No baseline was
+measured: Claude Code was not installed.
+
+```sh
+crab-bench --runs 2 --jobs 6 \
+  --model claude/claude-sonnet-5-5 --model claude/claude-opus-5-5 --model claude/claude-haiku-5-5
+```
+
+All 28 tasks, 56 runs a row:
+
+| Model      | Passed | Exact | Clean | Requests / run | Tool calls / run | Tokens sent / run | Tokens written / run | Seconds / run | Reply lines / run | Refused shell calls |
+| ---------- | ------ | ----- | ----- | -------------- | ---------------- | ----------------- | -------------------- | ------------- | ----------------- | ------------------- |
+| Sonnet 5.5 | 100%   | 93%   | 100%  | 3.2            | 2.8              | 33.0k             | 578                  | 10            | 1.1               | 0                   |
+| Opus 5.5   | 100%   | 93%   | 100%  | 3.5            | 3.1              | 39.0k             | 645                  | 12            | 1.1               | 0                   |
+| Haiku 5.5  | 100%   | 93%   | 100%  | 3.4            | 3.0              | 45.1k             | 853                  | 10            | 1.0               | 0                   |
+
+Every model answered the question and the report without changing a file,
+kept every final reply within its limit, and never had a shell call turned
+away. Tokens sent are higher than on 10 November, about 28k against 21k on the
+smallest tasks, because the system prompt and the turn rules grew since.
+Haiku's 283.7k a run on `real-catalog-values` is most of its higher average:
+it reads the 170 KB file whole.
+
+| Task                     | Sonnet 5.5   | Opus 5.5     | Haiku 5.5     |
+| ------------------------ | ------------ | ------------ | ------------- |
+| `ask-no-change`          | 31.1k · 4s   | 31.4k · 5s   | 26.0k · 2s    |
+| `report-no-change`       | 22.1k · 3s   | 34.2k · 6s   | 22.1k · 3s    |
+| `cmd-fix-reply-short`    | 34.4k · 4s   | 34.4k · 5s   | 35.0k · 5s    |
+| `cmd-rename-no-shell`    | 33.2k · 7s   | 39.2k · 9s   | 39.8k · 6s    |
+| `cmd-fix-failing-test`   | 33.6k · 4s   | 33.6k · 5s   | 35.5k · 3s    |
+| `cmd-lint-loop`          | 48.1k · 7s   | 68.4k · 14s  | 62.9k · 8s    |
+| `cmd-slow-command`       | 32.7k · 135s | 32.7k · 135s | 32.6k · 132s  |
+| `cmd-stale-file`         | 53.6k · 6s   | 53.5k · 6s   | 53.7k · 5s    |
+| `real-add-attributes`    | 33.3k · 8s   | 47.9k · 12s  | 41.6k · 13s   |
+| `real-catalog-values`    | 41.9k · 9s   | 68.2k · 10s  | 283.7k · 11s  |
+| `real-deep-edit`         | 29.7k · 5s   | 29.6k · 6s   | 29.7k · 4s    |
+| `real-delete-tests`      | 39.6k · 7s   | 49.0k · 10s  | 57.7k · 7s    |
+| `real-header-every-file` | 30.1k · 7s   | 30.1k · 10s  | 30.3k · 6s    |
+| `real-move-function`     | 42.9k · 6s   | 55.3k · 11s  | 55.5k · 9s    |
+| `real-rename-method`     | 31.8k · 9s   | 38.3k · 12s  | 39.0k · 7s    |
+| `real-rename-type`       | 43.2k · 16s  | 82.6k · 24s  | 64.6k · 18s   |
+| `delete-block`           | 28.8k · 4s   | 28.8k · 4s   | 28.8k · 3s    |
+| `insert-block`           | 28.3k · 5s   | 33.4k · 6s   | 28.8k · 5s    |
+| `long-file`              | 28.4k · 4s   | 28.3k · 5s   | 34.3k · 4s    |
+| `multi-file`             | 29.2k · 5s   | 29.0k · 6s   | 30.2k · 4s    |
+| `nested-indent`          | 28.7k · 5s   | 28.6k · 5s   | 28.6k · 3s    |
+| `repeated-lines`         | 28.8k · 4s   | 28.7k · 4s   | 28.7k · 3s    |
+| `rewrite-body`           | 29.0k · 4s   | 28.8k · 5s   | 28.8k · 3s    |
+| `scattered`              | 28.3k · 5s   | 33.6k · 7s   | 29.8k · 3s    |
+| `shifting-lines`         | 29.8k · 4s   | 40.7k · 7s   | 29.9k · 4s    |
+| `single-line`            | 27.8k · 4s   | 27.5k · 5s   | 27.5k · 3s    |
+| `tabs`                   | 28.2k · 5s   | 28.2k · 4s   | 28.2k · 4s    |
+| `unicode`                | 28.5k · 5s   | 28.0k · 5s   | 28.7k · 3s    |
+
+Every cell passed two of two.
+
 ## Tasks
 
 A task is a folder under `crates/omc-bench/tasks`:
@@ -333,7 +395,10 @@ a `check` file instead of `after/` or `change.patch`, or beside them: one
 command, run by `bash` in the folder the model worked in once the run is over,
 that ends successfully when the model did what was asked. The folder is a git
 repository with the starting files committed, so the command can use `git diff`
-to see that a file was left alone.
+to see that a file was left alone. A `reply` file holds the most lines with
+text the model's final reply, what it says after its last tool call, may have;
+a run whose final reply is longer, empty, or uses bold, headings or bullet lists
+fails.
 
 Prompts say exactly what to change, so that a failed run is a failed edit and
 not a different opinion about the code.
@@ -382,6 +447,17 @@ well, and are scored by a check command. They need `python3`.
 | `cmd-lint-loop`        | Run a checker and fix the seven problems it lists in three files, until it passes. |
 | `cmd-slow-command`     | Run a command that takes 130 seconds and write down what it prints at the end.   |
 | `cmd-stale-file`       | Read a file, run a script that rewrites it, then edit the rewritten file.        |
+| `cmd-rename-no-shell`  | Rename a function across seven files with `bash` at hand, in at most two lines. |
+| `cmd-fix-reply-short`  | Fix the failing test and report it in at most two lines.                         |
+
+The last tasks check how the model behaves rather than what it edits: each
+gives it `bash` and limits its final reply, and the first two pass only when
+no file changed.
+
+| Task               | What it asks                                                        |
+| ------------------ | ------------------------------------------------------------------- |
+| `ask-no-change`    | A question about the code, answered in at most two lines.           |
+| `report-no-change` | A report that something looks wrong, answered in at most three lines. |
 
 To add a task, add a folder in one of those shapes. A test fails when a task
 scored on files adds or removes files, changes nothing, or has a patch that

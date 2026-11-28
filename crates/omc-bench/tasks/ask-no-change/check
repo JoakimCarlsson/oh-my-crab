@@ -1,0 +1,1 @@
+git diff --quiet HEAD && test -z "$(git status --porcelain | grep -v __pycache__)"

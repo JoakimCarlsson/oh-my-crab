@@ -21,7 +21,7 @@ const MAX_MATCHES: usize = 100;
 const MAX_LINE: usize = 300;
 
 /// What the tool is, for the model.
-const DESCRIPTION: &str = "Read the earlier conversation again, including the messages a compaction summarized and the tool outputs elided to save room. Each message has a number, shown as #N.\n\
+const DESCRIPTION: &str = "Read the earlier conversation again, including the messages a compaction summarized and the tool outputs elided to save room. Use it only after a notice or an elision note says something was left out; until then every earlier message is still in your context, so read it there and never call this tool to look back at recent turns. Each message has a number, shown as #N.\n\
 - call_id: the full output of one tool call, with its arguments, such as one an elision note names.\n\
 - search: the lines of the whole history that contain this text, ignoring case, with the numbers of their messages.\n\
 - messages: the messages numbered in a range, such as 120-140, in full.\n\

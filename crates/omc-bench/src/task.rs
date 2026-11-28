@@ -28,6 +28,9 @@ const TOOLS: &str = "tools";
 /// The file in a task's folder that holds the command that says whether the model did what was asked: run by `bash` in the folder the model worked in, it ends successfully when it did.
 const CHECK: &str = "check";
 
+/// The file in a task's folder that holds the most lines with text the model's final reply may have; a longer, empty or formatted reply fails the run.
+const REPLY: &str = "reply";
+
 /// The folder git keeps its own files in, which is no part of a task's files.
 const GIT: &str = ".git";
 
@@ -48,6 +51,8 @@ pub(crate) struct Task {
     pub(crate) tools: Option<Vec<String>>,
     /// The patch that turns the files the model starts from into the ones it should leave, when the task gives them that way.
     pub(crate) patch: Option<PathBuf>,
+    /// The most lines with text the final reply may have, when the task limits it.
+    pub(crate) reply: Option<usize>,
 }
 
 impl Task {
@@ -208,6 +213,13 @@ fn read(name: String, path: &Path, fixtures: &Path) -> Result<Task, String> {
             .map(str::to_owned)
             .collect()
     });
+    let reply = match written(&path.join(REPLY)) {
+        None => None,
+        Some(text) => Some(
+            text.parse()
+                .map_err(|_| format!("task {name}: {REPLY} must be a number of lines"))?,
+        ),
+    };
     Ok(Task {
         name,
         prompt,
@@ -216,6 +228,7 @@ fn read(name: String, path: &Path, fixtures: &Path) -> Result<Task, String> {
         check,
         tools,
         patch,
+        reply,
     })
 }
 

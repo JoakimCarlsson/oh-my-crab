@@ -73,7 +73,9 @@ impl Tool for Grep {
         "Search file contents with a regular expression. Honors .gitignore and skips binary \
          files. Returns matches as path:line:text, capped at the limit, followed by the snapshot \
          tag of each file with matches; pass a tag to edit. In a short result, a match inside a \
-         function of a code file names it before the text, as path:line in name:text."
+         function of a code file names it before the text, as path:line in name:text, and a \
+         match in a JSON or YAML file names the key it stands under the same way: check that \
+         name before editing one of several lines that look alike."
     }
 
     /// Returns the argument schema.
@@ -185,19 +187,49 @@ impl Sink for Collector<'_> {
     }
 }
 
-/// Gives each match in `found` the name of the function its line is in, when its file is code and the line is inside a named function but is not the line the function starts on. `files` lists the files with matches, each with the place in `found` its matches start at.
+/// Gives each match in `found` the name of what its line is in: the function, when its file is code and the line is inside a named function but is not the line the function starts on, or the enclosing key, when its file is JSON or YAML, so that identical lines under different keys can be told apart. `files` lists the files with matches, each with the place in `found` its matches start at.
 fn name_functions(found: &mut [Match], files: &[(std::path::PathBuf, usize)]) {
     for (index, (path, start)) in files.iter().enumerate() {
         let end = files.get(index + 1).map_or(found.len(), |(_, next)| *next);
         let Ok(text) = std::fs::read_to_string(path) else {
             continue;
         };
+        let data = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| matches!(extension, "json" | "jsonc" | "yaml" | "yml"));
+        if data {
+            let lines: Vec<&str> = text.lines().collect();
+            for found in &mut found[*start..end] {
+                found.within = enclosing_key(&lines, found.line as usize);
+            }
+            continue;
+        }
         let functions = named_functions(path, &text);
         for found in &mut found[*start..end] {
             found.within =
                 innermost(&functions, found.line as usize).map(|named| named.name.clone());
         }
     }
+}
+
+/// The key that line `line`, counted from one, of the JSON or YAML text `lines` stands under: the key of the nearest line above it that is indented less and opens a block, such as `"zai": {` or `zai:`; nothing for a line at the top level or under no such line.
+fn enclosing_key(lines: &[&str], line: usize) -> Option<String> {
+    let indent = |text: &str| text.len() - text.trim_start().len();
+    let own = lines.get(line.checked_sub(1)?)?;
+    let depth = indent(own);
+    lines[..line - 1]
+        .iter()
+        .rev()
+        .filter(|above| !above.trim().is_empty())
+        .find(|above| indent(above) < depth)
+        .and_then(|above| {
+            let above = above.trim().trim_start_matches("- ");
+            let (key, rest) = above.split_once(':')?;
+            let opens = matches!(rest.trim(), "" | "{" | "[");
+            let key = key.trim().trim_matches(['"', '\'']);
+            (opens && !key.is_empty()).then(|| key.to_owned())
+        })
 }
 
 /// The function in `functions` that holds `line` most closely, the one that starts last, unless `line` is the line it starts on, which names it already.
@@ -366,6 +398,34 @@ mod tests {
             .await
             .unwrap();
         assert!(!long.text.contains(" in f:"));
+    }
+
+    /// A match in a JSON or YAML file names the key it stands under, so that identical lines under different keys can be told apart.
+    #[tokio::test]
+    async fn names_the_key_a_data_line_is_under() {
+        let (tool, dir) = tool("grep-key");
+        std::fs::write(
+            dir.join("m.json"),
+            "{\n  \"zai\": {\n    \"glm\": {\"output\":1}\n  },\n  \"zai-plan\": {\n    \"glm\": {\"output\":1}\n  }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("s.yaml"),
+            "web:\n  replicas: 2\nworker:\n  replicas: 2\n",
+        )
+        .unwrap();
+        let out = tool
+            .call(json!({ "pattern": "glm|replicas" }))
+            .await
+            .unwrap();
+        for line in [
+            "m.json:3 in zai:",
+            "m.json:6 in zai-plan:",
+            "s.yaml:2 in web:",
+            "s.yaml:4 in worker:",
+        ] {
+            assert!(out.text.contains(line), "{line}: {}", out.text);
+        }
     }
 
     /// The result is capped at the limit and says so.

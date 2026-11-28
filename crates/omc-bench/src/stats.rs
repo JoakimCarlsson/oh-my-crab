@@ -243,6 +243,8 @@ mod tests {
             tokens,
             written: 1000,
             seconds,
+            reply_lines: 1,
+            refused_shell: 0,
         }
     }
 

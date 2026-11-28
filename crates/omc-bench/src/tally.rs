@@ -14,6 +14,9 @@ const EDITING: &[&str] = &[
     "apply_patch",
 ];
 
+/// How crab's answer to a `bash` call it turned away begins.
+const REFUSED: &str = "Not run";
+
 /// How often one tool was called in a run.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Uses {
@@ -44,6 +47,10 @@ pub(crate) struct Tally {
     counted: HashSet<String>,
     /// Whether the model has said, thought or called anything yet.
     active: bool,
+    /// What the model said since its last tool call.
+    reply: String,
+    /// How many `bash` calls crab turned away.
+    refused_shell: u32,
 }
 
 impl Tally {
@@ -54,18 +61,44 @@ impl Tally {
                 self.active = true;
                 if let (Some(name), Some(ToolState::Running)) = (&tool.title, tool.state) {
                     self.called(&tool.id, name);
+                    self.reply.clear();
                 }
                 if tool.state == Some(ToolState::Failed) {
                     self.failed(&tool.id);
+                    let shell = self
+                        .started
+                        .get(&tool.id)
+                        .is_some_and(|name| name == "bash");
+                    let refused = tool
+                        .output
+                        .as_deref()
+                        .is_some_and(|output| output.starts_with(REFUSED));
+                    if shell && refused {
+                        self.refused_shell += 1;
+                    }
                 }
             }
             Event::Used(usage) => {
                 self.measured.push((usage.used, usage.written));
                 self.context = self.context.max(usage.used);
             }
-            Event::Started(_) | Event::Said(_) | Event::Thought(_) => self.active = true,
+            Event::Said(text) => {
+                self.active = true;
+                self.reply.push_str(text);
+            }
+            Event::Started(_) | Event::Thought(_) => self.active = true,
             _ => {}
         }
+    }
+
+    /// What the model said after its last tool call: its final reply.
+    pub(crate) fn reply(&self) -> &str {
+        &self.reply
+    }
+
+    /// How many `bash` calls crab turned away, as edits or reads a dedicated tool does.
+    pub(crate) fn refused_shell(&self) -> u32 {
+        self.refused_shell
     }
 
     /// Counts the call `id` of the tool `name`, once however often it is reported; the name is kept in lower case, so that the same tool counts the same whatever harness names it.
@@ -241,5 +274,27 @@ mod tests {
                 failed: 1
             }
         );
+    }
+
+    /// The reply is what was said after the last tool call, and a `bash` call crab turned away counts as a refused shell edit.
+    #[test]
+    fn keeps_the_final_reply_and_refused_shell_calls() {
+        let mut tally = Tally::default();
+        let mut refused = tool("2", None, ToolState::Failed);
+        if let Event::Tool(tool) = &mut refused {
+            tool.output = Some("Not run: use edit".into());
+        }
+        for event in [
+            Event::Said("reading".into()),
+            tool("1", Some("read"), ToolState::Running),
+            tool("2", Some("bash"), ToolState::Running),
+            refused,
+            Event::Said("a\n\n".into()),
+            Event::Said("b".into()),
+        ] {
+            tally.take(&event);
+        }
+        assert_eq!(tally.reply(), "a\n\nb");
+        assert_eq!(tally.refused_shell(), 1);
     }
 }

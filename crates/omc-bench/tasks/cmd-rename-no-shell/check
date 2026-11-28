@@ -1,0 +1,1 @@
+! grep -rq get_total --include=*.py . && python3 -m unittest -q

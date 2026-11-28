@@ -1200,20 +1200,17 @@ A new block of the agent's reply starts, of the `Part` given: `Thinking` or
 
 ### `Said`
 
-The agent's reply text, to append to the current `Text` block. Text is held
-until the model's reply ends and then sent whole: text written in a reply that
-also calls tools is working notes, and is sent as a `Thinking` block of
-`Thought` instead, so `Said` carries only answers.
+The next chunk of the agent's reply text, to append to the current `Text`
+block.
 
 ```json
-{"Said":"Fixed `add` in `calc.py`."}
+{"Said":"` in `calc.py`"}
 ```
 
 ### `Thought`
 
 The next chunk of the agent's thinking, to append to the current `Thinking`
-block, streamed as it comes; also the text of a reply that calls tools, sent
-whole once that reply ends.
+block.
 
 ```json
 {"Thought":"Look at the fixture first."}

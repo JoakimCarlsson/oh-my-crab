@@ -72,10 +72,47 @@ pub(crate) fn coerce(schema: &Value, value: Value) -> Value {
         converted(&wanted, value)
     };
     match value {
-        Value::Object(fields) => Value::Object(coerce_fields(rules, wrapped(rules, fields))),
+        Value::Object(fields) => {
+            Value::Object(coerce_fields(rules, wrapped(rules, lowered(rules, fields))))
+        }
         Value::Array(items) => Value::Array(coerce_items(rules, items)),
         other => other,
     }
+}
+
+/// The properties `fields` of an object with every property its schema does not name moved into the one item of a list property, when that list holds exactly one object, its items' schema names the property and the item lacks it: a model asked for `{"files": [{"path": ..., "ops": [...]}]}` that sends `{"files": [{"path": ...}], "ops": [...]}` means the `ops` of that one file. Anything else is left as it is, for the check to report.
+fn lowered(rules: &Map<String, Value>, mut fields: Map<String, Value>) -> Map<String, Value> {
+    let Some(properties) = rules.get("properties").and_then(Value::as_object) else {
+        return fields;
+    };
+    let stray: Vec<String> = fields
+        .keys()
+        .filter(|key| !properties.contains_key(*key))
+        .cloned()
+        .collect();
+    for key in stray {
+        let target = properties.iter().find_map(|(name, property)| {
+            let names_key = property["items"]["properties"]
+                .as_object()
+                .is_some_and(|inner| inner.contains_key(&key));
+            let one_lacking = matches!(
+                fields.get(name),
+                Some(Value::Array(items))
+                    if items.len() == 1 && items[0].as_object().is_some_and(|item| !item.contains_key(&key))
+            );
+            (property["type"] == "array" && names_key && one_lacking).then(|| name.clone())
+        });
+        if let Some(name) = target
+            && let Some(value) = fields.remove(&key)
+            && let Some(Value::Object(item)) = fields
+                .get_mut(&name)
+                .and_then(Value::as_array_mut)
+                .and_then(|items| items.first_mut())
+        {
+            item.insert(key, value);
+        }
+    }
+    fields
 }
 
 /// The properties `fields` of an object, or, when they hold one item of a list the object must have and does not, the object with that list and the item in it: a model asked for `{"files": [{...}]}` that sends only the `{...}` of its one file means the list, and one that sends `{"path": ..., "op": ..., "line": ...}` for `{"path": ..., "ops": [{...}]}` means the one operation.
@@ -303,6 +340,23 @@ mod tests {
             },
             "required": ["path"]
         })
+    }
+
+    /// A property the object does not have, sent beside a one-item list whose item has it and lacks it, moves into that item; with two items, or an item that has it, nothing moves.
+    #[test]
+    fn a_stray_property_moves_into_the_one_item() {
+        let schema = tool_schema();
+        assert_eq!(
+            coerce(
+                &schema,
+                json!({ "path": "a", "edits": [{ "line": 1 }], "text": "x" })
+            ),
+            json!({ "path": "a", "edits": [{ "line": 1, "text": "x" }] })
+        );
+        let two = json!({ "path": "a", "edits": [{ "line": 1 }, { "line": 2 }], "text": "x" });
+        assert_eq!(coerce(&schema, two.clone()), two);
+        let has = json!({ "path": "a", "edits": [{ "line": 1, "text": "y" }], "text": "x" });
+        assert_eq!(coerce(&schema, has.clone()), has);
     }
 
     /// Arguments that hold one item of the required list of objects get that list with the item in it, keeping the properties that are the object's own, and are left alone when what is left does not fit an item or the list is there.
